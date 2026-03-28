@@ -525,8 +525,8 @@ async fn process_zlm_hook(
                 .await?;
             hook_ack(&hook_name)
         }
-        "on_record_hls" => {
-            let hook = parse_record_hls_hook(&sanitized_payload)?;
+        "on_record_ts" | "on_record_hls" => {
+            let hook = parse_record_hls_hook(&sanitized_payload, &hook_name)?;
             if let Some(file_path) = resolve_record_hls_file_path(&hook) {
                 validate_record_file_path(&file_path, &state.storage_allowlist)?;
                 let _ = state
@@ -801,9 +801,12 @@ fn parse_stream_none_reader_hook(
     })
 }
 
-fn parse_record_hls_hook(payload: &serde_json::Value) -> Result<ZlmOnRecordHlsPayload, AppError> {
+fn parse_record_hls_hook(
+    payload: &serde_json::Value,
+    hook_name: &str,
+) -> Result<ZlmOnRecordHlsPayload, AppError> {
     serde_json::from_value(payload.clone())
-        .map_err(|error| AppError::BadRequest(format!("invalid on_record_hls payload: {error}")))
+        .map_err(|error| AppError::BadRequest(format!("invalid {hook_name} payload: {error}")))
 }
 
 fn parse_publish_hook(payload: &serde_json::Value) -> Result<ZlmOnPublishPayload, AppError> {

@@ -317,7 +317,7 @@ task_event_payload_field() {
   local path=${3:?json path required}
   local pg_path
   pg_path=$(printf '%s' "${path}" | sed "s/\\./,/g")
-  sql_scalar "select coalesce(payload #>> '{${pg_path}}', '') from task_events where task_id = '${task_id}' and event_type = '${event_type}' order by created_at desc limit 1;"
+  sql_scalar "select coalesce(payload #>> '{${pg_path}}', payload #>> '{payload,${pg_path}}', '') from task_events where task_id = '${task_id}' and event_type = '${event_type}' order by created_at desc limit 1;"
 }
 
 task_event_payload_has_value() {
@@ -440,9 +440,12 @@ prepare_sample_media() {
     ffmpeg -hide_banner -y \
       -f lavfi -i testsrc=size=320x180:rate=12 \
       -f lavfi -i sine=frequency=1000:sample_rate=48000 \
-      -t 180 \
+      -t 600 \
       -pix_fmt yuv420p \
       -c:v libx264 \
+      -g 24 \
+      -keyint_min 24 \
+      -sc_threshold 0 \
       -preset veryfast \
       -c:a aac \
       -shortest \
@@ -599,6 +602,10 @@ start_source_file_to_live() {
   "input": {
     "kind": "file",
     "url": "/data/media/work/samples/e2e-source.mp4"
+  },
+  "process": {
+    "mode": "copy_or_transcode",
+    "gop": 24
   },
   "publish": {
     "kind": "zlm_ingest",

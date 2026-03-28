@@ -1549,7 +1549,23 @@ fn build_multicast_bridge_plan(
         .then(|| build_startup_probe(&spec.publish))
         .transpose()?;
     let mut args = ffmpeg_base_args(input_url, false);
-    append_process_args(&mut args, spec, "passthrough")?;
+    insert_ffmpeg_input_args(
+        &mut args,
+        [
+            "-use_wallclock_as_timestamps".to_string(),
+            "1".to_string(),
+            "-fflags".to_string(),
+            "+genpts".to_string(),
+        ],
+    );
+    if should_stabilize_live_mpegts_multicast_bridge(spec, &output) {
+        // ZLM-published live inputs can surface unset/non-monotonic DTS when copied
+        // directly into MPEG-TS. Re-encode video to regenerate timestamps while
+        // keeping audio copy so the bridge stays close to passthrough semantics.
+        append_live_mpegts_multicast_bridge_args(&mut args, spec);
+    } else {
+        append_process_args(&mut args, spec, "passthrough")?;
+    }
     args.extend([
         "-threads".to_string(),
         "0".to_string(),
@@ -1567,6 +1583,67 @@ fn build_multicast_bridge_plan(
         success_check: output.success_check,
         startup_probe,
     })
+}
+
+fn should_stabilize_live_mpegts_multicast_bridge(spec: &TaskSpec, output: &PublishOutput) -> bool {
+    output.format == "mpegts"
+        && spec.process.mode.as_deref().unwrap_or("passthrough") == "passthrough"
+        && matches!(
+            spec.input.kind,
+            Some(
+                InputKind::Rtsp
+                    | InputKind::Rtmp
+                    | InputKind::Hls
+                    | InputKind::HttpFlv
+                    | InputKind::HttpTs
+            )
+        )
+        && matches!(
+            spec.publish.kind,
+            Some(PublishTargetKind::UdpMpegtsMulticast)
+        )
+}
+
+fn append_live_mpegts_multicast_bridge_args(args: &mut Vec<String>, spec: &TaskSpec) {
+    let video_codec = spec
+        .process
+        .video_codec
+        .clone()
+        .unwrap_or_else(|| "libx264".to_string());
+
+    args.extend([
+        "-c:v".to_string(),
+        video_codec.clone(),
+        "-c:a".to_string(),
+        "copy".to_string(),
+    ]);
+
+    if let Some(bitrate) = spec.process.bitrate {
+        args.extend(["-b:v".to_string(), format!("{bitrate}k")]);
+    }
+    if let Some(fps) = spec.process.fps {
+        args.extend(["-r".to_string(), fps.to_string()]);
+    }
+
+    let gop = spec.process.gop.unwrap_or(24);
+    args.extend([
+        "-g".to_string(),
+        gop.to_string(),
+        "-sc_threshold".to_string(),
+        "0".to_string(),
+    ]);
+
+    if let Some(profile) = spec.process.profile.clone() {
+        args.extend(["-profile:v".to_string(), profile]);
+    }
+
+    match spec.process.preset.clone() {
+        Some(preset) => args.extend(["-preset".to_string(), preset]),
+        None if video_codec == "libx264" => {
+            args.extend(["-preset".to_string(), "ultrafast".to_string()])
+        }
+        None => {}
+    }
 }
 
 fn build_live_relay_plan(
@@ -1701,6 +1778,14 @@ fn prepare_plan_paths(plan: &ProcessPlan) -> Result<(), ExecutorError> {
     }
 
     Ok(())
+}
+
+fn insert_ffmpeg_input_args(args: &mut Vec<String>, extra_args: [String; 4]) {
+    let input_index = args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("ffmpeg args should always include an input marker");
+    args.splice(input_index..input_index, extra_args);
 }
 
 fn build_input_url(input: &InputSpec) -> Result<String, ExecutorError> {
@@ -3639,6 +3724,74 @@ mod tests {
             == "udp://239.10.10.10:5000?localaddr=192.168.1.10&reuse=1&ttl=2&pkt_size=1316"));
         assert!(plan.args.iter().any(|arg| arg
             == "udp://239.20.20.20:6000?localaddr=192.168.1.20&reuse=1&ttl=4&pkt_size=1316"));
+        let fflags_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "-fflags")
+            .expect("multicast bridge should inject ffmpeg input flags");
+        let wallclock_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "-use_wallclock_as_timestamps")
+            .expect("multicast bridge should inject wallclock timestamping");
+        let input_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("ffmpeg args should contain input marker");
+        assert!(wallclock_index < input_index);
+        assert!(fflags_index < input_index);
+        assert_eq!(plan.args.get(wallclock_index + 1).map(String::as_str), Some("1"));
+        assert_eq!(plan.args.get(fflags_index + 1).map(String::as_str), Some("+genpts"));
+    }
+
+    #[test]
+    fn build_multicast_bridge_plan_stabilizes_live_mpegts_multicast_passthrough() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::MulticastBridge,
+            resolved_spec: json!({
+                "type": "multicast_bridge",
+                "name": "bridge-live-to-mcast",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "rtsp",
+                    "url": "rtsp://camera.example/live"
+                },
+                "process": {"mode": "passthrough"},
+                "publish": {
+                    "kind": "udp_mpegts_multicast",
+                    "group": "239.20.20.20",
+                    "port": 6000,
+                    "interface_ip": "192.168.1.20",
+                    "ttl": 4,
+                    "reuse": true,
+                    "pkt_size": 1316
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(plan.args.windows(2).any(|window| window == ["-c:v", "libx264"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "copy"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-preset", "ultrafast"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-g", "24"]));
+        assert!(plan
+            .args
+            .windows(2)
+            .any(|window| window == ["-sc_threshold", "0"]));
     }
 
     #[test]
