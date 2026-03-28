@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package streamserver.controlplane;
+
+service ControlPlane {
+  rpc StreamConnect(stream AgentEnvelope) returns (stream CoreEnvelope);
+}
+
+message AgentEnvelope {
+  oneof payload {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+    CapabilitySnapshot capability_snapshot = 3;
+    TaskEvent task_event = 4;
+    TaskLogBatch task_log_batch = 5;
+    TaskProgress task_progress = 6;
+    TaskSnapshot task_snapshot = 7;
+  }
+}
+
+message CoreEnvelope {
+  oneof payload {
+    StartTask start_task = 1;
+    StopTask stop_task = 2;
+    ProbeCapabilities probe_capabilities = 3;
+    AdoptOrphans adopt_orphans = 4;
+  }
+}
+
+message Register {
+  string node_id = 1;
+  string node_name = 2;
+  string agent_version = 3;
+  string hostname = 4;
+  repeated string labels = 5;
+  repeated string interfaces = 6;
+  string zlm_api_base = 7;
+  string agent_stream_addr = 8;
+  string network_mode = 9;
+  string ffmpeg_bin = 10;
+  string ffprobe_bin = 11;
+}
+
+message Heartbeat {
+  int64 node_time_ms = 1;
+  double cpu_percent = 2;
+  double mem_percent = 3;
+  double disk_percent = 4;
+  uint32 running_tasks = 5;
+  double slot_usage = 6;
+  bool zlm_alive = 7;
+  bool ffmpeg_alive = 8;
+}
+
+message CapabilitySnapshot {
+  repeated string ffmpeg_protocols = 1;
+  repeated string ffmpeg_formats = 2;
+  repeated string ffmpeg_encoders = 3;
+  repeated string ffmpeg_decoders = 4;
+  string zlm_version = 5;
+  repeated string zlm_api_list = 6;
+  repeated string gpu = 7;
+}
+
+message TaskEvent {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  string event_type = 3;
+  string event_level = 4;
+  string message = 5;
+  string payload_json = 6;
+}
+
+message TaskLogBatch {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  string stream = 3;
+  repeated string lines = 4;
+}
+
+message TaskProgress {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  uint64 frame = 3;
+  double fps = 4;
+  double bitrate_kbps = 5;
+  double speed = 6;
+  uint64 out_time_ms = 7;
+  uint64 dup_frames = 8;
+  uint64 drop_frames = 9;
+}
+
+message TaskSnapshot {
+  string runtime_id = 1;
+  string task_id = 2;
+  int32 attempt_no = 3;
+  string worker_kind = 4;
+  int32 pid = 5;
+  string state = 6;
+  string command_line = 7;
+  repeated string outputs = 8;
+  string metadata_json = 9;
+}
+
+message StartTask {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  string task_type = 3;
+  string resolved_spec_json = 4;
+  string execution_mode = 5;
+  string lease_token = 6;
+  string trace_context = 7;
+}
+
+message StopTask {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  string reason = 3;
+  uint32 grace_period_sec = 4;
+  uint32 force_after_sec = 5;
+}
+
+message ProbeCapabilities {}
+
+message AdoptOrphans {
+  repeated string task_ids = 1;
+  repeated string worker_kind = 2;
+}

@@ -1,0 +1,9 @@
+[logging]
+level = "debug"
+
+[core]
+hook_source_allowlist = ["127.0.0.1"]
+storage_allowlist = ["./data/media/work", "./data/zlm/record"]
+
+[agent]
+work_root = "./data/media/work"

@@ -1,0 +1,36 @@
+[logging]
+level = "info"
+json = false
+
+[core]
+http_addr = "0.0.0.0:8080"
+grpc_addr = "0.0.0.0:50051"
+grpc_tls_cert_path = ""
+grpc_tls_key_path = ""
+grpc_tls_client_ca_path = ""
+database_url = ""
+jwt_public_key = ""
+hook_shared_secret = ""
+hook_source_allowlist = []
+zlm_auto_close_on_no_reader_enabled = false
+storage_allowlist = ["/data/media/work", "/data/zlm/record"]
+
+[agent]
+http_addr = "0.0.0.0:8081"
+node_id = ""
+node_name = "local-agent"
+core_endpoint = "http://127.0.0.1:50051"
+cert_path = "certs/agent.pem"
+key_path = "certs/agent.key"
+ca_path = "certs/ca.pem"
+tls_domain_name = ""
+ffmpeg_bin = "ffmpeg"
+ffprobe_bin = "ffprobe"
+zlm_api_base = "http://127.0.0.1:8080"
+zlm_api_secret = ""
+zlm_auto_close_on_no_reader_enabled = false
+agent_stream_addr = "http://127.0.0.1:8081"
+network_mode = "bridge"
+labels = []
+max_runtime_slots = 4
+work_root = "/data/media/work"

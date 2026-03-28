@@ -1,0 +1,121 @@
+services:
+  postgres:
+    image: postgres:16.4-bookworm@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
+    environment:
+      POSTGRES_DB: streamserver
+      POSTGRES_PASSWORD: streamserver
+      POSTGRES_USER: postgres
+    command: ["postgres", "-c", "listen_addresses=*"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d streamserver"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      streamserver-e2e:
+        ipv4_address: 172.28.0.40
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  media-core:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: media-core-runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      STREAMSERVER_ENV: development
+      CORE_HTTP_ADDR: 0.0.0.0:8080
+      CORE_GRPC_ADDR: 0.0.0.0:50051
+      DATABASE_URL: postgresql://postgres:streamserver@postgres:5432/streamserver
+      HOOK_SHARED_SECRET: streamserver-e2e-secret
+      HOOK_SOURCE_ALLOWLIST: 172.28.0.20
+      STORAGE_ALLOWLIST: /data/media/work,/data/zlm/record,/data/zlm/www
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/ready >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      streamserver-e2e:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "18080:8080"
+
+  zlmediakit:
+    image: zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f
+    depends_on:
+      media-core:
+        condition: service_healthy
+    command: ["./MediaServer", "-s", "default.pem", "-c", "../conf/config.ini", "-l", "0"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1/index/api/getStatistic?secret=streamserver-e2e-secret' >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      streamserver-e2e:
+        ipv4_address: 172.28.0.20
+    ports:
+      - "18082:80"
+      - "11935:1935"
+      - "15554:554"
+    volumes:
+      - media-work:/data/media/work
+      - zlm-record:/data/zlm/record
+      - zlm-www:/data/zlm/www
+      - ./docker/zlm/config.ini:/opt/media/conf/config.ini:ro
+
+  media-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: media-agent-runtime
+    depends_on:
+      media-core:
+        condition: service_healthy
+      zlmediakit:
+        condition: service_healthy
+    environment:
+      STREAMSERVER_ENV: development
+      AGENT_HTTP_ADDR: 0.0.0.0:8081
+      AGENT_NODE_ID: 11111111-1111-1111-1111-111111111111
+      AGENT_NODE_NAME: compose-agent-1
+      AGENT_CORE_ENDPOINT: http://media-core:50051
+      AGENT_STREAM_ADDR: http://media-agent:8081
+      AGENT_LABELS: compose,e2e
+      WORK_ROOT: /data/media/work
+      FFMPEG_BIN: ffmpeg
+      FFPROBE_BIN: ffprobe
+      ZLM_API_BASE: http://zlmediakit:80
+      ZLM_API_SECRET: streamserver-e2e-secret
+      ZLM_AUTO_CLOSE_ON_NO_READER_ENABLED: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health/ready >/dev/null"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    networks:
+      streamserver-e2e:
+        ipv4_address: 172.28.0.30
+    ports:
+      - "18081:8081"
+    volumes:
+      - media-work:/data/media/work
+      - media-logs:/data/media/logs
+
+networks:
+  streamserver-e2e:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  media-logs:
+  media-work:
+  postgres-data:
+  zlm-record:
+  zlm-www:
