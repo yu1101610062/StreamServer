@@ -70,6 +70,13 @@ struct SessionLoad {
     running_tasks: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NodeLiveLoad {
+    pub connected: bool,
+    pub slot_usage: f64,
+    pub running_tasks: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DispatchScore {
     same_subnet: bool,
@@ -528,6 +535,23 @@ impl ControlPlaneService {
             running_tasks: handle.load.running_tasks,
         })
     }
+
+    pub async fn current_node_loads(&self) -> HashMap<Uuid, NodeLiveLoad> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .iter()
+            .map(|(node_id, handle)| {
+                (
+                    *node_id,
+                    NodeLiveLoad {
+                        connected: true,
+                        slot_usage: handle.load.slot_usage,
+                        running_tasks: handle.load.running_tasks,
+                    },
+                )
+            })
+            .collect()
+    }
 }
 
 #[tonic::async_trait]
@@ -591,6 +615,7 @@ fn registration_from_rpc(register: RpcRegister) -> Result<AgentRegistration, Sta
         labels: normalize_strings(register.labels),
         interfaces: normalize_strings(register.interfaces),
         zlm_api_base: register.zlm_api_base.trim().to_string(),
+        zlm_api_secret: register.zlm_api_secret.trim().to_string(),
         agent_stream_addr: require_field("agent_stream_addr", register.agent_stream_addr)?,
         network_mode,
         ffmpeg_bin: require_field("ffmpeg_bin", register.ffmpeg_bin)?,

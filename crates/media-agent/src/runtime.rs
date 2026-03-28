@@ -163,6 +163,7 @@ struct ProcessPlan {
     outputs: Vec<String>,
     success_check: SuccessCheck,
     startup_probe: Option<StartupProbe>,
+    recording: Option<LiveRelayRecording>,
 }
 
 #[derive(Debug, Clone)]
@@ -728,6 +729,7 @@ impl ManagedProcessExecutor {
                 "outputs": plan.outputs,
                 "startup_probe": plan.startup_probe,
                 "stream_online": plan.startup_probe.is_none(),
+                "recording": plan.recording,
             }),
         };
         self.registry.track(handle.clone());
@@ -1464,6 +1466,7 @@ fn build_file_transcode_plan(
         outputs: vec![output_path.clone()],
         success_check: SuccessCheck::FileExists(PathBuf::from(output_path)),
         startup_probe: None,
+        recording: None,
     })
 }
 
@@ -1485,39 +1488,47 @@ fn build_file_to_live_plan(
     let startup_probe = build_startup_probe(&spec.publish)?;
     let mut outputs = vec![publish_output.target.clone()];
     let mut success_check = publish_output.success_check.clone();
+    let mut recording = None;
 
     let mut args = ffmpeg_base_args(input_url, true);
     append_process_args(&mut args, spec, "copy_or_transcode")?;
     args.extend(["-threads".to_string(), "0".to_string()]);
 
     if spec.record.enabled.unwrap_or(false) {
-        let record_format = match spec
+        match spec
             .record
             .format
             .unwrap_or(media_domain::RecordFormat::Mp4)
         {
-            media_domain::RecordFormat::Mp4 => "mp4".to_string(),
-            media_domain::RecordFormat::Hls | media_domain::RecordFormat::Both => {
-                return Err(ExecutorError::InvalidRequest(
-                    "file_to_live record.format=hls/both is not yet supported by the managed executor".to_string(),
-                ));
+            media_domain::RecordFormat::Mp4 => {
+                let record_format = "mp4".to_string();
+                let record_path =
+                    spec.record.save_path.clone().unwrap_or_else(|| {
+                        work_dir.join("record.mp4").to_string_lossy().to_string()
+                    });
+                let tee_target = format!(
+                    "[f={}:onfail=ignore]{}|[f={}:onfail=ignore]{}",
+                    publish_output.format,
+                    escape_tee_target(&publish_output.target),
+                    record_format,
+                    escape_tee_target(&record_path),
+                );
+                args.extend(["-f".to_string(), "tee".to_string(), tee_target]);
+                outputs.push(record_path.clone());
+                success_check = SuccessCheck::FileExists(PathBuf::from(record_path));
             }
-        };
-        let record_path = spec
-            .record
-            .save_path
-            .clone()
-            .unwrap_or_else(|| work_dir.join("record.mp4").to_string_lossy().to_string());
-        let tee_target = format!(
-            "[f={}:onfail=ignore]{}|[f={}:onfail=ignore]{}",
-            publish_output.format,
-            escape_tee_target(&publish_output.target),
-            record_format,
-            escape_tee_target(&record_path),
-        );
-        args.extend(["-f".to_string(), "tee".to_string(), tee_target]);
-        outputs.push(record_path.clone());
-        success_check = SuccessCheck::FileExists(PathBuf::from(record_path));
+            media_domain::RecordFormat::Hls | media_domain::RecordFormat::Both => {
+                args.extend([
+                    "-f".to_string(),
+                    publish_output.format.clone(),
+                    publish_output.target.clone(),
+                ]);
+                recording = build_live_relay_recording(spec, &work_dir)?;
+                if let Some(recording_plan) = &recording {
+                    outputs.push(recording_plan.root_path.clone());
+                }
+            }
+        }
     } else {
         args.extend([
             "-f".to_string(),
@@ -1534,6 +1545,7 @@ fn build_file_to_live_plan(
         outputs,
         success_check,
         startup_probe: Some(startup_probe),
+        recording,
     })
 }
 
@@ -1582,6 +1594,7 @@ fn build_multicast_bridge_plan(
         outputs: vec![output.target],
         success_check: output.success_check,
         startup_probe,
+        recording: None,
     })
 }
 
@@ -3741,8 +3754,14 @@ mod tests {
             .expect("ffmpeg args should contain input marker");
         assert!(wallclock_index < input_index);
         assert!(fflags_index < input_index);
-        assert_eq!(plan.args.get(wallclock_index + 1).map(String::as_str), Some("1"));
-        assert_eq!(plan.args.get(fflags_index + 1).map(String::as_str), Some("+genpts"));
+        assert_eq!(
+            plan.args.get(wallclock_index + 1).map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            plan.args.get(fflags_index + 1).map(String::as_str),
+            Some("+genpts")
+        );
     }
 
     #[test]
@@ -3784,14 +3803,27 @@ mod tests {
         let plan =
             build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
 
-        assert!(plan.args.windows(2).any(|window| window == ["-c:v", "libx264"]));
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "copy"]));
-        assert!(plan.args.windows(2).any(|window| window == ["-preset", "ultrafast"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-preset", "ultrafast"])
+        );
         assert!(plan.args.windows(2).any(|window| window == ["-g", "24"]));
-        assert!(plan
-            .args
-            .windows(2)
-            .any(|window| window == ["-sc_threshold", "0"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-sc_threshold", "0"])
+        );
     }
 
     #[test]
@@ -3831,9 +3863,22 @@ mod tests {
             build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
 
         assert_eq!(plan.output_target, "rtmp://zlmediakit/live/bridge-ingest");
-        assert_eq!(plan.startup_probe.as_ref().and_then(|probe| probe.schema.as_deref()), Some("rtmp"));
-        assert_eq!(plan.startup_probe.as_ref().map(|probe| probe.app.as_str()), Some("live"));
-        assert_eq!(plan.startup_probe.as_ref().map(|probe| probe.stream.as_str()), Some("bridge-ingest"));
+        assert_eq!(
+            plan.startup_probe
+                .as_ref()
+                .and_then(|probe| probe.schema.as_deref()),
+            Some("rtmp")
+        );
+        assert_eq!(
+            plan.startup_probe.as_ref().map(|probe| probe.app.as_str()),
+            Some("live")
+        );
+        assert_eq!(
+            plan.startup_probe
+                .as_ref()
+                .map(|probe| probe.stream.as_str()),
+            Some("bridge-ingest")
+        );
     }
 
     #[test]

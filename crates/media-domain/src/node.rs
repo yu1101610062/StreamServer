@@ -53,6 +53,7 @@ pub struct AgentRegistration {
     pub labels: Vec<String>,
     pub interfaces: Vec<String>,
     pub zlm_api_base: String,
+    pub zlm_api_secret: String,
     pub agent_stream_addr: String,
     pub network_mode: NetworkMode,
     pub ffmpeg_bin: String,

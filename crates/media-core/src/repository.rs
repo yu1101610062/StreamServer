@@ -3,7 +3,8 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, AttemptStatus, CapabilitySnapshot, EventSource, HeartbeatSnapshot, Page,
-    StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType, WorkerKind,
+    StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType, TaskValidationError,
+    ValidationIssue, WorkerKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,9 +33,10 @@ impl TaskRepository {
         request_hash: &str,
         requested_spec: TaskSpec,
     ) -> Result<CreateTaskResult, RepoError> {
-        let resolved_spec = requested_spec.resolved();
-        requested_spec.validate()?;
-        resolved_spec.validate()?;
+        let resolved = self.resolve_requested_task(&requested_spec).await?;
+        let requested_spec = resolved.requested_spec;
+        let resolved_spec = resolved.resolved_spec;
+        let template_id = resolved.template_id;
 
         let tenant_id = resolved_spec.tenant_id().to_string();
         let created_by = resolved_spec.created_by().unwrap_or("system").to_string();
@@ -48,7 +50,7 @@ impl TaskRepository {
             name: resolved_spec.name.clone(),
             task_type: resolved_spec.task_type,
             status,
-            template_id: None,
+            template_id,
             profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
             assigned_node_id: None,
@@ -114,9 +116,9 @@ impl TaskRepository {
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, $2, $3, $4::task_type, $5::task_status, null, $6, $7,
-              $8, $9, $10, $11, null,
-              0, $12, $13, $14, null, null
+              $1, $2, $3, $4::task_type, $5::task_status, $6, $7, $8,
+              $9, $10, $11, $12, null,
+              0, $13, $14, $15, null, null
             )
             "#,
         )
@@ -125,6 +127,7 @@ impl TaskRepository {
         .bind(&resolved_spec.name)
         .bind(resolved_spec.task_type.as_str())
         .bind(status.as_str())
+        .bind(template_id)
         .bind(resolved_spec.profile.as_deref())
         .bind(idempotency_key)
         .bind(i32::from(resolved_spec.priority))
@@ -339,6 +342,737 @@ impl TaskRepository {
         Ok(resolved)
     }
 
+    pub async fn list_task_events(
+        &self,
+        task_id: Uuid,
+        filter: TaskEventFilter,
+    ) -> Result<Page<TaskEventSummary>, RepoError> {
+        let page = filter.page.unwrap_or(1).max(1);
+        let page_size = filter.page_size.unwrap_or(20).clamp(1, 200);
+        let total = self.count_task_events(task_id, &filter).await?;
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              id,
+              attempt_no,
+              source::text as source,
+              event_type,
+              event_level,
+              payload,
+              created_at
+            from task_events
+            where task_id = "#,
+        );
+        builder.push_bind(task_id);
+        apply_task_event_filters(&mut builder, &filter);
+        builder.push(" order by created_at desc, id desc limit ");
+        builder.push_bind(i64::from(page_size));
+        builder.push(" offset ");
+        builder.push_bind(i64::from((page - 1) * page_size));
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| TaskEventSummary::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Page::new(rows, page, page_size, total))
+    }
+
+    pub async fn list_task_logs(
+        &self,
+        task_id: Uuid,
+        filter: TaskLogFilter,
+    ) -> Result<TaskLogResponse, RepoError> {
+        let task = self.fetch_task_summary(task_id).await?;
+        let attempt_no = filter.attempt_no.unwrap_or(task.current_attempt_no).max(0);
+        if attempt_no <= 0 {
+            return Ok(TaskLogResponse {
+                attempt_no,
+                next_cursor: None,
+                lines: Vec::new(),
+            });
+        }
+
+        let stream_filter = filter.stream.as_deref().unwrap_or("merged").trim();
+        let cursor_ts = parse_log_cursor(filter.cursor.as_deref())?;
+        let limit = filter.limit.unwrap_or(200).clamp(1, 500) as usize;
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select created_at, payload
+              from task_events
+             where task_id = "#,
+        );
+        builder.push_bind(task_id);
+        builder.push(" and attempt_no = ");
+        builder.push_bind(attempt_no);
+        builder.push(" and event_type = 'task_log_batch'");
+        if let Some(cursor_ts) = cursor_ts {
+            builder.push(" and created_at < ");
+            builder.push_bind(cursor_ts);
+        }
+        builder.push(" order by created_at desc, id desc limit ");
+        builder.push_bind(200_i64);
+
+        let rows = builder.build().fetch_all(&self.pool).await?;
+        let mut lines = Vec::new();
+        let mut last_cursor = None;
+
+        for row in rows {
+            let created_at: DateTime<Utc> = row.try_get("created_at")?;
+            let payload: Value = row.try_get("payload")?;
+            let stream = payload
+                .get("stream")
+                .and_then(Value::as_str)
+                .unwrap_or("stderr")
+                .to_string();
+            if stream_filter != "merged" && stream_filter != stream {
+                continue;
+            }
+            let batch_lines = payload
+                .get("lines")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for line in batch_lines {
+                if let Some(line) = line.as_str() {
+                    lines.push(TaskLogLine {
+                        ts: created_at,
+                        stream: stream.clone(),
+                        line: line.to_string(),
+                    });
+                    last_cursor = Some(log_cursor_string(created_at));
+                    if lines.len() >= limit {
+                        return Ok(TaskLogResponse {
+                            attempt_no,
+                            next_cursor: last_cursor,
+                            lines,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(TaskLogResponse {
+            attempt_no,
+            next_cursor: last_cursor,
+            lines,
+        })
+    }
+
+    pub async fn create_template(
+        &self,
+        request: TemplateCreateRequest,
+        created_by: &str,
+    ) -> Result<TaskTemplateDetail, RepoError> {
+        if request.name.trim().is_empty() {
+            return Err(validation_error("name", "must not be empty"));
+        }
+
+        let now = Utc::now();
+        let template_id = Uuid::now_v7();
+        let default_spec = normalize_template_default_spec(
+            request.task_type,
+            request.profile.as_deref(),
+            request.default_spec,
+        )?;
+        sqlx::query(
+            r#"
+            insert into task_templates (
+              id, name, type, profile, default_spec, enabled, created_by, created_at, updated_at
+            ) values (
+              $1, $2, $3::task_type, $4, $5, $6, $7, $8, $8
+            )
+            "#,
+        )
+        .bind(template_id)
+        .bind(request.name.trim())
+        .bind(request.task_type.as_str())
+        .bind(request.profile.as_deref())
+        .bind(&default_spec)
+        .bind(request.enabled)
+        .bind(created_by)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_template(template_id).await
+    }
+
+    pub async fn list_templates(
+        &self,
+        filter: TemplateListFilter,
+    ) -> Result<Vec<TaskTemplateSummary>, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              profile,
+              enabled,
+              created_by,
+              created_at,
+              updated_at
+            from task_templates
+            where 1 = 1
+            "#,
+        );
+        if let Some(task_type) = filter.task_type {
+            builder.push(" and type = ");
+            builder.push_bind(task_type.as_str());
+            builder.push("::task_type");
+        }
+        if let Some(keyword) = filter
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let pattern = format!("%{keyword}%");
+            builder.push(" and (name ilike ");
+            builder.push_bind(pattern.clone());
+            builder.push(" or coalesce(profile, '') ilike ");
+            builder.push_bind(pattern);
+            builder.push(")");
+        }
+        builder.push(" order by updated_at desc, name asc");
+
+        builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| TaskTemplateSummary::from_row(&row))
+            .collect()
+    }
+
+    pub async fn get_template(&self, template_id: Uuid) -> Result<TaskTemplateDetail, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              profile,
+              default_spec,
+              enabled,
+              created_by,
+              created_at,
+              updated_at
+            from task_templates
+            where id = $1
+            "#,
+        )
+        .bind(template_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| RepoError::TemplateNotFound(template_id.to_string()))
+        .and_then(|row| TaskTemplateDetail::from_row(&row))
+    }
+
+    pub async fn render_template(
+        &self,
+        template_id: Uuid,
+        overrides: Value,
+    ) -> Result<Value, RepoError> {
+        let template = self.fetch_template_by_id(template_id).await?;
+        let task_type = template.task_type();
+        let profile = overrides
+            .get("profile")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| template.profile().map(str::to_string));
+        let merged = build_resolved_task_json(
+            task_type,
+            profile.as_deref(),
+            Some(&template.default_spec),
+            &overrides,
+        )?;
+        let spec: TaskSpec = serde_json::from_value(merged.clone())?;
+        spec.validate()?;
+        Ok(serde_json::to_value(spec.resolved())?)
+    }
+
+    pub async fn list_streams(
+        &self,
+        filter: StreamListFilter,
+    ) -> Result<Vec<StreamSummary>, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              sb.id,
+              sb.task_id,
+              sb.attempt_id,
+              ta.attempt_no,
+              t.tenant_id,
+              t.name as task_name,
+              t.assigned_node_id as node_id,
+              sb.schema,
+              sb.vhost,
+              sb.app,
+              sb.stream,
+              sb.zlm_proxy_key,
+              sb.zlm_pusher_key,
+              sb.rtp_stream_id,
+              t.started_at,
+              t.updated_at,
+              (
+                select case
+                  when te.event_type = 'stream_no_reader' then false
+                  when te.event_type in ('stream_publish_requested', 'running') then true
+                  else null
+                end
+                  from task_events te
+                 where te.task_id = sb.task_id
+                   and te.event_type in ('stream_no_reader', 'stream_publish_requested', 'running')
+                 order by te.created_at desc, te.id desc
+                 limit 1
+              ) as has_viewer
+            from stream_bindings sb
+            join tasks t on t.id = sb.task_id
+            join task_attempts ta on ta.id = sb.attempt_id
+            where 1 = 1
+            "#,
+        );
+        if let Some(tenant_id) = filter
+            .tenant_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder.push(" and t.tenant_id = ");
+            builder.push_bind(tenant_id);
+        }
+        if let Some(schema) = filter
+            .schema
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder.push(" and sb.schema = ");
+            builder.push_bind(schema);
+        }
+        if let Some(app) = filter
+            .app
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder.push(" and sb.app = ");
+            builder.push_bind(app);
+        }
+        if let Some(stream) = filter
+            .stream
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder.push(" and sb.stream = ");
+            builder.push_bind(stream);
+        }
+        if let Some(task_id) = filter.task_id {
+            builder.push(" and sb.task_id = ");
+            builder.push_bind(task_id);
+        }
+        if let Some(node_id) = filter.node_id {
+            builder.push(" and t.assigned_node_id = ");
+            builder.push_bind(node_id);
+        }
+        builder.push(" order by t.updated_at desc, sb.schema asc, sb.app asc, sb.stream asc");
+        let mut streams = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| StreamSummary::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(has_viewer) = filter.has_viewer {
+            streams.retain(|stream| stream.has_viewer == Some(has_viewer));
+        }
+        Ok(streams)
+    }
+
+    pub async fn list_record_files(
+        &self,
+        filter: RecordListFilter,
+    ) -> Result<Page<RecordFileSummary>, RepoError> {
+        let page = filter.page.unwrap_or(1).max(1);
+        let page_size = filter.page_size.unwrap_or(20).clamp(1, 200);
+        let total = self.count_record_files(&filter).await?;
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              rf.id,
+              rf.task_id,
+              rf.attempt_id,
+              rf.vhost,
+              rf.app,
+              rf.stream,
+              rf.file_path,
+              rf.file_size,
+              rf.time_len,
+              rf.start_time,
+              rf.source,
+              rf.created_at
+            from record_files rf
+            join tasks t on t.id = rf.task_id
+            where 1 = 1
+            "#,
+        );
+        apply_record_filters(&mut builder, &filter);
+        builder.push(" order by start_time desc nulls last, created_at desc limit ");
+        builder.push_bind(i64::from(page_size));
+        builder.push(" offset ");
+        builder.push_bind(i64::from((page - 1) * page_size));
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| RecordFileSummary::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Page::new(rows, page, page_size, total))
+    }
+
+    pub async fn list_nodes(&self) -> Result<Vec<NodeSummary>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              n.id,
+              n.node_name,
+              n.hostname,
+              n.labels,
+              n.zlm_api_base,
+              n.agent_stream_addr,
+              n.network_mode,
+              n.interfaces,
+              n.healthy,
+              n.last_seen_at,
+              n.created_at,
+              n.updated_at,
+              c.ffmpeg_protocols,
+              c.ffmpeg_formats,
+              c.ffmpeg_encoders,
+              c.ffmpeg_decoders,
+              c.zlm_api_list,
+              c.zlm_version,
+              c.gpu,
+              c.captured_at
+            from media_nodes n
+            left join node_capabilities c on c.node_id = n.id
+            order by n.updated_at desc, n.node_name asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| NodeSummary::from_row(&row))
+        .collect()
+    }
+
+    pub async fn get_node_debug_target(&self, node_id: Uuid) -> Result<NodeDebugTarget, RepoError> {
+        sqlx::query(
+            r#"
+            select id, zlm_api_base, zlm_api_secret
+              from media_nodes
+             where id = $1
+            "#,
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(RepoError::NodeNotFound(node_id))
+        .and_then(|row| {
+            Ok(NodeDebugTarget {
+                zlm_api_base: row.try_get("zlm_api_base")?,
+                zlm_api_secret: row.try_get("zlm_api_secret")?,
+            })
+        })
+    }
+
+    pub async fn list_due_at_tasks(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>, RepoError> {
+        Ok(sqlx::query_scalar(
+            r#"
+            select id
+              from tasks
+             where schedule_start_mode = 'at'
+               and status = 'VALIDATING'::task_status
+               and resolved_spec is not null
+               and nullif(resolved_spec->'schedule'->>'start_at', '') is not null
+               and (resolved_spec->'schedule'->>'start_at')::timestamptz <= $1
+             order by created_at asc
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn list_cron_schedules(&self) -> Result<Vec<CronScheduleEntry>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              t.id,
+              t.requested_spec,
+              t.created_at,
+              (
+                select payload->>'scheduled_for'
+                  from task_events te
+                 where te.task_id = t.id
+                   and te.event_type = 'cron_task_triggered'
+                 order by te.created_at desc, te.id desc
+                 limit 1
+              ) as last_scheduled_for
+            from tasks t
+            where t.schedule_start_mode = 'cron'
+              and t.status in ('VALIDATING', 'CREATED', 'QUEUED')
+            order by t.created_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            let last_scheduled_for = row
+                .try_get::<Option<String>, _>("last_scheduled_for")?
+                .as_deref()
+                .map(DateTime::parse_from_rfc3339)
+                .transpose()
+                .map_err(|error| {
+                    RepoError::Serde(serde_json::Error::io(std::io::Error::other(error)))
+                })?
+                .map(|value| value.with_timezone(&Utc));
+
+            Ok(CronScheduleEntry {
+                task_id: row.try_get("id")?,
+                requested_spec: row.try_get("requested_spec")?,
+                created_at: row.try_get("created_at")?,
+                last_scheduled_for,
+            })
+        })
+        .collect()
+    }
+
+    pub async fn trigger_cron_task(
+        &self,
+        parent_task_id: Uuid,
+        scheduled_for: DateTime<Utc>,
+    ) -> Result<Option<TaskSummary>, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select
+              id,
+              tenant_id,
+              name,
+              type::text as task_type,
+              status::text as status,
+              template_id,
+              profile,
+              priority,
+              assigned_node_id,
+              current_attempt_no,
+              created_at,
+              updated_at,
+              started_at,
+              finished_at,
+              requested_spec
+            from tasks
+            where id = $1
+            for update
+            "#,
+        )
+        .bind(parent_task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepoError::TaskNotFound(parent_task_id))?;
+
+        let already_triggered: bool = sqlx::query_scalar(
+            r#"
+            select exists (
+              select 1
+                from task_events
+               where task_id = $1
+                 and event_type = 'cron_task_triggered'
+                 and payload->>'scheduled_for' = $2
+            )
+            "#,
+        )
+        .bind(parent_task_id)
+        .bind(scheduled_for.to_rfc3339())
+        .fetch_one(&mut *tx)
+        .await?;
+        if already_triggered {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let parent = TaskSummary::from_row(&row)?;
+        let mut requested_spec: TaskSpec = serde_json::from_value(row.try_get("requested_spec")?)?;
+        requested_spec.schedule.start_mode = Some(StartMode::Immediate);
+        requested_spec.schedule.start_at = None;
+        requested_spec.schedule.cron = None;
+
+        let resolved = self.resolve_requested_task(&requested_spec).await?;
+        let requested_spec = resolved.requested_spec;
+        let resolved_spec = resolved.resolved_spec;
+        let template_id = resolved.template_id.or(parent.template_id);
+        let tenant_id = resolved_spec.tenant_id().to_string();
+        let created_by = resolved_spec
+            .created_by()
+            .unwrap_or("scheduler")
+            .to_string();
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let summary = TaskSummary {
+            id: task_id,
+            tenant_id: tenant_id.clone(),
+            name: resolved_spec.name.clone(),
+            task_type: resolved_spec.task_type,
+            status: resolved_spec.initial_status(),
+            template_id,
+            profile: resolved_spec.profile.clone(),
+            priority: resolved_spec.priority,
+            assigned_node_id: None,
+            current_attempt_no: 0,
+            created_at: now,
+            updated_at: now,
+            started_at: None,
+            finished_at: None,
+        };
+
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, tenant_id, name, type, status, template_id, profile, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, $2, $3, $4::task_type, $5::task_status, $6, $7, $8,
+              $9, $10, $11, $12, null,
+              0, 'immediate', $13, $13, null, null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(&tenant_id)
+        .bind(&summary.name)
+        .bind(summary.task_type.as_str())
+        .bind(summary.status.as_str())
+        .bind(summary.template_id)
+        .bind(summary.profile.as_deref())
+        .bind(format!("cron-{parent_task_id}-{}", scheduled_for.timestamp()))
+        .bind(i32::from(summary.priority))
+        .bind(serde_json::to_value(&requested_spec)?)
+        .bind(serde_json::to_value(&resolved_spec)?)
+        .bind(&created_by)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        self.insert_event(
+            &mut tx,
+            parent_task_id,
+            None,
+            None,
+            EventSource::Scheduler,
+            "cron_task_triggered",
+            "info",
+            json!({
+                "scheduled_for": scheduled_for,
+                "spawned_task_id": task_id,
+            }),
+        )
+        .await?;
+
+        self.insert_event(
+            &mut tx,
+            task_id,
+            None,
+            None,
+            EventSource::Scheduler,
+            "task_created",
+            "info",
+            json!({
+                "status": summary.status,
+                "schedule_start_mode": StartMode::Immediate,
+                "scheduled_for": scheduled_for,
+                "parent_task_id": parent_task_id,
+            }),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(summary))
+    }
+
+    async fn resolve_requested_task(
+        &self,
+        requested_spec: &TaskSpec,
+    ) -> Result<ResolvedTaskRequest, RepoError> {
+        let template = if let Some(name) = requested_spec
+            .template
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(self.fetch_template_by_name(name).await?)
+        } else {
+            None
+        };
+
+        if let Some(template) = &template {
+            if template.task_type() != requested_spec.task_type {
+                return Err(validation_error(
+                    "template",
+                    format!(
+                        "template {} is for type {}, but request is {}",
+                        template.name(),
+                        template.task_type(),
+                        requested_spec.task_type
+                    ),
+                ));
+            }
+        }
+
+        let effective_profile = requested_spec
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                template
+                    .as_ref()
+                    .and_then(|value| value.profile().map(str::to_string))
+            });
+        let overlay = task_spec_overlay(requested_spec);
+        let merged_json = build_resolved_task_json(
+            requested_spec.task_type,
+            effective_profile.as_deref(),
+            template.as_ref().map(|value| &value.default_spec),
+            &overlay,
+        )?;
+        let merged_spec: TaskSpec = serde_json::from_value(merged_json)?;
+        merged_spec.validate()?;
+        let resolved_spec = merged_spec.resolved();
+        resolved_spec.validate()?;
+
+        Ok(ResolvedTaskRequest {
+            requested_spec: merged_spec,
+            resolved_spec,
+            template_id: template.map(|value| value.id()),
+        })
+    }
+
     pub async fn transition_task(
         &self,
         task_id: Uuid,
@@ -514,15 +1248,16 @@ impl TaskRepository {
         let source = TaskSummary::from_row(&row)?;
         source.status.apply_operation(TaskOperation::Clone)?;
 
-        let requested_spec: Value = row.try_get("requested_spec")?;
         let template_id: Option<Uuid> = row.try_get("template_id")?;
-        let mut requested_spec: TaskSpec = serde_json::from_value(requested_spec)?;
+        let requested_spec_value: Value = row.try_get("requested_spec")?;
+        let mut requested_spec: TaskSpec = serde_json::from_value(requested_spec_value)?;
         if let Some(overrides) = overrides {
             apply_clone_overrides(&mut requested_spec, overrides);
         }
-        let resolved_spec = requested_spec.resolved();
-        requested_spec.validate()?;
-        resolved_spec.validate()?;
+        let resolved = self.resolve_requested_task(&requested_spec).await?;
+        let requested_spec = resolved.requested_spec;
+        let resolved_spec = resolved.resolved_spec;
+        let template_id = resolved.template_id.or(template_id);
 
         let tenant_id = resolved_spec.tenant_id().to_string();
         let created_by = resolved_spec.created_by().unwrap_or("system").to_string();
@@ -877,17 +1612,18 @@ impl TaskRepository {
         sqlx::query(
             r#"
             insert into media_nodes (
-              id, node_name, hostname, labels, zlm_api_base, agent_stream_addr,
+              id, node_name, hostname, labels, zlm_api_base, zlm_api_secret, agent_stream_addr,
               network_mode, interfaces, healthy, last_seen_at, created_at, updated_at
             ) values (
-              $1, $2, $3, $4, $5, $6,
-              $7, $8, true, $9, $10, $10
+              $1, $2, $3, $4, $5, $6, $7,
+              $8, $9, true, $10, $11, $11
             )
             on conflict (id) do update
                set node_name = excluded.node_name,
                    hostname = excluded.hostname,
                    labels = excluded.labels,
                    zlm_api_base = excluded.zlm_api_base,
+                   zlm_api_secret = excluded.zlm_api_secret,
                    agent_stream_addr = excluded.agent_stream_addr,
                    network_mode = excluded.network_mode,
                    interfaces = excluded.interfaces,
@@ -901,6 +1637,7 @@ impl TaskRepository {
         .bind(&registration.hostname)
         .bind(serde_json::to_value(&registration.labels)?)
         .bind(&registration.zlm_api_base)
+        .bind(&registration.zlm_api_secret)
         .bind(&registration.agent_stream_addr)
         .bind(registration.network_mode.as_str())
         .bind(serde_json::to_value(&registration.interfaces)?)
@@ -1902,6 +2639,65 @@ impl TaskRepository {
         Ok(total as u64)
     }
 
+    async fn count_task_events(
+        &self,
+        task_id: Uuid,
+        filter: &TaskEventFilter,
+    ) -> Result<u64, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "select count(*) as total from task_events where task_id = ",
+        );
+        builder.push_bind(task_id);
+        apply_task_event_filters(&mut builder, filter);
+
+        let row = builder.build().fetch_one(&self.pool).await?;
+        let total: i64 = row.try_get("total")?;
+        Ok(total as u64)
+    }
+
+    async fn count_record_files(&self, filter: &RecordListFilter) -> Result<u64, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "select count(*) as total from record_files rf join tasks t on t.id = rf.task_id where 1 = 1",
+        );
+        apply_record_filters(&mut builder, filter);
+
+        let row = builder.build().fetch_one(&self.pool).await?;
+        let total: i64 = row.try_get("total")?;
+        Ok(total as u64)
+    }
+
+    async fn fetch_template_by_name(&self, name: &str) -> Result<TaskTemplateDetail, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              profile,
+              default_spec,
+              enabled,
+              created_by,
+              created_at,
+              updated_at
+            from task_templates
+            where name = $1
+              and enabled = true
+            "#,
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| RepoError::TemplateNotFound(name.to_string()))
+        .and_then(|row| TaskTemplateDetail::from_row(&row))
+    }
+
+    async fn fetch_template_by_id(
+        &self,
+        template_id: Uuid,
+    ) -> Result<TaskTemplateDetail, RepoError> {
+        self.get_template(template_id).await
+    }
+
     fn apply_filters<'a>(
         &self,
         builder: &mut QueryBuilder<'a, Postgres>,
@@ -2284,6 +3080,892 @@ pub struct StopCommand {
 }
 
 #[derive(Debug, Clone)]
+struct ResolvedTaskRequest {
+    requested_spec: TaskSpec,
+    resolved_spec: TaskSpec,
+    template_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskEventFilter {
+    #[serde(default)]
+    pub attempt_no: Option<i32>,
+    #[serde(default)]
+    pub source: Option<EventSource>,
+    #[serde(default)]
+    pub event_type: Option<String>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TaskLogFilter {
+    #[serde(default)]
+    pub attempt_no: Option<i32>,
+    #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskLogLine {
+    pub ts: DateTime<Utc>,
+    pub stream: String,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskLogResponse {
+    pub attempt_no: i32,
+    pub next_cursor: Option<String>,
+    pub lines: Vec<TaskLogLine>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TemplateCreateRequest {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub task_type: TaskType,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub default_spec: Value,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TemplateListFilter {
+    #[serde(default, rename = "type")]
+    pub task_type: Option<TaskType>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskTemplateSummary {
+    pub id: Uuid,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub task_type: TaskType,
+    pub profile: Option<String>,
+    pub enabled: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TaskTemplateSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            task_type: TaskType::from_str(row.try_get::<&str, _>("task_type")?)
+                .map_err(RepoError::ParseEnum)?,
+            profile: row.try_get("profile")?,
+            enabled: row.try_get("enabled")?,
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskTemplateDetail {
+    #[serde(flatten)]
+    pub summary: TaskTemplateSummary,
+    pub default_spec: Value,
+}
+
+impl TaskTemplateDetail {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            summary: TaskTemplateSummary::from_row(row)?,
+            default_spec: row.try_get("default_spec")?,
+        })
+    }
+
+    fn id(&self) -> Uuid {
+        self.summary.id
+    }
+
+    fn name(&self) -> &str {
+        &self.summary.name
+    }
+
+    fn task_type(&self) -> TaskType {
+        self.summary.task_type
+    }
+
+    fn profile(&self) -> Option<&str> {
+        self.summary.profile.as_deref()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamListFilter {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub schema: Option<String>,
+    #[serde(default)]
+    pub app: Option<String>,
+    #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub node_id: Option<Uuid>,
+    #[serde(default)]
+    pub has_viewer: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamSummary {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub attempt_id: Uuid,
+    pub attempt_no: i32,
+    pub tenant_id: String,
+    pub task_name: String,
+    pub node_id: Option<Uuid>,
+    pub schema: String,
+    pub vhost: String,
+    pub app: String,
+    pub stream: String,
+    pub zlm_proxy_key: Option<String>,
+    pub zlm_pusher_key: Option<String>,
+    pub rtp_stream_id: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub has_viewer: Option<bool>,
+}
+
+impl StreamSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            task_id: row.try_get("task_id")?,
+            attempt_id: row.try_get("attempt_id")?,
+            attempt_no: row.try_get("attempt_no")?,
+            tenant_id: row.try_get("tenant_id")?,
+            task_name: row.try_get("task_name")?,
+            node_id: row.try_get("node_id")?,
+            schema: row.try_get("schema")?,
+            vhost: row.try_get("vhost")?,
+            app: row.try_get("app")?,
+            stream: row.try_get("stream")?,
+            zlm_proxy_key: row.try_get("zlm_proxy_key")?,
+            zlm_pusher_key: row.try_get("zlm_pusher_key")?,
+            rtp_stream_id: row.try_get("rtp_stream_id")?,
+            started_at: row.try_get("started_at")?,
+            updated_at: row.try_get("updated_at")?,
+            has_viewer: row.try_get("has_viewer")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecordListFilter {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub stream: Option<String>,
+    #[serde(default)]
+    pub date_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub date_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordFileSummary {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub attempt_id: Option<Uuid>,
+    pub vhost: Option<String>,
+    pub app: Option<String>,
+    pub stream: Option<String>,
+    pub file_path: String,
+    pub file_size: i64,
+    pub time_len: Option<i32>,
+    pub start_time: Option<DateTime<Utc>>,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl RecordFileSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            task_id: row.try_get("task_id")?,
+            attempt_id: row.try_get("attempt_id")?,
+            vhost: row.try_get("vhost")?,
+            app: row.try_get("app")?,
+            stream: row.try_get("stream")?,
+            file_path: row.try_get("file_path")?,
+            file_size: row.try_get("file_size")?,
+            time_len: row.try_get("time_len")?,
+            start_time: row.try_get("start_time")?,
+            source: row.try_get("source")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSummary {
+    pub id: Uuid,
+    pub node_name: String,
+    pub hostname: String,
+    pub labels: Vec<String>,
+    pub zlm_api_base: String,
+    pub agent_stream_addr: String,
+    pub network_mode: String,
+    pub interfaces: Vec<String>,
+    pub healthy: bool,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub ffmpeg_protocols: Vec<String>,
+    pub ffmpeg_formats: Vec<String>,
+    pub ffmpeg_encoders: Vec<String>,
+    pub ffmpeg_decoders: Vec<String>,
+    pub zlm_api_list: Vec<String>,
+    pub zlm_version: Option<String>,
+    pub gpu: Vec<String>,
+    pub capability_captured_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected: Option<bool>,
+}
+
+impl NodeSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            node_name: row.try_get("node_name")?,
+            hostname: row.try_get("hostname")?,
+            labels: serde_json::from_value(row.try_get("labels")?)?,
+            zlm_api_base: row.try_get("zlm_api_base")?,
+            agent_stream_addr: row.try_get("agent_stream_addr")?,
+            network_mode: row.try_get("network_mode")?,
+            interfaces: serde_json::from_value(row.try_get("interfaces")?)?,
+            healthy: row.try_get("healthy")?,
+            last_seen_at: row.try_get("last_seen_at")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            ffmpeg_protocols: row
+                .try_get::<Option<Value>, _>("ffmpeg_protocols")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            ffmpeg_formats: row
+                .try_get::<Option<Value>, _>("ffmpeg_formats")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            ffmpeg_encoders: row
+                .try_get::<Option<Value>, _>("ffmpeg_encoders")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            ffmpeg_decoders: row
+                .try_get::<Option<Value>, _>("ffmpeg_decoders")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            zlm_api_list: row
+                .try_get::<Option<Value>, _>("zlm_api_list")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            zlm_version: row.try_get("zlm_version")?,
+            gpu: row
+                .try_get::<Option<Value>, _>("gpu")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
+            capability_captured_at: row.try_get("captured_at")?,
+            slot_usage: None,
+            running_tasks: None,
+            connected: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeDebugTarget {
+    pub zlm_api_base: String,
+    pub zlm_api_secret: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CronScheduleEntry {
+    pub task_id: Uuid,
+    pub requested_spec: Value,
+    pub created_at: DateTime<Utc>,
+    pub last_scheduled_for: Option<DateTime<Utc>>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn validation_error(field: &'static str, message: impl Into<String>) -> RepoError {
+    RepoError::Validation(TaskValidationError {
+        issues: vec![ValidationIssue::new(field, message)],
+    })
+}
+
+fn parse_log_cursor(value: Option<&str>) -> Result<Option<DateTime<Utc>>, RepoError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let millis = value
+        .parse::<i64>()
+        .map_err(|_| validation_error("cursor", "must be a unix timestamp in milliseconds"))?;
+    DateTime::<Utc>::from_timestamp_millis(millis)
+        .ok_or_else(|| validation_error("cursor", "must be a valid unix timestamp"))
+        .map(Some)
+}
+
+fn log_cursor_string(value: DateTime<Utc>) -> String {
+    value.timestamp_millis().to_string()
+}
+
+fn apply_task_event_filters<'a>(
+    builder: &mut QueryBuilder<'a, Postgres>,
+    filter: &'a TaskEventFilter,
+) {
+    if let Some(attempt_no) = filter.attempt_no {
+        builder.push(" and attempt_no = ");
+        builder.push_bind(attempt_no);
+    }
+    if let Some(source) = filter.source {
+        builder.push(" and source = ");
+        builder.push_bind(source.as_str());
+        builder.push("::event_source");
+    }
+    if let Some(event_type) = filter
+        .event_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        builder.push(" and event_type = ");
+        builder.push_bind(event_type);
+    }
+}
+
+fn apply_record_filters<'a>(
+    builder: &mut QueryBuilder<'a, Postgres>,
+    filter: &'a RecordListFilter,
+) {
+    if let Some(tenant_id) = filter
+        .tenant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        builder.push(" and t.tenant_id = ");
+        builder.push_bind(tenant_id);
+    }
+    if let Some(task_id) = filter.task_id {
+        builder.push(" and rf.task_id = ");
+        builder.push_bind(task_id);
+    }
+    if let Some(stream) = filter
+        .stream
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        builder.push(" and rf.stream = ");
+        builder.push_bind(stream);
+    }
+    if let Some(date_from) = filter.date_from {
+        builder.push(" and coalesce(rf.start_time, rf.created_at) >= ");
+        builder.push_bind(date_from);
+    }
+    if let Some(date_to) = filter.date_to {
+        builder.push(" and coalesce(rf.start_time, rf.created_at) <= ");
+        builder.push_bind(date_to);
+    }
+}
+
+fn normalize_template_default_spec(
+    task_type: TaskType,
+    profile: Option<&str>,
+    default_spec: Value,
+) -> Result<Value, RepoError> {
+    if !default_spec.is_object() {
+        return Err(validation_error(
+            "default_spec",
+            "template default_spec must be a JSON object",
+        ));
+    }
+    build_resolved_task_json(task_type, profile, None, &default_spec)
+}
+
+fn build_resolved_task_json(
+    task_type: TaskType,
+    profile: Option<&str>,
+    template_defaults: Option<&Value>,
+    request_overrides: &Value,
+) -> Result<Value, RepoError> {
+    let mut merged = profile_defaults_json(task_type, profile);
+    if let Some(template_defaults) = template_defaults {
+        if !template_defaults.is_object() {
+            return Err(validation_error(
+                "template.default_spec",
+                "template default_spec must be a JSON object",
+            ));
+        }
+        deep_merge(&mut merged, template_defaults.clone());
+    }
+    if !request_overrides.is_object() {
+        return Err(validation_error(
+            "task",
+            "request payload must be a JSON object",
+        ));
+    }
+    deep_merge(&mut merged, request_overrides.clone());
+    merged["type"] = Value::String(task_type.as_str().to_string());
+    if merged
+        .get("profile")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        if let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) {
+            merged["profile"] = Value::String(profile.to_string());
+        }
+    }
+    Ok(merged)
+}
+
+fn profile_defaults_json(task_type: TaskType, profile: Option<&str>) -> Value {
+    let mut value = json!({});
+    let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) else {
+        return value;
+    };
+
+    let defaults = match profile {
+        "realtime_compat" => json!({
+            "process": {
+                "mode": "copy_or_transcode",
+                "video_codec": "h264",
+                "audio_codec": "aac"
+            },
+            "publish": {
+                "enable_rtsp": true,
+                "enable_rtmp": true,
+                "enable_http_ts": true,
+                "enable_http_fmp4": true,
+                "enable_hls": false,
+                "enable_webrtc": false
+            }
+        }),
+        "rtc_web_compat" => json!({
+            "process": {
+                "mode": "transcode",
+                "video_codec": "h264",
+                "audio_codec": "opus",
+                "profile": "baseline"
+            },
+            "publish": {
+                "enable_rtsp": true,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": true,
+                "enable_hls": false,
+                "enable_webrtc": true
+            }
+        }),
+        "archive_quality" => json!({
+            "process": {
+                "mode": "copy_or_transcode"
+            },
+            "record": {
+                "enabled": true,
+                "format": "mp4"
+            }
+        }),
+        "multicast_ts" => json!({
+            "process": {
+                "mode": "copy_or_transcode"
+            },
+            "publish": {
+                "format": "mpegts",
+                "ttl": 1,
+                "reuse": true,
+                "pkt_size": 1316
+            }
+        }),
+        "rtmp_hevc_ext" => json!({
+            "process": {
+                "mode": "transcode",
+                "video_codec": "h265",
+                "audio_codec": "aac"
+            },
+            "publish": {
+                "enable_rtmp": true
+            }
+        }),
+        _ => json!({}),
+    };
+    deep_merge(&mut value, defaults);
+
+    if !value.is_object() {
+        return json!({});
+    }
+
+    if task_type == TaskType::FileTranscode {
+        value["recovery"] = json!({"policy": "on_failure"});
+    }
+
+    value
+}
+
+fn task_spec_overlay(spec: &TaskSpec) -> Value {
+    let mut overlay = serde_json::Map::new();
+    overlay.insert(
+        "type".to_string(),
+        Value::String(spec.task_type.as_str().to_string()),
+    );
+    overlay.insert("name".to_string(), Value::String(spec.name.clone()));
+    overlay.insert("priority".to_string(), json!(spec.priority));
+    if let Some(template) = spec
+        .template
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        overlay.insert(
+            "template".to_string(),
+            Value::String(template.trim().to_string()),
+        );
+    }
+    if let Some(profile) = spec
+        .profile
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        overlay.insert(
+            "profile".to_string(),
+            Value::String(profile.trim().to_string()),
+        );
+    }
+
+    let mut common = serde_json::Map::new();
+    if let Some(tenant_id) = spec
+        .common
+        .tenant_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        common.insert(
+            "tenant_id".to_string(),
+            Value::String(tenant_id.trim().to_string()),
+        );
+    }
+    if let Some(created_by) = spec
+        .common
+        .created_by
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        common.insert(
+            "created_by".to_string(),
+            Value::String(created_by.trim().to_string()),
+        );
+    }
+    if let Some(callback_url) = spec
+        .common
+        .callback_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        common.insert(
+            "callback_url".to_string(),
+            Value::String(callback_url.trim().to_string()),
+        );
+    }
+    if !spec.common.labels.is_empty() {
+        common.insert("labels".to_string(), json!(spec.common.labels));
+    }
+    if !common.is_empty() {
+        overlay.insert("common".to_string(), Value::Object(common));
+    }
+
+    let input = overlay_optional_fields(&[
+        ("kind", spec.input.kind.map(|value| json!(value))),
+        ("url", spec.input.url.as_ref().map(|value| json!(value))),
+        ("group", spec.input.group.as_ref().map(|value| json!(value))),
+        ("port", spec.input.port.map(|value| json!(value))),
+        (
+            "interface_ip",
+            spec.input.interface_ip.as_ref().map(|value| json!(value)),
+        ),
+        ("ttl", spec.input.ttl.map(|value| json!(value))),
+        ("reuse", spec.input.reuse.map(|value| json!(value))),
+        ("pkt_size", spec.input.pkt_size.map(|value| json!(value))),
+        ("dscp", spec.input.dscp.map(|value| json!(value))),
+        (
+            "buffer_size",
+            spec.input.buffer_size.map(|value| json!(value)),
+        ),
+        ("fifo_size", spec.input.fifo_size.map(|value| json!(value))),
+        (
+            "probe_timeout_ms",
+            spec.input.probe_timeout_ms.map(|value| json!(value)),
+        ),
+        ("tcp_mode", spec.input.tcp_mode.map(|value| json!(value))),
+        ("ssrc", spec.input.ssrc.map(|value| json!(value))),
+    ]);
+    if let Some(input) = input {
+        overlay.insert("input".to_string(), input);
+    }
+
+    let process = overlay_optional_fields(&[
+        ("mode", spec.process.mode.as_ref().map(|value| json!(value))),
+        (
+            "video_codec",
+            spec.process.video_codec.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "audio_codec",
+            spec.process.audio_codec.as_ref().map(|value| json!(value)),
+        ),
+        ("bitrate", spec.process.bitrate.map(|value| json!(value))),
+        ("fps", spec.process.fps.map(|value| json!(value))),
+        ("gop", spec.process.gop.map(|value| json!(value))),
+        (
+            "profile",
+            spec.process.profile.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "preset",
+            spec.process.preset.as_ref().map(|value| json!(value)),
+        ),
+    ]);
+    if let Some(process) = process {
+        overlay.insert("process".to_string(), process);
+    }
+
+    let publish = overlay_optional_fields(&[
+        ("kind", spec.publish.kind.map(|value| json!(value))),
+        ("url", spec.publish.url.as_ref().map(|value| json!(value))),
+        (
+            "group",
+            spec.publish.group.as_ref().map(|value| json!(value)),
+        ),
+        ("port", spec.publish.port.map(|value| json!(value))),
+        (
+            "interface_ip",
+            spec.publish.interface_ip.as_ref().map(|value| json!(value)),
+        ),
+        ("ttl", spec.publish.ttl.map(|value| json!(value))),
+        ("reuse", spec.publish.reuse.map(|value| json!(value))),
+        ("pkt_size", spec.publish.pkt_size.map(|value| json!(value))),
+        ("dscp", spec.publish.dscp.map(|value| json!(value))),
+        (
+            "buffer_size",
+            spec.publish.buffer_size.map(|value| json!(value)),
+        ),
+        (
+            "fifo_size",
+            spec.publish.fifo_size.map(|value| json!(value)),
+        ),
+        (
+            "format",
+            spec.publish.format.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "enable_rtsp",
+            spec.publish.enable_rtsp.map(|value| json!(value)),
+        ),
+        (
+            "enable_rtmp",
+            spec.publish.enable_rtmp.map(|value| json!(value)),
+        ),
+        (
+            "enable_http_ts",
+            spec.publish.enable_http_ts.map(|value| json!(value)),
+        ),
+        (
+            "enable_http_fmp4",
+            spec.publish.enable_http_fmp4.map(|value| json!(value)),
+        ),
+        (
+            "enable_hls",
+            spec.publish.enable_hls.map(|value| json!(value)),
+        ),
+        (
+            "enable_webrtc",
+            spec.publish.enable_webrtc.map(|value| json!(value)),
+        ),
+        (
+            "stop_on_no_reader",
+            spec.publish.stop_on_no_reader.map(|value| json!(value)),
+        ),
+    ]);
+    if let Some(publish) = publish {
+        overlay.insert("publish".to_string(), publish);
+    }
+
+    let record = overlay_optional_fields(&[
+        ("enabled", spec.record.enabled.map(|value| json!(value))),
+        ("format", spec.record.format.map(|value| json!(value))),
+        (
+            "segment_sec",
+            spec.record.segment_sec.map(|value| json!(value)),
+        ),
+        (
+            "save_path",
+            spec.record.save_path.as_ref().map(|value| json!(value)),
+        ),
+        ("as_player", spec.record.as_player.map(|value| json!(value))),
+        (
+            "archive_policy",
+            spec.record
+                .archive_policy
+                .as_ref()
+                .map(|value| json!(value)),
+        ),
+        (
+            "retention_days",
+            spec.record.retention_days.map(|value| json!(value)),
+        ),
+    ]);
+    if let Some(record) = record {
+        overlay.insert("record".to_string(), record);
+    }
+
+    let recovery = overlay_optional_fields(&[
+        ("policy", spec.recovery.policy.map(|value| json!(value))),
+        (
+            "resume_mode",
+            spec.recovery.resume_mode.as_ref().map(|value| json!(value)),
+        ),
+        (
+            "orphan_adopt",
+            spec.recovery.orphan_adopt.map(|value| json!(value)),
+        ),
+        (
+            "max_consecutive_failures",
+            spec.recovery
+                .max_consecutive_failures
+                .map(|value| json!(value)),
+        ),
+    ]);
+    if let Some(recovery) = recovery {
+        overlay.insert("recovery".to_string(), recovery);
+    }
+
+    let mut schedule = serde_json::Map::new();
+    if let Some(start_mode) = spec.schedule.start_mode {
+        schedule.insert("start_mode".to_string(), json!(start_mode));
+    }
+    if let Some(start_at) = spec.schedule.start_at {
+        schedule.insert("start_at".to_string(), json!(start_at));
+    }
+    if let Some(cron) = spec
+        .schedule
+        .cron
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        schedule.insert("cron".to_string(), json!(cron));
+    }
+    if !schedule.is_empty() {
+        overlay.insert("schedule".to_string(), Value::Object(schedule));
+    }
+
+    let mut resource = serde_json::Map::new();
+    if !spec.resource.required_labels.is_empty() {
+        resource.insert(
+            "required_labels".to_string(),
+            json!(spec.resource.required_labels),
+        );
+    }
+    if !spec.resource.preferred_labels.is_empty() {
+        resource.insert(
+            "preferred_labels".to_string(),
+            json!(spec.resource.preferred_labels),
+        );
+    }
+    if let Some(network_interface) = spec
+        .resource
+        .network_interface
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        resource.insert("network_interface".to_string(), json!(network_interface));
+    }
+    if let Some(need_gpu) = spec.resource.need_gpu {
+        resource.insert("need_gpu".to_string(), json!(need_gpu));
+    }
+    if let Some(slot_class) = spec
+        .resource
+        .slot_class
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        resource.insert("slot_class".to_string(), json!(slot_class));
+    }
+    if let Some(max_cpu_percent) = spec.resource.max_cpu_percent {
+        resource.insert("max_cpu_percent".to_string(), json!(max_cpu_percent));
+    }
+    if !resource.is_empty() {
+        overlay.insert("resource".to_string(), Value::Object(resource));
+    }
+
+    Value::Object(overlay)
+}
+
+fn overlay_optional_fields(fields: &[(&str, Option<Value>)]) -> Option<Value> {
+    let mut object = serde_json::Map::new();
+    for (key, value) in fields {
+        if let Some(value) = value {
+            object.insert((*key).to_string(), value.clone());
+        }
+    }
+    (!object.is_empty()).then_some(Value::Object(object))
+}
+
+fn deep_merge(base: &mut Value, overlay: Value) {
+    match (base, overlay) {
+        (Value::Object(base_map), Value::Object(overlay_map)) => {
+            for (key, overlay_value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(base_value) => deep_merge(base_value, overlay_value),
+                    None => {
+                        base_map.insert(key, overlay_value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AgentTaskEventRecord {
     pub task_id: Uuid,
     pub attempt_no: i32,
@@ -2438,6 +4120,25 @@ pub struct TaskListFilter {
     pub sort_order: Option<String>,
 }
 
+impl TaskListFilter {
+    pub fn for_principal(mut self, tenant_id: Option<&str>) -> Result<Self, RepoError> {
+        let Some(tenant_id) = tenant_id else {
+            return Ok(self);
+        };
+
+        match self.tenant_id.as_deref() {
+            Some(current) if current != tenant_id => Err(validation_error(
+                "tenant_id",
+                "must match the authenticated tenant scope",
+            )),
+            _ => {
+                self.tenant_id = Some(tenant_id.to_string());
+                Ok(self)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: Uuid,
@@ -2573,6 +4274,8 @@ struct OperationRequestRow {
 pub enum RepoError {
     #[error("task {0} was not found")]
     TaskNotFound(Uuid),
+    #[error("template {0} was not found")]
+    TemplateNotFound(String),
     #[error("node {0} was not found")]
     NodeNotFound(Uuid),
     #[error("task {0} is missing resolved_spec")]
@@ -2685,4 +4388,103 @@ fn parse_publish_stream_url(value: &str) -> Option<(String, String)> {
 
 fn build_rtp_stream_id(task_id: Uuid, attempt_no: i32) -> String {
     format!("{task_id}-{attempt_no}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_resolved_task_json_applies_profile_template_then_request() {
+        let merged = build_resolved_task_json(
+            TaskType::LiveRelay,
+            Some("realtime_compat"),
+            Some(&json!({
+                "publish": {
+                    "enable_rtsp": false,
+                    "enable_hls": true
+                },
+                "record": {
+                    "enabled": true
+                }
+            })),
+            &json!({
+                "name": "relay-camera-01",
+                "common": {
+                    "created_by": "alice"
+                },
+                "input": {
+                    "kind": "rtsp",
+                    "url": "rtsp://camera.example/live"
+                },
+                "publish": {
+                    "enable_rtsp": true
+                }
+            }),
+        )
+        .expect("merged json should build");
+
+        let spec: TaskSpec = serde_json::from_value(merged).expect("task spec should parse");
+        let resolved = spec.resolved();
+
+        assert_eq!(resolved.process.video_codec.as_deref(), Some("h264"));
+        assert_eq!(resolved.publish.enable_rtsp, Some(true));
+        assert_eq!(resolved.publish.enable_hls, Some(true));
+        assert_eq!(resolved.record.enabled, Some(true));
+    }
+
+    #[test]
+    fn task_list_filter_is_scoped_to_principal_tenant() {
+        let filter = TaskListFilter {
+            tenant_id: None,
+            ..TaskListFilter::default()
+        }
+        .for_principal(Some("tenant-a"))
+        .expect("tenant scope should apply");
+
+        assert_eq!(filter.tenant_id.as_deref(), Some("tenant-a"));
+
+        let error = TaskListFilter {
+            tenant_id: Some("tenant-b".to_string()),
+            ..TaskListFilter::default()
+        }
+        .for_principal(Some("tenant-a"))
+        .expect_err("mismatched tenant should fail");
+
+        assert!(matches!(error, RepoError::Validation(_)));
+    }
+
+    #[test]
+    fn task_spec_overlay_skips_empty_option_fields() {
+        let spec = TaskSpec {
+            task_type: TaskType::LiveRelay,
+            template: Some("tpl_default_rtsp".to_string()),
+            name: "relay-camera-01".to_string(),
+            profile: None,
+            priority: 50,
+            common: media_domain::CommonSpec {
+                tenant_id: None,
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: media_domain::InputSpec {
+                kind: Some(media_domain::InputKind::Rtsp),
+                url: Some("rtsp://camera.example/live".to_string()),
+                ..Default::default()
+            },
+            process: Default::default(),
+            publish: Default::default(),
+            record: Default::default(),
+            recovery: Default::default(),
+            schedule: Default::default(),
+            resource: Default::default(),
+        };
+
+        let overlay = task_spec_overlay(&spec);
+
+        assert_eq!(overlay["template"], json!("tpl_default_rtsp"));
+        assert_eq!(overlay["common"]["created_by"], json!("alice"));
+        assert!(overlay["publish"].is_null());
+    }
 }

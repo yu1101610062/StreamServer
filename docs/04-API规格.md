@@ -12,6 +12,7 @@
 - Content-Type: `application/json`
 - 写接口统一要求 `Idempotency-Key` 请求头
 - 鉴权方式：`Authorization: Bearer <token>`
+- 若部署配置 `core.auth_enabled = false`，则北向 API 关闭 JWT 鉴权，默认按平台管理员权限放行
 - 时间统一返回 RFC 3339
 
 ### 2.2 幂等规则
@@ -70,6 +71,11 @@
 ### 3.1 `POST /tasks`
 
 创建任务。默认行为是创建后立即进入校验与调度；若 `schedule.start_mode = "manual"`，则停留在 `CREATED`。
+
+定时说明：
+
+- `schedule.start_mode = "at"`：Task 本身停留在 `VALIDATING`，由调度器在 `schedule.start_at` 到点后下发。
+- `schedule.start_mode = "cron"`：Task 本身作为计划定义存在；每次命中 Cron 表达式时，调度器会派生一个新的 `immediate` 子任务并立即进入调度。
 
 调度规则：
 

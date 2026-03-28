@@ -35,10 +35,11 @@ message Register {
   repeated string labels = 5;
   repeated string interfaces = 6;
   string zlm_api_base = 7;
-  string agent_stream_addr = 8;
-  string network_mode = 9;
-  string ffmpeg_bin = 10;
-  string ffprobe_bin = 11;
+  string zlm_api_secret = 8;
+  string agent_stream_addr = 9;
+  string network_mode = 10;
+  string ffmpeg_bin = 11;
+  string ffprobe_bin = 12;
 }
 
 message Heartbeat {

@@ -9,6 +9,7 @@ grpc_tls_cert_path = ""
 grpc_tls_key_path = ""
 grpc_tls_client_ca_path = ""
 database_url = ""
+auth_enabled = false
 jwt_public_key = ""
 hook_shared_secret = ""
 hook_source_allowlist = []

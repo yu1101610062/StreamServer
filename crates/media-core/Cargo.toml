@@ -10,6 +10,8 @@ anyhow.workspace = true
 axum.workspace = true
 chrono.workspace = true
 config.workspace = true
+cron.workspace = true
+jsonwebtoken.workspace = true
 media-domain = { path = "../media-domain" }
 media-rpc = { path = "../media-rpc" }
 reqwest.workspace = true

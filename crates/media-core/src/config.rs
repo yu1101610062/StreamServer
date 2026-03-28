@@ -47,6 +47,8 @@ pub struct CoreSettings {
     #[serde(default)]
     pub database_url: String,
     #[serde(default)]
+    pub auth_enabled: bool,
+    #[serde(default)]
     pub jwt_public_key: String,
     #[serde(default)]
     pub hook_shared_secret: String,
@@ -67,6 +69,7 @@ impl Default for CoreSettings {
             grpc_tls_key_path: default_grpc_tls_key_path(),
             grpc_tls_client_ca_path: default_grpc_tls_client_ca_path(),
             database_url: String::new(),
+            auth_enabled: false,
             jwt_public_key: String::new(),
             hook_shared_secret: String::new(),
             hook_source_allowlist: Vec::new(),
@@ -110,6 +113,12 @@ impl Settings {
             !self.core.database_url.trim().is_empty(),
             "DATABASE_URL must be configured"
         );
+        if self.core.auth_enabled {
+            anyhow::ensure!(
+                !self.core.jwt_public_key.trim().is_empty(),
+                "JWT_PUBLIC_KEY must be configured when auth is enabled"
+            );
+        }
         anyhow::ensure!(
             !self.core.storage_allowlist.is_empty(),
             "storage allowlist must not be empty"
@@ -148,6 +157,9 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("DATABASE_URL") {
         settings.core.database_url = value;
+    }
+    if let Some(value) = env("AUTH_ENABLED") {
+        settings.core.auth_enabled = matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
     if let Some(value) = env("JWT_PUBLIC_KEY") {
         settings.core.jwt_public_key = value;
