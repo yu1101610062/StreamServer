@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
 
@@ -37,17 +37,25 @@ impl AuthConfig {
         headers: &HeaderMap,
         permission: ApiPermission,
     ) -> Result<AuthenticatedPrincipal, AppError> {
-        let principal = if !self.enabled {
-            AuthenticatedPrincipal::platform_admin("auth_disabled")
-        } else {
-            let verifier = self.verifier.as_ref().ok_or_else(|| {
-                AppError::Internal("auth is enabled but verifier is missing".to_string())
-            })?;
-            verifier.verify(headers)?
-        };
+        let principal = self.session(headers)?;
 
         principal.require_permission(permission)?;
         Ok(principal)
+    }
+
+    pub fn session(&self, headers: &HeaderMap) -> Result<AuthenticatedPrincipal, AppError> {
+        if !self.enabled {
+            return Ok(AuthenticatedPrincipal::platform_admin("auth_disabled"));
+        }
+
+        let verifier = self.verifier.as_ref().ok_or_else(|| {
+            AppError::Internal("auth is enabled but verifier is missing".to_string())
+        })?;
+        verifier.verify(headers)
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
     }
 }
 
@@ -124,7 +132,31 @@ pub enum ApiPermission {
     DebugRead,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+impl ApiPermission {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskRead => "task_read",
+            Self::TaskWrite => "task_write",
+            Self::TemplateRead => "template_read",
+            Self::TemplateWrite => "template_write",
+            Self::RecordRead => "record_read",
+            Self::NodeRead => "node_read",
+            Self::DebugRead => "debug_read",
+        }
+    }
+}
+
+const ALL_PERMISSIONS: [ApiPermission; 7] = [
+    ApiPermission::TaskRead,
+    ApiPermission::TaskWrite,
+    ApiPermission::TemplateRead,
+    ApiPermission::TemplateWrite,
+    ApiPermission::RecordRead,
+    ApiPermission::NodeRead,
+    ApiPermission::DebugRead,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApiRole {
     PlatformAdmin,
@@ -222,6 +254,14 @@ impl AuthenticatedPrincipal {
                 "principal is not allowed to access tenant {tenant_id}"
             ))),
         }
+    }
+
+    pub fn granted_permissions(&self) -> Vec<ApiPermission> {
+        ALL_PERMISSIONS
+            .iter()
+            .copied()
+            .filter(|permission| self.require_permission(*permission).is_ok())
+            .collect()
     }
 }
 

@@ -5,9 +5,10 @@ mod error;
 mod repository;
 mod scheduler;
 mod telemetry;
+mod ui;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     net::{IpAddr, SocketAddr},
     path::{Component, Path as FsPath, PathBuf},
@@ -19,16 +20,18 @@ use auth::{ApiPermission, AuthConfig};
 use axum::{
     Json, Router,
     extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use control_plane::{ControlPlaneService, NodeLiveLoad};
 use error::AppError;
 use repository::{
-    CreateTaskResult, RecordListFilter, StreamListFilter, TaskCloneOverride, TaskEventFilter,
-    TaskListFilter, TaskLogFilter, TaskRepository, TemplateCreateRequest, TemplateListFilter,
-    ZlmPublishTaskRecord, ZlmRecordFileRecord, ZlmStreamEventRecord, ZlmTaskEventHookRecord,
+    CreateTaskResult, HookEventListFilter, NodeSummary, RecordListFilter, StreamListFilter,
+    TaskCloneOverride, TaskEventFilter, TaskListFilter, TaskLogFilter, TaskRepository,
+    TemplateCreateRequest, TemplateListFilter, ZlmPublishTaskRecord, ZlmRecordFileRecord,
+    ZlmStreamEventRecord, ZlmTaskEventHookRecord,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -38,13 +41,13 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::{net::TcpListener, sync::watch};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use media_domain::{TaskOperation, TaskSpec};
 
 #[derive(Debug, Clone)]
-struct AppState {
+pub(crate) struct AppState {
     repository: Arc<TaskRepository>,
     control_plane: ControlPlaneService,
     started_at: DateTime<Utc>,
@@ -136,7 +139,42 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_app(state: AppState) -> Router {
+pub(crate) fn build_app(state: AppState) -> Router {
+    let api_router = Router::new()
+        .route("/me", get(ui::current_session))
+        .route("/tasks/preview", post(ui::preview_task))
+        .route("/tasks", post(create_task).get(list_tasks))
+        .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}/events", get(get_task_events))
+        .route("/tasks/{id}/logs", get(get_task_logs))
+        .route("/tasks/{id}/resolved-spec", get(get_resolved_spec))
+        .route("/tasks/{id}/start", post(start_task))
+        .route("/tasks/{id}/stop", post(stop_task))
+        .route("/tasks/{id}/cancel", post(cancel_task))
+        .route("/tasks/{id}/retry", post(retry_task))
+        .route("/tasks/{id}/clone", post(clone_task))
+        .route("/templates", post(create_template).get(list_templates))
+        .route("/templates/{id}", get(get_template))
+        .route("/templates/{id}/render", post(render_template))
+        .route("/streams", get(list_streams))
+        .route("/records", get(list_records))
+        .route("/nodes", get(list_nodes))
+        .route("/nodes/{id}/heartbeats", get(list_node_heartbeats))
+        .route("/debug/hooks", get(list_debug_hooks))
+        .route("/debug/zlm/media", get(debug_zlm_media))
+        .route("/debug/zlm/sessions", get(debug_zlm_sessions))
+        .route("/debug/zlm/players", get(debug_zlm_players))
+        .route("/debug/zlm/statistic", get(debug_zlm_statistic))
+        .route("/debug/zlm/threads-load", get(debug_zlm_threads_load))
+        .route(
+            "/debug/zlm/work-threads-load",
+            get(debug_zlm_work_threads_load),
+        )
+        .route("/debug/zlm/kick-session", post(debug_zlm_kick_session))
+        .route("/debug/zlm/kick-sessions", post(debug_zlm_kick_sessions))
+        .route("/debug/zlm/close-stream", post(debug_zlm_close_stream))
+        .route("/debug/zlm/snap", get(debug_zlm_snap));
+
     Router::new()
         .route("/health/live", get(live_health))
         .route("/health/ready", get(ready_health))
@@ -145,31 +183,8 @@ fn build_app(state: AppState) -> Router {
             "/internal/hooks/zlm/{server_id}/{hook_name}",
             post(receive_named_zlm_hook),
         )
-        .nest(
-            "/api/v1",
-            Router::new()
-                .route("/tasks", post(create_task).get(list_tasks))
-                .route("/tasks/{id}", get(get_task))
-                .route("/tasks/{id}/events", get(get_task_events))
-                .route("/tasks/{id}/logs", get(get_task_logs))
-                .route("/tasks/{id}/resolved-spec", get(get_resolved_spec))
-                .route("/tasks/{id}/start", post(start_task))
-                .route("/tasks/{id}/stop", post(stop_task))
-                .route("/tasks/{id}/cancel", post(cancel_task))
-                .route("/tasks/{id}/retry", post(retry_task))
-                .route("/tasks/{id}/clone", post(clone_task))
-                .route("/templates", post(create_template).get(list_templates))
-                .route("/templates/{id}", get(get_template))
-                .route("/templates/{id}/render", post(render_template))
-                .route("/streams", get(list_streams))
-                .route("/records", get(list_records))
-                .route("/nodes", get(list_nodes))
-                .route("/debug/zlm/media", get(debug_zlm_media))
-                .route("/debug/zlm/sessions", get(debug_zlm_sessions))
-                .route("/debug/zlm/players", get(debug_zlm_players))
-                .route("/debug/zlm/kick-session", post(debug_zlm_kick_session))
-                .route("/debug/zlm/close-stream", post(debug_zlm_close_stream)),
-        )
+        .nest("/api/v1", api_router)
+        .merge(ui::router())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -452,7 +467,24 @@ async fn list_streams(
     if !matches!(principal.role(), auth::ApiRole::PlatformAdmin) {
         filter.tenant_id = principal.tenant_id().map(str::to_string);
     }
-    Ok(Json(state.repository.list_streams(filter).await?))
+    let expected_has_viewer = filter.has_viewer;
+    let mut streams = state.repository.list_streams(filter).await?;
+    if streams.is_empty() {
+        return Ok(Json(streams));
+    }
+
+    let node_lookup = state
+        .repository
+        .list_nodes()
+        .await?
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    enrich_streams_with_runtime(&state, &mut streams, &node_lookup).await;
+    if let Some(expected_has_viewer) = expected_has_viewer {
+        streams.retain(|stream| stream_has_viewers(stream) == Some(expected_has_viewer));
+    }
+    Ok(Json(streams))
 }
 
 async fn list_records(
@@ -478,6 +510,30 @@ async fn list_nodes(
         apply_live_load(node, live_loads.get(&node.id).copied());
     }
     Ok(Json(nodes))
+}
+
+async fn list_node_heartbeats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<Uuid>,
+    Query(query): Query<NodeHeartbeatQuery>,
+) -> Result<Json<Vec<repository::NodeHeartbeatSummary>>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::NodeRead)?;
+    Ok(Json(
+        state
+            .repository
+            .list_node_heartbeats(node_id, query.limit.unwrap_or(24))
+            .await?,
+    ))
+}
+
+async fn list_debug_hooks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HookEventListFilter>,
+) -> Result<Json<Vec<repository::HookEventSummary>>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    Ok(Json(state.repository.list_hook_events(query).await?))
 }
 
 async fn debug_zlm_media(
@@ -531,6 +587,51 @@ async fn debug_zlm_players(
     ))
 }
 
+async fn debug_zlm_statistic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NodeScopedQuery>,
+) -> Result<Json<Value>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    Ok(Json(
+        call_zlm_api(&state, query.node_id, "/index/api/getStatistic", Vec::new()).await?,
+    ))
+}
+
+async fn debug_zlm_threads_load(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NodeScopedQuery>,
+) -> Result<Json<Value>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    Ok(Json(
+        call_zlm_api(
+            &state,
+            query.node_id,
+            "/index/api/getThreadsLoad",
+            Vec::new(),
+        )
+        .await?,
+    ))
+}
+
+async fn debug_zlm_work_threads_load(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NodeScopedQuery>,
+) -> Result<Json<Value>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    Ok(Json(
+        call_zlm_api(
+            &state,
+            query.node_id,
+            "/index/api/getWorkThreadsLoad",
+            Vec::new(),
+        )
+        .await?,
+    ))
+}
+
 async fn debug_zlm_kick_session(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -545,6 +646,29 @@ async fn debug_zlm_kick_session(
             vec![("id".to_string(), request.session_id)],
         )
         .await?,
+    ))
+}
+
+async fn debug_zlm_kick_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DebugKickSessionsRequest>,
+) -> Result<Json<Value>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let mut params = Vec::new();
+    if let Some(local_port) = request.local_port {
+        params.push(("local_port".to_string(), local_port.to_string()));
+    }
+    if let Some(peer_ip) = request
+        .peer_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        params.push(("peer_ip".to_string(), peer_ip.to_string()));
+    }
+    Ok(Json(
+        call_zlm_api(&state, request.node_id, "/index/api/kick_sessions", params).await?,
     ))
 }
 
@@ -571,15 +695,234 @@ async fn debug_zlm_close_stream(
     ))
 }
 
+async fn debug_zlm_snap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DebugSnapQuery>,
+) -> Result<Json<DebugSnapResponse>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let (content_type, body) = call_zlm_binary_api(
+        &state,
+        query.node_id,
+        "/index/api/getSnap",
+        vec![
+            ("url".to_string(), query.url),
+            ("timeout_sec".to_string(), query.timeout_sec.to_string()),
+            ("expire_sec".to_string(), query.expire_sec.to_string()),
+        ],
+    )
+    .await?;
+    Ok(Json(DebugSnapResponse {
+        content_type: content_type.clone(),
+        data_url: format!(
+            "data:{content_type};base64,{}",
+            BASE64_STANDARD.encode(body)
+        ),
+    }))
+}
+
 fn apply_live_load(node: &mut repository::NodeSummary, load: Option<NodeLiveLoad>) {
     if let Some(load) = load {
         node.slot_usage = Some(load.slot_usage);
         node.running_tasks = Some(load.running_tasks);
         node.connected = Some(load.connected);
+        node.cpu_percent = Some(load.cpu_percent);
+        node.mem_percent = Some(load.mem_percent);
+        node.disk_percent = Some(load.disk_percent);
+        node.zlm_alive = Some(load.zlm_alive);
+        node.ffmpeg_alive = Some(load.ffmpeg_alive);
         node.healthy = load.connected;
     } else {
         node.connected = Some(false);
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct StreamRuntimeInfo {
+    viewer_count: u32,
+    bitrate_kbps: f64,
+    schemas: BTreeSet<String>,
+}
+
+async fn enrich_streams_with_runtime(
+    state: &AppState,
+    streams: &mut [repository::StreamSummary],
+    nodes: &HashMap<Uuid, NodeSummary>,
+) {
+    let mut stream_indexes_by_node = HashMap::<Uuid, Vec<usize>>::new();
+    for (index, stream) in streams.iter().enumerate() {
+        if let Some(node_id) = stream.node_id {
+            stream_indexes_by_node
+                .entry(node_id)
+                .or_default()
+                .push(index);
+        }
+    }
+
+    for (node_id, indexes) in stream_indexes_by_node {
+        let Some(node) = nodes.get(&node_id) else {
+            continue;
+        };
+        match load_zlm_media_index(state, node_id).await {
+            Ok(index) => {
+                for stream_index in indexes {
+                    let stream = &mut streams[stream_index];
+                    let key = (
+                        stream.vhost.clone(),
+                        stream.app.clone(),
+                        stream.stream.clone(),
+                    );
+                    if let Some(runtime) = index.get(&key) {
+                        stream.viewer_count = Some(runtime.viewer_count);
+                        stream.has_viewer = Some(runtime.viewer_count > 0);
+                        if runtime.bitrate_kbps > 0.0 {
+                            stream.bitrate_kbps = Some(runtime.bitrate_kbps);
+                        }
+                        stream.play_urls = build_play_urls(
+                            &node.agent_stream_addr,
+                            &runtime.schemas,
+                            &stream.app,
+                            &stream.stream,
+                        );
+                    } else if stream.play_urls.is_empty() {
+                        stream.play_urls = build_fallback_play_urls(
+                            &node.agent_stream_addr,
+                            &stream.schema,
+                            &stream.app,
+                            &stream.stream,
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(
+                    node_id = %node_id,
+                    error = %error,
+                    "failed to enrich stream runtime from ZLM; using stored summary only"
+                );
+                for stream_index in indexes {
+                    let stream = &mut streams[stream_index];
+                    if stream.play_urls.is_empty() {
+                        stream.play_urls = build_fallback_play_urls(
+                            &node.agent_stream_addr,
+                            &stream.schema,
+                            &stream.app,
+                            &stream.stream,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn stream_has_viewers(stream: &repository::StreamSummary) -> Option<bool> {
+    stream
+        .viewer_count
+        .map(|count| count > 0)
+        .or(stream.has_viewer)
+}
+
+async fn load_zlm_media_index(
+    state: &AppState,
+    node_id: Uuid,
+) -> Result<HashMap<(String, String, String), StreamRuntimeInfo>, AppError> {
+    let body = call_zlm_api(state, node_id, "/index/api/getMediaList", Vec::new()).await?;
+    Ok(build_stream_runtime_index(&body))
+}
+
+fn build_stream_runtime_index(
+    body: &Value,
+) -> HashMap<(String, String, String), StreamRuntimeInfo> {
+    let mut index = HashMap::new();
+    let Some(items) = body.get("data").and_then(Value::as_array) else {
+        return index;
+    };
+
+    for item in items {
+        let Some(vhost) = item.get("vhost").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(app) = item.get("app").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(stream) = item.get("stream").and_then(Value::as_str) else {
+            continue;
+        };
+        let key = (vhost.to_string(), app.to_string(), stream.to_string());
+        let entry = index.entry(key).or_insert_with(StreamRuntimeInfo::default);
+        entry.viewer_count = entry
+            .viewer_count
+            .max(value_to_u32(item.get("totalReaderCount")).unwrap_or_default());
+        entry.bitrate_kbps = entry
+            .bitrate_kbps
+            .max(value_to_f64(item.get("bytesSpeed")).unwrap_or(0.0) * 8.0 / 1000.0);
+        if let Some(schema) = item.get("schema").and_then(Value::as_str) {
+            entry.schemas.insert(schema.trim().to_string());
+        }
+    }
+
+    index
+}
+
+fn build_fallback_play_urls(
+    agent_stream_addr: &str,
+    schema: &str,
+    app: &str,
+    stream: &str,
+) -> Vec<String> {
+    let mut schemas = BTreeSet::new();
+    schemas.insert(schema.trim().to_string());
+    build_play_urls(agent_stream_addr, &schemas, app, stream)
+}
+
+fn build_play_urls(
+    agent_stream_addr: &str,
+    schemas: &BTreeSet<String>,
+    app: &str,
+    stream: &str,
+) -> Vec<String> {
+    let Ok(base) = Url::parse(agent_stream_addr) else {
+        return Vec::new();
+    };
+    let Some(host) = base.host_str() else {
+        return Vec::new();
+    };
+    let http_authority = match base.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let http_base = format!("{}://{http_authority}", base.scheme());
+    let mut urls = Vec::new();
+
+    for schema in schemas {
+        match schema.as_str() {
+            "rtsp" => urls.push(format!("rtsp://{host}/{app}/{stream}")),
+            "rtmp" => urls.push(format!("rtmp://{host}/{app}/{stream}")),
+            "hls" => urls.push(format!("{http_base}/{app}/{stream}/hls.m3u8")),
+            "ts" | "http_ts" => urls.push(format!("{http_base}/{app}/{stream}.live.ts")),
+            "fmp4" | "http_fmp4" | "http_fmp4_ts" => {
+                urls.push(format!("{http_base}/{app}/{stream}.live.mp4"))
+            }
+            _ => {}
+        }
+    }
+
+    urls
+}
+
+fn value_to_u32(value: Option<&Value>) -> Option<u32> {
+    value
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_i64().map(|v| v.max(0) as u64))
+        })
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn value_to_f64(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| value.as_f64().or_else(|| value.as_u64().map(|v| v as f64)))
 }
 
 fn debug_media_query_params(query: &ZlmMediaQuery) -> Vec<(String, String)> {
@@ -644,6 +987,59 @@ async fn call_zlm_api(
         .map_err(|error| AppError::Internal(format!("failed to decode ZLM API body: {error}")))?;
 
     ensure_zlm_debug_success(path, body)
+}
+
+async fn call_zlm_binary_api(
+    state: &AppState,
+    node_id: Uuid,
+    path: &str,
+    params: Vec<(String, String)>,
+) -> Result<(String, Vec<u8>), AppError> {
+    let target = state.repository.get_node_debug_target(node_id).await?;
+    let mut url = build_zlm_debug_url(&target, path)?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in &params {
+            query.append_pair(key, value);
+        }
+    }
+
+    let response = state
+        .http_client
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| AppError::Internal(format!("failed to call ZLM API: {error}")))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::Internal(format!("failed to decode ZLM binary body: {error}")))?
+        .to_vec();
+
+    if content_type.contains("application/json") {
+        let value: Value = serde_json::from_slice(&body).map_err(|error| {
+            AppError::Internal(format!("failed to decode unexpected JSON body: {error}"))
+        })?;
+        let _ = ensure_zlm_debug_success(path, value)?;
+        return Err(AppError::Internal(format!(
+            "{path} returned JSON instead of a binary image payload"
+        )));
+    }
+
+    if !status.is_success() {
+        return Err(AppError::Internal(format!(
+            "{path} returned HTTP status {status}"
+        )));
+    }
+
+    Ok((content_type, body))
 }
 
 fn build_zlm_debug_url(target: &repository::NodeDebugTarget, path: &str) -> Result<Url, AppError> {
@@ -1546,6 +1942,12 @@ struct NodeScopedQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct NodeHeartbeatQuery {
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ZlmMediaQuery {
     node_id: Uuid,
     #[serde(default)]
@@ -1565,6 +1967,15 @@ struct DebugKickSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct DebugKickSessionsRequest {
+    node_id: Uuid,
+    #[serde(default)]
+    local_port: Option<u16>,
+    #[serde(default)]
+    peer_ip: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DebugCloseStreamRequest {
     node_id: Uuid,
     schema: String,
@@ -1575,16 +1986,48 @@ struct DebugCloseStreamRequest {
     force: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct DebugSnapQuery {
+    node_id: Uuid,
+    url: String,
+    #[serde(default = "default_snap_timeout_sec")]
+    timeout_sec: u32,
+    #[serde(default = "default_snap_expire_sec")]
+    expire_sec: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct DebugSnapResponse {
+    content_type: String,
+    data_url: String,
+}
+
+const fn default_snap_timeout_sec() -> u32 {
+    10
+}
+
+const fn default_snap_expire_sec() -> u32 {
+    30
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{
+        Json, Router,
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
+        response::IntoResponse,
+        routing::get,
     };
+    use media_domain::{AgentRegistration, HeartbeatSnapshot, NetworkMode};
     use serde_json::json;
     use sqlx::postgres::PgPoolOptions;
-    use tokio::{net::TcpStream, time::timeout};
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+        time::timeout,
+    };
     use tower::util::ServiceExt;
 
     const TEST_RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDRNk+CElS+M3My1DbTUInl9aeU\nYCLza8Uftij7kPTApECFQcy1em6CZwb+PDHjjtFB2i8Ncfbx+dt2S6CbJHSF0dDB\n+GoiaVaYolB9XoQODqA7LXTy/D4e9jdNJQgDVXlzXsTm4k3v1CnC1As7RfUkgdM/\npsbfsbeai7RULN2NnQIDAQAB\n-----END PUBLIC KEY-----";
@@ -1714,6 +2157,164 @@ mod tests {
         state.auth =
             AuthConfig::from_public_key(true, TEST_RSA_PUBLIC_KEY).expect("rsa key should load");
         state
+    }
+
+    async fn upsert_test_node(
+        repository: &TaskRepository,
+        node_id: Uuid,
+        zlm_api_base: &str,
+        agent_stream_addr: &str,
+    ) -> anyhow::Result<()> {
+        repository
+            .upsert_node_registration(
+                &AgentRegistration {
+                    node_id,
+                    node_name: format!("node-{}", short_id(node_id)),
+                    agent_version: "test".to_string(),
+                    hostname: "worker-a".to_string(),
+                    labels: vec!["edge".to_string()],
+                    interfaces: vec!["192.168.1.20".to_string()],
+                    zlm_api_base: zlm_api_base.to_string(),
+                    zlm_api_secret: "secret".to_string(),
+                    agent_stream_addr: agent_stream_addr.to_string(),
+                    network_mode: NetworkMode::Bridge,
+                    ffmpeg_bin: "ffmpeg".to_string(),
+                    ffprobe_bin: "ffprobe".to_string(),
+                },
+                Utc::now(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_running_stream_task(
+        pool: &sqlx::PgPool,
+        node_id: Uuid,
+        resolved_spec: Value,
+        app: &str,
+        stream: &str,
+    ) -> anyhow::Result<Uuid> {
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, tenant_id, name, type, status, template_id, profile, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'default', 'relay-camera-01', 'live_relay'::task_type, 'RUNNING'::task_status, null, null, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5, null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("stream-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'RUNNING'::attempt_status,
+              null, null, 'rtsp', '__defaultVhost__', $4, $5,
+              null, null, null, null,
+              null, $6, null, $6
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(app)
+        .bind(stream)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into stream_bindings (
+              id, task_id, attempt_id, schema, vhost, app, stream, zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+            ) values (
+              $1, $2, $3, 'rtsp', '__defaultVhost__', $4, $5, null, null, null, $6
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(task_id)
+        .bind(attempt_id)
+        .bind(app)
+        .bind(stream)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(task_id)
+    }
+
+    async fn spawn_zlm_stub() -> anyhow::Result<(String, JoinHandle<()>)> {
+        async fn media_list() -> Json<Value> {
+            Json(json!({
+                "code": 0,
+                "data": [
+                    {
+                        "schema": "rtsp",
+                        "vhost": "__defaultVhost__",
+                        "app": "live",
+                        "stream": "camera01",
+                        "totalReaderCount": 3,
+                        "bytesSpeed": 4000
+                    },
+                    {
+                        "schema": "rtmp",
+                        "vhost": "__defaultVhost__",
+                        "app": "live",
+                        "stream": "camera01",
+                        "totalReaderCount": 3,
+                        "bytesSpeed": 4000
+                    },
+                    {
+                        "schema": "hls",
+                        "vhost": "__defaultVhost__",
+                        "app": "live",
+                        "stream": "camera01",
+                        "totalReaderCount": 3,
+                        "bytesSpeed": 4000
+                    }
+                ]
+            }))
+        }
+
+        async fn snap() -> impl IntoResponse {
+            (
+                [(header::CONTENT_TYPE, "image/jpeg")],
+                vec![0xFFu8, 0xD8, 0xFF, 0xD9],
+            )
+        }
+
+        let app = Router::new()
+            .route("/index/api/getMediaList", get(media_list))
+            .route("/index/api/getSnap", get(snap));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("stub server should run");
+        });
+        Ok((format!("http://{addr}"), handle))
+    }
+
+    fn short_id(value: Uuid) -> String {
+        value.simple().to_string()[..8].to_string()
     }
 
     fn sample_create_task_payload(start_mode: &str) -> serde_json::Value {
@@ -2103,6 +2704,119 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn current_session_returns_platform_admin_when_auth_is_disabled() -> anyhow::Result<()> {
+        let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
+        let app = build_app(test_app_state(pool));
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/me").body(Body::empty())?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["auth_enabled"], json!(false));
+        assert_eq!(body["role"], json!("platform_admin"));
+        assert_eq!(body["subject"], json!("auth_disabled"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn current_session_requires_bearer_token_when_auth_is_enabled() -> anyhow::Result<()> {
+        let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
+        let app = build_app(test_app_state_with_auth(pool));
+
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri("/api/v1/me").body(Body::empty())?)
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], json!("ACCESS_FORBIDDEN"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preview_task_returns_resolved_spec_without_persisting() -> anyhow::Result<()> {
+        let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
+        let app = build_app(test_app_state(pool));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks/preview")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(
+                        &sample_create_task_payload("manual"),
+                    )?))?,
+            )
+            .await?;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["requested_spec"]["name"], json!("relay-camera-01"));
+        assert_eq!(
+            body["resolved_spec"]["schedule"]["start_mode"],
+            json!("manual")
+        );
+        assert_eq!(body["resolved_spec"]["publish"]["enable_rtsp"], json!(true));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ui_routes_serve_shell_and_static_assets() -> anyhow::Result<()> {
+        let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
+        let app = build_app(test_app_state(pool));
+
+        let root = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty())?)
+            .await?;
+        assert_eq!(root.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            root.headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("/tasks")
+        );
+
+        let tasks = app
+            .clone()
+            .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
+            .await?;
+        assert_eq!(tasks.status(), StatusCode::OK);
+        let html = to_bytes(tasks.into_body(), usize::MAX).await?;
+        let html = String::from_utf8(html.to_vec())?;
+        assert!(html.contains("StreamServer Console"));
+        assert!(html.contains("/assets/app.js"));
+
+        let asset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/app.js")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(asset.status(), StatusCode::OK);
+        assert_eq!(
+            asset
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/javascript; charset=utf-8")
+        );
+        let body = to_bytes(asset.into_body(), usize::MAX).await?;
+        let body = String::from_utf8(body.to_vec())?;
+        assert!(body.contains("function renderTasksPage"));
+
+        Ok(())
+    }
+
     #[test]
     fn canonicalize_json_sorts_object_keys() {
         let payload = json!({
@@ -2313,5 +3027,273 @@ mod tests {
         assert_eq!(hook.re_use_port, Some(true));
         assert_eq!(hook.stream_id, "0195-test-1");
         assert_eq!(hook.tcp_mode, Some(0));
+    }
+
+    #[tokio::test]
+    async fn tasks_list_exposes_created_by() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let app = build_app(test_app_state(db.pool.clone()));
+        let payload = sample_create_task_payload("manual");
+        let body = serde_json::to_vec(&payload)?;
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", "task-created-by-1")
+                    .body(Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(create.status(), StatusCode::CREATED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/tasks")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["items"][0]["created_by"], json!("alice"));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        repository
+            .record_node_heartbeat(
+                node_id,
+                &HeartbeatSnapshot {
+                    node_time: Utc::now(),
+                    cpu_percent: 12.5,
+                    mem_percent: 48.0,
+                    disk_percent: 61.0,
+                    running_tasks: 2,
+                    slot_usage: 0.4,
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                },
+            )
+            .await?;
+        repository
+            .record_node_heartbeat(
+                node_id,
+                &HeartbeatSnapshot {
+                    node_time: Utc::now(),
+                    cpu_percent: 20.0,
+                    mem_percent: 52.0,
+                    disk_percent: 63.0,
+                    running_tasks: 3,
+                    slot_usage: 0.55,
+                    zlm_alive: true,
+                    ffmpeg_alive: false,
+                },
+            )
+            .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/nodes/{node_id}/heartbeats?limit=10"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("heartbeats should be a list");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["node_id"], json!(node_id));
+        assert_eq!(items[0]["running_tasks"], json!(3));
+        assert_eq!(items[1]["running_tasks"], json!(2));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let (zlm_base, zlm_handle) = spawn_zlm_stub().await?;
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-01",
+            "common": {"tenant_id": "default", "created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {
+                "enable_rtsp": true,
+                "enable_rtmp": true,
+                "enable_http_ts": true,
+                "enable_http_fmp4": true,
+                "enable_hls": true
+            },
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("streams should be a list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["viewer_count"], json!(3));
+        assert_eq!(items[0]["has_viewer"], json!(true));
+        assert!(items[0]["bitrate_kbps"].as_f64().unwrap_or_default() >= 32.0);
+        let play_urls = items[0]["play_urls"]
+            .as_array()
+            .expect("play_urls should be a list");
+        assert!(
+            play_urls
+                .iter()
+                .any(|value| value == "rtsp://stream.example/live/camera01")
+        );
+        assert!(
+            play_urls
+                .iter()
+                .any(|value| value == "rtmp://stream.example/live/camera01")
+        );
+        assert!(
+            play_urls
+                .iter()
+                .any(|value| value == "http://stream.example/live/camera01/hls.m3u8")
+        );
+
+        zlm_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debug_hooks_route_filters_by_node() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        let other_node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        upsert_test_node(
+            &repository,
+            other_node_id,
+            "http://127.0.0.1:65534",
+            "http://stream-b.example",
+        )
+        .await?;
+        sqlx::query(
+            r#"
+            insert into hook_events (
+              id, server_id, hook_name, dedup_key, payload, received_at, processed_at
+            ) values
+              ($1, $2, 'on_publish', 'hook-node-a', '{"app":"live"}'::jsonb, $3, $3),
+              ($4, $5, 'on_record_mp4', 'hook-node-b', '{"app":"archive"}'::jsonb, $3, $3)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(node_id.to_string())
+        .bind(Utc::now())
+        .bind(Uuid::now_v7())
+        .bind(other_node_id.to_string())
+        .execute(&db.pool)
+        .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/debug/hooks?node_id={node_id}&limit=10"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("hooks should be a list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["server_id"], json!(node_id.to_string()));
+        assert_eq!(items[0]["hook_name"], json!("on_publish"));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debug_zlm_snap_returns_data_url() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let (zlm_base, zlm_handle) = spawn_zlm_stub().await?;
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
+        let app = build_app(test_app_state(db.pool.clone()));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/debug/zlm/snap?node_id={node_id}&url={}",
+                        "rtsp%3A%2F%2Fstream.example%2Flive%2Fcamera01"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["content_type"], json!("image/jpeg"));
+        assert!(
+            body["data_url"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:image/jpeg;base64,")
+        );
+
+        zlm_handle.abort();
+        db.cleanup().await?;
+        Ok(())
     }
 }

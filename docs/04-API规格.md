@@ -301,6 +301,12 @@
 - `node_id`
 - `has_viewer`
 
+返回字段补充：
+
+- `viewer_count`：从节点 ZLM `getMediaList.totalReaderCount` 富化得到的精确 viewer 数
+- `bitrate_kbps`：从节点 ZLM `getMediaList.bytesSpeed` 换算得到的实时码率
+- `play_urls`：ControlPlane 根据节点 `agent_stream_addr` 和当前在线 schema 生成的播放地址列表
+
 ### 5.2 `GET /records`
 
 支持字段：
@@ -316,6 +322,10 @@
 
 返回节点健康、能力摘要、当前负载和最近心跳。
 
+### 5.4 `GET /nodes/{id}/heartbeats`
+
+返回指定节点最近的 heartbeat 历史样本，默认 `24` 条，最大 `200` 条。
+
 ## 6. 调试接口
 
 ### 6.1 `GET /debug/zlm/media`
@@ -330,7 +340,19 @@
 
 按节点透传封装后的 `getMediaPlayerList` 结果，仅管理员可用。
 
-### 6.4 `POST /debug/zlm/kick-session`
+### 6.4 `GET /debug/zlm/statistic`
+
+按节点透传封装后的 `getStatistic` 结果，仅管理员可用。
+
+### 6.5 `GET /debug/zlm/threads-load`
+
+按节点透传封装后的 `getThreadsLoad` 结果，仅管理员可用。
+
+### 6.6 `GET /debug/zlm/work-threads-load`
+
+按节点透传封装后的 `getWorkThreadsLoad` 结果，仅管理员可用。
+
+### 6.7 `POST /debug/zlm/kick-session`
 
 请求体：
 
@@ -341,7 +363,21 @@
 }
 ```
 
-### 6.5 `POST /debug/zlm/close-stream`
+### 6.8 `POST /debug/zlm/kick-sessions`
+
+请求体：
+
+```json
+{
+  "node_id": "0195...",
+  "local_port": 554,
+  "peer_ip": "10.0.0.8"
+}
+```
+
+`local_port` 和 `peer_ip` 都是可选过滤项，至少提供一个更有意义。
+
+### 6.9 `POST /debug/zlm/close-stream`
 
 请求体：
 
@@ -355,6 +391,34 @@
   "force": false
 }
 ```
+
+### 6.10 `GET /debug/zlm/snap`
+
+查询参数：
+
+- `node_id`
+- `url`
+- `timeout_sec`，默认 `10`
+- `expire_sec`，默认 `30`
+
+返回 JSON：
+
+```json
+{
+  "content_type": "image/jpeg",
+  "data_url": "data:image/jpeg;base64,..."
+}
+```
+
+### 6.11 `GET /debug/hooks`
+
+返回指定节点最近的 Hook 时间线。
+
+查询参数：
+
+- `node_id`
+- `hook_name`
+- `limit`，默认 `50`
 
 ## 7. 权限约束
 

@@ -53,6 +53,7 @@ impl TaskRepository {
             template_id,
             profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
+            created_by: created_by.clone(),
             assigned_node_id: None,
             current_attempt_no: 0,
             created_at,
@@ -185,6 +186,18 @@ impl TaskRepository {
         Ok(CreateTaskResult::Fresh(summary))
     }
 
+    pub async fn preview_task_spec(
+        &self,
+        requested_spec: TaskSpec,
+    ) -> Result<TaskPreview, RepoError> {
+        let resolved = self.resolve_requested_task(&requested_spec).await?;
+        Ok(TaskPreview {
+            template_id: resolved.template_id,
+            requested_spec: serde_json::to_value(&resolved.requested_spec)?,
+            resolved_spec: serde_json::to_value(&resolved.resolved_spec)?,
+        })
+    }
+
     pub async fn list_tasks(&self, filter: TaskListFilter) -> Result<Page<TaskSummary>, RepoError> {
         let page = filter.page.unwrap_or(1).max(1);
         let page_size = filter.page_size.unwrap_or(20).clamp(1, 100);
@@ -201,6 +214,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -244,6 +258,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -778,6 +793,40 @@ impl TaskRepository {
         .collect()
     }
 
+    pub async fn list_node_heartbeats(
+        &self,
+        node_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<NodeHeartbeatSummary>, RepoError> {
+        let limit = limit.clamp(1, 200);
+        Ok(sqlx::query(
+            r#"
+            select
+              node_id,
+              cpu_percent,
+              mem_percent,
+              disk_percent,
+              running_tasks,
+              slot_usage,
+              zlm_alive,
+              ffmpeg_alive,
+              node_time,
+              received_at
+            from node_heartbeats
+            where node_id = $1
+            order by received_at desc, node_time desc
+            limit $2
+            "#,
+        )
+        .bind(node_id)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| NodeHeartbeatSummary::from_row(&row))
+        .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub async fn get_node_debug_target(&self, node_id: Uuid) -> Result<NodeDebugTarget, RepoError> {
         sqlx::query(
             r#"
@@ -796,6 +845,49 @@ impl TaskRepository {
                 zlm_api_secret: row.try_get("zlm_api_secret")?,
             })
         })
+    }
+
+    pub async fn list_hook_events(
+        &self,
+        filter: HookEventListFilter,
+    ) -> Result<Vec<HookEventSummary>, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              id,
+              server_id,
+              hook_name,
+              dedup_key,
+              payload,
+              received_at,
+              processed_at
+            from hook_events
+            where 1 = 1
+            "#,
+        );
+        if let Some(node_id) = filter.node_id {
+            builder.push(" and server_id = ");
+            builder.push_bind(node_id.to_string());
+        }
+        if let Some(hook_name) = filter
+            .hook_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder.push(" and hook_name = ");
+            builder.push_bind(hook_name);
+        }
+        builder.push(" order by received_at desc, id desc limit ");
+        builder.push_bind(i64::from(filter.limit.unwrap_or(50).clamp(1, 200)));
+
+        Ok(builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| HookEventSummary::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub async fn list_due_at_tasks(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>, RepoError> {
@@ -878,6 +970,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -941,6 +1034,7 @@ impl TaskRepository {
             template_id,
             profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
+            created_by: created_by.clone(),
             assigned_node_id: None,
             current_attempt_no: 0,
             created_at: now,
@@ -1274,6 +1368,7 @@ impl TaskRepository {
             template_id,
             profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
+            created_by: created_by.clone(),
             assigned_node_id: None,
             current_attempt_no: 0,
             created_at: now,
@@ -1654,6 +1749,7 @@ impl TaskRepository {
         node_id: Uuid,
         heartbeat: &HeartbeatSnapshot,
     ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
             update media_nodes
@@ -1666,12 +1762,39 @@ impl TaskRepository {
         .bind(heartbeat.node_time)
         .bind(Utc::now())
         .bind(node_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(RepoError::NodeNotFound(node_id));
         }
+
+        sqlx::query(
+            r#"
+            insert into node_heartbeats (
+              id, node_id, cpu_percent, mem_percent, disk_percent, running_tasks,
+              slot_usage, zlm_alive, ffmpeg_alive, node_time, received_at
+            ) values (
+              $1, $2, $3, $4, $5, $6,
+              $7, $8, $9, $10, $11
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(node_id)
+        .bind(heartbeat.cpu_percent)
+        .bind(heartbeat.mem_percent)
+        .bind(heartbeat.disk_percent)
+        .bind(i32::try_from(heartbeat.running_tasks).unwrap_or(i32::MAX))
+        .bind(heartbeat.slot_usage)
+        .bind(heartbeat.zlm_alive)
+        .bind(heartbeat.ffmpeg_alive)
+        .bind(heartbeat.node_time)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -3126,6 +3249,13 @@ pub struct TaskLogResponse {
     pub lines: Vec<TaskLogLine>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskPreview {
+    pub template_id: Option<Uuid>,
+    pub requested_spec: Value,
+    pub resolved_spec: Value,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TemplateCreateRequest {
     pub name: String,
@@ -3245,6 +3375,12 @@ pub struct StreamSummary {
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
     pub has_viewer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub viewer_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate_kbps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub play_urls: Vec<String>,
 }
 
 impl StreamSummary {
@@ -3267,6 +3403,9 @@ impl StreamSummary {
             started_at: row.try_get("started_at")?,
             updated_at: row.try_get("updated_at")?,
             has_viewer: row.try_get("has_viewer")?,
+            viewer_count: None,
+            bitrate_kbps: None,
+            play_urls: Vec::new(),
         })
     }
 }
@@ -3352,6 +3491,16 @@ pub struct NodeSummary {
     pub running_tasks: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mem_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zlm_alive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ffmpeg_alive: Option<bool>,
 }
 
 impl NodeSummary {
@@ -3404,6 +3553,43 @@ impl NodeSummary {
             slot_usage: None,
             running_tasks: None,
             connected: None,
+            cpu_percent: None,
+            mem_percent: None,
+            disk_percent: None,
+            zlm_alive: None,
+            ffmpeg_alive: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeHeartbeatSummary {
+    pub node_id: Uuid,
+    pub cpu_percent: f64,
+    pub mem_percent: f64,
+    pub disk_percent: f64,
+    pub running_tasks: u32,
+    pub slot_usage: f64,
+    pub zlm_alive: bool,
+    pub ffmpeg_alive: bool,
+    pub node_time: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+}
+
+impl NodeHeartbeatSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        let running_tasks = row.try_get::<i32, _>("running_tasks")?;
+        Ok(Self {
+            node_id: row.try_get("node_id")?,
+            cpu_percent: row.try_get("cpu_percent")?,
+            mem_percent: row.try_get("mem_percent")?,
+            disk_percent: row.try_get("disk_percent")?,
+            running_tasks: u32::try_from(running_tasks).unwrap_or_default(),
+            slot_usage: row.try_get("slot_usage")?,
+            zlm_alive: row.try_get("zlm_alive")?,
+            ffmpeg_alive: row.try_get("ffmpeg_alive")?,
+            node_time: row.try_get("node_time")?,
+            received_at: row.try_get("received_at")?,
         })
     }
 }
@@ -3412,6 +3598,41 @@ impl NodeSummary {
 pub struct NodeDebugTarget {
     pub zlm_api_base: String,
     pub zlm_api_secret: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HookEventListFilter {
+    #[serde(default)]
+    pub node_id: Option<Uuid>,
+    #[serde(default)]
+    pub hook_name: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HookEventSummary {
+    pub id: Uuid,
+    pub server_id: String,
+    pub hook_name: String,
+    pub dedup_key: String,
+    pub payload: Value,
+    pub received_at: DateTime<Utc>,
+    pub processed_at: Option<DateTime<Utc>>,
+}
+
+impl HookEventSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            server_id: row.try_get("server_id")?,
+            hook_name: row.try_get("hook_name")?,
+            dedup_key: row.try_get("dedup_key")?,
+            payload: row.try_get("payload")?,
+            received_at: row.try_get("received_at")?,
+            processed_at: row.try_get("processed_at")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4150,6 +4371,7 @@ pub struct TaskSummary {
     pub template_id: Option<Uuid>,
     pub profile: Option<String>,
     pub priority: u8,
+    pub created_by: String,
     pub assigned_node_id: Option<Uuid>,
     pub current_attempt_no: i32,
     pub created_at: DateTime<Utc>,
@@ -4179,6 +4401,7 @@ impl TaskSummary {
             template_id: row.try_get("template_id")?,
             profile: row.try_get("profile")?,
             priority: u8::try_from(priority).unwrap_or(50),
+            created_by: row.try_get("created_by")?,
             assigned_node_id: row.try_get("assigned_node_id")?,
             current_attempt_no: row.try_get("current_attempt_no")?,
             created_at: row.try_get("created_at")?,

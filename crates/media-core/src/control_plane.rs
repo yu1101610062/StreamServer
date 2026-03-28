@@ -68,6 +68,11 @@ struct SessionTarget {
 struct SessionLoad {
     slot_usage: f64,
     running_tasks: u32,
+    cpu_percent: f64,
+    mem_percent: f64,
+    disk_percent: f64,
+    zlm_alive: bool,
+    ffmpeg_alive: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +80,11 @@ pub struct NodeLiveLoad {
     pub connected: bool,
     pub slot_usage: f64,
     pub running_tasks: u32,
+    pub cpu_percent: f64,
+    pub mem_percent: f64,
+    pub disk_percent: f64,
+    pub zlm_alive: bool,
+    pub ffmpeg_alive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -482,6 +492,11 @@ impl ControlPlaneService {
         session.load = SessionLoad {
             slot_usage: normalized_slot_usage(snapshot.slot_usage),
             running_tasks: snapshot.running_tasks,
+            cpu_percent: snapshot.cpu_percent,
+            mem_percent: snapshot.mem_percent,
+            disk_percent: snapshot.disk_percent,
+            zlm_alive: snapshot.zlm_alive,
+            ffmpeg_alive: snapshot.ffmpeg_alive,
         };
         Ok(())
     }
@@ -547,6 +562,11 @@ impl ControlPlaneService {
                         connected: true,
                         slot_usage: handle.load.slot_usage,
                         running_tasks: handle.load.running_tasks,
+                        cpu_percent: handle.load.cpu_percent,
+                        mem_percent: handle.load.mem_percent,
+                        disk_percent: handle.load.disk_percent,
+                        zlm_alive: handle.load.zlm_alive,
+                        ffmpeg_alive: handle.load.ffmpeg_alive,
                     },
                 )
             })
