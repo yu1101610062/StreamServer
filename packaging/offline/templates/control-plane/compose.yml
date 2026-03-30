@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+  media-core:
+    image: ${MEDIA_CORE_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      STREAMSERVER_ENV: production
+      CORE_HTTP_ADDR: 0.0.0.0:8080
+      CORE_GRPC_ADDR: 0.0.0.0:50051
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
+      HOOK_SOURCE_ALLOWLIST: ${HOOK_SOURCE_ALLOWLIST}
+      STORAGE_ALLOWLIST: ${STORAGE_ALLOWLIST}
+      AUTH_ENABLED: ${AUTH_ENABLED}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/ready >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - ./certs:/certs:ro
+    ports:
+      - "${CORE_HTTP_PORT}:8080"
+      - "${CORE_GRPC_PORT}:50051"
