@@ -314,6 +314,16 @@ impl LocalExecutor for ManagedProcessExecutor {
             ));
         }
 
+        if self.settings.max_runtime_slots > 0 {
+            let active_runtimes = u32::try_from(self.registry.count()).unwrap_or(u32::MAX);
+            if active_runtimes >= self.settings.max_runtime_slots {
+                return Err(ExecutorError::InvalidRequest(format!(
+                    "max_runtime_slots exhausted: {active_runtimes}/{}",
+                    self.settings.max_runtime_slots
+                )));
+            }
+        }
+
         match request.task_type {
             TaskType::LiveRelay => self.start_live_relay_task(request),
             TaskType::RtpReceive => self.start_rtp_receive_task(request),
@@ -3682,6 +3692,65 @@ mod tests {
         assert_eq!(plan.executable, "ffmpeg");
         assert!(plan.args.iter().any(|arg| arg == "pipe:1"));
         assert_eq!(plan.output_target, "/tmp/output.mp4");
+    }
+
+    #[test]
+    fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-runtime-slots-{}", Uuid::now_v7()));
+        let registry = LocalRuntimeRegistry::new();
+        registry.track(RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(1234),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Running,
+            command_line: Some("ffmpeg -i input".to_string()),
+            outputs: vec!["/tmp/output.mp4".to_string()],
+            metadata: json!({"task_type": "file_transcode"}),
+        });
+
+        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+        settings.max_runtime_slots = 1;
+        settings.ffmpeg_bin = "/definitely/missing-ffmpeg".to_string();
+        let executor = ManagedProcessExecutor::new(settings, registry, events_tx);
+        let request = StartTaskRequest {
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "/tmp/input.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "url": "/tmp/output.mp4"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let error = executor
+            .start_task(&request)
+            .expect_err("exhausted slots should reject the task before spawn");
+        assert!(matches!(
+            error,
+            ExecutorError::InvalidRequest(message) if message.contains("max_runtime_slots")
+        ));
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]

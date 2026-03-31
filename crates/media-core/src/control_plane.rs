@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
         Arc,
@@ -52,6 +52,7 @@ struct SessionHandle {
     sender: mpsc::Sender<Result<CoreEnvelope, Status>>,
     registration: AgentRegistration,
     load: SessionLoad,
+    reservations: VecDeque<DispatchReservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +74,11 @@ struct SessionLoad {
     disk_percent: f64,
     zlm_alive: bool,
     ffmpeg_alive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DispatchReservation {
+    task_id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,13 +120,21 @@ impl ControlPlaneService {
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
         let source_affinity_ip = task_source_affinity_ip(&resolved_spec);
         let target = self
-            .pick_best_session(source_affinity_ip)
+            .claim_best_session(source_affinity_ip, task_id)
             .await
             .ok_or(ControlPlaneError::NoConnectedNode)?;
-        let command = self
+        let command = match self
             .repository
             .prepare_task_dispatch(task_id, target.node_id, &format!("node:{}", target.node_id))
-            .await?;
+            .await
+        {
+            Ok(command) => command,
+            Err(error) => {
+                self.release_dispatch_reservation(target.node_id, Some(target.session_id), task_id)
+                    .await;
+                return Err(error.into());
+            }
+        };
 
         let envelope = CoreEnvelope {
             payload: Some(media_rpc::control_plane::core_envelope::Payload::StartTask(
@@ -137,7 +151,8 @@ impl ControlPlaneService {
         };
 
         if send_core_message(&target.sender, envelope).await.is_err() {
-            self.close_session(target.node_id, target.session_id).await;
+            self.release_dispatch_reservation(target.node_id, Some(target.session_id), task_id)
+                .await;
             self.repository
                 .rollback_task_dispatch(
                     task_id,
@@ -146,6 +161,7 @@ impl ControlPlaneService {
                     "failed to send start_task to agent",
                 )
                 .await?;
+            self.close_session(target.node_id, target.session_id).await;
             return Err(ControlPlaneError::NodeDisconnected(target.node_id));
         }
 
@@ -230,6 +246,7 @@ impl ControlPlaneService {
                     sender: sender.clone(),
                     registration: registration.clone(),
                     load: SessionLoad::default(),
+                    reservations: VecDeque::new(),
                 },
             );
             true
@@ -378,6 +395,10 @@ impl ControlPlaneService {
                     .record_agent_task_event(node_id, event.clone())
                     .await
                     .map_err(repo_status)?;
+                if event_releases_dispatch_reservation(&event.event_type) {
+                    self.release_dispatch_reservation(node_id, None, event.task_id)
+                        .await;
+                }
                 info!(
                     node_id = %node_id,
                     task_id = %event.task_id,
@@ -426,6 +447,10 @@ impl ControlPlaneService {
                     .record_agent_snapshot(node_id, snapshot.clone())
                     .await
                     .map_err(repo_status)?;
+                if snapshot.state.eq_ignore_ascii_case("exited") {
+                    self.release_dispatch_reservation(node_id, None, snapshot.task_id)
+                        .await;
+                }
                 info!(
                     node_id = %node_id,
                     task_id = %snapshot.task_id,
@@ -452,6 +477,14 @@ impl ControlPlaneService {
 
         if removed.is_none() {
             return;
+        }
+
+        if let Err(error) = self
+            .repository
+            .recover_tasks_for_disconnected_node(node_id)
+            .await
+        {
+            warn!(node_id = %node_id, error = %error, "failed to recover tasks after session close");
         }
 
         if let Err(error) = self
@@ -497,6 +530,14 @@ impl ControlPlaneService {
         let session = sessions
             .get_mut(&node_id)
             .ok_or_else(|| Status::unavailable("control-plane session no longer exists"))?;
+        let running_increase = snapshot
+            .running_tasks
+            .saturating_sub(session.load.running_tasks);
+        for _ in 0..running_increase {
+            if session.reservations.pop_front().is_none() {
+                break;
+            }
+        }
         session.load = SessionLoad {
             slot_usage: normalized_slot_usage(snapshot.slot_usage),
             running_tasks: snapshot.running_tasks,
@@ -513,6 +554,7 @@ impl ControlPlaneService {
         let sessions = self.sessions.lock().await;
         sessions
             .iter()
+            .filter(|(_, handle)| !session_is_saturated(&handle.load, reservation_count(handle)))
             .min_by(|(left_id, left_handle), (right_id, right_handle)| {
                 compare_dispatch_score(
                     dispatch_score(
@@ -520,12 +562,14 @@ impl ControlPlaneService {
                         &left_handle.registration,
                         &left_handle.load,
                         source_affinity_ip,
+                        reservation_count(left_handle),
                     ),
                     dispatch_score(
                         **right_id,
                         &right_handle.registration,
                         &right_handle.load,
                         source_affinity_ip,
+                        reservation_count(right_handle),
                     ),
                 )
             })
@@ -535,6 +579,7 @@ impl ControlPlaneService {
                     &handle.registration,
                     &handle.load,
                     source_affinity_ip,
+                    reservation_count(handle),
                 );
                 SessionTarget {
                     node_id: *node_id,
@@ -545,6 +590,77 @@ impl ControlPlaneService {
                     running_tasks: score.running_tasks,
                 }
             })
+    }
+
+    async fn claim_best_session(
+        &self,
+        source_affinity_ip: Option<IpAddr>,
+        task_id: Uuid,
+    ) -> Option<SessionTarget> {
+        let mut sessions = self.sessions.lock().await;
+        let best_node_id = sessions
+            .iter()
+            .filter(|(_, handle)| !session_is_saturated(&handle.load, reservation_count(handle)))
+            .min_by(|(left_id, left_handle), (right_id, right_handle)| {
+                compare_dispatch_score(
+                    dispatch_score(
+                        **left_id,
+                        &left_handle.registration,
+                        &left_handle.load,
+                        source_affinity_ip,
+                        reservation_count(left_handle),
+                    ),
+                    dispatch_score(
+                        **right_id,
+                        &right_handle.registration,
+                        &right_handle.load,
+                        source_affinity_ip,
+                        reservation_count(right_handle),
+                    ),
+                )
+            })
+            .map(|(node_id, _)| *node_id)?;
+        let handle = sessions.get_mut(&best_node_id)?;
+        handle
+            .reservations
+            .push_back(DispatchReservation { task_id });
+        let score = dispatch_score(
+            best_node_id,
+            &handle.registration,
+            &handle.load,
+            source_affinity_ip,
+            reservation_count(handle),
+        );
+        Some(SessionTarget {
+            node_id: best_node_id,
+            session_id: handle.session_id,
+            sender: handle.sender.clone(),
+            same_subnet: score.same_subnet,
+            slot_usage: score.slot_usage,
+            running_tasks: score.running_tasks,
+        })
+    }
+
+    async fn release_dispatch_reservation(
+        &self,
+        node_id: Uuid,
+        session_id: Option<u64>,
+        task_id: Uuid,
+    ) {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&node_id) else {
+            return;
+        };
+        if session_id.is_some_and(|expected| expected != session.session_id) {
+            return;
+        }
+        if let Some(index) = session
+            .reservations
+            .iter()
+            .position(|reservation| reservation.task_id == task_id)
+        {
+            session.reservations.remove(index);
+        }
     }
 
     async fn session_for_node(&self, node_id: Uuid) -> Option<SessionTarget> {
@@ -818,17 +934,64 @@ fn parse_url_host_ip_literal(value: &str) -> Option<IpAddr> {
         .and_then(parse_ip_literal)
 }
 
+fn reservation_count(handle: &SessionHandle) -> u32 {
+    u32::try_from(handle.reservations.len()).unwrap_or(u32::MAX)
+}
+
+fn effective_running_tasks(load: &SessionLoad, reserved_dispatches: u32) -> u32 {
+    load.running_tasks.saturating_add(reserved_dispatches)
+}
+
+fn estimated_max_slots(load: &SessionLoad) -> Option<u32> {
+    let slot_usage = normalized_slot_usage(load.slot_usage);
+    if !slot_usage.is_finite() || slot_usage <= 0.0 || load.running_tasks == 0 {
+        return None;
+    }
+
+    let estimate = (load.running_tasks as f64 / slot_usage).ceil();
+    if !estimate.is_finite() || estimate <= 0.0 {
+        return None;
+    }
+
+    Some((estimate as u32).max(load.running_tasks))
+}
+
+fn effective_slot_usage(load: &SessionLoad, reserved_dispatches: u32) -> f64 {
+    let base_usage = normalized_slot_usage(load.slot_usage);
+    if reserved_dispatches == 0 || !base_usage.is_finite() || base_usage >= 1.0 {
+        return base_usage;
+    }
+
+    match estimated_max_slots(load) {
+        Some(max_slots) if max_slots > 0 => {
+            (effective_running_tasks(load, reserved_dispatches) as f64 / max_slots as f64)
+                .clamp(0.0, 1.0)
+        }
+        _ => base_usage,
+    }
+}
+
+fn session_is_saturated(load: &SessionLoad, reserved_dispatches: u32) -> bool {
+    let slot_usage = effective_slot_usage(load, reserved_dispatches);
+    slot_usage.is_finite() && slot_usage >= 1.0
+}
+
+fn event_releases_dispatch_reservation(event_type: &str) -> bool {
+    matches!(event_type, "rejected" | "succeeded" | "failed" | "canceled")
+}
+
 fn dispatch_score(
     node_id: Uuid,
     registration: &AgentRegistration,
     load: &SessionLoad,
     source_affinity_ip: Option<IpAddr>,
+    reserved_dispatches: u32,
 ) -> DispatchScore {
     DispatchScore {
         same_subnet: source_affinity_ip
             .is_some_and(|source_ip| node_has_same_subnet(registration, source_ip)),
-        slot_usage: normalized_slot_usage(load.slot_usage),
-        running_tasks: load.running_tasks,
+        slot_usage: effective_slot_usage(load, reserved_dispatches),
+        running_tasks: effective_running_tasks(load, reserved_dispatches),
         node_id,
     }
 }
@@ -1098,6 +1261,19 @@ mod tests {
         }
     }
 
+    fn sample_heartbeat(running_tasks: u32, slot_usage: f64) -> HeartbeatSnapshot {
+        HeartbeatSnapshot {
+            node_time: Utc::now(),
+            cpu_percent: 0.0,
+            mem_percent: 0.0,
+            disk_percent: 0.0,
+            running_tasks,
+            slot_usage,
+            zlm_alive: true,
+            ffmpeg_alive: true,
+        }
+    }
+
     #[test]
     fn task_source_affinity_uses_source_url_instead_of_local_interface_ip() {
         let spec = sample_spec(
@@ -1197,6 +1373,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pick_best_session_skips_saturated_node_without_database() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000009").unwrap();
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        service.sessions.lock().await.insert(
+            node_id,
+            SessionHandle {
+                session_id: 1,
+                sender,
+                registration: sample_registration(node_id),
+                load: SessionLoad {
+                    slot_usage: 1.0,
+                    running_tasks: 1,
+                    cpu_percent: 0.0,
+                    mem_percent: 0.0,
+                    disk_percent: 0.0,
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                },
+                reservations: VecDeque::new(),
+            },
+        );
+
+        assert!(service.pick_best_session(None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_best_session_uses_reservations_to_spread_burst_dispatches() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let first_node = Uuid::parse_str("00000000-0000-0000-0000-000000000007").unwrap();
+        let second_node = Uuid::parse_str("00000000-0000-0000-0000-000000000008").unwrap();
+        let (first_sender, _first_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let (second_sender, _second_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        {
+            let mut sessions = service.sessions.lock().await;
+            for (session_id, node_id, sender) in [
+                (1, first_node, first_sender),
+                (2, second_node, second_sender),
+            ] {
+                sessions.insert(
+                    node_id,
+                    SessionHandle {
+                        session_id,
+                        sender,
+                        registration: sample_registration(node_id),
+                        load: SessionLoad::default(),
+                        reservations: VecDeque::new(),
+                    },
+                );
+            }
+        }
+
+        let first = service
+            .claim_best_session(
+                None,
+                Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap(),
+            )
+            .await
+            .expect("first dispatch should find a node");
+        let second = service
+            .claim_best_session(
+                None,
+                Uuid::parse_str("00000000-0000-0000-0000-000000000102").unwrap(),
+            )
+            .await
+            .expect("second dispatch should find a node");
+
+        assert_eq!(first.node_id, first_node);
+        assert_eq!(second.node_id, second_node);
+    }
+
     #[test]
     fn same_subnet_matches_ipv4_prefix() {
         assert!(same_subnet(
@@ -1277,6 +1533,235 @@ mod tests {
                 .unwrap_or_default()
                 .contains("failed to send start_task to agent")
         );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_returns_no_connected_node_when_only_node_is_full() -> anyhow::Result<()>
+    {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let task = match repository
+            .create_task(
+                "full-node-dispatch",
+                "full-node-dispatch-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000010")?;
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _session_id = service
+            .bootstrap_session(&sample_registration(node_id), sender)
+            .await?;
+        service
+            .update_session_load(node_id, &sample_heartbeat(1, 1.0))
+            .await?;
+
+        let error = service
+            .dispatch_task(task.id)
+            .await
+            .expect_err("full node should be filtered out");
+        assert!(matches!(error, ControlPlaneError::NoConnectedNode));
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.assigned_node_id, None);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_reserves_slots_to_reduce_burst_skew() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+
+        let first_task = match repository
+            .create_task(
+                "burst-reservation-a",
+                "burst-reservation-a-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let first_task = repository.ensure_task_queued(first_task.id).await?;
+
+        let second_task = match repository
+            .create_task(
+                "burst-reservation-b",
+                "burst-reservation-b-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let second_task = repository.ensure_task_queued(second_task.id).await?;
+
+        let first_node = Uuid::parse_str("00000000-0000-0000-0000-000000000011")?;
+        let second_node = Uuid::parse_str("00000000-0000-0000-0000-000000000012")?;
+        let (first_sender, _first_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let (second_sender, _second_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _first_session = service
+            .bootstrap_session(&sample_registration(first_node), first_sender)
+            .await?;
+        let _second_session = service
+            .bootstrap_session(&sample_registration(second_node), second_sender)
+            .await?;
+
+        service.dispatch_task(first_task.id).await?;
+        service.dispatch_task(second_task.id).await?;
+
+        let first_summary = repository.get_task_summary(first_task.id).await?;
+        let second_summary = repository.get_task_summary(second_task.id).await?;
+        assert_eq!(first_summary.assigned_node_id, Some(first_node));
+        assert_eq!(second_summary.assigned_node_id, Some(second_node));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_session_requeues_dispatching_task() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let task = match repository
+            .create_task(
+                "disconnect-dispatching",
+                "disconnect-dispatching-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000013")?;
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let session_id = service
+            .bootstrap_session(&sample_registration(node_id), sender)
+            .await?;
+
+        service.dispatch_task(task.id).await?;
+        service.close_session(node_id, session_id).await;
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.assigned_node_id, None);
+
+        let attempt = sqlx::query(
+            r#"
+            select status::text as status, failure_code
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 1
+            "#,
+        )
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(attempt.try_get::<String, _>("status")?, "FAILED");
+        assert_eq!(
+            attempt.try_get::<Option<String>, _>("failure_code")?,
+            Some("node_disconnected".to_string())
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_session_retries_running_task_when_recovery_is_enabled() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let task = match repository
+            .create_task(
+                "disconnect-running",
+                "disconnect-running-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000014")?;
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let session_id = service
+            .bootstrap_session(&sample_registration(node_id), sender)
+            .await?;
+
+        service.dispatch_task(task.id).await?;
+        repository
+            .record_agent_task_event(
+                node_id,
+                AgentTaskEventRecord {
+                    task_id: task.id,
+                    attempt_no: 1,
+                    event_type: "running".to_string(),
+                    event_level: "info".to_string(),
+                    message: "task is running".to_string(),
+                    payload: Value::Null,
+                },
+            )
+            .await?;
+
+        service.close_session(node_id, session_id).await;
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.current_attempt_no, 2);
+        assert_eq!(summary.assigned_node_id, None);
+
+        let attempts = sqlx::query(
+            r#"
+            select attempt_no, status::text as status, failure_code, node_id
+              from task_attempts
+             where task_id = $1
+             order by attempt_no asc
+            "#,
+        )
+        .bind(task.id)
+        .fetch_all(&db.pool)
+        .await?;
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].try_get::<i32, _>("attempt_no")?, 1);
+        assert_eq!(attempts[0].try_get::<String, _>("status")?, "FAILED");
+        assert_eq!(
+            attempts[0].try_get::<Option<String>, _>("failure_code")?,
+            Some("node_disconnected".to_string())
+        );
+        assert_eq!(attempts[1].try_get::<i32, _>("attempt_no")?, 2);
+        assert_eq!(attempts[1].try_get::<String, _>("status")?, "PENDING");
+        assert_eq!(attempts[1].try_get::<Option<Uuid>, _>("node_id")?, None);
 
         db.cleanup().await?;
         Ok(())
