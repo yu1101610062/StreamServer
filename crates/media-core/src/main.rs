@@ -2533,6 +2533,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_due_at_tasks_includes_queued_immediate_tasks_after_failed_initial_dispatch()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let task = match repository
+            .create_task(
+                "queued-sweep-task",
+                "queued-sweep-task-hash",
+                serde_json::from_value::<TaskSpec>(sample_create_task_payload("immediate"))?,
+            )
+            .await?
+        {
+            CreateTaskResult::Fresh(task) | CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+        assert_eq!(task.status, media_domain::TaskStatus::Queued);
+
+        let due_tasks = repository.list_due_at_tasks(Utc::now()).await?;
+        assert!(
+            due_tasks.contains(&task.id),
+            "queued immediate task should be picked up by scheduler sweep"
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn clone_task_applies_supported_request_overrides() -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
             return Ok(());

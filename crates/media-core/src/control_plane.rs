@@ -138,6 +138,14 @@ impl ControlPlaneService {
 
         if send_core_message(&target.sender, envelope).await.is_err() {
             self.close_session(target.node_id, target.session_id).await;
+            self.repository
+                .rollback_task_dispatch(
+                    task_id,
+                    command.attempt_no,
+                    target.node_id,
+                    "failed to send start_task to agent",
+                )
+                .await?;
             return Err(ControlPlaneError::NodeDisconnected(target.node_id));
         }
 
@@ -921,8 +929,10 @@ mod tests {
 
     use media_domain::{
         CommonSpec, InputSpec, PublishSpec, RecordSpec, RecoverySpec, ResourceSpec, ScheduleSpec,
-        TaskType,
+        TaskStatus, TaskType,
     };
+    use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+    use tokio::{net::TcpStream, sync::mpsc, time::timeout};
 
     fn sample_spec(kind: InputKind, url: Option<&str>, interface_ip: Option<&str>) -> TaskSpec {
         TaskSpec {
@@ -959,6 +969,132 @@ mod tests {
             recovery: RecoverySpec::default(),
             schedule: ScheduleSpec::default(),
             resource: ResourceSpec::default(),
+        }
+    }
+
+    struct TestDatabase {
+        admin_pool: PgPool,
+        pool: PgPool,
+        database_name: String,
+    }
+
+    impl TestDatabase {
+        async fn new(run_migrations: bool) -> anyhow::Result<Self> {
+            let admin_url = test_admin_database_url();
+            let admin_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&admin_url)
+                .await?;
+            let database_name = format!("streamserver_test_{}", Uuid::now_v7().simple());
+            sqlx::query(&format!("create database {database_name}"))
+                .execute(&admin_pool)
+                .await?;
+
+            let database_url = test_database_url(&admin_url, &database_name)?;
+            let pool = PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await?;
+            if run_migrations {
+                sqlx::migrate!("../../migrations").run(&pool).await?;
+            }
+
+            Ok(Self {
+                admin_pool,
+                pool,
+                database_name,
+            })
+        }
+
+        async fn maybe_new(run_migrations: bool) -> anyhow::Result<Option<Self>> {
+            if !database_is_reachable(&test_admin_database_url()).await {
+                eprintln!("skipping database-backed test: database is unreachable");
+                return Ok(None);
+            }
+            match Self::new(run_migrations).await {
+                Ok(database) => Ok(Some(database)),
+                Err(error) => {
+                    eprintln!("skipping database-backed test: {error}");
+                    Ok(None)
+                }
+            }
+        }
+
+        async fn cleanup(self) -> anyhow::Result<()> {
+            self.pool.close().await;
+            sqlx::query(
+                r#"
+                select pg_terminate_backend(pid)
+                  from pg_stat_activity
+                 where datname = $1
+                   and pid <> pg_backend_pid()
+                "#,
+            )
+            .bind(&self.database_name)
+            .execute(&self.admin_pool)
+            .await?;
+            sqlx::query(&format!("drop database if exists {}", self.database_name))
+                .execute(&self.admin_pool)
+                .await?;
+            self.admin_pool.close().await;
+            Ok(())
+        }
+    }
+
+    fn test_admin_database_url() -> String {
+        std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "postgresql://postgres:test@127.0.0.1/postgres".to_string())
+    }
+
+    fn test_database_url(admin_url: &str, database_name: &str) -> anyhow::Result<String> {
+        let mut url = reqwest::Url::parse(admin_url)?;
+        url.set_path(&format!("/{database_name}"));
+        url.set_query(None);
+        Ok(url.to_string())
+    }
+
+    async fn database_is_reachable(database_url: &str) -> bool {
+        let Ok(url) = reqwest::Url::parse(database_url) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let port = url.port().unwrap_or(5432);
+        timeout(
+            std::time::Duration::from_secs(1),
+            TcpStream::connect((host, port)),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+    }
+
+    async fn require_test_database(run_migrations: bool) -> anyhow::Result<Option<TestDatabase>> {
+        TestDatabase::maybe_new(run_migrations).await
+    }
+
+    fn sample_immediate_task_spec() -> TaskSpec {
+        let mut spec = sample_spec(InputKind::Rtsp, Some("rtsp://192.168.20.15/live"), None);
+        spec.schedule.start_mode = Some(media_domain::StartMode::Immediate);
+        spec
+    }
+
+    fn sample_registration(node_id: Uuid) -> AgentRegistration {
+        AgentRegistration {
+            node_id,
+            node_name: format!("node-{node_id}"),
+            agent_version: "test".to_string(),
+            hostname: "worker-a".to_string(),
+            labels: vec!["edge".to_string()],
+            interfaces: vec!["eth0|192.168.20.2/24".to_string()],
+            zlm_api_base: "http://127.0.0.1:65535".to_string(),
+            zlm_api_secret: "secret".to_string(),
+            agent_stream_addr: "http://stream.example".to_string(),
+            network_mode: NetworkMode::Bridge,
+            ffmpeg_bin: "ffmpeg".to_string(),
+            ffprobe_bin: "ffprobe".to_string(),
         }
     }
 
@@ -1073,5 +1209,76 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(192, 168, 2, 10)),
             24,
         ));
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_rolls_back_when_agent_channel_is_closed() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let task = match repository
+            .create_task(
+                "dispatch-send-failure",
+                "dispatch-send-failure-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let node_id = Uuid::now_v7();
+        let (sender, receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _session_id = service
+            .bootstrap_session(&sample_registration(node_id), sender)
+            .await?;
+        drop(receiver);
+
+        let error = service
+            .dispatch_task(task.id)
+            .await
+            .expect_err("closed channel should fail dispatch");
+        assert!(matches!(error, ControlPlaneError::NodeDisconnected(id) if id == node_id));
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.assigned_node_id, None);
+
+        let active_lease_count: i64 =
+            sqlx::query_scalar("select count(*) from task_leases where task_id = $1")
+                .bind(task.id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(active_lease_count, 0);
+
+        let attempt = sqlx::query(
+            r#"
+            select status::text as status, failure_code, failure_reason
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 1
+            "#,
+        )
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(attempt.try_get::<String, _>("status")?, "FAILED");
+        assert_eq!(
+            attempt.try_get::<Option<String>, _>("failure_code")?,
+            Some("dispatch_send_failed".to_string())
+        );
+        assert!(
+            attempt
+                .try_get::<Option<String>, _>("failure_reason")?
+                .unwrap_or_default()
+                .contains("failed to send start_task to agent")
+        );
+
+        db.cleanup().await?;
+        Ok(())
     }
 }

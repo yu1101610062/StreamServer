@@ -895,11 +895,18 @@ impl TaskRepository {
             r#"
             select id
               from tasks
-             where schedule_start_mode = 'at'
-               and status = 'VALIDATING'::task_status
-               and resolved_spec is not null
-               and nullif(resolved_spec->'schedule'->>'start_at', '') is not null
-               and (resolved_spec->'schedule'->>'start_at')::timestamptz <= $1
+             where (
+                    schedule_start_mode = 'at'
+                and status = 'VALIDATING'::task_status
+                and resolved_spec is not null
+                and nullif(resolved_spec->'schedule'->>'start_at', '') is not null
+                and (resolved_spec->'schedule'->>'start_at')::timestamptz <= $1
+             )
+                or (
+                    status = 'QUEUED'::task_status
+                and resolved_spec is not null
+                and schedule_start_mode <> 'cron'
+             )
              order by created_at asc
             "#,
         )
@@ -1444,6 +1451,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -1523,6 +1531,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -1672,6 +1681,76 @@ impl TaskRepository {
             resolved_spec,
             lease_token,
         })
+    }
+
+    pub async fn rollback_task_dispatch(
+        &self,
+        task_id: Uuid,
+        attempt_no: i32,
+        node_id: Uuid,
+        reason: &str,
+    ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            update tasks
+               set status = 'QUEUED'::task_status,
+                   assigned_node_id = null,
+                   updated_at = $1
+             where id = $2
+               and current_attempt_no = $3
+               and status = 'DISPATCHING'::task_status
+            "#,
+        )
+        .bind(now)
+        .bind(task_id)
+        .bind(attempt_no)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            update task_attempts
+               set status = 'FAILED'::attempt_status,
+                   node_id = $1,
+                   failure_code = 'dispatch_send_failed',
+                   failure_reason = $2,
+                   ended_at = $3
+             where task_id = $4
+               and attempt_no = $5
+               and status = 'PENDING'::attempt_status
+            "#,
+        )
+        .bind(node_id)
+        .bind(reason)
+        .bind(now)
+        .bind(task_id)
+        .bind(attempt_no)
+        .execute(&mut *tx)
+        .await?;
+
+        self.delete_task_lease(&mut tx, task_id).await?;
+        self.insert_event(
+            &mut tx,
+            task_id,
+            None,
+            Some(attempt_no),
+            EventSource::Core,
+            "task_dispatch_failed",
+            "warn",
+            json!({
+                "node_id": node_id,
+                "attempt_no": attempt_no,
+                "reason": reason,
+                "requeued": true,
+            }),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn build_stop_command(
@@ -2734,6 +2813,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
