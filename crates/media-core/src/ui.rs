@@ -28,6 +28,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/streams", get(shell))
         .route("/multicast", get(shell))
         .route("/records", get(shell))
+        .route("/transcode-artifacts", get(shell))
         .route("/security", get(shell))
         .route("/nodes", get(shell))
         .route("/debug", get(shell))

@@ -247,7 +247,12 @@ impl JwtSigner {
         anyhow::bail!("JWT private key must be a valid RSA or Ed25519 private key in PEM format")
     }
 
-    fn issue(&self, subject: &str, role: ApiRole, ttl: Duration) -> anyhow::Result<IssuedAccessToken> {
+    fn issue(
+        &self,
+        subject: &str,
+        role: ApiRole,
+        ttl: Duration,
+    ) -> anyhow::Result<IssuedAccessToken> {
         let now = Utc::now();
         let expires_at = now + ttl;
         let claims = JwtClaims {
@@ -487,16 +492,31 @@ mod tests {
     #[test]
     fn machine_principal_has_limited_permissions() {
         let principal = AuthenticatedPrincipal::machine_allowlisted("10.0.0.5");
-        assert!(principal.require_permission(ApiPermission::TaskWrite).is_ok());
-        assert!(principal.require_permission(ApiPermission::TemplateRead).is_ok());
-        assert!(principal.require_permission(ApiPermission::NodeRead).is_err());
-        assert!(principal.require_permission(ApiPermission::DebugRead).is_err());
+        assert!(
+            principal
+                .require_permission(ApiPermission::TaskWrite)
+                .is_ok()
+        );
+        assert!(
+            principal
+                .require_permission(ApiPermission::TemplateRead)
+                .is_ok()
+        );
+        assert!(
+            principal
+                .require_permission(ApiPermission::NodeRead)
+                .is_err()
+        );
+        assert!(
+            principal
+                .require_permission(ApiPermission::DebugRead)
+                .is_err()
+        );
     }
 
     #[test]
     fn signer_and_verifier_round_trip() {
-        let signer =
-            JwtSigner::from_private_key_pem(ED25519_PRIVATE_KEY).expect("private key");
+        let signer = JwtSigner::from_private_key_pem(ED25519_PRIVATE_KEY).expect("private key");
         let verifier = JwtVerifier::from_public_key_pem(ED25519_PUBLIC_KEY).expect("public key");
         let issued = signer
             .issue("alice", ApiRole::Admin, Duration::minutes(5))

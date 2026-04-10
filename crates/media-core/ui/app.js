@@ -42,6 +42,12 @@ const NAV_ITEMS = [
     permission: "record_read",
   },
   {
+    path: "/transcode-artifacts",
+    label: "转码产物",
+    note: "离线转码结果、HTTP 地址、文件路径",
+    permission: "record_read",
+  },
+  {
     path: "/security",
     label: "安全设置",
     note: "修改密码、维护机器 API 白名单",
@@ -660,6 +666,7 @@ function buildApiDocDetails() {
       { name: "items[].app", type: "string", description: "应用名。" },
       { name: "items[].stream", type: "string", description: "流名。" },
       { name: "items[].file_path", type: "string", description: "文件绝对路径。" },
+      { name: "items[].http_url", type: "string", description: "可直接访问的 HTTP 地址；历史记录可能为空。" },
       { name: "items[].file_size", type: "number", description: "文件大小（字节）。" },
       { name: "items[].time_len", type: "number", description: "时长（秒）。" },
       { name: "items[].start_time", type: "string", description: "录像开始时间。" },
@@ -669,6 +676,32 @@ function buildApiDocDetails() {
     enums: {
       source: Object.entries(LABELS.recordSource).map(([value, label]) => ({ value, label })),
     },
+  },
+  "GET /api/v1/transcode-artifacts": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      query: {
+        task_id: EXAMPLE_TASK_ID,
+        date_from: "2026-04-11T00:00:00+08:00",
+        date_to: "2026-04-11T23:59:59+08:00",
+        page: 1,
+        page_size: 20,
+      },
+    },
+    responseFields: [
+      { name: "items[].id", type: "string", description: "转码产物记录 ID。" },
+      { name: "items[].task_id", type: "string", description: "关联任务 ID。" },
+      { name: "items[].attempt_id", type: "string", description: "关联 attempt ID。" },
+      { name: "items[].node_id", type: "string", description: "产物所在工作节点 ID。" },
+      { name: "items[].file_name", type: "string", description: "文件名。" },
+      { name: "items[].file_path", type: "string", description: "工作节点上的绝对路径。" },
+      { name: "items[].http_url", type: "string", description: "可直接访问的 HTTP 地址。" },
+      { name: "items[].file_size", type: "number", description: "文件大小（字节）。" },
+      { name: "items[].created_at", type: "string", description: "产物落库时间。" },
+      { name: "total", type: "number", description: "总条数。" },
+    ],
   },
   "GET /api/v1/nodes": {
     requestSample: {
@@ -826,6 +859,7 @@ const LABELS = {
     streams: "流中心",
     multicast: "组播中心",
     records: "录像中心",
+    "transcode-artifacts": "转码产物",
     security: "安全设置",
     nodes: "节点中心",
     debug: "调试台",
@@ -1342,6 +1376,8 @@ async function loadRouteData(route) {
       return await loadMulticastData(route);
     case "records":
       return await loadRecordsData(route);
+    case "transcode-artifacts":
+      return await loadTranscodeArtifactsData(route);
     case "security":
       return await loadSecurityData();
     case "nodes":
@@ -1374,6 +1410,8 @@ function renderRouteBody(route, data) {
       return renderMulticastPage(data);
     case "records":
       return renderRecordsPage(data);
+    case "transcode-artifacts":
+      return renderTranscodeArtifactsPage(data);
     case "security":
       return renderSecurityPage(data);
     case "nodes":
@@ -1588,6 +1626,17 @@ async function loadRecordsData(route) {
   }
   const recordsPage = await apiRequest(`/api/v1/records?${query.toString()}`);
   return { recordsPage };
+}
+
+async function loadTranscodeArtifactsData(route) {
+  const params = route.searchParams;
+  const query = new URLSearchParams();
+  copyIfPresent(params, query, ["task_id", "date_from", "date_to", "page", "page_size"]);
+  if (!query.get("page_size")) {
+    query.set("page_size", "20");
+  }
+  const artifactsPage = await apiRequest(`/api/v1/transcode-artifacts?${query.toString()}`);
+  return { artifactsPage };
 }
 
 async function loadSecurityData() {
@@ -2247,7 +2296,7 @@ function renderRecordsPage(data) {
         <div>
           <div class="brand-mark">录像</div>
           <h3>录像中心</h3>
-          <p>按照日期、任务和流名检索录像，并直接复制路径或跳转任务。</p>
+          <p>按照日期、任务和流名检索录像，并直接复制路径、复制 HTTP 地址或在新标签页打开。</p>
         </div>
       </div>
       <form id="records-filter-form" class="filters">
@@ -2279,6 +2328,7 @@ function renderRecordsPage(data) {
               <th>任务</th>
               <th>流</th>
               <th>文件路径</th>
+              <th>HTTP 地址</th>
               <th>Size</th>
               <th>时长</th>
               <th>开始时间</th>
@@ -2297,6 +2347,11 @@ function renderRecordsPage(data) {
                           <td><a href="/tasks/${record.task_id}" data-link class="mono">${shortId(record.task_id)}</a></td>
                           <td>${escapeHtml([record.vhost, record.app, record.stream].filter(Boolean).join("/") || "—")}</td>
                           <td><code class="selectable">${escapeHtml(record.file_path)}</code></td>
+                          <td>${
+                            record.http_url
+                              ? `<code class="selectable">${escapeHtml(record.http_url)}</code>`
+                              : "—"
+                          }</td>
                           <td>${escapeHtml(formatBytes(record.file_size))}</td>
                           <td>${escapeHtml(record.time_len ? `${record.time_len}s` : "—")}</td>
                           <td>${escapeHtml(formatTime(record.start_time || record.created_at))}</td>
@@ -2304,6 +2359,14 @@ function renderRecordsPage(data) {
                           <td>
                             <div class="toolbar-actions">
                               <button class="ghost-button" data-action="copy" data-value="${escapeAttr(record.file_path)}">复制路径</button>
+                              ${
+                                record.http_url
+                                  ? `
+                                    <button class="ghost-button" data-action="copy" data-value="${escapeAttr(record.http_url)}">复制 HTTP 地址</button>
+                                    <a class="ghost-button" href="${escapeAttr(record.http_url)}" target="_blank" rel="noreferrer">打开</a>
+                                  `
+                                  : ""
+                              }
                               <a class="ghost-button" href="/tasks/${record.task_id}" data-link>任务</a>
                             </div>
                           </td>
@@ -2311,7 +2374,89 @@ function renderRecordsPage(data) {
                       `,
                     )
                     .join("")
-                : `<tr><td colspan="9">${renderInlineEmpty("当前没有录像文件。")}</td></tr>`
+                : `<tr><td colspan="10">${renderInlineEmpty("当前没有录像文件。")}</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderTranscodeArtifactsPage(data) {
+  const params = state.route.searchParams;
+  return `
+    <section class="hero-panel">
+      <div class="section-header">
+        <div>
+          <div class="brand-mark">转码</div>
+          <h3>转码产物</h3>
+          <p>查询 file_transcode 生成的离线文件，并直接访问工作节点上的 HTTP 文件地址。</p>
+        </div>
+      </div>
+      <form id="transcode-artifacts-filter-form" class="filters">
+        ${renderTextField("任务 ID", "task_id", params.get("task_id") || "", "uuid")}
+        ${renderDateTimeField("开始时间", "date_from", params.get("date_from") || "")}
+        ${renderDateTimeField("结束时间", "date_to", params.get("date_to") || "")}
+        <div class="toolbar-actions">
+          <button class="button" type="submit">筛选</button>
+          <button class="ghost-button" type="button" data-action="reset-transcode-artifact-filters">重置</button>
+        </div>
+      </form>
+    </section>
+    <section class="table-panel">
+      <div class="table-toolbar">
+        <div>
+          <h3>离线转码产物</h3>
+          <p>共 ${data.artifactsPage.total} 条，当前第 ${data.artifactsPage.page} 页。</p>
+        </div>
+        <div class="toolbar-actions">
+          ${renderPager("transcode-artifacts", data.artifactsPage)}
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>产物 ID</th>
+              <th>任务</th>
+              <th>节点</th>
+              <th>文件名</th>
+              <th>文件路径</th>
+              <th>HTTP 地址</th>
+              <th>Size</th>
+              <th>创建时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              data.artifactsPage.items.length
+                ? data.artifactsPage.items
+                    .map(
+                      (artifact) => `
+                        <tr>
+                          <td class="mono">${shortId(artifact.id)}</td>
+                          <td><a href="/tasks/${artifact.task_id}" data-link class="mono">${shortId(artifact.task_id)}</a></td>
+                          <td class="mono">${shortId(artifact.node_id)}</td>
+                          <td>${escapeHtml(artifact.file_name)}</td>
+                          <td><code class="selectable">${escapeHtml(artifact.file_path)}</code></td>
+                          <td><code class="selectable">${escapeHtml(artifact.http_url)}</code></td>
+                          <td>${escapeHtml(formatBytes(artifact.file_size))}</td>
+                          <td>${escapeHtml(formatTime(artifact.created_at))}</td>
+                          <td>
+                            <div class="toolbar-actions">
+                              <button class="ghost-button" data-action="copy" data-value="${escapeAttr(artifact.file_path)}">复制路径</button>
+                              <button class="ghost-button" data-action="copy" data-value="${escapeAttr(artifact.http_url)}">复制 HTTP 地址</button>
+                              <a class="ghost-button" href="${escapeAttr(artifact.http_url)}" target="_blank" rel="noreferrer">打开</a>
+                              <a class="ghost-button" href="/tasks/${artifact.task_id}" data-link>任务</a>
+                            </div>
+                          </td>
+                        </tr>
+                      `,
+                    )
+                    .join("")
+                : `<tr><td colspan="9">${renderInlineEmpty("当前没有转码产物。")}</td></tr>`
             }
           </tbody>
         </table>
@@ -3053,6 +3198,9 @@ async function handleClick(event) {
       case "reset-record-filters":
         await navigate("/records");
         break;
+      case "reset-transcode-artifact-filters":
+        await navigate("/transcode-artifacts");
+        break;
       case "load-more-logs":
         await updateTaskDetailQuery({
           tab: "logs",
@@ -3123,6 +3271,9 @@ async function handleSubmit(event) {
         break;
       case "records-filter-form":
         await navigate(`/records?${buildQueryString(new FormData(form))}`);
+        break;
+      case "transcode-artifacts-filter-form":
+        await navigate(`/transcode-artifacts?${buildQueryString(new FormData(form))}`);
         break;
       case "task-events-filter-form":
         await updateTaskDetailQuery({
@@ -3256,6 +3407,7 @@ function parseRoute(pathname, search) {
   if (cleanPath === "/streams") return { name: "streams", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/multicast") return { name: "multicast", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/records") return { name: "records", path: cleanPath, searchParams, params: {} };
+  if (cleanPath === "/transcode-artifacts") return { name: "transcode-artifacts", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/security") return { name: "security", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/nodes") return { name: "nodes", path: cleanPath, searchParams, params: {} };
   if (cleanPath.startsWith("/debug")) return { name: "debug", path: cleanPath, searchParams, params: {} };
@@ -3282,7 +3434,9 @@ function currentRouteSubtitle() {
     case "multicast":
       return "聚合组播任务、上下游绑定、网卡和最近异常。";
     case "records":
-      return "按任务、流和时间检索录像文件，并快速复制路径。";
+      return "按任务、流和时间检索录像文件，并直接打开或复制 HTTP 地址。";
+    case "transcode-artifacts":
+      return "查询 file_transcode 生成的离线产物，并直接打开工作节点上的 HTTP 文件地址。";
     case "security":
       return "修改当前密码，并维护允许直连业务 API 的机器 IP 白名单。";
     case "nodes":
@@ -4146,6 +4300,9 @@ function pageHref(kind, pageNumber, taskId) {
     case "records":
       query.set("page", String(pageNumber));
       return `/records?${query.toString()}`;
+    case "transcode-artifacts":
+      query.set("page", String(pageNumber));
+      return `/transcode-artifacts?${query.toString()}`;
     case "task-events":
       query.set("tab", "events");
       query.set("page", String(pageNumber));

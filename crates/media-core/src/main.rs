@@ -78,7 +78,10 @@ where
         parts: &mut axum::http::request::Parts,
         _state: &S,
     ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|value| value.0);
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|value| value.0);
         std::future::ready(Ok(Self(peer)))
     }
 }
@@ -203,6 +206,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/templates/{id}/render", post(render_template))
         .route("/streams", get(list_streams))
         .route("/records", get(list_records))
+        .route("/transcode-artifacts", get(list_transcode_artifacts))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{id}/heartbeats", get(list_node_heartbeats))
         .route("/debug/hooks", get(list_debug_hooks))
@@ -264,13 +268,11 @@ pub(crate) async fn authorize_business_request(
     match maybe_extract_bearer_token(headers)? {
         Some(_) => state.auth.authorize(headers, permission),
         None => {
-            let peer_ip = peer
-                .map(|addr| addr.ip())
-                .ok_or_else(|| {
-                    AppError::Forbidden(
-                        "missing Authorization header and peer address is unavailable".to_string(),
-                    )
-                })?;
+            let peer_ip = peer.map(|addr| addr.ip()).ok_or_else(|| {
+                AppError::Forbidden(
+                    "missing Authorization header and peer address is unavailable".to_string(),
+                )
+            })?;
             let allowed = state.repository.is_machine_ip_allowlisted(peer_ip).await?;
             if !allowed {
                 return Err(AppError::Forbidden(
@@ -681,7 +683,9 @@ async fn list_machine_allowlist(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MachineAllowlistResponse>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::SecurityWrite)?;
+    let _principal = state
+        .auth
+        .authorize(&headers, ApiPermission::SecurityWrite)?;
     let entries = state.repository.list_machine_allowlist().await?;
     Ok(Json(MachineAllowlistResponse { entries }))
 }
@@ -691,7 +695,9 @@ async fn update_machine_allowlist(
     headers: HeaderMap,
     Json(request): Json<UpdateMachineAllowlistRequest>,
 ) -> Result<Json<MachineAllowlistResponse>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::SecurityWrite)?;
+    let principal = state
+        .auth
+        .authorize(&headers, ApiPermission::SecurityWrite)?;
     let entries = normalize_machine_allowlist_entries(request.entries)?;
     state.repository.replace_machine_allowlist(&entries).await?;
     record_security_event(
@@ -1008,6 +1014,19 @@ async fn list_records(
     let _principal =
         authorize_business_request(&state, &headers, peer, ApiPermission::RecordRead).await?;
     Ok(Json(state.repository.list_record_files(filter).await?))
+}
+
+async fn list_transcode_artifacts(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Query(filter): Query<repository::TranscodeArtifactListFilter>,
+) -> Result<Json<media_domain::Page<repository::TranscodeArtifactSummary>>, AppError> {
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::RecordRead).await?;
+    Ok(Json(
+        state.repository.list_transcode_artifacts(filter).await?,
+    ))
 }
 
 async fn list_nodes(

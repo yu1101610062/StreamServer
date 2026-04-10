@@ -4,7 +4,7 @@ use std::{
     fs,
     future::Future,
     net::Ipv4Addr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
     ptr,
     str::FromStr,
@@ -843,7 +843,7 @@ impl ManagedProcessExecutor {
                 .expect("runtime map lock poisoned")
                 .remove(&runtime_id);
 
-            let exited_handle = registry
+            let mut exited_handle = registry
                 .update(runtime_id, |runtime| {
                     runtime.state = RuntimeState::Exited;
                     runtime.last_progress_at = Some(Utc::now());
@@ -861,6 +861,8 @@ impl ManagedProcessExecutor {
                     outputs: wait_handle.outputs.clone(),
                     metadata: wait_handle.metadata.clone(),
                 });
+
+            attach_transcode_artifact_metadata(&mut exited_handle, &success_check);
 
             if should_auto_restart_process(&exited_handle, was_stopped, &status) {
                 let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
@@ -1432,6 +1434,55 @@ fn parse_task_spec(request: &StartTaskRequest) -> Result<TaskSpec, ExecutorError
     })
 }
 
+const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
+
+fn path_is_under_root(path: &str, root: &str) -> bool {
+    path != root
+        && path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn normalized_posix_path(path: &str) -> Result<String, ExecutorError> {
+    let path = Path::new(path.trim());
+    if !path.is_absolute() {
+        return Err(ExecutorError::InvalidRequest(
+            "file_transcode publish.url must be an absolute path".to_string(),
+        ));
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(ExecutorError::InvalidRequest(
+                    "file_transcode publish.url must not contain parent segments".to_string(),
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(ExecutorError::InvalidRequest(
+                    "file_transcode publish.url must be a POSIX path".to_string(),
+                ));
+            }
+        }
+    }
+
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn validate_transcode_output_path(path: &str) -> Result<String, ExecutorError> {
+    let normalized = normalized_posix_path(path)?;
+    if !path_is_under_root(&normalized, TRANSCODE_ARTIFACT_ROOT) {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "file_transcode publish.url must stay under {TRANSCODE_ARTIFACT_ROOT}"
+        )));
+    }
+    Ok(normalized)
+}
+
 fn build_file_transcode_plan(
     settings: &AgentSettings,
     request: &StartTaskRequest,
@@ -1455,6 +1506,7 @@ fn build_file_transcode_plan(
             ));
         }
     };
+    let output_path = validate_transcode_output_path(&output_path)?;
     let output_format = spec
         .publish
         .format
@@ -2696,7 +2748,7 @@ fn spawn_adopted_runtime_monitor(
                 .expect("runtime map lock poisoned")
                 .remove(&runtime_id);
 
-            let exited_handle = registry
+            let mut exited_handle = registry
                 .update(runtime_id, |runtime| {
                     runtime.state = RuntimeState::Exited;
                     runtime.last_progress_at = Some(Utc::now());
@@ -2707,6 +2759,7 @@ fn spawn_adopted_runtime_monitor(
                     handle.last_progress_at = Some(Utc::now());
                     handle
                 });
+            attach_transcode_artifact_metadata(&mut exited_handle, &success_check);
 
             let (event_type, event_level, message, payload) =
                 classify_adopted_exit(&exited_handle, &success_check, stop_requested);
@@ -3573,6 +3626,40 @@ fn zlm_record_kind_code(kind: &ZlmRecordKind) -> u8 {
     }
 }
 
+fn attach_transcode_artifact_metadata(handle: &mut RuntimeHandle, success_check: &SuccessCheck) {
+    if task_type_from_handle(handle) != Some(TaskType::FileTranscode) {
+        return;
+    }
+    let SuccessCheck::FileExists(path) = success_check else {
+        return;
+    };
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if !metadata.is_file() {
+        return;
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let file_path = path.to_string_lossy().to_string();
+
+    let Some(object) = handle.metadata.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "transcode_artifact".to_string(),
+        json!({
+            "file_name": file_name,
+            "file_path": file_path,
+            "file_size": i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+        }),
+    );
+}
+
 fn classify_adopted_exit(
     handle: &RuntimeHandle,
     success_check: &SuccessCheck,
@@ -3784,7 +3871,7 @@ mod tests {
                 "record": {},
                 "publish": {
                     "kind": "file",
-                    "url": "/tmp/output.mp4"
+                    "url": "/data/zlm/www/artifacts/transcode/output.mp4"
                 },
                 "recovery": {},
                 "schedule": {"start_mode": "immediate"},
@@ -3800,7 +3887,47 @@ mod tests {
             build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
         assert_eq!(plan.executable, "ffmpeg");
         assert!(plan.args.iter().any(|arg| arg == "pipe:1"));
-        assert_eq!(plan.output_target, "/tmp/output.mp4");
+        assert_eq!(
+            plan.output_target,
+            "/data/zlm/www/artifacts/transcode/output.mp4"
+        );
+    }
+
+    #[test]
+    fn build_file_transcode_plan_rejects_output_outside_http_root() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "/tmp/input.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "url": "/tmp/output.mp4"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let error = build_file_transcode_plan(&settings, &request, &spec)
+            .expect_err("plan should reject output outside web root");
+        assert!(matches!(
+            error,
+            ExecutorError::InvalidRequest(message)
+                if message.contains(TRANSCODE_ARTIFACT_ROOT)
+        ));
     }
 
     #[test]
@@ -3818,7 +3945,7 @@ mod tests {
             last_progress_at: None,
             state: RuntimeState::Running,
             command_line: Some("ffmpeg -i input".to_string()),
-            outputs: vec!["/tmp/output.mp4".to_string()],
+            outputs: vec!["/data/zlm/www/artifacts/transcode/output.mp4".to_string()],
             metadata: json!({"task_type": "file_transcode"}),
         });
 
@@ -3840,7 +3967,7 @@ mod tests {
                 "record": {},
                 "publish": {
                     "kind": "file",
-                    "url": "/tmp/output.mp4"
+                    "url": "/data/zlm/www/artifacts/transcode/output.mp4"
                 },
                 "recovery": {},
                 "schedule": {"start_mode": "immediate"},

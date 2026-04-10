@@ -320,11 +320,42 @@
 - `page`
 - `page_size`
 
-### 5.3 `GET /nodes`
+返回字段补充：
+
+- `http_url`：录像文件的 HTTP 访问地址。若 ZLM Hook 未上报 URL，则允许为空。
+
+### 5.3 `GET /transcode-artifacts`
+
+支持字段：
+
+- `task_id`
+- `date_from`
+- `date_to`
+- `page`
+- `page_size`
+
+返回字段：
+
+- `id`
+- `task_id`
+- `attempt_id`
+- `node_id`
+- `file_name`
+- `file_path`
+- `http_url`
+- `file_size`
+- `created_at`
+
+说明：
+
+- 只覆盖改造后的 `file_transcode` 成功产物。
+- `http_url` 基于工作节点 `agent_stream_addr` 和 `/data/zlm/www` 下的相对路径生成。
+
+### 5.4 `GET /nodes`
 
 返回节点健康、能力摘要、当前负载和最近心跳。
 
-### 5.4 `GET /nodes/{id}/heartbeats`
+### 5.5 `GET /nodes/{id}/heartbeats`
 
 返回指定节点最近的 heartbeat 历史样本，默认 `24` 条，最大 `200` 条。
 

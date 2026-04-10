@@ -1,4 +1,8 @@
-use std::{net::IpAddr, str::FromStr};
+use std::{
+    net::IpAddr,
+    path::{Component, Path},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use media_domain::{
@@ -6,6 +10,7 @@ use media_domain::{
     RecoveryPolicy, StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType,
     TaskValidationError, ValidationIssue, WorkerKind,
 };
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgRow};
@@ -107,7 +112,8 @@ impl TaskRepository {
         .await?
         .ok_or_else(|| RepoError::AuthUserNotFound(username.to_string()))?;
         let user_id: Uuid = row.try_get("id")?;
-        self.revoke_user_refresh_sessions(user_id, Utc::now()).await?;
+        self.revoke_user_refresh_sessions(user_id, Utc::now())
+            .await?;
         self.insert_security_audit_event(SecurityAuditEventRecord {
             event_type: event_type.to_string(),
             actor: actor.to_string(),
@@ -168,10 +174,7 @@ impl TaskRepository {
         Ok(())
     }
 
-    pub async fn insert_refresh_session(
-        &self,
-        record: NewRefreshSession,
-    ) -> Result<(), RepoError> {
+    pub async fn insert_refresh_session(&self, record: NewRefreshSession) -> Result<(), RepoError> {
         sqlx::query(
             r#"
             insert into auth_refresh_sessions (
@@ -1077,6 +1080,7 @@ impl TaskRepository {
               rf.app,
               rf.stream,
               rf.file_path,
+              rf.http_url,
               rf.file_size,
               rf.time_len,
               rf.start_time,
@@ -1099,6 +1103,47 @@ impl TaskRepository {
             .await?
             .into_iter()
             .map(|row| RecordFileSummary::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Page::new(rows, page, page_size, total))
+    }
+
+    pub async fn list_transcode_artifacts(
+        &self,
+        filter: TranscodeArtifactListFilter,
+    ) -> Result<Page<TranscodeArtifactSummary>, RepoError> {
+        let page = filter.page.unwrap_or(1).max(1);
+        let page_size = filter.page_size.unwrap_or(20).clamp(1, 200);
+        let total = self.count_transcode_artifacts(&filter).await?;
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              id,
+              task_id,
+              attempt_id,
+              node_id,
+              file_name,
+              file_path,
+              http_url,
+              file_size,
+              created_at
+            from transcode_artifacts
+            where 1 = 1
+            "#,
+        );
+        apply_transcode_artifact_filters(&mut builder, &filter);
+        builder.push(" order by created_at desc limit ");
+        builder.push_bind(i64::from(page_size));
+        builder.push(" offset ");
+        builder.push_bind(i64::from((page - 1) * page_size));
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| TranscodeArtifactSummary::from_row(&row))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Page::new(rows, page, page_size, total))
@@ -1507,8 +1552,10 @@ impl TaskRepository {
         )?;
         let merged_spec: TaskSpec = serde_json::from_value(merged_json)?;
         merged_spec.validate()?;
+        validate_transcode_publish_target(&merged_spec)?;
         let resolved_spec = merged_spec.resolved();
         resolved_spec.validate()?;
+        validate_transcode_publish_target(&resolved_spec)?;
 
         Ok(ResolvedTaskRequest {
             requested_spec: merged_spec,
@@ -2836,6 +2883,8 @@ impl TaskRepository {
 
         self.upsert_stream_binding_from_snapshot(&mut tx, &snapshot)
             .await?;
+        self.upsert_transcode_artifact_from_snapshot(&mut tx, node_id, &snapshot)
+            .await?;
 
         tx.commit().await?;
         Ok(())
@@ -2911,6 +2960,85 @@ impl TaskRepository {
         Ok(())
     }
 
+    async fn upsert_transcode_artifact_from_snapshot(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        node_id: Uuid,
+        snapshot: &TaskSnapshotRecord,
+    ) -> Result<(), RepoError> {
+        let Some(metadata) = snapshot
+            .metadata
+            .get("transcode_artifact")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TranscodeArtifactMetadata>(value).ok())
+        else {
+            return Ok(());
+        };
+
+        let Some(attempt_id) = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            select id
+              from task_attempts
+             where task_id = $1
+               and attempt_no = $2
+            "#,
+        )
+        .bind(snapshot.task_id)
+        .bind(snapshot.attempt_no)
+        .fetch_optional(&mut **tx)
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let Some(agent_stream_addr) = sqlx::query_scalar::<_, String>(
+            r#"
+            select agent_stream_addr
+              from media_nodes
+             where id = $1
+            "#,
+        )
+        .bind(node_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        else {
+            return Ok(());
+        };
+
+        let http_url =
+            artifact_http_url_from_path(agent_stream_addr.as_str(), metadata.file_path.as_str())?;
+
+        sqlx::query(
+            r#"
+            insert into transcode_artifacts (
+              id, task_id, attempt_id, node_id, file_name, file_path, http_url, file_size, created_at
+            ) values (
+              $1, $2, $3, $4, $5, $6, $7, $8, $9
+            )
+            on conflict (file_path) do update
+               set task_id = excluded.task_id,
+                   attempt_id = excluded.attempt_id,
+                   node_id = excluded.node_id,
+                   file_name = excluded.file_name,
+                   http_url = excluded.http_url,
+                   file_size = excluded.file_size
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(snapshot.task_id)
+        .bind(attempt_id)
+        .bind(node_id)
+        .bind(&metadata.file_name)
+        .bind(&metadata.file_path)
+        .bind(&http_url)
+        .bind(metadata.file_size)
+        .bind(Utc::now())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn resolve_node_id_by_server_id(
         &self,
         server_id: &str,
@@ -2967,14 +3095,15 @@ impl TaskRepository {
             .find_stream_binding_for_hook(&mut tx, &record.vhost, &record.app, &record.stream)
             .await?
         {
+            let http_url = resolve_record_http_url(&mut tx, server_id, &record).await?;
             sqlx::query(
                 r#"
                 insert into record_files (
-                  id, task_id, attempt_id, vhost, app, stream, file_path, file_size,
+                  id, task_id, attempt_id, vhost, app, stream, file_path, http_url, file_size,
                   time_len, start_time, source, created_at
                 ) values (
-                  $1, $2, $3, $4, $5, $6, $7, $8,
-                  $9, $10, 'hook', $11
+                  $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                  $10, $11, 'hook', $12
                 )
                 on conflict (file_path) do update
                    set task_id = excluded.task_id,
@@ -2982,6 +3111,7 @@ impl TaskRepository {
                        vhost = excluded.vhost,
                        app = excluded.app,
                        stream = excluded.stream,
+                       http_url = excluded.http_url,
                        file_size = excluded.file_size,
                        time_len = excluded.time_len,
                        start_time = excluded.start_time,
@@ -2995,6 +3125,7 @@ impl TaskRepository {
             .bind(&record.app)
             .bind(&record.stream)
             .bind(&record.file_path)
+            .bind(http_url.as_deref())
             .bind(record.file_size)
             .bind(record.time_len_sec)
             .bind(record.start_time)
@@ -3021,7 +3152,8 @@ impl TaskRepository {
                     "file_path": record.file_path,
                     "file_name": record.file_name,
                     "folder": record.folder,
-                    "url": record.url,
+                    "url": http_url.clone().or(record.url.clone()),
+                    "http_url": http_url,
                     "file_size": record.file_size,
                     "time_len": record.time_len_sec,
                     "start_time": record.start_time,
@@ -3370,6 +3502,20 @@ impl TaskRepository {
             "select count(*) as total from record_files rf join tasks t on t.id = rf.task_id where 1 = 1",
         );
         apply_record_filters(&mut builder, filter);
+
+        let row = builder.build().fetch_one(&self.pool).await?;
+        let total: i64 = row.try_get("total")?;
+        Ok(total as u64)
+    }
+
+    async fn count_transcode_artifacts(
+        &self,
+        filter: &TranscodeArtifactListFilter,
+    ) -> Result<u64, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "select count(*) as total from transcode_artifacts where 1 = 1",
+        );
+        apply_transcode_artifact_filters(&mut builder, filter);
 
         let row = builder.build().fetch_one(&self.pool).await?;
         let total: i64 = row.try_get("total")?;
@@ -4022,6 +4168,7 @@ pub struct RecordFileSummary {
     pub app: Option<String>,
     pub stream: Option<String>,
     pub file_path: String,
+    pub http_url: Option<String>,
     pub file_size: i64,
     pub time_len: Option<i32>,
     pub start_time: Option<DateTime<Utc>>,
@@ -4039,10 +4186,54 @@ impl RecordFileSummary {
             app: row.try_get("app")?,
             stream: row.try_get("stream")?,
             file_path: row.try_get("file_path")?,
+            http_url: row.try_get("http_url")?,
             file_size: row.try_get("file_size")?,
             time_len: row.try_get("time_len")?,
             start_time: row.try_get("start_time")?,
             source: row.try_get("source")?,
+            created_at: row.try_get("created_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranscodeArtifactListFilter {
+    #[serde(default)]
+    pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub date_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub date_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscodeArtifactSummary {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub attempt_id: Option<Uuid>,
+    pub node_id: Uuid,
+    pub file_name: String,
+    pub file_path: String,
+    pub http_url: String,
+    pub file_size: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TranscodeArtifactSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            task_id: row.try_get("task_id")?,
+            attempt_id: row.try_get("attempt_id")?,
+            node_id: row.try_get("node_id")?,
+            file_name: row.try_get("file_name")?,
+            file_path: row.try_get("file_path")?,
+            http_url: row.try_get("http_url")?,
+            file_size: row.try_get("file_size")?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -4303,6 +4494,152 @@ fn apply_record_filters<'a>(
         builder.push(" and coalesce(rf.start_time, rf.created_at) <= ");
         builder.push_bind(date_to);
     }
+}
+
+fn apply_transcode_artifact_filters<'a>(
+    builder: &mut QueryBuilder<'a, Postgres>,
+    filter: &'a TranscodeArtifactListFilter,
+) {
+    if let Some(task_id) = filter.task_id {
+        builder.push(" and task_id = ");
+        builder.push_bind(task_id);
+    }
+    if let Some(date_from) = filter.date_from {
+        builder.push(" and created_at >= ");
+        builder.push_bind(date_from);
+    }
+    if let Some(date_to) = filter.date_to {
+        builder.push(" and created_at <= ");
+        builder.push_bind(date_to);
+    }
+}
+
+const ZLM_HTTP_ROOT: &str = "/data/zlm/www";
+const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
+
+fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    if path == root {
+        return None;
+    }
+    path.strip_prefix(root)?.strip_prefix('/')
+}
+
+fn normalized_absolute_path(path: &str) -> Result<String, RepoError> {
+    let path = Path::new(path.trim());
+    if !path.is_absolute() {
+        return Err(validation_error("publish.url", "must be an absolute path"));
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(validation_error(
+                    "publish.url",
+                    "must not contain parent segments",
+                ));
+            }
+            Component::Prefix(_) => {
+                return Err(validation_error("publish.url", "must be a POSIX path"));
+            }
+        }
+    }
+
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn validate_transcode_publish_target(spec: &TaskSpec) -> Result<(), RepoError> {
+    if spec.task_type != TaskType::FileTranscode {
+        return Ok(());
+    }
+
+    let output = spec
+        .publish
+        .url
+        .as_deref()
+        .ok_or_else(|| validation_error("publish.url", "is required for file_transcode"))?;
+    let normalized = normalized_absolute_path(output)?;
+    if relative_path_under_root(&normalized, TRANSCODE_ARTIFACT_ROOT).is_none() {
+        return Err(validation_error(
+            "publish.url",
+            format!("file_transcode output must stay under {TRANSCODE_ARTIFACT_ROOT}"),
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_http_url_from_path(
+    agent_stream_addr: &str,
+    file_path: &str,
+) -> Result<String, RepoError> {
+    let normalized = normalized_absolute_path(file_path)?;
+    let relative = relative_path_under_root(&normalized, ZLM_HTTP_ROOT).ok_or_else(|| {
+        validation_error("publish.url", "output path must be under /data/zlm/www")
+    })?;
+    let base = Url::parse(agent_stream_addr).map_err(|error| {
+        validation_error(
+            "agent_stream_addr",
+            format!("invalid node stream base {agent_stream_addr}: {error}"),
+        )
+    })?;
+    let joined = base.join(relative).map_err(|error| {
+        validation_error(
+            "publish.url",
+            format!("failed to build artifact URL from {file_path}: {error}"),
+        )
+    })?;
+    Ok(joined.to_string())
+}
+
+fn resolve_absolute_http_url(agent_stream_addr: &str, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if Url::parse(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+    let Ok(base) = Url::parse(agent_stream_addr) else {
+        return None;
+    };
+    base.join(trimmed).ok().map(|value| value.to_string())
+}
+
+async fn resolve_record_http_url(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    server_id: &str,
+    record: &ZlmRecordFileRecord,
+) -> Result<Option<String>, RepoError> {
+    let Some(raw_url) = record.url.as_deref() else {
+        return Ok(None);
+    };
+    let Some(node_id) = Uuid::parse_str(server_id.trim()).ok() else {
+        return Ok(Url::parse(raw_url.trim())
+            .ok()
+            .map(|value| value.to_string()));
+    };
+    let Some(agent_stream_addr) = sqlx::query_scalar::<_, String>(
+        r#"
+        select agent_stream_addr
+          from media_nodes
+         where id = $1
+        "#,
+    )
+    .bind(node_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    else {
+        return Ok(Url::parse(raw_url.trim())
+            .ok()
+            .map(|value| value.to_string()));
+    };
+    Ok(resolve_absolute_http_url(
+        agent_stream_addr.as_str(),
+        raw_url,
+    ))
 }
 
 fn normalize_template_default_spec(
@@ -4874,6 +5211,13 @@ struct StreamBindingSnapshot {
     stream: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct TranscodeArtifactMetadata {
+    file_name: String,
+    file_path: String,
+    file_size: i64,
+}
+
 #[derive(Debug, Clone)]
 struct HookStreamBinding {
     task_id: Uuid,
@@ -5335,5 +5679,50 @@ mod tests {
         assert_eq!(overlay["template"], json!("tpl_default_rtsp"));
         assert_eq!(overlay["common"]["created_by"], json!("alice"));
         assert!(overlay["publish"].is_null());
+    }
+
+    #[test]
+    fn artifact_http_url_from_path_uses_node_stream_base() {
+        let url = artifact_http_url_from_path(
+            "http://192.168.1.10:8081",
+            "/data/zlm/www/artifacts/transcode/2026/clip.mp4",
+        )
+        .expect("artifact url should build");
+
+        assert_eq!(
+            url,
+            "http://192.168.1.10:8081/artifacts/transcode/2026/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn resolve_absolute_http_url_accepts_relative_paths() {
+        let url = resolve_absolute_http_url("http://worker.example:8081", "/record/live.m3u8")
+            .expect("relative hook url should resolve");
+        assert_eq!(url, "http://worker.example:8081/record/live.m3u8");
+    }
+
+    #[test]
+    fn validate_transcode_publish_target_rejects_paths_outside_zlm_http_root() {
+        let spec: TaskSpec = serde_json::from_value(json!({
+            "type": "file_transcode",
+            "name": "artifact-test",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "/tmp/input.mp4"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "url": "/tmp/output.mp4"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }))
+        .expect("task spec should parse");
+
+        let error =
+            validate_transcode_publish_target(&spec).expect_err("invalid output should reject");
+        assert!(matches!(error, RepoError::Validation(_)));
     }
 }

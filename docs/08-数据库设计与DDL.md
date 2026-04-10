@@ -217,6 +217,7 @@ create table record_files (
   app text,
   stream text,
   file_path text not null,
+  http_url text,
   file_size bigint not null default 0,
   time_len integer,
   start_time timestamptz,
@@ -226,7 +227,23 @@ create table record_files (
 );
 ```
 
-### 4.9 `task_events`
+### 4.9 `transcode_artifacts`
+
+```sql
+create table transcode_artifacts (
+  id uuid primary key,
+  task_id uuid not null references tasks(id) on delete cascade,
+  attempt_id uuid references task_attempts(id) on delete set null,
+  node_id uuid not null references media_nodes(id),
+  file_name text not null,
+  file_path text not null unique,
+  http_url text not null,
+  file_size bigint not null default 0,
+  created_at timestamptz not null default now()
+);
+```
+
+### 4.10 `task_events`
 
 ```sql
 create table task_events (
@@ -243,7 +260,7 @@ create table task_events (
 );
 ```
 
-### 4.10 `task_checkpoints`
+### 4.11 `task_checkpoints`
 
 ```sql
 create table task_checkpoints (
@@ -257,7 +274,7 @@ create table task_checkpoints (
 );
 ```
 
-### 4.11 `operation_requests`
+### 4.12 `operation_requests`
 
 用于所有写接口的幂等记录。
 
@@ -278,7 +295,7 @@ create table operation_requests (
 );
 ```
 
-### 4.12 `hook_events`
+### 4.13 `hook_events`
 
 保存原始 Hook 负载，便于幂等和审计。
 
@@ -312,6 +329,12 @@ create index idx_task_events_task_created_desc
 create index idx_record_files_task_start_time_desc
   on record_files(task_id, start_time desc nulls last);
 
+create index idx_transcode_artifacts_task_created_desc
+  on transcode_artifacts(task_id, created_at desc);
+
+create index idx_transcode_artifacts_created_desc
+  on transcode_artifacts(created_at desc);
+
 create index idx_stream_bindings_task_id
   on stream_bindings(task_id);
 ```
@@ -323,6 +346,8 @@ create index idx_stream_bindings_task_id
 - `task_attempts.attempt_no` 从 1 开始自增，不回收。
 - `stream_bindings` 必须关联到具体 Attempt。
 - `record_files.file_path` 全局唯一。
+- `record_files.http_url` 允许为空，兼容历史录像和未携带 URL 的 Hook。
+- `transcode_artifacts` 只记录成功完成且输出到 `/data/zlm/www/artifacts/transcode/...` 的 `file_transcode` 产物。
 - `task_events.dedup_key` 允许为空；仅 Hook 或外部重复事件写入时使用。
 
 ## 7. 迁移策略
