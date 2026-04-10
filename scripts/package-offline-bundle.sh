@@ -29,7 +29,7 @@ usage() {
   $(basename "$0") [--output-dir DIR] [--skip-images]
 
 说明:
-  在 macOS arm64 上构建 Linux AMD64 离线部署包。
+  在 macOS arm64 或 Linux 主机上构建 Linux AMD64 离线部署包。
   默认输出到 ./dist。
 
 环境变量:
@@ -63,18 +63,40 @@ parse_args() {
   done
 }
 
-ensure_macos_arm64() {
-  [ "$(uname -s)" = "Darwin" ] || fail "打包脚本要求在 macOS 上运行"
-  [ "$(uname -m)" = "arm64" ] || fail "打包脚本要求在 macOS arm64 上运行"
+ensure_supported_packaging_host() {
+  local host_os
+  local host_arch
+
+  host_os="$(uname -s)"
+  host_arch="$(uname -m)"
+
+  case "${host_os}" in
+    Darwin)
+      [ "${host_arch}" = "arm64" ] || fail "macOS 打包仍要求在 macOS arm64 上运行"
+      ;;
+    Linux)
+      ;;
+    *)
+      fail "打包脚本只支持在 macOS arm64 或 Linux 主机上运行"
+      ;;
+  esac
+}
+
+docker_buildx_available() {
+  docker buildx version >/dev/null 2>&1
 }
 
 ensure_tools() {
   require_cmd docker
-  docker info >/dev/null 2>&1 || fail "Docker 不可用，请先启动 Docker Desktop"
-  docker buildx version >/dev/null 2>&1 || fail "缺少 docker buildx"
+  docker info >/dev/null 2>&1 || fail "Docker 不可用，请先启动 Docker Desktop 或 Docker Engine"
   require_cmd openssl
   require_cmd tar
-  require_cmd shasum
+  if ! command -v shasum >/dev/null 2>&1 && ! command -v sha256sum >/dev/null 2>&1; then
+    fail "缺少校验和命令: shasum 或 sha256sum"
+  fi
+  if [ "${SKIP_IMAGES}" -eq 0 ] && ! docker_buildx_available; then
+    fail "缺少 docker buildx；完整打包需要 docker buildx，--skip-images 可忽略此依赖"
+  fi
 }
 
 workspace_version() {
@@ -362,7 +384,11 @@ create_archive() {
     -czf "${archive_path}" \
     -C "${stage_dir}" \
     "${bundle_name}"
-  shasum -a 256 "${archive_path}" >"${archive_path}.sha256"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${archive_path}" >"${archive_path}.sha256"
+  else
+    sha256sum "${archive_path}" >"${archive_path}.sha256"
+  fi
 }
 
 main() {
@@ -379,7 +405,7 @@ main() {
   local archive_path
 
   parse_args "$@"
-  ensure_macos_arm64
+  ensure_supported_packaging_host
   ensure_tools
 
   if [ -n "${APT_MIRROR}" ]; then
