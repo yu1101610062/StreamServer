@@ -14,6 +14,9 @@ fi
 # shellcheck disable=SC1090
 . "${MANIFEST_FILE}"
 
+COMPOSE_CMD=()
+COMPOSE_CMD_DISPLAY=""
+
 log() {
   printf '[streamserver-install] %s\n' "$*"
 }
@@ -35,10 +38,29 @@ ensure_linux_amd64() {
   esac
 }
 
+detect_compose_cmd() {
+  if docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker compose)
+    COMPOSE_CMD_DISPLAY="docker compose"
+    return 0
+  fi
+  if command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1; then
+    COMPOSE_CMD=(docker-compose)
+    COMPOSE_CMD_DISPLAY="docker-compose"
+    return 0
+  fi
+  fail "缺少 Compose 命令，请安装 docker compose 插件或 docker-compose"
+}
+
+compose_cmd() {
+  [ "${#COMPOSE_CMD[@]}" -gt 0 ] || fail "Compose 命令尚未初始化"
+  "${COMPOSE_CMD[@]}" "$@"
+}
+
 ensure_docker_ready() {
   require_cmd docker
   docker info >/dev/null 2>&1 || fail "Docker 不可用，请先启动 Docker Engine"
-  docker compose version >/dev/null 2>&1 || fail "缺少 docker compose v2"
+  detect_compose_cmd
 }
 
 prompt() {
@@ -409,7 +431,7 @@ prepare_worker_layout() {
 emit_manual_start_hint() {
   local install_dir="$1"
   log "已写入部署文件，稍后可执行:"
-  log "  cd ${install_dir} && docker compose up -d"
+  log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} up -d"
 }
 
 show_tls_notice() {
@@ -450,11 +472,11 @@ start_stack_if_requested() {
   if prompt_yes_no "是否立即启动该部署？" "Y"; then
     (
       cd "${install_dir}"
-      docker compose up -d
+      compose_cmd up -d
     )
     log "已启动，常用命令:"
-    log "  cd ${install_dir} && docker compose ps"
-    log "  cd ${install_dir} && docker compose logs -f"
+    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} ps"
+    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} logs -f"
   else
     emit_manual_start_hint "${install_dir}"
   fi
