@@ -16,6 +16,7 @@ fi
 
 COMPOSE_CMD=()
 COMPOSE_CMD_DISPLAY=""
+COMPOSE_FILE_NAME="compose.yml"
 
 log() {
   printf '[streamserver-install] %s\n' "$*"
@@ -55,6 +56,10 @@ detect_compose_cmd() {
 compose_cmd() {
   [ "${#COMPOSE_CMD[@]}" -gt 0 ] || fail "Compose 命令尚未初始化"
   "${COMPOSE_CMD[@]}" "$@"
+}
+
+compose_with_file() {
+  compose_cmd -f "${COMPOSE_FILE_NAME}" "$@"
 }
 
 ensure_docker_ready() {
@@ -411,7 +416,8 @@ copy_common_assets() {
 copy_compose_template() {
   local template_name="$1"
   local install_dir="$2"
-  cp "${PACKAGE_ROOT}/templates/${template_name}/compose.yml" "${install_dir}/compose.yml"
+  cp "${PACKAGE_ROOT}/templates/${template_name}/compose.yml" "${install_dir}/${COMPOSE_FILE_NAME}"
+  ln -sfn "${COMPOSE_FILE_NAME}" "${install_dir}/docker-compose.yml"
 }
 
 prepare_control_plane_layout() {
@@ -431,7 +437,7 @@ prepare_worker_layout() {
 emit_manual_start_hint() {
   local install_dir="$1"
   log "已写入部署文件，稍后可执行:"
-  log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} up -d"
+  log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} up -d"
 }
 
 show_tls_notice() {
@@ -472,11 +478,11 @@ start_stack_if_requested() {
   if prompt_yes_no "是否立即启动该部署？" "Y"; then
     (
       cd "${install_dir}"
-      compose_cmd up -d
+      compose_with_file up -d
     )
     log "已启动，常用命令:"
-    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} ps"
-    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} logs -f"
+    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} ps"
+    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} logs -f"
   else
     emit_manual_start_hint "${install_dir}"
   fi
@@ -484,47 +490,53 @@ start_stack_if_requested() {
 
 select_role() {
   local answer
-  echo "请选择安装角色:"
-  echo "  1) control-plane"
-  echo "     用途: 只安装中心控制面，包含 media-core 和 PostgreSQL。"
-  echo "     适合: 多工作节点部署中的中心节点，或你已经有独立媒体工作节点的情况。"
-  echo "     网络特性: 不处理媒体组播，只暴露控制面 HTTP/gRPC 端口。"
-  echo
-  echo "  2) worker-bridge"
-  echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
-  echo "     适合: 普通拉流、转发、录像、RTSP/RTMP/HLS 联调。"
-  echo "     网络特性: 使用 Docker bridge 网络，和宿主网络隔离较好。"
-  echo "     限制: 不推荐用于真实 UDP 组播场景。"
-  echo
-  echo "  3) worker-host"
-  echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
-  echo "     适合: 真实 UDP 组播、需要直接绑定宿主机网卡的工作节点。"
-  echo "     网络特性: media-agent 和 ZLMediaKit 直接使用 host 网络。"
-  echo "     注意: 会直接占用宿主机媒体端口，更适合专用媒体节点。"
-  echo
-  echo "  4) all-in-one"
-  echo "     用途: 单机安装完整系统，包含 media-core、PostgreSQL、media-agent、ZLMediaKit。"
-  echo "     适合: 单机演示、离线验收、非组播场景的一体化体验。"
-  echo "     网络特性: 全部服务使用 Docker bridge 网络，隔离性最好，对宿主机干扰最小。"
-  echo "     优先推荐: 只要不需要真实组播，单机模式应先选它。"
-  echo "     限制: 不推荐用于真实 UDP 组播。"
-  echo
-  echo "  5) all-in-one-host"
-  echo "     用途: 单机安装完整系统，但媒体面直连宿主机网络。"
-  echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-  echo "     网络特性: media-core/PostgreSQL 保持 bridge；media-agent/ZLMediaKit 使用 host。"
-  echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
-  echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
-  echo "     注意: 仍会直接占用宿主机的 80/554/1935/8081 等媒体相关端口。"
+  {
+    echo "请选择安装角色:"
+    echo "  1) control-plane"
+    echo "     用途: 只安装中心控制面，包含 media-core 和 PostgreSQL。"
+    echo "     适合: 多工作节点部署中的中心节点，或你已经有独立媒体工作节点的情况。"
+    echo "     网络特性: 不处理媒体组播，只暴露控制面 HTTP/gRPC 端口。"
+    echo
+    echo "  2) worker-bridge"
+    echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
+    echo "     适合: 普通拉流、转发、录像、RTSP/RTMP/HLS 联调。"
+    echo "     网络特性: 使用 Docker bridge 网络，和宿主网络隔离较好。"
+    echo "     限制: 不推荐用于真实 UDP 组播场景。"
+    echo
+    echo "  3) worker-host"
+    echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
+    echo "     适合: 真实 UDP 组播、需要直接绑定宿主机网卡的工作节点。"
+    echo "     网络特性: media-agent 和 ZLMediaKit 直接使用 host 网络。"
+    echo "     注意: 会直接占用宿主机媒体端口，更适合专用媒体节点。"
+    echo
+    echo "  4) all-in-one"
+    echo "     用途: 单机安装完整系统，包含 media-core、PostgreSQL、media-agent、ZLMediaKit。"
+    echo "     适合: 单机演示、离线验收、非组播场景的一体化体验。"
+    echo "     网络特性: 全部服务使用 Docker bridge 网络，隔离性最好，对宿主机干扰最小。"
+    echo "     优先推荐: 只要不需要真实组播，单机模式应先选它。"
+    echo "     限制: 不推荐用于真实 UDP 组播。"
+    echo
+    echo "  5) all-in-one-host"
+    echo "     用途: 单机安装完整系统，但媒体面直连宿主机网络。"
+    echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
+    echo "     网络特性: media-core/PostgreSQL 保持 bridge；media-agent/ZLMediaKit 使用 host。"
+    echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
+    echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
+    echo "     注意: 仍会直接占用宿主机的 80/554/1935/8081 等媒体相关端口。"
+    echo
+    echo "输入方式: 直接输入上面的角色编号 1-5 后回车。"
+    echo "默认值: 直接回车等同于输入 1（control-plane）。"
+    echo "快速建议: 如果只是单机先跑起来做演示或验收，优先输入 4（all-in-one）。"
+  } >&2
   while true; do
-    answer="$(prompt "输入角色编号" "1")"
+    answer="$(prompt "输入角色编号（1-5）" "1")"
     case "${answer}" in
       1) printf '%s' "control-plane"; return 0 ;;
       2) printf '%s' "worker-bridge"; return 0 ;;
       3) printf '%s' "worker-host"; return 0 ;;
       4) printf '%s' "all-in-one"; return 0 ;;
       5) printf '%s' "all-in-one-host"; return 0 ;;
-      *) echo "请输入 1 到 5。" >&2 ;;
+      *) echo "请输入 1 到 5；如果只是单机演示或验收，通常选 4。" >&2 ;;
     esac
   done
 }
