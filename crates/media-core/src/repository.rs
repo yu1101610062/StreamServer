@@ -3,8 +3,8 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, AttemptStatus, CapabilitySnapshot, EventSource, HeartbeatSnapshot, Page,
-    StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType, TaskValidationError,
-    ValidationIssue, WorkerKind,
+    RecoveryPolicy, StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType,
+    TaskValidationError, ValidationIssue, WorkerKind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -895,11 +895,18 @@ impl TaskRepository {
             r#"
             select id
               from tasks
-             where schedule_start_mode = 'at'
-               and status = 'VALIDATING'::task_status
-               and resolved_spec is not null
-               and nullif(resolved_spec->'schedule'->>'start_at', '') is not null
-               and (resolved_spec->'schedule'->>'start_at')::timestamptz <= $1
+             where (
+                    schedule_start_mode = 'at'
+                and status = 'VALIDATING'::task_status
+                and resolved_spec is not null
+                and nullif(resolved_spec->'schedule'->>'start_at', '') is not null
+                and (resolved_spec->'schedule'->>'start_at')::timestamptz <= $1
+             )
+                or (
+                    status = 'QUEUED'::task_status
+                and resolved_spec is not null
+                and schedule_start_mode <> 'cron'
+             )
              order by created_at asc
             "#,
         )
@@ -1224,12 +1231,39 @@ impl TaskRepository {
 
     pub async fn retry_task(&self, task_id: Uuid) -> Result<AttemptSummary, RepoError> {
         let current = self.fetch_task_summary(task_id).await?;
+        self.enqueue_retry(
+            current,
+            EventSource::User,
+            "task_retry_requested",
+            json!({}),
+        )
+        .await
+    }
+
+    async fn enqueue_retry(
+        &self,
+        current: TaskSummary,
+        event_source: EventSource,
+        event_type: &str,
+        extra_payload: Value,
+    ) -> Result<AttemptSummary, RepoError> {
         current.status.apply_operation(TaskOperation::Retry)?;
 
+        let task_id = current.id;
         let attempt_no = current.current_attempt_no + 1;
         let worker_kind = current.task_type.default_worker_kind();
         let created_at = Utc::now();
         let attempt_id = Uuid::now_v7();
+        let mut payload = json!({
+            "from": current.status,
+            "to": TaskStatus::Queued,
+            "attempt_no": attempt_no,
+        });
+        if let (Some(target), Some(extra)) = (payload.as_object_mut(), extra_payload.as_object()) {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -1260,6 +1294,7 @@ impl TaskRepository {
             r#"
             update tasks
                set status = 'QUEUED'::task_status,
+                   assigned_node_id = null,
                    current_attempt_no = $1,
                    updated_at = $2,
                    finished_at = null
@@ -1277,14 +1312,10 @@ impl TaskRepository {
             task_id,
             Some(attempt_id),
             Some(attempt_no),
-            EventSource::User,
-            "task_retry_requested",
+            event_source,
+            event_type,
             "info",
-            json!({
-                "from": current.status,
-                "to": TaskStatus::Queued,
-                "attempt_no": attempt_no,
-            }),
+            payload,
         )
         .await?;
 
@@ -1303,6 +1334,153 @@ impl TaskRepository {
             started_at: None,
             ended_at: None,
         })
+    }
+
+    pub async fn recover_tasks_for_disconnected_node(
+        &self,
+        node_id: Uuid,
+    ) -> Result<(), RepoError> {
+        let rows = sqlx::query(
+            r#"
+            select id, status::text as status, current_attempt_no, resolved_spec
+              from tasks
+             where assigned_node_id = $1
+               and current_attempt_no > 0
+               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
+             order by updated_at asc
+            "#,
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut retry_candidates = Vec::new();
+
+        for row in rows {
+            let task_id: Uuid = row.try_get("id")?;
+            let attempt_no: i32 = row.try_get("current_attempt_no")?;
+            let status = TaskStatus::from_str(&row.try_get::<String, _>("status")?)?;
+            let resolved_spec: Option<Value> = row.try_get("resolved_spec")?;
+
+            match status {
+                TaskStatus::Dispatching => {
+                    let mut tx = self.pool.begin().await?;
+                    let now = Utc::now();
+                    sqlx::query(
+                        r#"
+                        update tasks
+                           set status = 'QUEUED'::task_status,
+                               assigned_node_id = null,
+                               updated_at = $1
+                         where id = $2
+                           and current_attempt_no = $3
+                           and status = 'DISPATCHING'::task_status
+                        "#,
+                    )
+                    .bind(now)
+                    .bind(task_id)
+                    .bind(attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        r#"
+                        update task_attempts
+                           set status = 'FAILED'::attempt_status,
+                               node_id = $1,
+                               failure_code = 'node_disconnected',
+                               failure_reason = $2,
+                               ended_at = $3
+                         where task_id = $4
+                           and attempt_no = $5
+                           and status = 'PENDING'::attempt_status
+                        "#,
+                    )
+                    .bind(node_id)
+                    .bind("control-plane session closed before dispatch was acknowledged")
+                    .bind(now)
+                    .bind(task_id)
+                    .bind(attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    self.delete_task_lease(&mut tx, task_id).await?;
+                    self.insert_event(
+                        &mut tx,
+                        task_id,
+                        None,
+                        Some(attempt_no),
+                        EventSource::Core,
+                        "task_requeued_after_node_disconnect",
+                        "warn",
+                        json!({
+                            "node_id": node_id,
+                            "attempt_no": attempt_no,
+                            "requeued": true,
+                        }),
+                    )
+                    .await?;
+                    tx.commit().await?;
+                }
+                TaskStatus::Starting | TaskStatus::Running | TaskStatus::Recovering => {
+                    let should_retry = resolved_spec
+                        .as_ref()
+                        .and_then(|value| serde_json::from_value::<TaskSpec>(value.clone()).ok())
+                        .is_some_and(|spec| retry_enabled_on_disconnect(&spec));
+                    let mut tx = self.pool.begin().await?;
+                    let now = Utc::now();
+                    self.mark_task_lost(
+                        &mut tx,
+                        task_id,
+                        attempt_no,
+                        node_id,
+                        "node_disconnected",
+                        "control-plane session closed before task completed",
+                        now,
+                    )
+                    .await?;
+                    self.insert_event(
+                        &mut tx,
+                        task_id,
+                        None,
+                        Some(attempt_no),
+                        EventSource::Core,
+                        "task_lost_after_node_disconnect",
+                        "warn",
+                        json!({
+                            "node_id": node_id,
+                            "attempt_no": attempt_no,
+                            "auto_retry": should_retry,
+                        }),
+                    )
+                    .await?;
+                    tx.commit().await?;
+
+                    if should_retry {
+                        retry_candidates.push(task_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for task_id in retry_candidates {
+            let current = self.fetch_task_summary(task_id).await?;
+            if current.status == TaskStatus::Lost {
+                self.enqueue_retry(
+                    current,
+                    EventSource::Core,
+                    "task_retry_after_node_disconnect",
+                    json!({
+                        "reason": "node_disconnected",
+                        "auto_retry": true,
+                    }),
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn clone_task(
@@ -1444,6 +1622,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -1523,6 +1702,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -1672,6 +1852,76 @@ impl TaskRepository {
             resolved_spec,
             lease_token,
         })
+    }
+
+    pub async fn rollback_task_dispatch(
+        &self,
+        task_id: Uuid,
+        attempt_no: i32,
+        node_id: Uuid,
+        reason: &str,
+    ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            update tasks
+               set status = 'QUEUED'::task_status,
+                   assigned_node_id = null,
+                   updated_at = $1
+             where id = $2
+               and current_attempt_no = $3
+               and status = 'DISPATCHING'::task_status
+            "#,
+        )
+        .bind(now)
+        .bind(task_id)
+        .bind(attempt_no)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            update task_attempts
+               set status = 'FAILED'::attempt_status,
+                   node_id = $1,
+                   failure_code = 'dispatch_send_failed',
+                   failure_reason = $2,
+                   ended_at = $3
+             where task_id = $4
+               and attempt_no = $5
+               and status = 'PENDING'::attempt_status
+            "#,
+        )
+        .bind(node_id)
+        .bind(reason)
+        .bind(now)
+        .bind(task_id)
+        .bind(attempt_no)
+        .execute(&mut *tx)
+        .await?;
+
+        self.delete_task_lease(&mut tx, task_id).await?;
+        self.insert_event(
+            &mut tx,
+            task_id,
+            None,
+            Some(attempt_no),
+            EventSource::Core,
+            "task_dispatch_failed",
+            "warn",
+            json!({
+                "node_id": node_id,
+                "attempt_no": attempt_no,
+                "reason": reason,
+                "requeued": true,
+            }),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn build_stop_command(
@@ -2734,6 +2984,7 @@ impl TaskRepository {
               template_id,
               profile,
               priority,
+              created_by,
               assigned_node_id,
               current_attempt_no,
               created_at,
@@ -3148,6 +3399,15 @@ impl TaskRepository {
         self.delete_task_lease(tx, task_id).await?;
         Ok(())
     }
+}
+
+fn retry_enabled_on_disconnect(spec: &TaskSpec) -> bool {
+    !matches!(
+        spec.recovery
+            .policy
+            .unwrap_or(RecoveryPolicy::default_for(spec.task_type)),
+        RecoveryPolicy::Never
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
