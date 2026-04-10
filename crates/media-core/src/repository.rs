@@ -4200,6 +4200,10 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
         ("group", spec.input.group.as_ref().map(|value| json!(value))),
         ("port", spec.input.port.map(|value| json!(value))),
         (
+            "interface_name",
+            spec.input.interface_name.as_ref().map(|value| json!(value)),
+        ),
+        (
             "interface_ip",
             spec.input.interface_ip.as_ref().map(|value| json!(value)),
         ),
@@ -4257,6 +4261,13 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
             spec.publish.group.as_ref().map(|value| json!(value)),
         ),
         ("port", spec.publish.port.map(|value| json!(value))),
+        (
+            "interface_name",
+            spec.publish
+                .interface_name
+                .as_ref()
+                .map(|value| json!(value)),
+        ),
         (
             "interface_ip",
             spec.publish.interface_ip.as_ref().map(|value| json!(value)),

@@ -62,6 +62,14 @@ pub struct AgentSettings {
     pub zlm_auto_close_on_no_reader_enabled: bool,
     #[serde(default = "default_agent_stream_addr")]
     pub agent_stream_addr: String,
+    #[serde(default)]
+    pub primary_interface_name: String,
+    #[serde(default)]
+    pub primary_interface_ip: String,
+    #[serde(default)]
+    pub multicast_interface_name: String,
+    #[serde(default)]
+    pub multicast_interface_ip: String,
     #[serde(default = "default_network_mode")]
     pub network_mode: String,
     #[serde(default)]
@@ -89,6 +97,10 @@ impl Default for AgentSettings {
             zlm_api_secret: String::new(),
             zlm_auto_close_on_no_reader_enabled: false,
             agent_stream_addr: default_agent_stream_addr(),
+            primary_interface_name: String::new(),
+            primary_interface_ip: String::new(),
+            multicast_interface_name: String::new(),
+            multicast_interface_ip: String::new(),
             network_mode: default_network_mode(),
             labels: Vec::new(),
             max_runtime_slots: default_max_runtime_slots(),
@@ -220,6 +232,18 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("AGENT_STREAM_ADDR") {
         settings.agent.agent_stream_addr = value;
+    }
+    if let Some(value) = env("AGENT_PRIMARY_INTERFACE_NAME") {
+        settings.agent.primary_interface_name = value;
+    }
+    if let Some(value) = env("AGENT_PRIMARY_INTERFACE_IP") {
+        settings.agent.primary_interface_ip = value;
+    }
+    if let Some(value) = env("AGENT_MULTICAST_INTERFACE_NAME") {
+        settings.agent.multicast_interface_name = value;
+    }
+    if let Some(value) = env("AGENT_MULTICAST_INTERFACE_IP") {
+        settings.agent.multicast_interface_ip = value;
     }
     if let Some(value) = env("AGENT_NETWORK_MODE") {
         settings.agent.network_mode = value;

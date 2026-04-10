@@ -80,7 +80,9 @@
 调度规则：
 
 - 若任务输入可解析出源流地址，Core 优先用该地址匹配在线节点的已上报网卡；节点存在任一同网段网卡即可优先。
+- `input.interface_name` / `publish.interface_name` 用于任务层按网卡名覆盖节点本地绑定策略；运行时在节点本地解析成当前 IPv4。
 - `input.interface_ip` 只用于节点本地收发绑定，不参与源流亲和调度。
+- `multicast_bridge` 的组播输入/输出若未显式指定 `interface_name/interface_ip`，默认使用工作节点安装时配置的组播网卡。
 - 同网段优先不是强约束；若没有命中节点，则回落到其他在线节点。
 - 同网段优先级之后，再按节点实时负载排序，先比较 `slot_usage`，再比较 `running_tasks`。
 - 当前只对字面量 IP 生效；若输入 URL 使用域名，则退化为纯负载调度。

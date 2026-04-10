@@ -147,6 +147,134 @@ detect_primary_ip() {
   printf '%s' "127.0.0.1"
 }
 
+discover_ipv4_interfaces() {
+  require_cmd ip
+  ip -o -4 addr show up scope global 2>/dev/null \
+    | awk '!seen[$2]++ { split($4, cidr, "/"); print $2 "|" cidr[1] }'
+}
+
+detect_primary_interface_entry() {
+  if ! command -v ip >/dev/null 2>&1; then
+    return 0
+  fi
+  ip route get 1.1.1.1 2>/dev/null \
+    | awk '{
+        for (i = 1; i <= NF; i++) {
+          if ($i == "dev") dev = $(i + 1)
+          if ($i == "src") src = $(i + 1)
+        }
+      }
+      END {
+        if (dev != "" && src != "") {
+          print dev "|" src
+        }
+      }'
+}
+
+print_interface_options() {
+  local entry
+  local index=1
+  for entry in "$@"; do
+    printf '  %d) %s (%s)\n' \
+      "${index}" \
+      "${entry%%|*}" \
+      "${entry#*|}" >&2
+    index=$((index + 1))
+  done
+}
+
+resolve_interface_choice() {
+  local choice="$1"
+  shift
+  local entries=("$@")
+  local entry
+  local index=1
+
+  if [[ "${choice}" =~ ^[0-9]+$ ]]; then
+    for entry in "${entries[@]}"; do
+      if [ "${index}" -eq "${choice}" ]; then
+        printf '%s' "${entry}"
+        return 0
+      fi
+      index=$((index + 1))
+    done
+    return 1
+  fi
+
+  for entry in "${entries[@]}"; do
+    if [ "${entry%%|*}" = "${choice}" ]; then
+      printf '%s' "${entry}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prompt_interface_selection() {
+  local label="$1"
+  local default_name="$2"
+  local default_ip="$3"
+  shift 3
+  local entries=("$@")
+  local answer
+  local selected
+
+  while true; do
+    printf '%s 可用网卡（输入编号或网卡名）:\n' "${label}" >&2
+    print_interface_options "${entries[@]}"
+    answer="$(prompt "${label}" "${default_name}")"
+    if selected="$(resolve_interface_choice "${answer}" "${entries[@]}")"; then
+      printf '%s' "${selected}"
+      return 0
+    fi
+    printf '无效选择，请输入上面的编号或网卡名。默认推荐 %s (%s)\n' "${default_name}" "${default_ip}" >&2
+  done
+}
+
+configure_host_interface_defaults() {
+  local primary_entry
+  local multicast_entry
+  local default_entry
+  local default_name
+  local default_ip
+  local entry
+  local found_default=0
+  local entries=()
+
+  mapfile -t entries < <(discover_ipv4_interfaces)
+  [ "${#entries[@]}" -gt 0 ] || fail "未检测到可用的 IPv4 网卡，无法为 host 工作节点生成绑定配置"
+
+  default_entry="$(detect_primary_interface_entry)"
+  if [ -z "${default_entry}" ]; then
+    default_entry="${entries[0]}"
+  else
+    default_name="${default_entry%%|*}"
+    for entry in "${entries[@]}"; do
+      if [ "${entry%%|*}" = "${default_name}" ]; then
+        default_entry="${entry}"
+        found_default=1
+        break
+      fi
+    done
+    if [ "${found_default}" -ne 1 ]; then
+      default_entry="${entries[0]}"
+    fi
+  fi
+  default_name="${default_entry%%|*}"
+  default_ip="${default_entry#*|}"
+
+  echo "host 工作节点需要分别选择主网卡和组播网卡。" >&2
+  echo "建议：普通流量走主网卡；真实组播收发优先使用独立组播网卡，没有时可与主网卡相同。" >&2
+
+  primary_entry="$(prompt_interface_selection "主网卡" "${default_name}" "${default_ip}" "${entries[@]}")"
+  PRIMARY_INTERFACE_NAME="${primary_entry%%|*}"
+  PRIMARY_INTERFACE_IP="${primary_entry#*|}"
+
+  multicast_entry="$(prompt_interface_selection "组播网卡" "${PRIMARY_INTERFACE_NAME}" "${PRIMARY_INTERFACE_IP}" "${entries[@]}")"
+  MULTICAST_INTERFACE_NAME="${multicast_entry%%|*}"
+  MULTICAST_INTERFACE_IP="${multicast_entry#*|}"
+}
+
 escape_sed_replacement() {
   printf '%s' "$1" | sed 's/[\\/&|]/\\&/g'
 }
@@ -225,6 +353,7 @@ CORE_HTTP_PORT=${CORE_HTTP_PORT}
 CORE_GRPC_HOST=${CORE_GRPC_HOST}
 CORE_GRPC_PORT=${CORE_GRPC_PORT}
 PUBLIC_HOST=${PUBLIC_HOST}
+ZLM_API_HOST=${ZLM_API_HOST}
 AGENT_HTTP_PORT=${AGENT_HTTP_PORT}
 ZLM_HTTP_PORT=${ZLM_HTTP_PORT}
 ZLM_RTMP_PORT=${ZLM_RTMP_PORT}
@@ -259,10 +388,15 @@ CORE_HTTP_PORT=${CORE_HTTP_PORT}
 CORE_GRPC_HOST=${CORE_GRPC_HOST}
 CORE_GRPC_PORT=${CORE_GRPC_PORT}
 PUBLIC_HOST=${PUBLIC_HOST}
+ZLM_API_HOST=${ZLM_API_HOST}
 AGENT_HTTP_PORT=${AGENT_HTTP_PORT}
 ZLM_HTTP_PORT=${ZLM_HTTP_PORT}
 ZLM_RTMP_PORT=${ZLM_RTMP_PORT}
 ZLM_RTSP_PORT=${ZLM_RTSP_PORT}
+AGENT_PRIMARY_INTERFACE_NAME=${PRIMARY_INTERFACE_NAME}
+AGENT_PRIMARY_INTERFACE_IP=${PRIMARY_INTERFACE_IP}
+AGENT_MULTICAST_INTERFACE_NAME=${MULTICAST_INTERFACE_NAME}
+AGENT_MULTICAST_INTERFACE_IP=${MULTICAST_INTERFACE_IP}
 HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
 AGENT_NETWORK_MODE=host
 AGENT_LABELS=offline,worker,host
@@ -340,11 +474,16 @@ AGENT_HTTP_PORT=${AGENT_HTTP_PORT}
 ZLM_HTTP_PORT=${ZLM_HTTP_PORT}
 ZLM_RTMP_PORT=${ZLM_RTMP_PORT}
 ZLM_RTSP_PORT=${ZLM_RTSP_PORT}
+ZLM_API_HOST=${ZLM_API_HOST}
 HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
 HOOK_SOURCE_ALLOWLIST=${HOOK_SOURCE_ALLOWLIST}
 PUBLIC_HOST=${PUBLIC_HOST}
 NODE_ID=${NODE_ID}
 AGENT_NODE_NAME=${AGENT_NODE_NAME}
+AGENT_PRIMARY_INTERFACE_NAME=${PRIMARY_INTERFACE_NAME}
+AGENT_PRIMARY_INTERFACE_IP=${PRIMARY_INTERFACE_IP}
+AGENT_MULTICAST_INTERFACE_NAME=${MULTICAST_INTERFACE_NAME}
+AGENT_MULTICAST_INTERFACE_IP=${MULTICAST_INTERFACE_IP}
 AGENT_LABELS=offline,all-in-one,host
 STORAGE_ALLOWLIST=/data/media/work,/data/zlm/record,/data/zlm/www
 AUTH_ENABLED=false
@@ -618,11 +757,13 @@ configure_worker_host() {
   local default_dir="/opt/streamserver/worker-host"
   local default_ip
 
-  default_ip="$(detect_primary_ip)"
   PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker")"
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo worker-1)")"
+  configure_host_interface_defaults
+  default_ip="${PRIMARY_INTERFACE_IP}"
+  ZLM_API_HOST="${PRIMARY_INTERFACE_IP}"
   CORE_HTTP_HOST="$(prompt_non_empty "control-plane HTTP 地址或域名" "${default_ip}")"
   CORE_HTTP_PORT="$(prompt_non_empty "control-plane HTTP 端口" "8080")"
   CORE_GRPC_HOST="$(prompt_non_empty "control-plane gRPC 地址或域名" "${CORE_HTTP_HOST}")"
@@ -643,7 +784,7 @@ configure_worker_host() {
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
-    "::1,127.0.0.1"
+    "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
   write_worker_host_env "${INSTALL_DIR}/.env"
   ensure_images_loaded media-agent zlmediakit
   show_tls_notice "${INSTALL_DIR}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}" || return 0
@@ -707,12 +848,14 @@ configure_all_in_one_host() {
 
   default_secret="$(generate_secret)"
   default_password="$(generate_secret)"
-  default_ip="$(detect_primary_ip)"
 
   PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-all-in-one-host")"
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo node-1)")"
+  configure_host_interface_defaults
+  default_ip="${PRIMARY_INTERFACE_IP}"
+  ZLM_API_HOST="${PRIMARY_INTERFACE_IP}"
   POSTGRES_DB="$(prompt_non_empty "PostgreSQL 数据库名" "streamserver")"
   POSTGRES_USER="$(prompt_non_empty "PostgreSQL 用户名" "postgres")"
   POSTGRES_PASSWORD="$(prompt "PostgreSQL 密码（留空自动生成）" "")"
@@ -740,7 +883,7 @@ configure_all_in_one_host() {
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
-    "::1,127.0.0.1"
+    "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
   write_all_in_one_host_env "${INSTALL_DIR}/.env"
   ensure_images_loaded postgres media-core media-agent zlmediakit
   log "all-in-one-host 说明: media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"

@@ -1,9 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::CStr,
     fs,
     future::Future,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Stdio,
+    ptr,
     str::FromStr,
     sync::{
         Arc, RwLock,
@@ -1434,7 +1437,7 @@ fn build_file_transcode_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<ProcessPlan, ExecutorError> {
-    let input_url = build_input_url(&spec.input)?;
+    let input_url = build_input_url(settings, &spec.input)?;
 
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
     let output_path = match spec.publish.kind {
@@ -1494,7 +1497,7 @@ fn build_file_to_live_plan(
         }
     };
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let publish_output = build_publish_output(&spec.publish)?;
+    let publish_output = build_publish_output(settings, &spec.publish)?;
     let startup_probe = build_startup_probe(&spec.publish)?;
     let mut outputs = vec![publish_output.target.clone()];
     let mut success_check = publish_output.success_check.clone();
@@ -1564,9 +1567,9 @@ fn build_multicast_bridge_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<ProcessPlan, ExecutorError> {
-    let input_url = build_input_url(&spec.input)?;
+    let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let output = build_publish_output(&spec.publish)?;
+    let output = build_publish_output(settings, &spec.publish)?;
     let startup_probe = matches!(spec.publish.kind, Some(PublishTargetKind::ZlmIngest))
         .then(|| build_startup_probe(&spec.publish))
         .transpose()?;
@@ -1811,7 +1814,7 @@ fn insert_ffmpeg_input_args(args: &mut Vec<String>, extra_args: [String; 4]) {
     args.splice(input_index..input_index, extra_args);
 }
 
-fn build_input_url(input: &InputSpec) -> Result<String, ExecutorError> {
+fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String, ExecutorError> {
     match input.kind {
         Some(
             InputKind::Rtsp
@@ -1828,7 +1831,15 @@ fn build_input_url(input: &InputSpec) -> Result<String, ExecutorError> {
             input.kind.expect("kind checked"),
             input.group.as_deref(),
             input.port,
-            input.interface_ip.as_deref(),
+            resolve_interface_binding_ip(
+                input.interface_name.as_deref(),
+                input.interface_ip.as_deref(),
+                Some(settings.multicast_interface_name.as_str()),
+                Some(settings.multicast_interface_ip.as_str()),
+                "input",
+                true,
+            )?
+            .as_deref(),
             input.ttl,
             input.reuse,
             input.pkt_size,
@@ -1931,7 +1942,10 @@ struct PublishOutput {
     success_check: SuccessCheck,
 }
 
-fn build_publish_output(publish: &PublishSpec) -> Result<PublishOutput, ExecutorError> {
+fn build_publish_output(
+    settings: &AgentSettings,
+    publish: &PublishSpec,
+) -> Result<PublishOutput, ExecutorError> {
     match publish.kind {
         Some(PublishTargetKind::File) => {
             let target = required_nonempty("publish.url", publish.url.as_deref())?;
@@ -1966,7 +1980,15 @@ fn build_publish_output(publish: &PublishSpec) -> Result<PublishOutput, Executor
                 },
                 publish.group.as_deref(),
                 publish.port,
-                publish.interface_ip.as_deref(),
+                resolve_interface_binding_ip(
+                    publish.interface_name.as_deref(),
+                    publish.interface_ip.as_deref(),
+                    Some(settings.multicast_interface_name.as_str()),
+                    Some(settings.multicast_interface_ip.as_str()),
+                    "publish",
+                    false,
+                )?
+                .as_deref(),
                 publish.ttl,
                 publish.reuse,
                 publish.pkt_size,
@@ -1993,6 +2015,86 @@ fn build_publish_output(publish: &PublishSpec) -> Result<PublishOutput, Executor
             "publish.kind must be provided".to_string(),
         )),
     }
+}
+
+fn resolve_interface_binding_ip(
+    explicit_name: Option<&str>,
+    explicit_ip: Option<&str>,
+    default_name: Option<&str>,
+    default_ip: Option<&str>,
+    field_prefix: &str,
+    required: bool,
+) -> Result<Option<String>, ExecutorError> {
+    if let Some(ip) = nonempty(explicit_ip) {
+        return Ok(Some(ip.to_string()));
+    }
+    if let Some(name) = nonempty(explicit_name) {
+        let ip = resolve_interface_name_to_ipv4(name).ok_or_else(|| {
+            ExecutorError::InvalidRequest(format!(
+                "{field_prefix}.interface_name refers to an unknown interface or one without IPv4: {name}"
+            ))
+        })?;
+        return Ok(Some(ip));
+    }
+    if let Some(name) = nonempty(default_name) {
+        if let Some(ip) = resolve_interface_name_to_ipv4(name) {
+            return Ok(Some(ip));
+        }
+        if let Some(ip) = nonempty(default_ip) {
+            return Ok(Some(ip.to_string()));
+        }
+        return Err(ExecutorError::InvalidRequest(format!(
+            "configured default multicast interface has no IPv4 address: {name}"
+        )));
+    }
+    if let Some(ip) = nonempty(default_ip) {
+        return Ok(Some(ip.to_string()));
+    }
+    if required {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "{field_prefix}.interface_name or a configured default multicast interface must be provided"
+        )));
+    }
+    Ok(None)
+}
+
+fn resolve_interface_name_to_ipv4(name: &str) -> Option<String> {
+    let target = name.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    unsafe {
+        let mut addrs: *mut libc::ifaddrs = ptr::null_mut();
+        if libc::getifaddrs(&mut addrs) != 0 || addrs.is_null() {
+            return None;
+        }
+
+        let mut current = addrs;
+        let mut resolved = None;
+        while !current.is_null() {
+            let ifa = &*current;
+            if !ifa.ifa_name.is_null()
+                && !ifa.ifa_addr.is_null()
+                && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
+            {
+                let if_name = CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if if_name == target {
+                    let addr = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+                    resolved = Some(ip.to_string());
+                    break;
+                }
+            }
+            current = ifa.ifa_next;
+        }
+        libc::freeifaddrs(addrs);
+        resolved
+    }
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn build_live_relay_api_params(
@@ -2027,7 +2129,7 @@ fn build_live_relay_api_params(
         ),
         (
             "enable_hls".to_string(),
-            bool_as_flag(spec.publish.enable_hls.unwrap_or(false)),
+            bool_as_flag(spec.publish.enable_hls.unwrap_or(false) || spec.record.wants_hls()),
         ),
         (
             "enable_ts".to_string(),
@@ -2037,7 +2139,10 @@ fn build_live_relay_api_params(
             "enable_fmp4".to_string(),
             bool_as_flag(spec.publish.enable_http_fmp4.unwrap_or(true)),
         ),
-        ("enable_mp4".to_string(), "0".to_string()),
+        (
+            "enable_mp4".to_string(),
+            bool_as_flag(spec.record.wants_mp4()),
+        ),
         (
             "auto_close".to_string(),
             bool_as_flag(live_relay_auto_close_enabled(settings, spec)),
@@ -3626,6 +3731,10 @@ mod tests {
             zlm_api_secret: String::new(),
             zlm_auto_close_on_no_reader_enabled: false,
             agent_stream_addr: "http://127.0.0.1:8081".to_string(),
+            primary_interface_name: String::new(),
+            primary_interface_ip: String::new(),
+            multicast_interface_name: String::new(),
+            multicast_interface_ip: String::new(),
             network_mode: "bridge".to_string(),
             labels: Vec::new(),
             max_runtime_slots: 2,
@@ -3951,6 +4060,93 @@ mod tests {
     }
 
     #[test]
+    fn build_multicast_bridge_plan_uses_agent_default_multicast_interface_ip() {
+        let mut settings = test_settings("/tmp/work");
+        settings.multicast_interface_ip = "192.168.50.20".to_string();
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::MulticastBridge,
+            resolved_spec: json!({
+                "type": "multicast_bridge",
+                "name": "bridge-default-multicast",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "udp_mpegts_multicast",
+                    "group": "239.10.10.10",
+                    "port": 5000
+                },
+                "process": {"mode": "passthrough"},
+                "publish": {
+                    "kind": "zlm_ingest",
+                    "url": "rtmp://zlmediakit/live/bridge-default"
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .iter()
+                .any(|arg| arg == "udp://239.10.10.10:5000?localaddr=192.168.50.20")
+        );
+    }
+
+    #[test]
+    fn resolve_interface_binding_ip_resolves_explicit_interface_name() {
+        let Some(interface_name) = first_ipv4_interface_name_for_test() else {
+            return;
+        };
+
+        let resolved = resolve_interface_binding_ip(
+            Some(interface_name.as_str()),
+            None,
+            None,
+            None,
+            "input",
+            true,
+        )
+        .expect("interface lookup should succeed");
+
+        assert!(resolved.is_some());
+    }
+
+    fn first_ipv4_interface_name_for_test() -> Option<String> {
+        unsafe {
+            let mut addrs: *mut libc::ifaddrs = ptr::null_mut();
+            if libc::getifaddrs(&mut addrs) != 0 || addrs.is_null() {
+                return None;
+            }
+
+            let mut current = addrs;
+            let mut resolved = None;
+            while !current.is_null() {
+                let ifa = &*current;
+                if !ifa.ifa_name.is_null()
+                    && !ifa.ifa_addr.is_null()
+                    && (*ifa.ifa_addr).sa_family as i32 == libc::AF_INET
+                {
+                    resolved = Some(CStr::from_ptr(ifa.ifa_name).to_string_lossy().to_string());
+                    break;
+                }
+                current = ifa.ifa_next;
+            }
+            libc::freeifaddrs(addrs);
+            resolved
+        }
+    }
+
+    #[test]
     fn build_file_to_live_plan_uses_realtime_tee_output() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
@@ -4054,11 +4250,11 @@ mod tests {
                 "enable_rtmp": true,
                 "enable_http_ts": false,
                 "enable_http_fmp4": true,
-                "enable_hls": true,
+                "enable_hls": false,
                 "enable_webrtc": true,
                 "stop_on_no_reader": true
             },
-            "record": {},
+            "record": {"enabled": true, "format": "both"},
             "recovery": {},
             "schedule": {"start_mode": "immediate"},
             "resource": {}
@@ -4085,6 +4281,7 @@ mod tests {
         assert_eq!(params.get("enable_ts").map(String::as_str), Some("0"));
         assert_eq!(params.get("enable_fmp4").map(String::as_str), Some("1"));
         assert_eq!(params.get("enable_hls").map(String::as_str), Some("1"));
+        assert_eq!(params.get("enable_mp4").map(String::as_str), Some("1"));
         assert_eq!(params.get("auto_close").map(String::as_str), Some("1"));
         assert_eq!(params.get("timeout_sec").map(String::as_str), Some("7"));
     }

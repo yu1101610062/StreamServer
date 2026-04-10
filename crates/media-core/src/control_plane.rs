@@ -1115,6 +1115,7 @@ mod tests {
                 url: url.map(str::to_string),
                 group: None,
                 port: None,
+                interface_name: None,
                 interface_ip: interface_ip.map(str::to_string),
                 ttl: None,
                 reuse: None,

@@ -8,7 +8,7 @@ mod telemetry;
 mod ui;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     net::{IpAddr, SocketAddr},
     path::{Component, Path as FsPath, PathBuf},
@@ -480,7 +480,14 @@ async fn list_streams(
         .into_iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    enrich_streams_with_runtime(&state, &mut streams, &node_lookup).await;
+    let stale_indexes = enrich_streams_with_runtime(&state, &mut streams, &node_lookup).await;
+    if !stale_indexes.is_empty() {
+        streams = streams
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, stream)| (!stale_indexes.contains(&index)).then_some(stream))
+            .collect();
+    }
     if let Some(expected_has_viewer) = expected_has_viewer {
         streams.retain(|stream| stream_has_viewers(stream) == Some(expected_has_viewer));
     }
@@ -748,8 +755,9 @@ async fn enrich_streams_with_runtime(
     state: &AppState,
     streams: &mut [repository::StreamSummary],
     nodes: &HashMap<Uuid, NodeSummary>,
-) {
+) -> HashSet<usize> {
     let mut stream_indexes_by_node = HashMap::<Uuid, Vec<usize>>::new();
+    let mut stale_indexes = HashSet::new();
     for (index, stream) in streams.iter().enumerate() {
         if let Some(node_id) = stream.node_id {
             stream_indexes_by_node
@@ -784,13 +792,8 @@ async fn enrich_streams_with_runtime(
                             &stream.app,
                             &stream.stream,
                         );
-                    } else if stream.play_urls.is_empty() {
-                        stream.play_urls = build_fallback_play_urls(
-                            &node.agent_stream_addr,
-                            &stream.schema,
-                            &stream.app,
-                            &stream.stream,
-                        );
+                    } else {
+                        stale_indexes.insert(stream_index);
                     }
                 }
             }
@@ -814,6 +817,8 @@ async fn enrich_streams_with_runtime(
             }
         }
     }
+
+    stale_indexes
 }
 
 fn stream_has_viewers(stream: &repository::StreamSummary) -> Option<bool> {
@@ -1634,9 +1639,9 @@ fn build_publish_hook_response(
         "enable_rtmp": publish.enable_rtmp.unwrap_or(true),
         "enable_ts": publish.enable_http_ts.unwrap_or(true),
         "enable_fmp4": publish.enable_http_fmp4.unwrap_or(true),
-        "enable_hls": publish.enable_hls.unwrap_or(false),
+        "enable_hls": publish.enable_hls.unwrap_or(false) || record.wants_hls(),
         "enable_hls_fmp4": false,
-        "enable_mp4": false,
+        "enable_mp4": record.wants_mp4(),
         "modify_stamp": 2,
         "continue_push_ms": 15_000,
         "mp4_as_player": record.as_player.unwrap_or(false),
@@ -2952,7 +2957,7 @@ mod tests {
                 "enable_hls": true,
                 "stop_on_no_reader": true
             },
-            "record": {"enabled": false, "as_player": true},
+            "record": {"enabled": true, "format": "both", "as_player": true},
             "recovery": {},
             "schedule": {"start_mode": "immediate"},
             "resource": {}
@@ -2963,6 +2968,7 @@ mod tests {
 
         assert_eq!(response["enable_rtsp"], json!(false));
         assert_eq!(response["enable_hls"], json!(true));
+        assert_eq!(response["enable_mp4"], json!(true));
         assert_eq!(response["auto_close"], json!(true));
         assert_eq!(response["mp4_as_player"], json!(true));
     }
@@ -3225,6 +3231,50 @@ mod tests {
                 .iter()
                 .any(|value| value == "http://stream.example/live/camera01/hls.m3u8")
         );
+
+        zlm_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_streams_omits_stale_entries_when_runtime_lookup_succeeds() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let (zlm_base, zlm_handle) = spawn_zlm_stub().await?;
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera",
+            "common": {"tenant_id": "default", "created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {},
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        insert_running_stream_task(&db.pool, node_id, resolved_spec.clone(), "live", "camera01")
+            .await?;
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera02").await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("streams should be a list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["stream"], json!("camera01"));
 
         zlm_handle.abort();
         db.cleanup().await?;

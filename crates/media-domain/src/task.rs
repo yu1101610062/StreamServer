@@ -482,19 +482,6 @@ impl TaskSpec {
                         "must be provided for multicast input",
                     ));
                 }
-                if self
-                    .input
-                    .interface_ip
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_none()
-                {
-                    issues.push(ValidationIssue::new(
-                        "input.interface_ip",
-                        "must be provided for multicast input",
-                    ));
-                }
             }
             Some(InputKind::GbRtp) => {
                 if self.input.port.is_none() {
@@ -692,6 +679,8 @@ pub struct InputSpec {
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default)]
+    pub interface_name: Option<String>,
+    #[serde(default)]
     pub interface_ip: Option<String>,
     #[serde(default)]
     pub ttl: Option<u8>,
@@ -744,6 +733,8 @@ pub struct PublishSpec {
     #[serde(default)]
     pub port: Option<u16>,
     #[serde(default)]
+    pub interface_name: Option<String>,
+    #[serde(default)]
     pub interface_ip: Option<String>,
     #[serde(default)]
     pub ttl: Option<u8>,
@@ -791,6 +782,24 @@ pub struct RecordSpec {
     pub archive_policy: Option<String>,
     #[serde(default)]
     pub retention_days: Option<u16>,
+}
+
+impl RecordSpec {
+    pub fn wants_mp4(&self) -> bool {
+        self.enabled.unwrap_or(false)
+            && matches!(
+                self.format.unwrap_or(RecordFormat::Mp4),
+                RecordFormat::Mp4 | RecordFormat::Both
+            )
+    }
+
+    pub fn wants_hls(&self) -> bool {
+        self.enabled.unwrap_or(false)
+            && matches!(
+                self.format.unwrap_or(RecordFormat::Mp4),
+                RecordFormat::Hls | RecordFormat::Both
+            )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -977,9 +986,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_multicast_input_without_interface_ip() {
+    fn validate_allows_multicast_input_without_explicit_interface_binding() {
         let task = TaskSpec {
-            task_type: TaskType::FileTranscode,
+            task_type: TaskType::MulticastBridge,
             template: None,
             name: "bridge".to_string(),
             profile: None,
@@ -997,20 +1006,56 @@ mod tests {
                 ..InputSpec::default()
             },
             process: ProcessSpec::default(),
-            publish: PublishSpec::default(),
+            publish: PublishSpec {
+                kind: Some(PublishTargetKind::File),
+                url: Some("/tmp/out.ts".to_string()),
+                ..PublishSpec::default()
+            },
             record: RecordSpec::default(),
             recovery: RecoverySpec::default(),
             schedule: ScheduleSpec::default(),
             resource: ResourceSpec::default(),
         };
 
-        let error = task.validate().expect_err("validation should fail");
-        assert!(
-            error
-                .issues
-                .iter()
-                .any(|issue| issue.field == "input.interface_ip")
-        );
+        task.validate()
+            .expect("validation should allow agent-level multicast defaults");
+    }
+
+    #[test]
+    fn validate_allows_multicast_input_with_interface_name_only() {
+        let task = TaskSpec {
+            task_type: TaskType::MulticastBridge,
+            template: None,
+            name: "bridge".to_string(),
+            profile: None,
+            priority: 50,
+            common: CommonSpec {
+                tenant_id: None,
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::UdpMpegtsMulticast),
+                group: Some("239.0.0.1".to_string()),
+                port: Some(1234),
+                interface_name: Some("eth1".to_string()),
+                ..InputSpec::default()
+            },
+            process: ProcessSpec::default(),
+            publish: PublishSpec {
+                kind: Some(PublishTargetKind::File),
+                url: Some("/tmp/out.ts".to_string()),
+                ..PublishSpec::default()
+            },
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        task.validate()
+            .expect("validation should accept multicast interface_name");
     }
 
     #[test]
