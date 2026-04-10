@@ -4,6 +4,17 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>StreamServer Console</title>
+    <script>
+      (() => {
+        const key = "streamserver.console.theme";
+        const saved = localStorage.getItem(key) || "system";
+        const resolved = saved === "dark" || saved === "light"
+          ? saved
+          : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.style.colorScheme = resolved;
+      })();
+    </script>
     <link rel="stylesheet" href="/assets/styles.css" />
   </head>
   <body>

@@ -1,6 +1,22 @@
 const TOKEN_STORAGE_KEY = "streamserver.console.token";
+const THEME_STORAGE_KEY = "streamserver.console.theme";
+const AUTO_REFRESH_MS = 10000;
+const THEME_OPTIONS = ["system", "light", "dark"];
+const DEFAULT_PAGE_SIZE = "20";
 
 const NAV_ITEMS = [
+  {
+    path: "/overview",
+    label: "系统总览",
+    note: "系统介绍、整体状态、节点负载",
+    permission: null,
+  },
+  {
+    path: "/api-docs",
+    label: "外部 API 文档",
+    note: "第三方业务系统对接说明与示例",
+    permission: null,
+  },
   {
     path: "/tasks",
     label: "任务中心",
@@ -40,11 +56,11 @@ const NAV_ITEMS = [
 ];
 
 const TASK_TYPES = [
-  { value: "live_relay", label: "live_relay" },
-  { value: "file_transcode", label: "file_transcode" },
-  { value: "file_to_live", label: "file_to_live" },
-  { value: "multicast_bridge", label: "multicast_bridge" },
-  { value: "rtp_receive", label: "rtp_receive" },
+  { value: "live_relay", label: "实时拉流转发", note: "拉取实时源并发布为平台流" },
+  { value: "file_transcode", label: "文件转码", note: "离线转码并生成目标文件" },
+  { value: "file_to_live", label: "文件转直播", note: "把文件实时推送为直播流" },
+  { value: "multicast_bridge", label: "组播桥接", note: "组播与平台流互转" },
+  { value: "rtp_receive", label: "RTP 接收", note: "接收国标/RTP 并发布为内部流" },
 ];
 
 const INPUT_KINDS = [
@@ -71,7 +87,660 @@ const PROFILE_OPTIONS = [
   "multicast_ts",
   "rtmp_hevc_ext",
 ];
-const AUTO_REFRESH_MS = 10000;
+const API_EXAMPLE_BASE_URL = "http://media-core.example.com:8080";
+const EXAMPLE_TASK_ID = "019d77d3-a942-7c91-8e82-ff963ccf1222";
+const EXAMPLE_NODE_ID = "f8995794-b5af-440b-b1f4-742c6c7f1641";
+const EXAMPLE_AUTHORIZATION = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.demo.signature";
+
+function authHeaderParam() {
+  return {
+    name: "Authorization",
+    location: "Header",
+    type: "string",
+    required: "按环境",
+    description: "Bearer 访问令牌。当前环境启用鉴权时必须携带，用于标识调用方身份并校验权限范围。",
+    example: EXAMPLE_AUTHORIZATION,
+  };
+}
+
+function idempotencyHeaderParam() {
+  return {
+    name: "Idempotency-Key",
+    location: "Header",
+    type: "string",
+    required: true,
+    description: "任务创建幂等键。业务系统重复提交同一业务请求时，服务端返回同一任务结果，避免重复建单。",
+    example: "task-create-relay-camera-01-20260411",
+  };
+}
+
+function taskIdPathParam() {
+  return {
+    name: "id",
+    location: "Path",
+    type: "string",
+    required: true,
+    description: "任务 ID。由创建任务接口返回，后续查询详情、启动、停止、重试和克隆都依赖该值。",
+    example: EXAMPLE_TASK_ID,
+  };
+}
+
+function nodeIdPathParam() {
+  return {
+    name: "id",
+    location: "Path",
+    type: "string",
+    required: true,
+    description: "节点 ID。可先通过查询节点列表接口获取，再用于查看该节点的心跳与负载历史。",
+    example: EXAMPLE_NODE_ID,
+  };
+}
+
+const OVERVIEW_FEATURES = [
+  {
+    title: "任务编排",
+    description: "统一管理实时拉流、文件转码、文件转直播、组播桥接和 RTP 接收任务。",
+  },
+  {
+    title: "流媒体分发",
+    description: "对外提供 RTSP、RTMP、HTTP-TS、HTTP-FMP4 等多种播放协议。",
+  },
+  {
+    title: "录像索引",
+    description: "集中展示录像文件、检索时间范围，并快速回溯关联任务与流。",
+  },
+  {
+    title: "节点观测",
+    description: "汇总节点健康、CPU、内存、磁盘、ZLM 与 FFmpeg 运行状态。",
+  },
+];
+const EXTERNAL_API_DOCS = [
+  {
+    category: "任务管理",
+    method: "POST",
+    path: "/api/v1/tasks",
+    title: "创建任务",
+    summary: "创建新的业务任务，支持幂等键。",
+    description: "适合第三方业务系统发起实时转发、转码、直播和组播类任务。请求头需要提供 `Idempotency-Key`。",
+    params: [
+      authHeaderParam(),
+      idempotencyHeaderParam(),
+    ],
+    responseExample: { id: "0195...", status: "RUNNING", assigned_node_id: "f899..." },
+  },
+  {
+    category: "任务管理",
+    method: "GET",
+    path: "/api/v1/tasks",
+    title: "查询任务列表",
+    summary: "按状态、类型、节点、时间等条件查询任务。",
+    description: "适合做任务看板、工单回查和批量状态同步。",
+    params: [
+      authHeaderParam(),
+      { name: "status", location: "Query", type: "enum", required: false, description: "任务状态筛选。适合只同步运行中、失败或待处理任务。 ", example: "RUNNING" },
+      { name: "type", location: "Query", type: "enum", required: false, description: "任务类型筛选。适合按业务场景拆分任务列表。", example: "live_relay" },
+      { name: "assigned_node_id", location: "Query", type: "string", required: false, description: "执行节点 ID。用于查看某个工作节点承担的任务。", example: EXAMPLE_NODE_ID },
+      { name: "keyword", location: "Query", type: "string", required: false, description: "任务名或任务 ID 关键字，用于模糊检索。", example: "camera-01" },
+      { name: "created_from", location: "Query", type: "datetime", required: false, description: "创建时间起点，ISO 8601。用于限定查询窗口。", example: "2026-04-11T00:00:00+08:00" },
+      { name: "created_to", location: "Query", type: "datetime", required: false, description: "创建时间终点，ISO 8601。", example: "2026-04-11T23:59:59+08:00" },
+      { name: "page", location: "Query", type: "number", required: false, description: "页码，从 1 开始。", example: 1 },
+      { name: "page_size", location: "Query", type: "number", required: false, description: "每页条数。", example: 20 },
+      { name: "sort_by", location: "Query", type: "enum", required: false, description: "排序字段。", example: "updated_at" },
+      { name: "sort_order", location: "Query", type: "enum", required: false, description: "排序方向。", example: "desc" },
+    ],
+    responseExample: { items: [{ id: "0195...", name: "relay-camera-01", status: "RUNNING" }], total: 1, page: 1, page_size: 20 },
+  },
+  {
+    category: "任务管理",
+    method: "GET",
+    path: "/api/v1/tasks/{id}",
+    title: "查询任务详情",
+    summary: "返回任务主信息、当前 attempt、最近事件和规格。",
+    description: "适合做任务详情页、异常排障和状态同步。",
+    params: [
+      authHeaderParam(),
+      taskIdPathParam(),
+    ],
+    responseExample: { task: { id: "0195...", status: "RUNNING", type: "live_relay" }, recent_events: [] },
+  },
+  {
+    category: "任务管理",
+    method: "POST",
+    path: "/api/v1/tasks/{id}/start",
+    title: "启动任务",
+    summary: "启动已创建、失败或已取消的任务。",
+    description: "适合人工审核后启动或失败重启场景。",
+    params: [
+      authHeaderParam(),
+      taskIdPathParam(),
+    ],
+    responseExample: { id: "0195...", status: "RUNNING" },
+  },
+  {
+    category: "任务管理",
+    method: "POST",
+    path: "/api/v1/tasks/{id}/stop",
+    title: "停止任务",
+    summary: "停止运行中的任务。",
+    description: "适合业务系统主动下线转发、录像或组播桥接任务。",
+    params: [
+      authHeaderParam(),
+      taskIdPathParam(),
+    ],
+    responseExample: { id: "0195...", status: "STOPPING" },
+  },
+  {
+    category: "任务管理",
+    method: "POST",
+    path: "/api/v1/tasks/{id}/retry",
+    title: "重试任务",
+    summary: "为失败或丢失的任务创建新 attempt。",
+    description: "任务 ID 不变，便于外部系统维持同一业务单据。",
+    params: [
+      authHeaderParam(),
+      taskIdPathParam(),
+    ],
+    responseExample: { attempt_no: 2, status: "QUEUED" },
+  },
+  {
+    category: "任务管理",
+    method: "POST",
+    path: "/api/v1/tasks/{id}/clone",
+    title: "克隆任务",
+    summary: "复制既有任务并按需覆盖少量字段。",
+    description: "适合快速复制既有模板化任务。",
+    params: [
+      authHeaderParam(),
+      taskIdPathParam(),
+    ],
+    responseExample: { id: "0196...", status: "CREATED", name: "relay-camera-01-copy" },
+  },
+  {
+    category: "运行观察",
+    method: "GET",
+    path: "/api/v1/streams",
+    title: "查询在线流",
+    summary: "查看在线流、观众数和播放地址。",
+    description: "适合业务系统展示当前在线流状态和播放链接。",
+    params: [
+      authHeaderParam(),
+      { name: "schema", location: "Query", type: "enum", required: false, description: "按输出协议过滤。适合区分 RTSP、RTMP、HLS 等分发结果。", example: "rtsp" },
+      { name: "app", location: "Query", type: "string", required: false, description: "按应用名过滤。", example: "live" },
+      { name: "stream", location: "Query", type: "string", required: false, description: "按流名过滤。", example: "camera01" },
+      { name: "node_id", location: "Query", type: "string", required: false, description: "按节点过滤，用于查看某个工作节点上的在线流。", example: EXAMPLE_NODE_ID },
+      { name: "has_viewer", location: "Query", type: "boolean", required: false, description: "按是否存在观众过滤。", example: true },
+      { name: "task_id", location: "Query", type: "string", required: false, description: "按任务 ID 过滤。", example: EXAMPLE_TASK_ID },
+    ],
+    responseExample: [{ task_id: "0195...", app: "live", stream: "camera01", play_urls: ["rtmp://example/live/camera01"] }],
+  },
+  {
+    category: "运行观察",
+    method: "GET",
+    path: "/api/v1/records",
+    title: "查询录像文件",
+    summary: "按任务、流名和时间范围检索录像文件。",
+    description: "适合业务系统做录像浏览、回放索引和审计留痕。",
+    params: [
+      authHeaderParam(),
+      { name: "task_id", location: "Query", type: "string", required: false, description: "按任务 ID 过滤，用于回看某个业务任务的录像输出。", example: EXAMPLE_TASK_ID },
+      { name: "stream", location: "Query", type: "string", required: false, description: "按流名过滤。", example: "camera01" },
+      { name: "date_from", location: "Query", type: "datetime", required: false, description: "查询起始时间。", example: "2026-04-11T00:00:00+08:00" },
+      { name: "date_to", location: "Query", type: "datetime", required: false, description: "查询结束时间。", example: "2026-04-11T23:59:59+08:00" },
+      { name: "page", location: "Query", type: "number", required: false, description: "页码，从 1 开始。", example: 1 },
+      { name: "page_size", location: "Query", type: "number", required: false, description: "每页条数。", example: 20 },
+    ],
+    responseExample: { items: [{ task_id: "0195...", file_path: "/data/zlm/record/live/camera01/2026-04-10.mp4" }], total: 1 },
+  },
+  {
+    category: "节点状态",
+    method: "GET",
+    path: "/api/v1/nodes",
+    title: "查询节点列表",
+    summary: "返回节点健康、能力摘要和当前负载。",
+    description: "适合运维或外部监控系统汇总工作节点状态。",
+    params: [authHeaderParam()],
+    responseExample: [{ id: "f899...", node_name: "localhost", healthy: true, cpu_percent: 12.4, running_tasks: 3 }],
+  },
+  {
+    category: "节点状态",
+    method: "GET",
+    path: "/api/v1/nodes/{id}/heartbeats",
+    title: "查询节点心跳历史",
+    summary: "查看指定节点最近的负载采样。",
+    description: "适合做节点趋势图或故障回溯。",
+    params: [
+      authHeaderParam(),
+      nodeIdPathParam(),
+      { name: "limit", location: "Query", type: "number", required: false, description: "返回条数，默认 24。适合控制趋势图窗口长度。", example: 24 },
+    ],
+    responseExample: [{ received_at: "2026-04-10T14:32:45Z", cpu_percent: 8.4, mem_percent: 32.1 }],
+  },
+];
+
+function buildApiDocDetails() {
+  return {
+  "POST /api/v1/tasks": {
+    requestSample: {
+      note: "该示例覆盖了创建任务接口的主要可选字段，实际调用时可按任务类型删减无关字段。",
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+        "Idempotency-Key": "task-create-relay-camera-01-20260411",
+        "Content-Type": "application/json",
+      },
+      body: {
+        name: "relay-camera-01",
+        type: "live_relay",
+        template: "default-live-relay",
+        profile: "realtime_compat",
+        priority: 50,
+        common: {
+          tenant_id: "default",
+          created_by: "partner-system",
+          callback_url: "https://biz.example.com/streamserver/callback",
+          labels: ["camera", "vip"],
+        },
+        input: {
+          kind: "rtsp",
+          url: "rtsp://camera.example.com/live/01",
+          group: "239.10.10.31",
+          port: 12361,
+          interface_name: "eth1",
+          interface_ip: "172.17.13.196",
+          ttl: 16,
+          reuse: true,
+          probe_timeout_ms: 5000,
+          tcp_mode: 0,
+          ssrc: 0,
+        },
+        process: {
+          mode: "copy_or_transcode",
+          video_codec: "libx264",
+          audio_codec: "aac",
+          bitrate: 4096,
+          fps: 25,
+          gop: 50,
+        },
+        publish: {
+          kind: "zlm_ingest",
+          url: "rtmp://media-core.example.com/live/relay-camera-01",
+          group: "239.10.10.31",
+          port: 12361,
+          interface_name: "eth1",
+          interface_ip: "172.17.13.196",
+          enable_rtsp: true,
+          enable_rtmp: true,
+          enable_http_ts: true,
+          enable_http_fmp4: true,
+          enable_hls: true,
+          enable_webrtc: false,
+        },
+        record: {
+          enabled: true,
+          format: "both",
+          segment_sec: 300,
+          save_path: "/data/records/relay-camera-01",
+        },
+        recovery: {
+          policy: "on_failure",
+        },
+        schedule: {
+          start_mode: "immediate",
+          start_at: "2026-04-11T10:00:00+08:00",
+          cron: "0 */2 * * * *",
+        },
+        resource: {
+          required_labels: ["edge"],
+          preferred_labels: ["multicast", "ssd"],
+          network_interface: "eth0",
+          need_gpu: false,
+        },
+      },
+    },
+    requestFields: [
+      { name: "name", type: "string", required: true, description: "任务名称，建议由业务系统保证同类任务内可读且可检索。" },
+      { name: "type", type: "enum", required: true, description: "任务类型。决定输入、处理与发布结构。" },
+      { name: "template", type: "string", required: false, description: "模板名称。提供任务默认值和约束。" },
+      { name: "profile", type: "enum", required: false, description: "任务预设档位。用于实时兼容、归档或组播优化。" },
+      { name: "priority", type: "number", required: false, description: "调度优先级，通常 0-100，数字越大越优先。" },
+      { name: "common.tenant_id", type: "string", required: false, description: "租户标识。" },
+      { name: "common.created_by", type: "string", required: false, description: "任务创建来源，用于审计和回查。" },
+      { name: "common.callback_url", type: "string", required: false, description: "任务事件回调地址。" },
+      { name: "common.labels[]", type: "string[]", required: false, description: "业务标签，用于筛选和资源偏好。" },
+      { name: "input.kind", type: "enum", required: true, description: "输入类型，例如 RTSP、文件、组播或国标 RTP。" },
+      { name: "input.url", type: "string", required: false, description: "文件或网络源地址。" },
+      { name: "input.group", type: "string", required: false, description: "组播组地址。组播输入时使用。" },
+      { name: "input.port", type: "number", required: false, description: "输入端口。" },
+      { name: "input.interface_name", type: "string", required: false, description: "绑定输入网卡名。组播场景优先使用。" },
+      { name: "input.interface_ip", type: "string", required: false, description: "绑定输入本地地址。" },
+      { name: "input.ttl", type: "number", required: false, description: "组播 TTL。" },
+      { name: "input.reuse", type: "boolean", required: false, description: "是否开启端口重用。" },
+      { name: "input.probe_timeout_ms", type: "number", required: false, description: "探测源流超时时间。" },
+      { name: "input.tcp_mode", type: "number", required: false, description: "RTP 接收时的 TCP 模式。" },
+      { name: "input.ssrc", type: "number", required: false, description: "RTP 接收时的 SSRC。" },
+      { name: "process.mode", type: "string", required: false, description: "处理模式，如 copy_or_transcode。" },
+      { name: "process.video_codec", type: "string", required: false, description: "视频编码。" },
+      { name: "process.audio_codec", type: "string", required: false, description: "音频编码。" },
+      { name: "process.bitrate", type: "number", required: false, description: "目标码率 kbps。" },
+      { name: "process.fps", type: "number", required: false, description: "目标帧率。" },
+      { name: "process.gop", type: "number", required: false, description: "关键帧间隔。" },
+      { name: "publish.kind", type: "enum", required: false, description: "发布类型，可输出到内部流、文件或组播。" },
+      { name: "publish.url", type: "string", required: false, description: "目标文件路径或推流地址。" },
+      { name: "publish.group", type: "string", required: false, description: "输出组播组地址。" },
+      { name: "publish.port", type: "number", required: false, description: "输出端口。" },
+      { name: "publish.interface_name", type: "string", required: false, description: "绑定输出网卡名。" },
+      { name: "publish.interface_ip", type: "string", required: false, description: "绑定输出本地地址。" },
+      { name: "publish.enable_rtsp", type: "boolean", required: false, description: "是否暴露 RTSP 播放地址。" },
+      { name: "publish.enable_rtmp", type: "boolean", required: false, description: "是否暴露 RTMP 播放地址。" },
+      { name: "publish.enable_http_ts", type: "boolean", required: false, description: "是否暴露 HTTP-TS 播放地址。" },
+      { name: "publish.enable_http_fmp4", type: "boolean", required: false, description: "是否暴露 HTTP-FMP4 播放地址。" },
+      { name: "publish.enable_hls", type: "boolean", required: false, description: "是否暴露 HLS 播放地址。" },
+      { name: "publish.enable_webrtc", type: "boolean", required: false, description: "是否暴露 WebRTC 播放地址。" },
+      { name: "record.enabled", type: "boolean", required: false, description: "是否开启录像。" },
+      { name: "record.format", type: "enum", required: false, description: "录像格式，支持 MP4、HLS 或同时输出。" },
+      { name: "record.segment_sec", type: "number", required: false, description: "分段时长（秒）。" },
+      { name: "record.save_path", type: "string", required: false, description: "录像根路径。" },
+      { name: "recovery.policy", type: "enum", required: false, description: "失败后的恢复策略。" },
+      { name: "schedule.start_mode", type: "enum", required: false, description: "启动方式，可立即、手动、指定时间或 Cron。" },
+      { name: "schedule.start_at", type: "string", required: false, description: "指定启动时间，ISO 8601。" },
+      { name: "schedule.cron", type: "string", required: false, description: "Cron 表达式。" },
+      { name: "resource.required_labels[]", type: "string[]", required: false, description: "节点必需标签。" },
+      { name: "resource.preferred_labels[]", type: "string[]", required: false, description: "节点优选标签。" },
+      { name: "resource.network_interface", type: "string", required: false, description: "资源网络接口偏好。" },
+      { name: "resource.need_gpu", type: "boolean", required: false, description: "是否需要 GPU。" },
+    ],
+    responseFields: [
+      { name: "id", type: "string", description: "任务 ID。" },
+      { name: "name", type: "string", description: "任务名称。" },
+      { name: "type", type: "enum", description: "任务类型。" },
+      { name: "status", type: "enum", description: "当前任务状态。" },
+      { name: "assigned_node_id", type: "string", description: "当前分配的节点 ID。" },
+      { name: "current_attempt_no", type: "number", description: "当前尝试号。" },
+      { name: "created_at", type: "string", description: "创建时间。" },
+      { name: "updated_at", type: "string", description: "更新时间。" },
+    ],
+    enums: {
+      type: TASK_TYPES.map((item) => ({ value: item.value, label: item.label, description: item.note })),
+      "input.kind": Object.entries(LABELS.inputKind).map(([value, label]) => ({ value, label })),
+      "publish.kind": Object.entries(LABELS.publishKind).map(([value, label]) => ({ value, label })),
+      "record.format": Object.entries(LABELS.recordFormat).map(([value, label]) => ({ value, label })),
+      "recovery.policy": Object.entries(LABELS.recoveryPolicy).map(([value, label]) => ({ value, label })),
+      "schedule.start_mode": Object.entries(LABELS.startMode).map(([value, label]) => ({ value, label })),
+      status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })),
+    },
+  },
+  "GET /api/v1/tasks": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      query: {
+        status: "RUNNING",
+        type: "live_relay",
+        assigned_node_id: EXAMPLE_NODE_ID,
+        keyword: "camera-01",
+        created_from: "2026-04-11T00:00:00+08:00",
+        created_to: "2026-04-11T23:59:59+08:00",
+        page: 1,
+        page_size: 20,
+        sort_by: "updated_at",
+        sort_order: "desc",
+      },
+    },
+    responseFields: [
+      { name: "items[].id", type: "string", description: "任务 ID。" },
+      { name: "items[].name", type: "string", description: "任务名称。" },
+      { name: "items[].type", type: "enum", description: "任务类型。" },
+      { name: "items[].status", type: "enum", description: "任务状态。" },
+      { name: "items[].assigned_node_id", type: "string", description: "节点 ID。" },
+      { name: "items[].priority", type: "number", description: "优先级。" },
+      { name: "items[].created_by", type: "string", description: "创建人。" },
+      { name: "items[].created_at", type: "string", description: "创建时间。" },
+      { name: "items[].updated_at", type: "string", description: "更新时间。" },
+      { name: "total", type: "number", description: "总条数。" },
+      { name: "page", type: "number", description: "当前页。" },
+      { name: "page_size", type: "number", description: "每页条数。" },
+    ],
+    enums: {
+      status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })),
+      type: TASK_TYPES.map((item) => ({ value: item.value, label: item.label })),
+    },
+  },
+  "GET /api/v1/tasks/{id}": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      pathParams: {
+        id: EXAMPLE_TASK_ID,
+      },
+    },
+    responseFields: [
+      { name: "task", type: "object", description: "任务主信息。" },
+      { name: "current_attempt", type: "object", description: "当前 attempt 状态与节点信息。" },
+      { name: "recent_events[]", type: "array", description: "最近事件。" },
+      { name: "requested_spec", type: "object", description: "原始请求规格。" },
+      { name: "resolved_spec", type: "object", description: "服务端补全后的最终规格。" },
+    ],
+    enums: {
+      status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })),
+      source: Object.entries(LABELS.eventSource).map(([value, label]) => ({ value, label })),
+      level: Object.entries(LABELS.eventLevel).map(([value, label]) => ({ value, label })),
+    },
+  },
+  "POST /api/v1/tasks/{id}/start": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      pathParams: {
+        id: EXAMPLE_TASK_ID,
+      },
+    },
+    responseFields: [
+      { name: "id", type: "string", description: "任务 ID。" },
+      { name: "status", type: "enum", description: "启动后的任务状态。" },
+      { name: "current_attempt_no", type: "number", description: "最新 attempt 号。" },
+    ],
+    enums: { status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })) },
+  },
+  "POST /api/v1/tasks/{id}/stop": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      pathParams: {
+        id: EXAMPLE_TASK_ID,
+      },
+    },
+    responseFields: [
+      { name: "id", type: "string", description: "任务 ID。" },
+      { name: "status", type: "enum", description: "停止请求后的任务状态。" },
+    ],
+    enums: { status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })) },
+  },
+  "POST /api/v1/tasks/{id}/retry": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      pathParams: {
+        id: EXAMPLE_TASK_ID,
+      },
+    },
+    responseFields: [
+      { name: "attempt_no", type: "number", description: "新建的 attempt 号。" },
+      { name: "status", type: "enum", description: "重试后的任务状态。" },
+    ],
+    enums: { status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })) },
+  },
+  "POST /api/v1/tasks/{id}/clone": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+        "Content-Type": "application/json",
+      },
+      pathParams: {
+        id: EXAMPLE_TASK_ID,
+      },
+      body: {
+        name: "relay-camera-01-copy",
+        priority: 15,
+        schedule: {
+          start_mode: "manual",
+        },
+      },
+    },
+    requestFields: [
+      { name: "name", type: "string", required: true, description: "新任务名称。" },
+      { name: "priority", type: "number", required: false, description: "新任务优先级。" },
+      { name: "schedule.start_mode", type: "enum", required: false, description: "新任务启动方式。" },
+    ],
+    responseFields: [
+      { name: "id", type: "string", description: "新任务 ID。" },
+      { name: "name", type: "string", description: "新任务名称。" },
+      { name: "status", type: "enum", description: "通常为已创建。" },
+    ],
+    enums: {
+      "schedule.start_mode": Object.entries(LABELS.startMode).map(([value, label]) => ({ value, label })),
+      status: Object.entries(LABELS.status).map(([value, label]) => ({ value, label })),
+    },
+  },
+  "GET /api/v1/streams": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      query: {
+        schema: "rtsp",
+        app: "live",
+        stream: "camera01",
+        node_id: EXAMPLE_NODE_ID,
+        has_viewer: true,
+        task_id: EXAMPLE_TASK_ID,
+      },
+    },
+    responseFields: [
+      { name: "task_id", type: "string", description: "关联任务 ID。" },
+      { name: "node_id", type: "string", description: "当前流所在节点。" },
+      { name: "schema", type: "enum", description: "输出协议。" },
+      { name: "vhost", type: "string", description: "虚拟主机。" },
+      { name: "app", type: "string", description: "应用名。" },
+      { name: "stream", type: "string", description: "流名。" },
+      { name: "viewer_count", type: "number", description: "当前观众数。" },
+      { name: "has_viewer", type: "boolean", description: "是否存在观众。" },
+      { name: "play_urls[]", type: "string[]", description: "可直接播放的地址集合。" },
+    ],
+    enums: {
+      schema: Object.entries(LABELS.inputKind).map(([value, label]) => ({ value, label })),
+      has_viewer: [{ value: "true", label: "是" }, { value: "false", label: "否" }],
+    },
+  },
+  "GET /api/v1/records": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      query: {
+        task_id: EXAMPLE_TASK_ID,
+        stream: "camera01",
+        date_from: "2026-04-11T00:00:00+08:00",
+        date_to: "2026-04-11T23:59:59+08:00",
+        page: 1,
+        page_size: 20,
+      },
+    },
+    responseFields: [
+      { name: "items[].id", type: "string", description: "录像记录 ID。" },
+      { name: "items[].task_id", type: "string", description: "关联任务 ID。" },
+      { name: "items[].vhost", type: "string", description: "虚拟主机。" },
+      { name: "items[].app", type: "string", description: "应用名。" },
+      { name: "items[].stream", type: "string", description: "流名。" },
+      { name: "items[].file_path", type: "string", description: "文件绝对路径。" },
+      { name: "items[].file_size", type: "number", description: "文件大小（字节）。" },
+      { name: "items[].time_len", type: "number", description: "时长（秒）。" },
+      { name: "items[].start_time", type: "string", description: "录像开始时间。" },
+      { name: "items[].source", type: "enum", description: "记录来源。" },
+      { name: "total", type: "number", description: "总条数。" },
+    ],
+    enums: {
+      source: Object.entries(LABELS.recordSource).map(([value, label]) => ({ value, label })),
+    },
+  },
+  "GET /api/v1/nodes": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+    },
+    responseFields: [
+      { name: "id", type: "string", description: "节点 ID。" },
+      { name: "node_name", type: "string", description: "节点名称。" },
+      { name: "hostname", type: "string", description: "宿主机名。" },
+      { name: "healthy", type: "boolean", description: "节点健康状态。" },
+      { name: "network_mode", type: "enum", description: "节点网络模式。" },
+      { name: "cpu_percent", type: "number", description: "CPU 使用率。" },
+      { name: "mem_percent", type: "number", description: "内存使用率。" },
+      { name: "disk_percent", type: "number", description: "磁盘使用率。" },
+      { name: "running_tasks", type: "number", description: "当前运行任务数。" },
+      { name: "labels[]", type: "string[]", description: "节点标签。" },
+      { name: "interfaces[]", type: "string[]", description: "节点上报的网卡信息。" },
+      { name: "ffmpeg_protocols[]", type: "string[]", description: "FFmpeg 支持的协议。" },
+      { name: "ffmpeg_encoders[]", type: "string[]", description: "FFmpeg 支持的编码器。" },
+    ],
+    enums: {
+      healthy: [{ value: "true", label: "健康" }, { value: "false", label: "异常" }],
+      network_mode: Object.entries(LABELS.networkMode).map(([value, label]) => ({ value, label })),
+    },
+  },
+  "GET /api/v1/nodes/{id}/heartbeats": {
+    requestSample: {
+      headers: {
+        Authorization: EXAMPLE_AUTHORIZATION,
+      },
+      pathParams: {
+        id: EXAMPLE_NODE_ID,
+      },
+      query: {
+        limit: 24,
+      },
+    },
+    responseFields: [
+      { name: "received_at", type: "string", description: "控制面接收到心跳的时间。" },
+      { name: "node_time", type: "string", description: "节点本地上报时间。" },
+      { name: "cpu_percent", type: "number", description: "CPU 使用率。" },
+      { name: "mem_percent", type: "number", description: "内存使用率。" },
+      { name: "disk_percent", type: "number", description: "磁盘使用率。" },
+      { name: "running_tasks", type: "number", description: "运行任务数。" },
+      { name: "slot_usage", type: "number", description: "槽位使用率，0-1。" },
+      { name: "zlm_alive", type: "boolean", description: "ZLM 是否存活。" },
+      { name: "ffmpeg_alive", type: "boolean", description: "FFmpeg 是否存活。" },
+    ],
+  },
+  };
+}
+
+const SYSTEM_CAPABILITIES = [
+  {
+    title: "输入协议",
+    summary: "支持多种网络源、文件和组播输入。",
+    items: ["RTSP", "RTMP", "HLS", "HTTP-FLV", "HTTP-TS", "文件", "UDP MPEGTS 组播", "RTP 组播", "国标 RTP"],
+  },
+  {
+    title: "输出与分发",
+    summary: "支持内部流、组播输出和多协议播放暴露。",
+    items: ["内部流发布", "文件输出", "UDP MPEGTS 组播", "RTP 组播", "RTSP 播放", "RTMP 播放", "HTTP-TS", "HTTP-FMP4", "HLS", "WebRTC"],
+  },
+  {
+    title: "录像能力",
+    summary: "支持媒体录像索引与多格式落盘。",
+    items: ["MP4 录像", "HLS 切片", "MP4 + HLS 同时输出", "录像路径检索", "任务回溯", "文件路径复制"],
+  },
+  {
+    title: "调度与恢复",
+    summary: "支持任务调度、节点筛选和失败恢复。",
+    items: ["立即启动", "手动启动", "指定时间", "Cron 计划", "失败恢复", "节点标签调度", "GPU 需求", "优先级调度"],
+  },
+];
 
 const STATUS_THEME = {
   RUNNING: "status-running",
@@ -87,6 +756,108 @@ const STATUS_THEME = {
   SUCCEEDED: "status-succeeded status-outline",
   CANCELED: "status-canceled status-outline",
 };
+
+const LABELS = {
+  taskType: Object.fromEntries(TASK_TYPES.map((item) => [item.value, item.label])),
+  inputKind: {
+    rtsp: "RTSP",
+    rtmp: "RTMP",
+    hls: "HLS",
+    http_flv: "HTTP-FLV",
+    http_ts: "HTTP-TS",
+    file: "文件",
+    udp_mpegts_multicast: "UDP MPEGTS 组播",
+    rtp_multicast: "RTP 组播",
+    gb_rtp: "国标 RTP",
+  },
+  publishKind: {
+    file: "文件输出",
+    zlm_ingest: "内部流发布",
+    udp_mpegts_multicast: "UDP MPEGTS 组播",
+    rtp_multicast: "RTP 组播",
+  },
+  startMode: {
+    immediate: "立即启动",
+    manual: "手动启动",
+    cron: "定时计划",
+    at: "指定时间",
+  },
+  recordFormat: {
+    mp4: "MP4",
+    hls: "HLS",
+    both: "MP4 + HLS",
+  },
+  recoveryPolicy: {
+    never: "不恢复",
+    on_failure: "失败时恢复",
+    always: "始终恢复",
+  },
+  profile: {
+    realtime_compat: "实时兼容",
+    rtc_web_compat: "WebRTC 兼容",
+    archive_quality: "归档优先",
+    multicast_ts: "组播传输流",
+    rtmp_hevc_ext: "RTMP HEVC 扩展",
+  },
+  status: {
+    CREATED: "已创建",
+    VALIDATING: "校验中",
+    QUEUED: "排队中",
+    DISPATCHING: "派发中",
+    STARTING: "启动中",
+    RUNNING: "运行中",
+    STOPPING: "停止中",
+    RECOVERING: "恢复中",
+    SUCCEEDED: "已成功",
+    FAILED: "已失败",
+    CANCELED: "已取消",
+    LOST: "已丢失",
+  },
+  route: {
+    overview: "系统总览",
+    "api-docs": "外部 API 文档",
+    tasks: "任务中心",
+    "task-detail": "任务详情",
+    streams: "流中心",
+    multicast: "组播中心",
+    records: "录像中心",
+    nodes: "节点中心",
+    debug: "调试台",
+  },
+  apiRole: {
+    platform_admin: "平台管理员",
+    tenant_admin: "租户管理员",
+    tenant_viewer: "租户只读",
+  },
+  networkMode: {
+    host: "主机网络",
+    bridge: "桥接网络",
+  },
+  eventSource: {
+    core: "控制面",
+    agent: "工作节点",
+    ffmpeg: "FFmpeg",
+    zlm_api: "ZLM API",
+    zlm_hook: "ZLM Hook",
+    scheduler: "调度器",
+    user: "用户操作",
+  },
+  eventLevel: {
+    debug: "调试",
+    info: "信息",
+    warn: "警告",
+    error: "错误",
+  },
+  recordSource: {
+    hook: "Hook 回调",
+  },
+  bool: {
+    true: "是",
+    false: "否",
+  },
+};
+
+const API_DOC_DETAILS = buildApiDocDetails();
 
 const state = {
   token: window.localStorage.getItem(TOKEN_STORAGE_KEY) || "",
@@ -105,7 +876,9 @@ const state = {
     nodeInsights: new Map(),
   },
   ui: {
+    themePreference: readThemePreference(),
     authModalOpen: false,
+    apiDocModalKey: "",
     createOpen: false,
     openNodeId: "",
     createStep: 1,
@@ -113,6 +886,7 @@ const state = {
     createPreview: null,
     createError: null,
     authDraftToken: "",
+    scrollPositions: new Map(),
     debug: {
       nodeId: "",
       mediaResult: null,
@@ -130,6 +904,16 @@ const state = {
 let autoRefreshTimer = null;
 
 const appRoot = document.getElementById("app");
+const shell = {
+  ready: false,
+  sidebar: null,
+  topbar: null,
+  pageBody: null,
+  drawer: null,
+  authModal: null,
+  apiDocModal: null,
+  toasts: null,
+};
 
 boot().catch((error) => {
   console.error(error);
@@ -137,9 +921,11 @@ boot().catch((error) => {
 });
 
 async function boot() {
+  applyTheme(state.ui.themePreference);
+  watchSystemTheme();
   window.addEventListener("popstate", async () => {
     state.route = parseRoute(window.location.pathname, window.location.search);
-    await refreshRoute();
+    await refreshRoute({ preserveScroll: false, restoreStoredScroll: true });
   });
   document.addEventListener("click", handleClick);
   document.addEventListener("submit", handleSubmit);
@@ -147,7 +933,59 @@ async function boot() {
   document.addEventListener("input", handleInput);
   startAutoRefresh();
   await refreshSession(true);
-  await refreshRoute();
+  await refreshRoute({ preserveScroll: false, restoreStoredScroll: true });
+}
+
+function ensureShell() {
+  if (shell.ready) {
+    return;
+  }
+  appRoot.className = "app-shell";
+  appRoot.innerHTML = `
+    <aside id="sidebar-slot"></aside>
+    <main class="main-panel">
+      <header id="topbar-slot"></header>
+      <section id="page-body-slot" class="page-body"></section>
+    </main>
+    <div id="drawer-slot"></div>
+    <div id="auth-modal-slot"></div>
+    <div id="api-doc-modal-slot"></div>
+    <div id="toast-slot"></div>
+  `;
+  shell.sidebar = document.getElementById("sidebar-slot");
+  shell.topbar = document.getElementById("topbar-slot");
+  shell.pageBody = document.getElementById("page-body-slot");
+  shell.drawer = document.getElementById("drawer-slot");
+  shell.authModal = document.getElementById("auth-modal-slot");
+  shell.apiDocModal = document.getElementById("api-doc-modal-slot");
+  shell.toasts = document.getElementById("toast-slot");
+  shell.ready = true;
+}
+
+function renderApp(options = {}) {
+  const settings = {
+    chrome: true,
+    page: true,
+    overlays: true,
+    toasts: true,
+    ...options,
+  };
+  ensureShell();
+  if (settings.chrome) {
+    shell.sidebar.innerHTML = renderSidebar();
+    shell.topbar.innerHTML = renderTopbar();
+  }
+  if (settings.page) {
+    shell.pageBody.innerHTML = renderPageBody();
+  }
+  if (settings.overlays) {
+    shell.drawer.innerHTML = renderCreateDrawer();
+    shell.authModal.innerHTML = renderAuthModal();
+    shell.apiDocModal.innerHTML = renderApiDocModal();
+  }
+  if (settings.toasts) {
+    shell.toasts.innerHTML = renderToasts();
+  }
 }
 
 function startAutoRefresh() {
@@ -155,16 +993,39 @@ function startAutoRefresh() {
     window.clearInterval(autoRefreshTimer);
   }
   autoRefreshTimer = window.setInterval(async () => {
-    if (document.hidden || state.loading || state.ui.authModalOpen || state.ui.createOpen) {
+    if (shouldPauseAutoRefresh()) {
       return;
     }
     try {
       await refreshSession(true);
-      await refreshRoute();
+      await refreshRoute({ preserveScroll: true });
     } catch (error) {
       console.error(error);
     }
   }, AUTO_REFRESH_MS);
+}
+
+function shouldPauseAutoRefresh() {
+  if (document.hidden || state.loading || state.ui.authModalOpen || state.ui.createOpen || state.ui.apiDocModalKey) {
+    return true;
+  }
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return true;
+  }
+  const activeElement = document.activeElement;
+  if (!activeElement || activeElement === document.body) {
+    return false;
+  }
+  if (
+    activeElement instanceof HTMLInputElement ||
+    activeElement instanceof HTMLTextAreaElement ||
+    activeElement instanceof HTMLSelectElement ||
+    activeElement.isContentEditable
+  ) {
+    return true;
+  }
+  return Boolean(activeElement.closest("form"));
 }
 
 async function refreshSession(silent) {
@@ -180,7 +1041,12 @@ async function refreshSession(silent) {
   }
 }
 
-async function refreshRoute() {
+async function refreshRoute(options = {}) {
+  const { preserveScroll = true, restoreStoredScroll = false } = options;
+  const routeKey = currentRouteKey();
+  if (preserveScroll) {
+    rememberRouteScroll(routeKey);
+  }
   state.loading = true;
   state.pageError = null;
   renderApp();
@@ -192,22 +1058,30 @@ async function refreshRoute() {
   }
   state.loading = false;
   renderApp();
+  if (preserveScroll || restoreStoredScroll) {
+    restoreRouteScroll(routeKey);
+  }
 }
 
-function renderApp() {
-  appRoot.className = "app-shell";
-  appRoot.innerHTML = `
-    ${renderSidebar()}
-    <main class="main-panel">
-      ${renderTopbar()}
-      <section class="page-body">
-        ${renderPageBody()}
-      </section>
-    </main>
-    ${renderCreateDrawer()}
-    ${renderAuthModal()}
-    ${renderToasts()}
-  `;
+function currentRouteKey() {
+  return `${state.route.path}?${state.route.searchParams.toString()}`;
+}
+
+function rememberRouteScroll(routeKey) {
+  state.ui.scrollPositions.set(routeKey, {
+    x: window.scrollX,
+    y: window.scrollY,
+  });
+}
+
+function restoreRouteScroll(routeKey) {
+  const position = state.ui.scrollPositions.get(routeKey);
+  if (!position) {
+    return;
+  }
+  window.requestAnimationFrame(() => {
+    window.scrollTo(position.x, position.y);
+  });
 }
 
 function renderSidebar() {
@@ -215,10 +1089,10 @@ function renderSidebar() {
   return `
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark">CONTROL PLANE</div>
+        <div class="brand-mark">控制台</div>
         <div>
           <h1>StreamServer</h1>
-          <p>任务、节点、流和调试入口都由 <code>media-core</code> 单点托管。</p>
+          <p>统一承载任务编排、媒体流转发、录像索引、节点观测和第三方业务接口。</p>
         </div>
       </div>
       <section class="session-card">
@@ -226,7 +1100,7 @@ function renderSidebar() {
         <span class="muted">${escapeHtml(sessionSubtitle())}</span>
         <div class="toolbar-actions">
           ${state.session ? renderRolePill(state.session.role) : ""}
-          <button class="ghost-button" data-action="open-auth-modal">Token</button>
+          <button class="ghost-button" data-action="open-auth-modal">令牌</button>
         </div>
       </section>
       <nav class="sidebar-nav">
@@ -252,7 +1126,7 @@ function renderTopbar() {
   const title = currentRouteTitle();
   const subtitle = state.pageError
     ? "页面加载失败"
-    : state.loading
+    : state.loading && !state.routeData
       ? "正在读取控制面数据"
       : currentRouteSubtitle();
   return `
@@ -262,7 +1136,21 @@ function renderTopbar() {
         <p>${escapeHtml(subtitle)}</p>
       </div>
       <div class="topbar-actions">
-        <span class="tag">${escapeHtml(state.session?.environment || "unknown")}</span>
+        <div class="theme-switch" aria-label="主题切换">
+          ${THEME_OPTIONS.map(
+            (option) => `
+              <button
+                class="theme-option ${state.ui.themePreference === option ? "active" : ""}"
+                data-action="set-theme"
+                data-theme-value="${option}"
+                type="button"
+              >
+                ${escapeHtml(themeLabel(option))}
+              </button>
+            `,
+          ).join("")}
+        </div>
+        <span class="tag">${escapeHtml(state.session?.environment || "未知环境")}</span>
         <button class="ghost-button" data-action="refresh-page">刷新</button>
         ${canAccess("task_write") ? `<button class="button" data-action="open-create-drawer">新建任务</button>` : ""}
       </div>
@@ -271,7 +1159,7 @@ function renderTopbar() {
 }
 
 function renderPageBody() {
-  if (state.loading) {
+  if (state.loading && !state.routeData) {
     return renderLoadingPanel();
   }
   if (state.pageError) {
@@ -291,6 +1179,10 @@ async function loadRouteData(route) {
     return { authRequired: true };
   }
   switch (route.name) {
+    case "overview":
+      return await loadOverviewData();
+    case "api-docs":
+      return await loadApiDocsData();
     case "tasks":
       return await loadTasksData(route);
     case "task-detail":
@@ -315,6 +1207,10 @@ function renderRouteBody(route, data) {
     return renderAuthRequired();
   }
   switch (route.name) {
+    case "overview":
+      return renderOverviewPage(data);
+    case "api-docs":
+      return renderApiDocsPage(data);
     case "tasks":
       return renderTasksPage(data);
     case "task-detail":
@@ -339,7 +1235,7 @@ async function loadTasksData(route) {
   const query = new URLSearchParams();
   copyIfPresent(params, query, ["status", "type", "assigned_node_id", "keyword", "created_from", "created_to", "page", "page_size", "sort_by", "sort_order"]);
   if (!query.get("page_size")) {
-    query.set("page_size", "20");
+    query.set("page_size", DEFAULT_PAGE_SIZE);
   }
   const [tasksPage, nodes, templates] = await Promise.all([
     apiRequest(`/api/v1/tasks?${query.toString()}`),
@@ -347,6 +1243,89 @@ async function loadTasksData(route) {
     canAccess("template_read") ? fetchTemplatesCached(false) : Promise.resolve([]),
   ]);
   return { tasksPage, nodes, templates };
+}
+
+async function loadOverviewData() {
+  const [nodes, streams, recentTasksPage, runningTasksPage, failedTasksPage, queuedTasksPage, recordsPage] = await Promise.all([
+    canAccess("node_read") ? fetchNodesCached(true) : Promise.resolve([]),
+    canAccess("task_read") ? apiRequest("/api/v1/streams") : Promise.resolve([]),
+    canAccess("task_read")
+      ? apiRequest(`/api/v1/tasks?page_size=8&sort_by=updated_at&sort_order=desc`)
+      : Promise.resolve({ items: [], total: 0, page: 1, page_size: 8 }),
+    canAccess("task_read")
+      ? apiRequest("/api/v1/tasks?status=RUNNING&page_size=1")
+      : Promise.resolve({ items: [], total: 0, page: 1, page_size: 1 }),
+    canAccess("task_read")
+      ? apiRequest("/api/v1/tasks?status=FAILED&page_size=1")
+      : Promise.resolve({ items: [], total: 0, page: 1, page_size: 1 }),
+    canAccess("task_read")
+      ? apiRequest("/api/v1/tasks?status=QUEUED&page_size=1")
+      : Promise.resolve({ items: [], total: 0, page: 1, page_size: 1 }),
+    canAccess("record_read")
+      ? apiRequest("/api/v1/records?page_size=1")
+      : Promise.resolve({ items: [], total: 0, page: 1, page_size: 1 }),
+  ]);
+
+  const nodeList = Array.isArray(nodes) ? nodes : [];
+  const streamList = Array.isArray(streams) ? streams : [];
+  const recentTasks = recentTasksPage?.items || [];
+  const healthyNodes = nodeList.filter((node) => node.healthy);
+  const unhealthyNodes = nodeList.filter((node) => !node.healthy);
+  const activeIssues = [
+    ...recentTasks
+      .filter((task) => ["FAILED", "LOST"].includes(task.status))
+      .map((task) => ({
+        title: task.name,
+        description: `${taskStatusLabel(task.status)} · ${taskTypeLabel(task.type)}`,
+        time: task.updated_at || task.created_at,
+      })),
+    ...unhealthyNodes.map((node) => ({
+      title: node.node_name,
+      description: `节点异常 · CPU ${formatPercent(node.cpu_percent)} · 内存 ${formatPercent(node.mem_percent)}`,
+      time: node.last_seen_at,
+    })),
+  ]
+    .sort((left, right) => new Date(right.time || 0).getTime() - new Date(left.time || 0).getTime())
+    .slice(0, 6);
+
+  const statusSummary = {
+    running: runningTasksPage?.total || 0,
+    failed: failedTasksPage?.total || 0,
+    queued: queuedTasksPage?.total || 0,
+    records: recordsPage?.total || 0,
+  };
+
+  let systemState = "稳定运行";
+  let systemNote = "控制面、节点与流状态看起来正常，可以继续观测实时业务任务。";
+  if (!nodeList.length && !recentTasks.length) {
+    systemState = "等待接入";
+    systemNote = "当前没有可展示的节点或任务，适合先完成工作节点接入。";
+  } else if (unhealthyNodes.length || statusSummary.failed > 0) {
+    systemState = "需要关注";
+    systemNote = "存在离线节点或失败任务，建议优先查看节点详情与最近异常。";
+  } else if (statusSummary.queued > 0) {
+    systemState = "有任务排队";
+    systemNote = "系统整体可用，但仍有任务等待调度或启动。";
+  }
+
+  return {
+    nodes: nodeList,
+    healthyNodes,
+    unhealthyNodes,
+    streams: streamList,
+    recentTasks,
+    activeIssues,
+    statusSummary,
+    systemState,
+    systemNote,
+  };
+}
+
+async function loadApiDocsData() {
+  return {
+    docs: EXTERNAL_API_DOCS,
+    authEnabled: Boolean(state.session?.auth_enabled ?? !state.sessionError),
+  };
 }
 
 async function loadTaskDetailData(route) {
@@ -472,6 +1451,323 @@ async function loadDebugData() {
   return { nodes };
 }
 
+function renderOverviewPage(data) {
+  return `
+    <section class="hero-panel overview-hero">
+      <div class="section-header">
+        <div>
+          <div class="brand-mark">总览</div>
+          <h3>系统总览</h3>
+          <p>集中查看系统能力、整体健康度、节点负载、在线流和最近的异常动态。</p>
+        </div>
+        <div class="section-actions">
+          <span class="pill ${data.systemState === "稳定运行" ? "status-running" : data.systemState === "等待接入" ? "status-created" : "status-stopping"}">${escapeHtml(data.systemState)}</span>
+        </div>
+      </div>
+      <div class="overview-grid">
+        ${metricCard("整体状态", data.systemState)}
+        ${metricCard("在线节点", `${data.healthyNodes.length} / ${data.nodes.length || 0}`)}
+        ${metricCard("运行中任务", String(data.statusSummary.running))}
+        ${metricCard("在线流", String(data.streams.length))}
+        ${metricCard("录像记录", String(data.statusSummary.records))}
+        ${metricCard("待处理问题", String(data.activeIssues.length))}
+      </div>
+      <p class="hero-note">${escapeHtml(data.systemNote)}</p>
+    </section>
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>系统能力</h3>
+          <p>从输入、输出、录像和调度角度概括当前系统可落地的媒体能力。</p>
+        </div>
+      </div>
+      <div class="feature-grid">
+        ${OVERVIEW_FEATURES.map(
+          (feature) => `
+            <article class="feature-card">
+              <h4>${escapeHtml(feature.title)}</h4>
+              <p>${escapeHtml(feature.description)}</p>
+            </article>
+          `,
+        ).join("")}
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>能力矩阵</h3>
+          <p>面向部署与联调的技术能力摘要，帮助快速判断当前系统能接什么、出什么、怎么录和怎么调度。</p>
+        </div>
+      </div>
+      <div class="feature-grid">
+        ${SYSTEM_CAPABILITIES.map(
+          (capability) => `
+            <article class="feature-card">
+              <h4>${escapeHtml(capability.title)}</h4>
+              <p>${escapeHtml(capability.summary)}</p>
+              <div class="inline-list" style="margin-top: 12px;">
+                ${capability.items.map((item) => `<span class="tag">${escapeHtml(item)}</span>`).join("")}
+              </div>
+            </article>
+          `,
+        ).join("")}
+      </div>
+    </section>
+    <section class="split-grid">
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>节点状态与负载</h3>
+            <p>展示每个节点当前健康度、CPU、内存、磁盘和任务数。</p>
+          </div>
+        </div>
+        <div class="node-summary-list">
+          ${
+            data.nodes.length
+              ? data.nodes
+                  .map(
+                    (node) => `
+                      <article class="node-summary-card">
+                        <div class="toolbar-actions">
+                          <strong>${escapeHtml(node.node_name)}</strong>
+                          <span class="pill ${node.healthy ? "status-running" : "status-failed"}">${node.healthy ? "健康" : "异常"}</span>
+                        </div>
+                        <div class="subtle">${escapeHtml(node.hostname || "未知主机")} · ${escapeHtml(networkModeLabel(node.network_mode))}</div>
+                        <div class="inline-list">
+                          <span class="tag">CPU ${formatPercent(node.cpu_percent)}</span>
+                          <span class="tag">内存 ${formatPercent(node.mem_percent)}</span>
+                          <span class="tag">磁盘 ${formatPercent(node.disk_percent)}</span>
+                          <span class="tag">任务 ${escapeHtml(String(node.running_tasks ?? 0))}</span>
+                        </div>
+                        <div class="subtle">最近心跳：${escapeHtml(formatTime(node.last_seen_at))}</div>
+                      </article>
+                    `,
+                  )
+                  .join("")
+              : renderInlineEmpty("当前没有节点数据。")
+          }
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>最近异常与动态</h3>
+            <p>优先聚合失败任务、离线节点和最近更新的业务任务。</p>
+          </div>
+        </div>
+        <div class="event-list">
+          ${
+            data.activeIssues.length
+              ? data.activeIssues
+                  .map(
+                    (issue) => `
+                      <article class="event-item">
+                        <strong>${escapeHtml(issue.title)}</strong>
+                        <div class="subtle">${escapeHtml(issue.description)}</div>
+                        <div class="subtle">${escapeHtml(formatTime(issue.time))}</div>
+                      </article>
+                    `,
+                  )
+                  .join("")
+              : renderInlineEmpty("最近没有需要重点关注的异常。")
+          }
+        </div>
+      </div>
+    </section>
+    <section class="panel">
+      <div class="panel-header">
+        <div>
+          <h3>最近任务动态</h3>
+          <p>按更新时间倒序展示最近 8 条任务，方便快速回到详情和排障。</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>任务</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th>优先级</th>
+              <th>节点</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${
+              data.recentTasks.length
+                ? data.recentTasks
+                    .map(
+                      (task) => `
+                        <tr>
+                          <td>
+                            <a href="/tasks/${task.id}" data-link class="mono">${shortId(task.id)}</a>
+                            <div><strong>${escapeHtml(task.name)}</strong></div>
+                          </td>
+                          <td>${escapeHtml(taskTypeLabel(task.type))}</td>
+                          <td>${statusPill(task.status)}</td>
+                          <td>${escapeHtml(String(task.priority ?? "—"))}</td>
+                          <td>${escapeHtml(task.assigned_node_id || "未分配")}</td>
+                          <td>${escapeHtml(formatTime(task.updated_at || task.created_at))}</td>
+                        </tr>
+                      `,
+                    )
+                    .join("")
+                : `<tr><td colspan="6">${renderInlineEmpty("最近没有任务动态。")}</td></tr>`
+            }
+          </tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderApiDocsPage(data) {
+  const docsByCategory = groupBy(data.docs, (item) => item.category);
+  return `
+    <section class="hero-panel">
+      <div class="section-header">
+        <div>
+          <div class="brand-mark">外部接口</div>
+          <h3>外部 API 文档</h3>
+          <p>只展示对第三方业务系统开放的北向接口，不包含控制台内部和调试接口。</p>
+        </div>
+      </div>
+      <div class="overview-grid">
+        ${metricCard("接口分组", String(Object.keys(docsByCategory).length))}
+        ${metricCard("公开接口数", String(data.docs.length))}
+        ${metricCard("鉴权方式", "Bearer Token")}
+        ${metricCard("接口范围", "任务、流、录像、节点")}
+      </div>
+      <div class="subtle">
+        ${
+          data.authEnabled
+            ? '当前环境启用了鉴权，请在请求头中携带 <code>Authorization: Bearer &lt;token&gt;</code>。'
+            : '当前环境未启用鉴权，可直接调用接口。'
+        }
+        文档中的示例路径均以 <code>media-core</code> 提供的 HTTP 地址为准。
+      </div>
+    </section>
+    ${Object.entries(docsByCategory)
+      .map(
+        ([category, items]) => `
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <h3>${escapeHtml(category)}</h3>
+                <p>适合第三方业务系统直接调用的接口清单与示例。</p>
+              </div>
+            </div>
+            <div class="api-doc-grid">
+              ${items
+                .map(
+                  (item) => `
+                    <article class="api-doc-card">
+                      <div class="toolbar-actions">
+                        <span class="pill status-outline">${escapeHtml(item.method)}</span>
+                      </div>
+                      <h4>${escapeHtml(item.title)}</h4>
+                      <p>${escapeHtml(item.summary)}</p>
+                      <div class="subtle">${escapeHtml(item.description)}</div>
+                      <div class="api-doc-path-row">
+                        <code class="api-path selectable">${escapeHtml(item.path)}</code>
+                        <button class="ghost-button" data-action="copy" data-value="${escapeAttr(item.path)}">复制路径</button>
+                      </div>
+                      <div class="toolbar-actions" style="margin-top: 16px;">
+                        <button class="button" data-action="open-api-doc" data-api-doc-key="${escapeAttr(apiDocKey(item))}">查看完整参数与返回值</button>
+                      </div>
+                    </article>
+                  `,
+                )
+                .join("")}
+            </div>
+          </section>
+        `,
+      )
+      .join("")}
+  `;
+}
+
+function renderApiDocModal() {
+  const doc = getSelectedApiDoc();
+  const open = Boolean(doc);
+  if (!doc) {
+    return `
+      <div class="modal-backdrop ${open ? "open" : ""}"></div>
+      <section class="modal ${open ? "open" : ""}"></section>
+    `;
+  }
+  const details = API_DOC_DETAILS[apiDocKey(doc)] || {};
+  const requestSample = details.requestSample || {};
+  return `
+    <div class="modal-backdrop open" data-action="close-api-doc"></div>
+    <section class="modal api-doc-modal open">
+      <div class="section-header">
+        <div>
+          <div class="brand-mark">接口详情</div>
+          <h3>${escapeHtml(doc.title)}</h3>
+          <p>${escapeHtml(doc.summary)}</p>
+        </div>
+        <div class="section-actions">
+          <span class="pill status-outline">${escapeHtml(doc.method)}</span>
+          <button class="ghost-button" data-action="close-api-doc">关闭</button>
+        </div>
+      </div>
+      <div class="api-doc-modal-grid">
+        <div class="doc-stack">
+          <div class="doc-block">
+            <strong>接口路径</strong>
+            <div class="api-doc-path-row">
+              <div class="toolbar-actions">
+                <span class="pill status-outline">${escapeHtml(doc.method)}</span>
+                <code class="api-path selectable">${escapeHtml(doc.path)}</code>
+              </div>
+              <button class="ghost-button" data-action="copy" data-value="${escapeAttr(doc.path)}">复制路径</button>
+            </div>
+            <div class="subtle">${escapeHtml(doc.description)}</div>
+            ${requestSample.note ? `<div class="subtle">${escapeHtml(requestSample.note)}</div>` : ""}
+          </div>
+          <div class="doc-block">
+            <strong>完整请求示例</strong>
+            <div class="subtle doc-example-note">左侧示例会把请求头、路径参数、查询参数和请求体完整展开，方便第三方业务系统直接对照实现。</div>
+            ${renderApiExample(buildFullRequestExample(doc, requestSample))}
+          </div>
+        </div>
+        <div class="doc-stack">
+          <div class="doc-block">
+            <strong>请求参数</strong>
+            ${renderFieldDocs(doc.params, "当前接口没有额外的路径、查询或请求头参数。", {
+              includeLocation: true,
+              exampleResolver: (field) => resolveRequestParamExample(field, requestSample),
+            })}
+          </div>
+          <div class="doc-block">
+            <strong>请求体字段</strong>
+            ${renderFieldDocs(details.requestFields, "当前接口没有请求体，或请求体仅包含少量覆盖字段。", {
+              exampleResolver: (field) => lookupDocValue(requestSample.body, field.name),
+            })}
+          </div>
+          <div class="doc-block">
+            <strong>返回值字段</strong>
+            ${renderFieldDocs(details.responseFields, "当前接口返回值结构较简单，请参考底部响应示例。", {
+              includeRequired: false,
+              exampleResolver: (field) => lookupDocValue(doc.responseExample, field.name),
+            })}
+          </div>
+          <div class="doc-block">
+            <strong>枚举解释</strong>
+            ${renderEnumDocs(details.enums)}
+          </div>
+        </div>
+      </div>
+      <div class="doc-block">
+        <strong>响应示例</strong>
+        ${renderApiExample(doc.responseExample)}
+      </div>
+    </section>
+  `;
+}
+
 function renderTasksPage(data) {
   const params = state.route.searchParams;
   const nodeOptions = data.nodes || [];
@@ -480,7 +1776,7 @@ function renderTasksPage(data) {
     <section class="hero-panel">
       <div class="section-header">
         <div>
-          <div class="brand-mark">TASKS</div>
+          <div class="brand-mark">任务</div>
           <h3>任务中心</h3>
           <p>筛选、排序、启动、停止、重试、克隆，并从同一控制台进入详情和调试。</p>
         </div>
@@ -489,14 +1785,14 @@ function renderTasksPage(data) {
         </div>
       </div>
       <form id="tasks-filter-form" class="filters">
-        ${renderSelectField("状态", "status", ["", "CREATED", "VALIDATING", "QUEUED", "DISPATCHING", "STARTING", "RUNNING", "STOPPING", "RECOVERING", "SUCCEEDED", "FAILED", "CANCELED", "LOST"], params.get("status") || "")}
-        ${renderSelectField("类型", "type", ["", ...TASK_TYPES.map((item) => item.value)], params.get("type") || "")}
+        ${renderSelectField("状态", "status", ["", "CREATED", "VALIDATING", "QUEUED", "DISPATCHING", "STARTING", "RUNNING", "STOPPING", "RECOVERING", "SUCCEEDED", "FAILED", "CANCELED", "LOST"], params.get("status") || "", (value) => value ? taskStatusLabel(value) : "全部状态")}
+        ${renderSelectField("类型", "type", ["", ...TASK_TYPES.map((item) => item.value)], params.get("type") || "", (value) => value ? taskTypeLabel(value) : "全部类型")}
         ${renderSelectField("节点", "assigned_node_id", ["", ...nodeOptions.map((node) => node.id)], params.get("assigned_node_id") || "", (value) => value === "" ? "全部节点" : nodeLabel(nodeOptions.find((node) => node.id === value)))}
-        ${renderTextField("关键字", "keyword", params.get("keyword") || "", "name / task_id")}
+        ${renderTextField("关键字", "keyword", params.get("keyword") || "", "任务名 / 任务 ID")}
         ${renderDateTimeField("创建开始", "created_from", params.get("created_from") || "")}
         ${renderDateTimeField("创建结束", "created_to", params.get("created_to") || "")}
-        ${renderSelectField("排序字段", "sort_by", ["", "created_at", "updated_at", "priority", "status"], params.get("sort_by") || "", (value) => value || "默认")}
-        ${renderSelectField("排序方向", "sort_order", ["", "asc", "desc"], params.get("sort_order") || "", (value) => value || "默认")}
+        ${renderSelectField("排序字段", "sort_by", ["", "created_at", "updated_at", "priority", "status"], params.get("sort_by") || "", (value) => sortFieldLabel(value))}
+        ${renderSelectField("排序方向", "sort_order", ["", "asc", "desc"], params.get("sort_order") || "", (value) => sortOrderLabel(value))}
         <div class="toolbar-actions">
           <button class="button" type="submit">应用筛选</button>
           <button class="ghost-button" type="button" data-action="reset-task-filters">重置</button>
@@ -517,7 +1813,7 @@ function renderTasksPage(data) {
         <table>
           <thead>
             <tr>
-              <th>Task ID</th>
+              <th>任务 ID</th>
               <th>名称</th>
               <th>类型</th>
               <th>状态</th>
@@ -541,9 +1837,9 @@ function renderTasksPage(data) {
                           <td><a href="/tasks/${task.id}" data-link class="mono">${shortId(task.id)}</a></td>
                           <td>
                             <strong>${escapeHtml(task.name)}</strong>
-                            <div class="subtle">attempt ${task.current_attempt_no || 0}</div>
+                            <div class="subtle">第 ${task.current_attempt_no || 0} 次尝试</div>
                           </td>
-                          <td><span class="tag">${escapeHtml(task.type)}</span></td>
+                          <td><span class="tag">${escapeHtml(taskTypeLabel(task.type))}</span></td>
                           <td>${statusPill(task.status)}</td>
                           <td>${escapeHtml(String(task.priority))}</td>
                           <td>${escapeHtml(nodeLabel(node))}</td>
@@ -578,7 +1874,7 @@ function renderTaskDetailPage(route, data) {
         <div>
           <div class="brand-mark">TASK DETAIL</div>
           <h3>${escapeHtml(task.name)}</h3>
-          <p>${escapeHtml(task.id)} · ${escapeHtml(task.type)} · 当前 Attempt ${escapeHtml(String(task.current_attempt_no || 0))}</p>
+          <p>${escapeHtml(task.id)} · ${escapeHtml(taskTypeLabel(task.type))} · 当前第 ${escapeHtml(String(task.current_attempt_no || 0))} 次尝试</p>
         </div>
         <div class="section-actions">
           ${statusPill(task.status)}
@@ -600,12 +1896,12 @@ function renderTaskDetailPage(route, data) {
           <h3>详情页签</h3>
           <p>概览、事件、日志、requested_spec、resolved_spec。</p>
         </div>
-        <div class="tabs">
+      <div class="tabs">
           ${renderTaskDetailTab(route.params.id, activeTab, "overview", "概览")}
           ${renderTaskDetailTab(route.params.id, activeTab, "events", "事件")}
           ${renderTaskDetailTab(route.params.id, activeTab, "logs", "日志")}
-          ${renderTaskDetailTab(route.params.id, activeTab, "requested", "requested_spec")}
-          ${renderTaskDetailTab(route.params.id, activeTab, "resolved", "resolved_spec")}
+          ${renderTaskDetailTab(route.params.id, activeTab, "requested", "请求规格")}
+          ${renderTaskDetailTab(route.params.id, activeTab, "resolved", "解析规格")}
         </div>
       </div>
       ${
@@ -630,18 +1926,18 @@ function renderStreamsPage(data) {
     <section class="hero-panel">
       <div class="section-header">
         <div>
-          <div class="brand-mark">STREAMS</div>
+          <div class="brand-mark">流</div>
           <h3>流中心</h3>
-          <p>在线流、播放地址、关联任务、viewer 状态，以及管理员关流操作。</p>
+          <p>在线流、播放地址、关联任务、观众状态，以及管理员关流操作。</p>
         </div>
       </div>
       <form id="streams-filter-form" class="filters">
-        ${renderTextField("Schema", "schema", params.get("schema") || "", "rtsp / rtmp / http")}
-        ${renderTextField("App", "app", params.get("app") || "", "live")}
-        ${renderTextField("Stream", "stream", params.get("stream") || "", "camera01")}
-        ${renderTextField("Task ID", "task_id", params.get("task_id") || "", "可选")}
+        ${renderTextField("协议", "schema", params.get("schema") || "", "rtsp / rtmp / http")}
+        ${renderTextField("应用名", "app", params.get("app") || "", "live")}
+        ${renderTextField("流名", "stream", params.get("stream") || "", "camera01")}
+        ${renderTextField("任务 ID", "task_id", params.get("task_id") || "", "可选")}
         ${renderSelectField("节点", "node_id", ["", ...(data.nodes || []).map((node) => node.id)], params.get("node_id") || "", (value) => value === "" ? "全部节点" : nodeLabel(nodeMap.get(value)))}
-        ${renderSelectField("有观众", "has_viewer", ["", "true", "false"], params.get("has_viewer") || "", (value) => value === "" ? "全部" : value)}
+        ${renderSelectField("有观众", "has_viewer", ["", "true", "false"], params.get("has_viewer") || "", (value) => value === "" ? "全部" : boolLabel(value))}
         <div class="toolbar-actions">
           <button class="button" type="submit">筛选</button>
           <button class="ghost-button" type="button" data-action="reset-stream-filters">重置</button>
@@ -659,13 +1955,13 @@ function renderStreamsPage(data) {
         <table>
           <thead>
             <tr>
-              <th>Schema</th>
-              <th>Vhost/App/Stream</th>
-              <th>Task</th>
-              <th>Node</th>
-              <th>Viewer</th>
-              <th>Recording</th>
-              <th>Play URLs</th>
+              <th>协议</th>
+              <th>Vhost / 应用 / 流</th>
+              <th>任务</th>
+              <th>节点</th>
+              <th>观众数</th>
+              <th>录制状态</th>
+              <th>播放地址</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -678,7 +1974,7 @@ function renderStreamsPage(data) {
                       const node = nodeMap.get(stream.node_id);
                       return `
                         <tr>
-                          <td><span class="tag">${escapeHtml(stream.schema)}</span></td>
+                          <td><span class="tag">${escapeHtml(schemaLabel(stream.schema))}</span></td>
                           <td>
                             <strong>${escapeHtml(stream.vhost)}</strong>
                             <div class="mono">${escapeHtml(`${stream.app}/${stream.stream}`)}</div>
@@ -713,7 +2009,7 @@ function renderMulticastPage(data) {
     <section class="hero-panel">
       <div class="section-header">
         <div>
-          <div class="brand-mark">MULTICAST</div>
+          <div class="brand-mark">组播</div>
           <h3>组播中心</h3>
           <p>集中查看组播任务、网卡、TTL、上下游，以及最近错误。</p>
         </div>
@@ -730,14 +2026,14 @@ function renderMulticastPage(data) {
         <table>
           <thead>
             <tr>
-              <th>Task</th>
-              <th>Mode</th>
-              <th>Group</th>
-              <th>Port</th>
-              <th>Interface</th>
+              <th>任务</th>
+              <th>模式</th>
+              <th>组播地址</th>
+              <th>端口</th>
+              <th>绑定地址</th>
               <th>TTL</th>
-              <th>Node</th>
-              <th>Status</th>
+              <th>节点</th>
+              <th>状态</th>
               <th>额外信息</th>
             </tr>
           </thead>
@@ -766,9 +2062,9 @@ function renderMulticastPage(data) {
                           <td>${escapeHtml(row.node)}</td>
                           <td>${statusPill(task.status)}</td>
                           <td>
-                            <div class="subtle">最近码率: ${escapeHtml(row.bitrate)}</div>
-                            <div class="subtle">最近错误: ${escapeHtml(row.lastError)}</div>
-                            <div class="subtle">上下游: ${escapeHtml(row.binding)}</div>
+                            <div class="subtle">最近码率：${escapeHtml(row.bitrate)}</div>
+                            <div class="subtle">最近错误：${escapeHtml(row.lastError)}</div>
+                            <div class="subtle">上下游：${escapeHtml(row.binding)}</div>
                           </td>
                         </tr>
                       `;
@@ -789,14 +2085,14 @@ function renderRecordsPage(data) {
     <section class="hero-panel">
       <div class="section-header">
         <div>
-          <div class="brand-mark">RECORDS</div>
+          <div class="brand-mark">录像</div>
           <h3>录像中心</h3>
           <p>按照日期、任务和流名检索录像，并直接复制路径或跳转任务。</p>
         </div>
       </div>
       <form id="records-filter-form" class="filters">
-        ${renderTextField("Task ID", "task_id", params.get("task_id") || "", "uuid")}
-        ${renderTextField("Stream", "stream", params.get("stream") || "", "camera01")}
+        ${renderTextField("任务 ID", "task_id", params.get("task_id") || "", "uuid")}
+        ${renderTextField("流名", "stream", params.get("stream") || "", "camera01")}
         ${renderDateTimeField("开始时间", "date_from", params.get("date_from") || "")}
         ${renderDateTimeField("结束时间", "date_to", params.get("date_to") || "")}
         <div class="toolbar-actions">
@@ -819,14 +2115,14 @@ function renderRecordsPage(data) {
         <table>
           <thead>
             <tr>
-              <th>Record ID</th>
-              <th>Task</th>
-              <th>Stream</th>
-              <th>File Path</th>
+              <th>录像 ID</th>
+              <th>任务</th>
+              <th>流</th>
+              <th>文件路径</th>
               <th>Size</th>
               <th>时长</th>
               <th>开始时间</th>
-              <th>Source</th>
+              <th>来源</th>
               <th>操作</th>
             </tr>
           </thead>
@@ -840,11 +2136,11 @@ function renderRecordsPage(data) {
                           <td class="mono">${shortId(record.id)}</td>
                           <td><a href="/tasks/${record.task_id}" data-link class="mono">${shortId(record.task_id)}</a></td>
                           <td>${escapeHtml([record.vhost, record.app, record.stream].filter(Boolean).join("/") || "—")}</td>
-                          <td class="mono">${escapeHtml(record.file_path)}</td>
+                          <td><code class="selectable">${escapeHtml(record.file_path)}</code></td>
                           <td>${escapeHtml(formatBytes(record.file_size))}</td>
                           <td>${escapeHtml(record.time_len ? `${record.time_len}s` : "—")}</td>
                           <td>${escapeHtml(formatTime(record.start_time || record.created_at))}</td>
-                          <td>${escapeHtml(record.source)}</td>
+                          <td>${escapeHtml(recordSourceLabel(record.source))}</td>
                           <td>
                             <div class="toolbar-actions">
                               <button class="ghost-button" data-action="copy" data-value="${escapeAttr(record.file_path)}">复制路径</button>
@@ -869,7 +2165,7 @@ function renderNodesPage(data) {
     <section class="hero-panel">
       <div class="section-header">
         <div>
-          <div class="brand-mark">NODES</div>
+          <div class="brand-mark">节点</div>
           <h3>节点中心</h3>
           <p>查看节点健康、能力矩阵、实时负载和 ZLM 概览。</p>
         </div>
@@ -897,10 +2193,10 @@ function renderNodesPage(data) {
                       <div class="section-header">
                         <div>
                           <h3>${escapeHtml(node.node_name)}</h3>
-                          <p>${escapeHtml(node.hostname)} · ${escapeHtml(node.network_mode)} · ${escapeHtml(node.id)}</p>
+                          <p>${escapeHtml(node.hostname)} · ${escapeHtml(networkModeLabel(node.network_mode))} · ${escapeHtml(node.id)}</p>
                         </div>
                         <div class="section-actions">
-                          ${node.healthy ? `<span class="pill status-running">healthy</span>` : `<span class="pill status-failed">unhealthy</span>`}
+                          ${node.healthy ? `<span class="pill status-running">健康</span>` : `<span class="pill status-failed">异常</span>`}
                           <button class="ghost-button" data-action="toggle-node-detail" data-node-id="${node.id}">${open ? "收起" : "展开"}</button>
                           <a class="ghost-button" href="/tasks?assigned_node_id=${node.id}" data-link>任务</a>
                         </div>
@@ -908,7 +2204,7 @@ function renderNodesPage(data) {
                       ${
                         open
                           ? renderExpandedNodeInsight(node, insight)
-                          : `<div class="subtle">上次心跳: ${escapeHtml(formatTime(node.last_seen_at))} · CPU ${formatPercent(node.cpu_percent)} · MEM ${formatPercent(node.mem_percent)} · 运行任务 ${escapeHtml(String(node.running_tasks ?? 0))}</div>`
+                          : `<div class="subtle">上次心跳：${escapeHtml(formatTime(node.last_seen_at))} · CPU ${formatPercent(node.cpu_percent)} · 内存 ${formatPercent(node.mem_percent)} · 运行任务 ${escapeHtml(String(node.running_tasks ?? 0))}</div>`
                       }
                     </article>
                   `;
@@ -927,9 +2223,9 @@ function renderDebugPage(data) {
     <section class="hero-panel">
       <div class="section-header">
         <div>
-          <div class="brand-mark">DEBUG</div>
+          <div class="brand-mark">调试</div>
           <h3>调试台</h3>
-          <p>管理员专用。封装 ZLM 媒体列表、Session、玩家列表、踢会话和关流。</p>
+          <p>管理员专用，封装 ZLM 媒体列表、会话、玩家、关流、抓图和 Hook 排障入口。</p>
         </div>
       </div>
       <div class="form-grid">
@@ -937,7 +2233,7 @@ function renderDebugPage(data) {
       </div>
       ${
         selectedNode
-          ? `<p class="subtle">当前节点: ${escapeHtml(selectedNode.node_name)} · ${escapeHtml(selectedNode.zlm_version || "unknown ZLM")}</p>`
+          ? `<p class="subtle">当前节点：${escapeHtml(selectedNode.node_name)} · ${escapeHtml(selectedNode.zlm_version || "未知 ZLM 版本")}</p>`
           : `<p class="subtle">先选择一个节点，再执行调试查询。</p>`
       }
     </section>
@@ -958,7 +2254,7 @@ function renderDebugPage(data) {
             ${renderDebugResult(state.ui.debug.statisticResult)}
           </div>
           <div>
-            <h4>Threads / WorkThreads</h4>
+            <h4>线程负载明细</h4>
             ${renderThreadLoadPanel(state.ui.debug.threadsLoadResult, state.ui.debug.workThreadsLoadResult)}
           </div>
         </div>
@@ -971,10 +2267,10 @@ function renderDebugPage(data) {
           </div>
         </div>
         <form id="debug-media-form" class="form-grid">
-          ${renderTextField("Schema", "schema", "", "rtsp / rtmp")}
+          ${renderTextField("协议", "schema", "", "rtsp / rtmp")}
           ${renderTextField("Vhost", "vhost", "", "__defaultVhost__")}
-          ${renderTextField("App", "app", "", "live")}
-          ${renderTextField("Stream", "stream", "", "camera01")}
+          ${renderTextField("应用名", "app", "", "live")}
+          ${renderTextField("流名", "stream", "", "camera01")}
           <div class="toolbar-actions">
             <button class="button" type="submit">查询媒体</button>
           </div>
@@ -984,21 +2280,21 @@ function renderDebugPage(data) {
       <div class="panel">
         <div class="panel-header">
           <div>
-            <h3>Session 与玩家</h3>
-            <p>读取 getAllSession 与 getMediaPlayerList。</p>
+            <h3>会话与播放器</h3>
+            <p>读取 ZLM 的全部会话和播放器列表。</p>
           </div>
         </div>
         <div class="toolbar-actions">
-          <button class="button" data-action="debug-load-sessions">查询 Session</button>
-          <button class="soft-button" data-action="debug-load-players">查询玩家</button>
+          <button class="button" data-action="debug-load-sessions">查询会话</button>
+          <button class="soft-button" data-action="debug-load-players">查询播放器</button>
         </div>
         <div class="split-grid">
           <div>
-            <h4>Session</h4>
+            <h4>会话</h4>
             ${renderDebugResult(state.ui.debug.sessionsResult)}
           </div>
           <div>
-            <h4>Players</h4>
+            <h4>播放器</h4>
             ${renderDebugResult(state.ui.debug.playersResult)}
           </div>
         </div>
@@ -1011,35 +2307,35 @@ function renderDebugPage(data) {
           </div>
         </div>
         <form id="debug-kick-form" class="form-grid">
-          ${renderTextField("Session ID", "session_id", "", "必填")}
+          ${renderTextField("会话 ID", "session_id", "", "必填")}
           <div class="toolbar-actions">
             <button class="danger-button" type="submit">踢会话</button>
           </div>
         </form>
         <form id="debug-kick-batch-form" class="form-grid">
-          ${renderTextField("Local Port", "local_port", "", "例如 554")}
-          ${renderTextField("Peer IP", "peer_ip", "", "例如 10.0.0.8")}
+          ${renderTextField("本地端口", "local_port", "", "例如 554")}
+          ${renderTextField("对端 IP", "peer_ip", "", "例如 10.0.0.8")}
           <div class="toolbar-actions">
             <button class="danger-button" type="submit">批量踢会话</button>
           </div>
         </form>
         <form id="debug-close-form" class="form-grid">
-          ${renderTextField("Schema", "schema", "", "rtsp / rtmp / http")}
+          ${renderTextField("协议", "schema", "", "rtsp / rtmp / http")}
           ${renderTextField("Vhost", "vhost", "", "__defaultVhost__")}
-          ${renderTextField("App", "app", "", "live")}
-          ${renderTextField("Stream", "stream", "", "camera01")}
+          ${renderTextField("应用名", "app", "", "live")}
+          ${renderTextField("流名", "stream", "", "camera01")}
           <div class="checkbox-field">
             <input id="debug-force-close" type="checkbox" name="force" checked />
-            <label for="debug-force-close">force=true</label>
+            <label for="debug-force-close">强制关闭</label>
           </div>
           <div class="toolbar-actions">
             <button class="danger-button" type="submit">关闭流</button>
           </div>
         </form>
         <form id="debug-snap-form" class="form-grid">
-          ${renderTextField("Snapshot URL", "url", "", "rtsp://127.0.0.1/live/camera01")}
-          ${renderTextField("Timeout(s)", "timeout_sec", "10", "10", "number")}
-          ${renderTextField("Expire(s)", "expire_sec", "30", "30", "number")}
+          ${renderTextField("截图地址", "url", "", "rtsp://127.0.0.1/live/camera01")}
+          ${renderTextField("超时（秒）", "timeout_sec", "10", "10", "number")}
+          ${renderTextField("保留（秒）", "expire_sec", "30", "30", "number")}
           <div class="toolbar-actions">
             <button class="button" type="submit">抓图</button>
           </div>
@@ -1057,7 +2353,7 @@ function renderDebugPage(data) {
                     <button class="ghost-button" data-action="copy" data-value="${escapeAttr(state.ui.debug.snapResult.data_url)}">复制 Data URL</button>
                   </div>
                 </div>
-                <img class="snap-preview" src="${escapeAttr(state.ui.debug.snapResult.data_url)}" alt="ZLM snapshot preview" />
+                <img class="snap-preview" src="${escapeAttr(state.ui.debug.snapResult.data_url)}" alt="ZLM 抓图预览" />
               </div>
             `
             : ""
@@ -1083,14 +2379,14 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
   return `
     <div class="overview-grid">
       <div class="metric">
-        <label>当前 Attempt</label>
+        <label>当前尝试</label>
         <strong>${escapeHtml(detail.current_attempt ? `${detail.current_attempt.attempt_no}` : "0")}</strong>
-        <span class="subtle">${escapeHtml(detail.current_attempt?.status || "pending")}</span>
+        <span class="subtle">${escapeHtml(taskStatusLabel(detail.current_attempt?.status || ""))}</span>
       </div>
       <div class="metric">
         <label>执行节点</label>
         <strong>${escapeHtml(detail.current_attempt?.node_id || detail.task.assigned_node_id || "未分配")}</strong>
-        <span class="subtle">${escapeHtml(detail.current_attempt?.worker_kind || detail.task.type)}</span>
+        <span class="subtle">${escapeHtml(detail.current_attempt?.worker_kind || taskTypeLabel(detail.task.type))}</span>
       </div>
       <div class="metric">
         <label>录像摘要</label>
@@ -1119,11 +2415,11 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
                     (event) => `
                       <article class="event-item">
                         <div class="toolbar-actions">
-                          <span class="tag">${escapeHtml(event.source)}</span>
+                          <span class="tag">${escapeHtml(eventSourceLabel(event.source))}</span>
                           <span class="tag">${escapeHtml(event.event_type)}</span>
                           <span class="subtle">${escapeHtml(formatTime(event.created_at))}</span>
                         </div>
-                        <div class="subtle">${escapeHtml(event.event_level)}</div>
+                        <div class="subtle">${escapeHtml(eventLevelLabel(event.event_level))}</div>
                         <pre class="json-block">${escapeHtml(JSON.stringify(event.payload, null, 2))}</pre>
                       </article>
                     `,
@@ -1137,14 +2433,14 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
         <div class="panel-header">
           <div>
             <h3>规格差异</h3>
-            <p>requested_spec 与 resolved_spec 的差异路径。</p>
+            <p>请求规格与解析规格之间的差异路径。</p>
           </div>
         </div>
         <div class="diff-list">
           ${
             diffPaths.length
               ? diffPaths.map((path) => `<div class="diff-item mono">${escapeHtml(path)}</div>`).join("")
-              : renderInlineEmpty("requested_spec 与 resolved_spec 当前没有差异路径。")
+              : renderInlineEmpty("请求规格与解析规格当前没有差异路径。")
           }
         </div>
       </div>
@@ -1156,9 +2452,9 @@ function renderTaskEventsTab(taskId, eventsPage) {
   const params = state.route.searchParams;
   return `
     <form id="task-events-filter-form" class="filters">
-      ${renderTextField("Attempt", "attempt_no", params.get("attempt_no") || "", "留空表示全部")}
-      ${renderSelectField("Source", "source", ["", "core", "agent", "ffmpeg", "zlm_api", "zlm_hook", "scheduler", "user"], params.get("source") || "", (value) => value || "全部")}
-      ${renderTextField("Event Type", "event_type", params.get("event_type") || "", "task_started")}
+      ${renderTextField("尝试号", "attempt_no", params.get("attempt_no") || "", "留空表示全部")}
+      ${renderSelectField("来源", "source", ["", "core", "agent", "ffmpeg", "zlm_api", "zlm_hook", "scheduler", "user"], params.get("source") || "", (value) => value ? eventSourceLabel(value) : "全部来源")}
+      ${renderTextField("事件类型", "event_type", params.get("event_type") || "", "task_started")}
       <div class="toolbar-actions">
         <button class="button" type="submit">筛选事件</button>
       </div>
@@ -1171,11 +2467,11 @@ function renderTaskEventsTab(taskId, eventsPage) {
                 (event) => `
                   <article class="event-item">
                     <div class="toolbar-actions">
-                      <span class="tag">${escapeHtml(event.source)}</span>
+                      <span class="tag">${escapeHtml(eventSourceLabel(event.source))}</span>
                       <span class="tag">${escapeHtml(event.event_type)}</span>
                       <span class="subtle">${escapeHtml(formatTime(event.created_at))}</span>
                     </div>
-                    <div class="subtle">attempt ${escapeHtml(String(event.attempt_no || 0))} · ${escapeHtml(event.event_level)}</div>
+                    <div class="subtle">尝试 ${escapeHtml(String(event.attempt_no || 0))} · ${escapeHtml(eventLevelLabel(event.event_level))}</div>
                     <pre class="json-block">${escapeHtml(JSON.stringify(event.payload, null, 2))}</pre>
                   </article>
                 `,
@@ -1191,17 +2487,17 @@ function renderTaskEventsTab(taskId, eventsPage) {
 function renderTaskLogsTab(taskId, logs, params) {
   return `
     <form id="task-logs-filter-form" class="filters">
-      ${renderTextField("Attempt", "log_attempt_no", params.get("log_attempt_no") || "", "默认当前 attempt")}
-      ${renderSelectField("Stream", "log_stream", ["merged", "stdout", "stderr"], params.get("log_stream") || "merged")}
-      ${renderTextField("Limit", "log_limit", params.get("log_limit") || "200", "1 - 500")}
+      ${renderTextField("尝试号", "log_attempt_no", params.get("log_attempt_no") || "", "默认当前尝试")}
+      ${renderSelectField("日志流", "log_stream", ["merged", "stdout", "stderr"], params.get("log_stream") || "merged", (value) => logStreamLabel(value))}
+      ${renderTextField("条数上限", "log_limit", params.get("log_limit") || "200", "1 - 500")}
       <div class="toolbar-actions">
         <button class="button" type="submit">读取日志</button>
       </div>
     </form>
     <pre class="log-block">${escapeHtml(
       logs.lines.length
-        ? logs.lines.map((line) => `${formatTime(line.ts)} [${line.stream}] ${line.line}`).join("\n")
-        : "当前 attempt 没有日志。",
+        ? logs.lines.map((line) => `${formatTime(line.ts)} [${logStreamLabel(line.stream)}] ${line.line}`).join("\n")
+        : "当前尝试没有日志。",
     )}</pre>
     ${
       logs.next_cursor
@@ -1220,9 +2516,9 @@ function renderCreateDrawer() {
     <aside class="drawer ${open ? "open" : ""}">
       <div class="section-header">
         <div>
-          <div class="brand-mark">CREATE TASK</div>
+          <div class="brand-mark">创建任务</div>
           <h3>任务创建向导</h3>
-          <p>固定 7 步：类型、模板、输入源、处理与发布、恢复与调度、预览 resolved_spec、提交。</p>
+          <p>共 7 步：任务类型、模板、输入源、处理与发布、恢复与调度、规格预览、提交创建。</p>
         </div>
         <div class="section-actions">
           <button class="ghost-button" data-action="close-create-drawer">关闭</button>
@@ -1265,12 +2561,12 @@ function renderCreateStep(step, draft, templates) {
     case 1:
       return `
         <div class="create-grid">
-          ${renderSelectModelField("任务类型", "task_type", TASK_TYPES.map((item) => item.value), draft.task_type, (value) => value)}
+          ${renderSelectModelField("任务类型", "task_type", TASK_TYPES.map((item) => item.value), draft.task_type, (value) => taskTypeLabel(value))}
           ${renderTextModelField("任务名称", "name", draft.name, "relay-camera-01")}
-          ${renderTextModelField("Profile", "profile", draft.profile, "可选")}
-          ${renderTextModelField("Tenant", "common.tenant_id", draft.common.tenant_id, "default")}
-          ${renderTextModelField("Created By", "common.created_by", draft.common.created_by, "console-user")}
-          ${renderTextModelField("Priority", "priority", draft.priority, "0 - 100", "number")}
+          ${renderSelectModelField("任务预设", "profile", PROFILE_OPTIONS, draft.profile, (value) => profileLabel(value, "不使用预设"))}
+          ${renderTextModelField("租户", "common.tenant_id", draft.common.tenant_id, "default")}
+          ${renderTextModelField("创建人", "common.created_by", draft.common.created_by, "console-user")}
+          ${renderTextModelField("优先级", "priority", draft.priority, "0 - 100", "number")}
         </div>
       `;
     case 2: {
@@ -1294,8 +2590,8 @@ function renderCreateStep(step, draft, templates) {
       return `
         <div class="section-header">
           <div>
-            <h3>resolved_spec 预览</h3>
-            <p>提交前必须先让服务端计算最终结果。</p>
+            <h3>解析规格预览</h3>
+            <p>提交前由服务端计算最终规格，方便确认模板和默认值的实际落点。</p>
           </div>
           <div class="section-actions">
             <button class="button" data-action="create-preview">生成预览</button>
@@ -1310,9 +2606,9 @@ function renderCreateStep(step, draft, templates) {
     case 7:
       return `
         <div class="overview-grid">
-          ${metricCard("任务类型", draft.task_type)}
+          ${metricCard("任务类型", taskTypeLabel(draft.task_type))}
           ${metricCard("任务名称", draft.name || "未填写")}
-          ${metricCard("启动模式", draft.schedule.start_mode || "immediate")}
+          ${metricCard("启动模式", startModeLabel(draft.schedule.start_mode || "immediate"))}
           ${metricCard("模板", draft.template || "无")}
         </div>
         <pre class="json-block">${escapeHtml(JSON.stringify(state.ui.createPreview?.resolved_spec || buildDraftPayload(draft), null, 2))}</pre>
@@ -1345,16 +2641,17 @@ function renderCreateInputStep(draft) {
     <div class="create-grid">
       ${
         fixedInputKind
-          ? renderStaticModelField("输入类型", fixedInputKind)
-          : renderSelectModelField("输入类型", "input.kind", selectableInputKinds, draft.input.kind || "", (value) => value)
+          ? renderStaticModelField("输入类型", inputKindLabel(fixedInputKind))
+          : renderSelectModelField("输入类型", "input.kind", selectableInputKinds, draft.input.kind || "", (value) => inputKindLabel(value))
       }
       ${showUrl ? renderTextModelField("输入 URL", "input.url", draft.input.url, inputKind === "file" ? "/data/media/input.mp4" : "rtsp://camera/live") : ""}
       ${showMulticastInput ? renderTextModelField("组播地址", "input.group", draft.input.group, "239.0.0.1") : ""}
       ${(showMulticastInput || showRtpInput) ? renderTextModelField("端口", "input.port", draft.input.port, showRtpInput ? "30000" : "5004", "number") : ""}
-      ${showMulticastInput ? renderTextModelField("接口 IP", "input.interface_ip", draft.input.interface_ip, "192.168.1.10") : ""}
+      ${showMulticastInput ? renderTextModelField("绑定网卡名", "input.interface_name", draft.input.interface_name, "留空则使用节点默认组播网卡") : ""}
+      ${showMulticastInput ? renderTextModelField("绑定本地地址", "input.interface_ip", draft.input.interface_ip, "可选，本地监听地址") : ""}
       ${showMulticastInput ? renderTextModelField("TTL", "input.ttl", draft.input.ttl, "1", "number") : ""}
-      ${taskType !== "rtp_receive" ? renderTextModelField("Probe Timeout(ms)", "input.probe_timeout_ms", draft.input.probe_timeout_ms, "7000", "number") : ""}
-      ${showRtpInput ? renderTextModelField("TCP Mode", "input.tcp_mode", draft.input.tcp_mode, "0 / 1 / 2", "number") : ""}
+      ${taskType !== "rtp_receive" ? renderTextModelField("探测超时（毫秒）", "input.probe_timeout_ms", draft.input.probe_timeout_ms, "7000", "number") : ""}
+      ${showRtpInput ? renderTextModelField("TCP 模式", "input.tcp_mode", draft.input.tcp_mode, "0 / 1 / 2", "number") : ""}
       ${showRtpInput ? renderTextModelField("SSRC", "input.ssrc", draft.input.ssrc, "可选", "number") : ""}
       ${(showMulticastInput || showRtpInput) ? renderCheckboxModelField("端口重用", "input.reuse", draft.input.reuse) : ""}
     </div>
@@ -1379,18 +2676,19 @@ function renderCreateProcessStep(draft) {
   return `
     <div class="create-grid">
       ${showProcess ? renderTextModelField("处理模式", "process.mode", draft.process.mode, "copy_or_transcode") : ""}
-      ${showProcess ? renderTextModelField("Video Codec", "process.video_codec", draft.process.video_codec, "h264") : ""}
-      ${showProcess ? renderTextModelField("Audio Codec", "process.audio_codec", draft.process.audio_codec, "aac") : ""}
-      ${showProcess ? renderTextModelField("Bitrate", "process.bitrate", draft.process.bitrate, "2000", "number") : ""}
-      ${showProcess ? renderTextModelField("FPS", "process.fps", draft.process.fps, "25", "number") : ""}
+      ${showProcess ? renderTextModelField("视频编码", "process.video_codec", draft.process.video_codec, "h264") : ""}
+      ${showProcess ? renderTextModelField("音频编码", "process.audio_codec", draft.process.audio_codec, "aac") : ""}
+      ${showProcess ? renderTextModelField("目标码率", "process.bitrate", draft.process.bitrate, "2000", "number") : ""}
+      ${showProcess ? renderTextModelField("帧率", "process.fps", draft.process.fps, "25", "number") : ""}
       ${showProcess ? renderTextModelField("GOP", "process.gop", draft.process.gop, "50", "number") : ""}
-      ${showProcess ? renderTextModelField("Profile", "process.profile", draft.process.profile, "baseline") : ""}
-      ${showProcess ? renderTextModelField("Preset", "process.preset", draft.process.preset, "veryfast") : ""}
-      ${showPublishKindSelect ? renderSelectModelField("发布类型", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value || "内部流 / 不显式设置") : renderStaticModelField("发布类型", publishKind || "internal")}
+      ${showProcess ? renderTextModelField("编码档位", "process.profile", draft.process.profile, "baseline") : ""}
+      ${showProcess ? renderTextModelField("编码预设", "process.preset", draft.process.preset, "veryfast") : ""}
+      ${showPublishKindSelect ? renderSelectModelField("发布类型", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value ? publishKindLabel(value) : "内部流 / 不显式设置") : renderStaticModelField("发布类型", publishKindLabel(publishKind, "内部流"))}
       ${showPublishUrl ? renderTextModelField("发布 URL", "publish.url", draft.publish.url, taskType === "file_transcode" ? "/data/media/output.mp4" : "rtmp://zlm/live/stream") : ""}
       ${showPublishNetwork ? renderTextModelField("发布组播地址", "publish.group", draft.publish.group, "239.1.1.10") : ""}
       ${showPublishNetwork ? renderTextModelField("发布端口", "publish.port", draft.publish.port, "1234", "number") : ""}
-      ${showPublishNetwork ? renderTextModelField("发布网卡", "publish.interface_ip", draft.publish.interface_ip, "192.168.1.10") : ""}
+      ${showPublishNetwork ? renderTextModelField("发布网卡名", "publish.interface_name", draft.publish.interface_name, "留空则使用节点默认组播网卡") : ""}
+      ${showPublishNetwork ? renderTextModelField("发布本地地址", "publish.interface_ip", draft.publish.interface_ip, "可选，本地发送地址") : ""}
       ${showPublishNetwork ? renderTextModelField("发布 TTL", "publish.ttl", draft.publish.ttl, "1", "number") : ""}
       ${showPublishUrl || showPublishNetwork ? renderTextModelField("发布格式", "publish.format", draft.publish.format, "mpegts") : ""}
       ${showProtocolFlags ? renderCheckboxModelField("enable_rtsp", "publish.enable_rtsp", draft.publish.enable_rtsp) : ""}
@@ -1410,23 +2708,23 @@ function renderCreatePolicyStep(draft) {
   return `
     <div class="create-grid">
       ${renderCheckboxModelField("启用录制", "record.enabled", draft.record.enabled)}
-      ${showRecordFields ? renderSelectModelField("录制格式", "record.format", ["", ...RECORD_FORMATS], draft.record.format || "", (value) => value || "默认") : ""}
+      ${showRecordFields ? renderSelectModelField("录制格式", "record.format", ["", ...RECORD_FORMATS], draft.record.format || "", (value) => value ? recordFormatLabel(value) : "默认") : ""}
       ${showRecordFields ? renderTextModelField("录制切片秒数", "record.segment_sec", draft.record.segment_sec, "60", "number") : ""}
       ${showRecordFields ? renderTextModelField("录制路径", "record.save_path", draft.record.save_path, "/data/zlm/record") : ""}
-      ${showRecordFields ? renderCheckboxModelField("as_player", "record.as_player", draft.record.as_player) : ""}
-      ${renderSelectModelField("恢复策略", "recovery.policy", ["", ...RECOVERY_POLICIES], draft.recovery.policy || "", (value) => value || "默认")}
+      ${showRecordFields ? renderCheckboxModelField("按播放器口径记账", "record.as_player", draft.record.as_player) : ""}
+      ${renderSelectModelField("恢复策略", "recovery.policy", ["", ...RECOVERY_POLICIES], draft.recovery.policy || "", (value) => value ? recoveryPolicyLabel(value) : "默认")}
       ${renderTextModelField("恢复模式", "recovery.resume_mode", draft.recovery.resume_mode, "auto")}
       ${renderCheckboxModelField("孤儿接管", "recovery.orphan_adopt", draft.recovery.orphan_adopt)}
       ${renderTextModelField("最大连续失败", "recovery.max_consecutive_failures", draft.recovery.max_consecutive_failures, "3", "number")}
-      ${renderSelectModelField("启动模式", "schedule.start_mode", START_MODES, draft.schedule.start_mode, (value) => value)}
-      ${startMode === "at" ? renderTextModelField("Start At", "schedule.start_at", draft.schedule.start_at, "2026-03-30T12:00:00Z") : ""}
-      ${startMode === "cron" ? renderTextModelField("Cron", "schedule.cron", draft.schedule.cron, "0 */5 * * * *") : ""}
-      ${renderTextareaModelField("required_labels", "resource.required_labels_text", draft.resource.required_labels_text, "逗号分隔")}
-      ${renderTextareaModelField("preferred_labels", "resource.preferred_labels_text", draft.resource.preferred_labels_text, "逗号分隔")}
-      ${renderTextModelField("network_interface", "resource.network_interface", draft.resource.network_interface, "eth0")}
-      ${renderCheckboxModelField("need_gpu", "resource.need_gpu", draft.resource.need_gpu)}
-      ${renderTextModelField("slot_class", "resource.slot_class", draft.resource.slot_class, "standard")}
-      ${renderTextModelField("max_cpu_percent", "resource.max_cpu_percent", draft.resource.max_cpu_percent, "80", "number")}
+      ${renderSelectModelField("启动模式", "schedule.start_mode", START_MODES, draft.schedule.start_mode, (value) => startModeLabel(value))}
+      ${startMode === "at" ? renderTextModelField("指定启动时间", "schedule.start_at", draft.schedule.start_at, "2026-03-30T12:00:00Z") : ""}
+      ${startMode === "cron" ? renderTextModelField("Cron 表达式", "schedule.cron", draft.schedule.cron, "0 */5 * * * *") : ""}
+      ${renderTextareaModelField("必需标签", "resource.required_labels_text", draft.resource.required_labels_text, "逗号分隔")}
+      ${renderTextareaModelField("优选标签", "resource.preferred_labels_text", draft.resource.preferred_labels_text, "逗号分隔")}
+      ${renderTextModelField("资源网络接口", "resource.network_interface", draft.resource.network_interface, "eth0")}
+      ${renderCheckboxModelField("需要 GPU", "resource.need_gpu", draft.resource.need_gpu)}
+      ${renderTextModelField("资源槽位类型", "resource.slot_class", draft.resource.slot_class, "standard")}
+      ${renderTextModelField("最大 CPU 百分比", "resource.max_cpu_percent", draft.resource.max_cpu_percent, "80", "number")}
     </div>
   `;
 }
@@ -1438,16 +2736,16 @@ function renderAuthModal() {
     <section class="modal ${open ? "open" : ""}">
       <div class="section-header">
         <div>
-          <div class="brand-mark">AUTH</div>
-          <h3>Bearer Token</h3>
-          <p>当前前端不内建登录流程。启用鉴权时，直接粘贴 JWT Bearer Token。</p>
+          <div class="brand-mark">认证</div>
+          <h3>访问令牌</h3>
+          <p>当前控制台不内建登录流程。启用鉴权时，请直接粘贴 JWT Bearer Token。</p>
         </div>
         <div class="section-actions">
           <button class="ghost-button" data-action="close-auth-modal">关闭</button>
         </div>
       </div>
       <div class="field-block">
-        <label for="auth-token-input">Authorization Token</label>
+        <label for="auth-token-input">访问令牌（Bearer）</label>
         <textarea id="auth-token-input" data-action="auth-token-input" placeholder="eyJhbGciOi..." rows="8">${escapeHtml(state.ui.authDraftToken || state.token)}</textarea>
       </div>
       <div class="modal-actions">
@@ -1475,13 +2773,18 @@ function renderToasts() {
   `;
 }
 
+function getSelectedApiDoc() {
+  if (!state.ui.apiDocModalKey) {
+    return null;
+  }
+  return EXTERNAL_API_DOCS.find((item) => apiDocKey(item) === state.ui.apiDocModalKey) || null;
+}
+
 async function handleClick(event) {
   const link = event.target.closest("[data-link]");
   if (link) {
-    event.preventDefault();
-    const href = link.getAttribute("href");
-    if (href) {
-      await navigate(href);
+    if (link.getAttribute("aria-disabled") === "true") {
+      event.preventDefault();
     }
     return;
   }
@@ -1497,14 +2800,28 @@ async function handleClick(event) {
         await refreshSession(true);
         await refreshRoute();
         break;
+      case "set-theme":
+        state.ui.themePreference = actionTarget.dataset.themeValue || "system";
+        window.localStorage.setItem(THEME_STORAGE_KEY, state.ui.themePreference);
+        applyTheme(state.ui.themePreference);
+        renderApp({ chrome: true, page: false, overlays: false, toasts: false });
+        break;
+      case "open-api-doc":
+        state.ui.apiDocModalKey = actionTarget.dataset.apiDocKey || "";
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
+        break;
+      case "close-api-doc":
+        state.ui.apiDocModalKey = "";
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
+        break;
       case "open-auth-modal":
         state.ui.authDraftToken = state.token;
         state.ui.authModalOpen = true;
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "close-auth-modal":
         state.ui.authModalOpen = false;
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "save-auth-token":
         state.token = (state.ui.authDraftToken || "").trim();
@@ -1522,7 +2839,7 @@ async function handleClick(event) {
         state.token = "";
         window.localStorage.removeItem(TOKEN_STORAGE_KEY);
         await refreshSession(true);
-        renderApp();
+        renderApp({ chrome: true, page: false, overlays: true, toasts: false });
         break;
       case "open-create-drawer":
         if (!canAccess("task_write")) {
@@ -1531,15 +2848,15 @@ async function handleClick(event) {
         await ensureTemplatesLoaded();
         state.ui.createOpen = true;
         state.ui.createError = null;
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "close-create-drawer":
         state.ui.createOpen = false;
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "create-prev-step":
         state.ui.createStep = Math.max(1, state.ui.createStep - 1);
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "create-next-step":
         if (state.ui.createStep === 6 && !state.ui.createPreview) {
@@ -1548,11 +2865,11 @@ async function handleClick(event) {
         if (state.ui.createStep < 7) {
           state.ui.createStep += 1;
         }
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "create-preview":
         await requestTaskPreview();
-        renderApp();
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "create-submit":
         await submitTaskCreate();
@@ -1698,7 +3015,7 @@ async function handleChange(event) {
       state.ui.debug.workThreadsLoadResult = null;
       state.ui.debug.snapResult = null;
       state.ui.debug.hooksResult = null;
-      renderApp();
+      renderApp({ chrome: false, page: true, overlays: false, toasts: false });
     }
   } catch (error) {
     console.error(error);
@@ -1744,59 +3061,56 @@ async function navigate(href) {
 }
 
 function parseRoute(pathname, search) {
-  const cleanPath = pathname || "/tasks";
+  const cleanPath = pathname || "/overview";
   const searchParams = new URLSearchParams(search || "");
   const taskMatch = cleanPath.match(/^\/tasks\/([^/]+)$/);
   if (taskMatch) {
     return { name: "task-detail", path: cleanPath, searchParams, params: { id: taskMatch[1] } };
   }
+  if (cleanPath === "/overview") return { name: "overview", path: cleanPath, searchParams, params: {} };
+  if (cleanPath === "/api-docs") return { name: "api-docs", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/streams") return { name: "streams", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/multicast") return { name: "multicast", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/records") return { name: "records", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/nodes") return { name: "nodes", path: cleanPath, searchParams, params: {} };
   if (cleanPath.startsWith("/debug")) return { name: "debug", path: cleanPath, searchParams, params: {} };
-  return { name: "tasks", path: "/tasks", searchParams, params: {} };
+  if (cleanPath.startsWith("/tasks")) return { name: "tasks", path: "/tasks", searchParams, params: {} };
+  return { name: "overview", path: "/overview", searchParams, params: {} };
 }
 
 function currentRouteTitle() {
-  switch (state.route.name) {
-    case "task-detail":
-      return "任务详情";
-    case "streams":
-      return "流中心";
-    case "multicast":
-      return "组播中心";
-    case "records":
-      return "录像中心";
-    case "nodes":
-      return "节点中心";
-    case "debug":
-      return "调试台";
-    default:
-      return "任务中心";
-  }
+  return LABELS.route[state.route.name] || "系统总览";
 }
 
 function currentRouteSubtitle() {
   switch (state.route.name) {
+    case "overview":
+      return "系统介绍、整体状态、节点健康、在线流与最近任务动态。";
+    case "api-docs":
+      return "仅保留第三方业务系统需要调用的北向接口，并附示例。";
     case "task-detail":
-      return "基本信息、事件、日志、requested_spec、resolved_spec。";
+      return "聚焦单个任务的运行状态、事件、日志和规格差异。";
     case "streams":
-      return "内部流、播放地址、viewer 状态和管理员操作。";
+      return "查看在线流、播放地址、观众数和流关闭操作。";
     case "multicast":
-      return "multicast_bridge 任务、组地址、TTL、上下游。";
+      return "聚合组播任务、上下游绑定、网卡和最近异常。";
     case "records":
-      return "录像文件检索和任务回溯。";
+      return "按任务、流和时间检索录像文件，并快速复制路径。";
     case "nodes":
-      return "节点健康、能力矩阵、当前任务和 ZLM 概览。";
+      return "查看节点健康、能力矩阵、当前任务和 ZLM 概览。";
     case "debug":
-      return "原始 ZLM 调试接口的安全入口。";
+      return "提供管理员调试入口，覆盖会话、媒体、玩家、关流和抓图。";
+    case "tasks":
+      return "任务筛选、创建、派发、回溯和批量运维入口。";
     default:
-      return "任务列表、筛选、创建、重试、停止和克隆。";
+      return "任务筛选、创建、派发、回溯和批量运维入口。";
   }
 }
 
 function canAccess(permission) {
+  if (!permission) {
+    return true;
+  }
   if (!state.session) {
     return !state.sessionError;
   }
@@ -1807,8 +3121,8 @@ function sessionSubtitle() {
   if (!state.session) {
     return state.sessionError ? errorMessage(state.sessionError) : "正在建立会话";
   }
-  const tenant = state.session.tenant_id ? `tenant ${state.session.tenant_id}` : "platform scope";
-  return `${state.session.role} · ${tenant}`;
+  const tenant = state.session.tenant_id ? `租户 ${state.session.tenant_id}` : "平台范围";
+  return `${apiRoleLabel(state.session.role)} · ${tenant}`;
 }
 
 async function apiRequest(path, options = {}) {
@@ -1904,27 +3218,27 @@ async function applySelectedTemplate(templateName) {
   }
   state.ui.createPreview = null;
   state.ui.createError = null;
-  renderApp();
+  renderApp({ chrome: false, page: false, overlays: true, toasts: false });
 }
 
 async function performTaskAction(taskId, action) {
   if (!taskId) {
     return;
   }
-  const confirmed = window.confirm(`确认执行 ${action} ?`);
+  const confirmed = window.confirm(`确认执行“${taskActionLabel(action)}”吗？`);
   if (!confirmed) {
     return;
   }
   await apiRequest(`/api/v1/tasks/${taskId}/${action}`, {
     method: "POST",
   });
-  toast(`任务 ${shortId(taskId)} 已执行 ${action}`, "success");
+  toast(`任务 ${shortId(taskId)} 已执行${taskActionLabel(action)}`, "success");
   state.cache.taskDetails.delete(taskId);
   await refreshRoute();
 }
 
 async function cloneTask(taskId) {
-  const name = window.prompt("输入克隆后的任务名称", "task-copy");
+  const name = window.prompt("请输入克隆后的任务名称", "task-copy");
   if (!name) {
     return;
   }
@@ -1937,7 +3251,7 @@ async function cloneTask(taskId) {
 }
 
 async function closeStream(data) {
-  const confirmed = window.confirm(`确认关闭流 ${data.app}/${data.stream} ?`);
+  const confirmed = window.confirm(`确认关闭流 ${data.app}/${data.stream} 吗？`);
   if (!confirmed) {
     return;
   }
@@ -1959,14 +3273,14 @@ async function closeStream(data) {
 async function toggleNodeInsight(nodeId) {
   if (state.ui.openNodeId === nodeId) {
     state.ui.openNodeId = "";
-    renderApp();
+    renderApp({ chrome: false, page: true, overlays: false, toasts: false });
     return;
   }
   state.ui.openNodeId = nodeId;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
   const insight = await loadNodeInsight(nodeId);
   state.cache.nodeInsights.set(nodeId, insight);
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 async function loadNodeInsight(nodeId) {
@@ -1994,21 +3308,21 @@ async function loadDebugMedia(formData) {
   });
   state.ui.debug.mediaResult = await apiRequest(`/api/v1/debug/zlm/media?${query.toString()}`);
   state.ui.debug.lastError = null;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 async function loadDebugSessions() {
   ensureDebugNode();
   state.ui.debug.sessionsResult = await apiRequest(`/api/v1/debug/zlm/sessions?node_id=${encodeURIComponent(state.ui.debug.nodeId)}`);
   state.ui.debug.lastError = null;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 async function loadDebugPlayers() {
   ensureDebugNode();
   state.ui.debug.playersResult = await apiRequest(`/api/v1/debug/zlm/players?node_id=${encodeURIComponent(state.ui.debug.nodeId)}`);
   state.ui.debug.lastError = null;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 async function loadDebugStatistics() {
@@ -2022,21 +3336,21 @@ async function loadDebugStatistics() {
   state.ui.debug.threadsLoadResult = threadsLoad;
   state.ui.debug.workThreadsLoadResult = workThreadsLoad;
   state.ui.debug.lastError = null;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 async function loadDebugHooks() {
   ensureDebugNode();
   state.ui.debug.hooksResult = await apiRequest(`/api/v1/debug/hooks?node_id=${encodeURIComponent(state.ui.debug.nodeId)}&limit=40`);
   state.ui.debug.lastError = null;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 async function kickDebugSession(formData) {
   ensureDebugNode();
   const sessionId = (formData.get("session_id") || "").toString().trim();
   if (!sessionId) {
-    toast("Session ID 不能为空", "error");
+    toast("会话 ID 不能为空", "error");
     return;
   }
   await apiRequest("/api/v1/debug/zlm/kick-session", {
@@ -2046,7 +3360,7 @@ async function kickDebugSession(formData) {
       session_id: sessionId,
     },
   });
-  toast(`已请求踢出 Session ${sessionId}`, "success");
+  toast(`已请求踢出会话 ${sessionId}`, "success");
 }
 
 async function submitDebugKickBatch(formData) {
@@ -2088,7 +3402,7 @@ async function submitDebugSnap(formData) {
   });
   state.ui.debug.snapResult = await apiRequest(`/api/v1/debug/zlm/snap?${query.toString()}`);
   state.ui.debug.lastError = null;
-  renderApp();
+  renderApp({ chrome: false, page: true, overlays: false, toasts: false });
 }
 
 function ensureDebugNode() {
@@ -2105,7 +3419,7 @@ async function requestTaskPreview() {
       body: payload,
     });
     state.ui.createError = null;
-    toast("resolved_spec 预览已更新", "success");
+    toast("规格预览已更新", "success");
   } catch (error) {
     state.ui.createError = error;
     toast(errorMessage(error), "error");
@@ -2131,7 +3445,7 @@ async function submitTaskCreate() {
   } catch (error) {
     state.ui.createError = error;
     toast(errorMessage(error), "error");
-    renderApp();
+    renderApp({ chrome: false, page: false, overlays: true, toasts: true });
   }
 }
 
@@ -2162,6 +3476,7 @@ function buildDraftPayload(draft) {
   setIfPresent(payload.input, "url", draft.input.url);
   setIfPresent(payload.input, "group", draft.input.group);
   setIfNumber(payload.input, "port", draft.input.port);
+  setIfPresent(payload.input, "interface_name", draft.input.interface_name);
   setIfPresent(payload.input, "interface_ip", draft.input.interface_ip);
   setIfNumber(payload.input, "ttl", draft.input.ttl);
   setIfBoolean(payload.input, "reuse", draft.input.reuse);
@@ -2182,6 +3497,7 @@ function buildDraftPayload(draft) {
   setIfPresent(payload.publish, "url", draft.publish.url);
   setIfPresent(payload.publish, "group", draft.publish.group);
   setIfNumber(payload.publish, "port", draft.publish.port);
+  setIfPresent(payload.publish, "interface_name", draft.publish.interface_name);
   setIfPresent(payload.publish, "interface_ip", draft.publish.interface_ip);
   setIfNumber(payload.publish, "ttl", draft.publish.ttl);
   setIfPresent(payload.publish, "format", draft.publish.format);
@@ -2240,6 +3556,7 @@ function createDefaultDraft() {
       url: "",
       group: "",
       port: "",
+      interface_name: "",
       interface_ip: "",
       ttl: "",
       reuse: false,
@@ -2262,6 +3579,7 @@ function createDefaultDraft() {
       url: "",
       group: "",
       port: "",
+      interface_name: "",
       interface_ip: "",
       ttl: "",
       format: "",
@@ -2334,13 +3652,13 @@ function renderNodeMetric(node) {
   return `
     <div class="metric-panel">
       <label>${escapeHtml(node.node_name)}</label>
-      <strong>${node.healthy ? "ONLINE" : "OFFLINE"}</strong>
-      <div class="subtle">${escapeHtml(node.hostname)} · ${escapeHtml(node.network_mode)}</div>
+      <strong>${node.healthy ? "在线" : "离线"}</strong>
+      <div class="subtle">${escapeHtml(node.hostname)} · ${escapeHtml(networkModeLabel(node.network_mode))}</div>
       <div class="inline-list" style="margin-top: 12px;">
         ${node.zlm_version ? `<span class="tag">${escapeHtml(node.zlm_version)}</span>` : ""}
         <span class="tag">CPU ${formatPercent(node.cpu_percent)}</span>
-        <span class="tag">MEM ${formatPercent(node.mem_percent)}</span>
-        <span class="tag">RUN ${escapeHtml(String(node.running_tasks ?? 0))}</span>
+        <span class="tag">内存 ${formatPercent(node.mem_percent)}</span>
+        <span class="tag">任务 ${escapeHtml(String(node.running_tasks ?? 0))}</span>
       </div>
     </div>
   `;
@@ -2350,10 +3668,10 @@ function renderExpandedNodeInsight(node, insight) {
   return `
     <div class="overview-grid">
       ${metricCard("CPU", formatPercent(node.cpu_percent))}
-      ${metricCard("MEM", formatPercent(node.mem_percent))}
-      ${metricCard("Disk", formatPercent(node.disk_percent))}
-      ${metricCard("ZLM", node.zlm_alive === false ? "down" : "up")}
-      ${metricCard("FFmpeg", node.ffmpeg_alive === false ? "down" : "up")}
+      ${metricCard("内存", formatPercent(node.mem_percent))}
+      ${metricCard("磁盘", formatPercent(node.disk_percent))}
+      ${metricCard("ZLM", node.zlm_alive === false ? "异常" : "正常")}
+      ${metricCard("FFmpeg", node.ffmpeg_alive === false ? "异常" : "正常")}
       ${metricCard("最近心跳", formatTime(node.last_seen_at))}
     </div>
     <div class="split-grid" style="margin-top: 16px;">
@@ -2361,29 +3679,29 @@ function renderExpandedNodeInsight(node, insight) {
         <div class="panel-header">
           <div>
             <h3>能力矩阵</h3>
-            <p>${escapeHtml(node.labels.join(", ") || "无 labels")}</p>
+            <p>${escapeHtml(node.labels.join(", ") || "无标签")}</p>
           </div>
         </div>
         <div class="inline-list">
           ${node.ffmpeg_protocols.slice(0, 8).map((item) => `<span class="tag">${escapeHtml(item)}</span>`).join("")}
         </div>
-        <div class="subtle" style="margin-top: 12px;">Encoders: ${escapeHtml(node.ffmpeg_encoders.slice(0, 6).join(", ") || "—")}</div>
-        <div class="subtle">Interfaces: ${escapeHtml(node.interfaces.join(", ") || "—")}</div>
+        <div class="subtle" style="margin-top: 12px;">编码器：${escapeHtml(node.ffmpeg_encoders.slice(0, 6).join(", ") || "—")}</div>
+        <div class="subtle">网卡：${escapeHtml(node.interfaces.join(", ") || "—")}</div>
       </div>
       <div class="panel">
         <div class="panel-header">
           <div>
             <h3>ZLM 概览</h3>
-            <p>媒体、Session、玩家数量，以及线程负载和对象统计。</p>
+            <p>媒体对象、会话、播放器数量，以及线程负载和对象统计。</p>
           </div>
         </div>
         <div class="overview-grid">
-          ${metricCard("Media", safeCollectionSize(insight?.media?.data))}
-          ${metricCard("Sessions", safeCollectionSize(insight?.sessions?.data))}
-          ${metricCard("Players", safeCollectionSize(insight?.players?.data))}
-          ${metricCard("Threads Avg", formatThreadLoadAverage(insight?.threadsLoad))}
-          ${metricCard("Work Avg", formatThreadLoadAverage(insight?.workThreadsLoad))}
-          ${metricCard("Objects", formatStatisticObjectCount(insight?.statistic))}
+          ${metricCard("媒体对象", safeCollectionSize(insight?.media?.data))}
+          ${metricCard("会话数", safeCollectionSize(insight?.sessions?.data))}
+          ${metricCard("播放器", safeCollectionSize(insight?.players?.data))}
+          ${metricCard("前台线程均值", formatThreadLoadAverage(insight?.threadsLoad))}
+          ${metricCard("工作线程均值", formatThreadLoadAverage(insight?.workThreadsLoad))}
+          ${metricCard("对象数", formatStatisticObjectCount(insight?.statistic))}
         </div>
       </div>
     </div>
@@ -2392,7 +3710,7 @@ function renderExpandedNodeInsight(node, insight) {
         <div class="panel-header">
           <div>
             <h3>最近心跳</h3>
-            <p>最近 12 次 heartbeat 的负载快照。</p>
+            <p>最近 12 次心跳采样的负载快照。</p>
           </div>
         </div>
         ${renderHeartbeatTimeline(insight?.heartbeats)}
@@ -2401,7 +3719,7 @@ function renderExpandedNodeInsight(node, insight) {
         <div class="panel-header">
           <div>
             <h3>线程与对象统计</h3>
-            <p>getThreadsLoad / getWorkThreadsLoad / getStatistic 汇总。</p>
+            <p>汇总前台线程、工作线程与对象统计结果。</p>
           </div>
         </div>
         ${renderThreadLoadPanel(insight?.threadsLoad, insight?.workThreadsLoad)}
@@ -2427,7 +3745,7 @@ function renderExpandedNodeInsight(node, insight) {
                         ${statusPill(task.status)}
                       </div>
                       <div><strong>${escapeHtml(task.name)}</strong></div>
-                      <div class="subtle">${escapeHtml(task.type)} · priority ${escapeHtml(String(task.priority))}</div>
+                      <div class="subtle">${escapeHtml(taskTypeLabel(task.type))} · 优先级 ${escapeHtml(String(task.priority))}</div>
                     </article>
                   `,
                 )
@@ -2468,20 +3786,33 @@ function renderTaskDetailTab(taskId, activeTab, tab, label) {
 }
 
 function renderRolePill(role) {
-  return `<span class="role-pill">${escapeHtml(role)}</span>`;
+  return `<span class="role-pill">${escapeHtml(apiRoleLabel(role))}</span>`;
 }
 
 function renderPlayUrls(stream, node, task) {
   const urls = Array.isArray(stream) ? stream : [];
   return urls.length
-    ? `<div class="play-url-list">${urls.map((url) => `<button class="play-url" data-action="copy" data-value="${escapeAttr(url)}">${escapeHtml(url)}</button>`).join("")}</div>`
+    ? `
+      <div class="play-url-list">
+        ${urls
+          .map(
+            (url) => `
+              <div class="play-url">
+                <code class="selectable">${escapeHtml(url)}</code>
+                <button class="ghost-button" data-action="copy" data-value="${escapeAttr(url)}">复制</button>
+              </div>
+            `,
+          )
+          .join("")}
+      </div>
+    `
     : "—";
 }
 
 function renderRecordingLabel(task) {
   const enabled = Boolean(task?.resolved_spec?.record?.enabled);
   const format = task?.resolved_spec?.record?.format;
-  return enabled ? `enabled${format ? ` (${format})` : ""}` : "disabled";
+  return enabled ? `已启用${format ? `（${recordFormatLabel(format)}）` : ""}` : "未启用";
 }
 
 function renderDebugResult(value) {
@@ -2497,10 +3828,10 @@ function renderThreadLoadPanel(threadsLoad, workThreadsLoad) {
   }
   return `
     <div class="overview-grid">
-      ${metricCard("Threads Avg", formatThreadLoadAverage(threadsLoad))}
-      ${metricCard("Threads Max", formatThreadLoadMax(threadsLoad))}
-      ${metricCard("Work Avg", formatThreadLoadAverage(workThreadsLoad))}
-      ${metricCard("Work Max", formatThreadLoadMax(workThreadsLoad))}
+      ${metricCard("前台线程均值", formatThreadLoadAverage(threadsLoad))}
+      ${metricCard("前台线程峰值", formatThreadLoadMax(threadsLoad))}
+      ${metricCard("工作线程均值", formatThreadLoadAverage(workThreadsLoad))}
+      ${metricCard("工作线程峰值", formatThreadLoadMax(workThreadsLoad))}
     </div>
     <pre class="json-block">${escapeHtml(JSON.stringify({
       threads: threadsLoad?.data || threadsLoad || [],
@@ -2521,15 +3852,15 @@ function renderHeartbeatTimeline(heartbeats) {
             <article class="event-item">
               <div class="toolbar-actions">
                 <span class="subtle">${escapeHtml(formatTime(item.received_at || item.node_time))}</span>
-                <span class="tag">${item.zlm_alive === false ? "zlm_down" : "zlm_up"}</span>
-                <span class="tag">${item.ffmpeg_alive === false ? "ffmpeg_down" : "ffmpeg_up"}</span>
+                <span class="tag">${item.zlm_alive === false ? "ZLM 异常" : "ZLM 正常"}</span>
+                <span class="tag">${item.ffmpeg_alive === false ? "FFmpeg 异常" : "FFmpeg 正常"}</span>
               </div>
               <div class="inline-list">
                 <span class="tag">CPU ${formatPercent(item.cpu_percent)}</span>
-                <span class="tag">MEM ${formatPercent(item.mem_percent)}</span>
-                <span class="tag">DISK ${formatPercent(item.disk_percent)}</span>
-                <span class="tag">RUN ${escapeHtml(String(item.running_tasks ?? 0))}</span>
-                <span class="tag">SLOT ${formatPercent((item.slot_usage ?? 0) * 100)}</span>
+                <span class="tag">内存 ${formatPercent(item.mem_percent)}</span>
+                <span class="tag">磁盘 ${formatPercent(item.disk_percent)}</span>
+                <span class="tag">任务 ${escapeHtml(String(item.running_tasks ?? 0))}</span>
+                <span class="tag">槽位 ${formatPercent((item.slot_usage ?? 0) * 100)}</span>
               </div>
             </article>
           `,
@@ -2553,7 +3884,7 @@ function renderHookTimeline(items) {
                 <span class="tag">${escapeHtml(item.hook_name)}</span>
                 <span class="subtle">${escapeHtml(formatTime(item.received_at))}</span>
               </div>
-              <div class="subtle">${escapeHtml(item.processed_at ? `processed @ ${formatTime(item.processed_at)}` : "pending")}</div>
+              <div class="subtle">${escapeHtml(item.processed_at ? `已处理：${formatTime(item.processed_at)}` : "待处理")}</div>
               <pre class="json-block">${escapeHtml(JSON.stringify(item.payload, null, 2))}</pre>
             </article>
           `,
@@ -2680,7 +4011,7 @@ function metricCard(label, value, rawValue = false) {
 }
 
 function statusPill(status) {
-  return `<span class="status-pill ${STATUS_THEME[status] || "status-created"}">${escapeHtml(status)}</span>`;
+  return `<span class="status-pill ${STATUS_THEME[status] || "status-created"}">${escapeHtml(taskStatusLabel(status))}</span>`;
 }
 
 function renderLoadingPanel() {
@@ -2710,7 +4041,7 @@ function renderAuthRequired() {
       <h3>需要认证</h3>
       <p>${escapeHtml(errorMessage(state.sessionError) || "当前环境启用了鉴权，请先提供 Bearer Token。")}</p>
       <div class="actions">
-        <button class="button" data-action="open-auth-modal">输入 Token</button>
+        <button class="button" data-action="open-auth-modal">输入令牌</button>
       </div>
     </section>
   `;
@@ -2750,7 +4081,7 @@ function nodeLabel(node) {
 
 function viewerCountLabel(viewerCount, hasViewer) {
   if (viewerCount !== null && viewerCount !== undefined) return String(viewerCount);
-  if (hasViewer === true) return ">=1";
+  if (hasViewer === true) return "至少 1";
   if (hasViewer === false) return "0";
   return "—";
 }
@@ -2762,10 +4093,12 @@ function multicastRowModel(task, spec, detail, node, streams) {
   const progress = deriveLatestProgress(detail?.recent_events || []);
   const streamRuntime = Array.isArray(streams) ? streams.find((item) => item.bitrate_kbps || item.viewer_count !== undefined) : null;
   return {
-    mode: `${input.kind || "unknown"} -> ${publish.kind || "internal"}`,
+    mode: `${inputKindLabel(input.kind, "未知输入")} -> ${publish.kind ? publishKindLabel(publish.kind) : "内部流"}`,
     group: usePublish ? publish.group || "—" : input.group || "—",
     port: String(usePublish ? publish.port || "—" : input.port || "—"),
-    interfaceIp: usePublish ? publish.interface_ip || "—" : input.interface_ip || "—",
+    interfaceIp: usePublish
+      ? publish.interface_name || publish.interface_ip || "—"
+      : input.interface_name || input.interface_ip || "—",
     ttl: String(usePublish ? publish.ttl || "—" : input.ttl || "—"),
     node: nodeLabel(node),
     bitrate: formatBitrateKbps(streamRuntime?.bitrate_kbps ?? progress?.bitrate_kbps),
@@ -3081,6 +4414,7 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     url: "string",
     group: "string",
     port: "number",
+    interface_name: "string",
     interface_ip: "string",
     ttl: "number",
     reuse: "boolean",
@@ -3103,6 +4437,7 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     url: "string",
     group: "string",
     port: "number",
+    interface_name: "string",
     interface_ip: "string",
     ttl: "number",
     format: "string",
@@ -3170,12 +4505,382 @@ function applyDraftSectionDefaults(target, source, mapping) {
   });
 }
 
+function readThemePreference() {
+  const value = window.localStorage.getItem(THEME_STORAGE_KEY) || "system";
+  return THEME_OPTIONS.includes(value) ? value : "system";
+}
+
+function resolveTheme(preference) {
+  if (preference === "light" || preference === "dark") {
+    return preference;
+  }
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyTheme(preference) {
+  const theme = resolveTheme(preference);
+  document.documentElement.dataset.theme = theme;
+  document.documentElement.style.colorScheme = theme;
+}
+
+function watchSystemTheme() {
+  if (!window.matchMedia) {
+    return;
+  }
+  const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+  const update = () => {
+    if (state.ui.themePreference === "system") {
+      applyTheme("system");
+      if (shell.ready) {
+        renderApp({ chrome: true, page: false, overlays: false, toasts: false });
+      }
+    }
+  };
+  if (typeof mediaQuery.addEventListener === "function") {
+    mediaQuery.addEventListener("change", update);
+  } else if (typeof mediaQuery.addListener === "function") {
+    mediaQuery.addListener(update);
+  }
+}
+
+function themeLabel(value) {
+  return { system: "跟随系统", light: "浅色", dark: "深色" }[value] || value;
+}
+
+function labelFor(group, value, fallback = "—") {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+  return LABELS[group]?.[value] || String(value);
+}
+
+function taskTypeLabel(value, fallback = "未设置") {
+  return labelFor("taskType", value, fallback);
+}
+
+function inputKindLabel(value, fallback = "未设置") {
+  return labelFor("inputKind", value, fallback);
+}
+
+function publishKindLabel(value, fallback = "未设置") {
+  return labelFor("publishKind", value, fallback);
+}
+
+function startModeLabel(value, fallback = "未设置") {
+  return labelFor("startMode", value, fallback);
+}
+
+function recordFormatLabel(value, fallback = "未设置") {
+  return labelFor("recordFormat", value, fallback);
+}
+
+function recoveryPolicyLabel(value, fallback = "未设置") {
+  return labelFor("recoveryPolicy", value, fallback);
+}
+
+function profileLabel(value, fallback = "未设置") {
+  return labelFor("profile", value, fallback);
+}
+
+function taskStatusLabel(value, fallback = "未设置") {
+  return labelFor("status", value, fallback);
+}
+
+function apiRoleLabel(value, fallback = "未知角色") {
+  return labelFor("apiRole", value, fallback);
+}
+
+function networkModeLabel(value, fallback = "未知网络") {
+  return labelFor("networkMode", value, fallback);
+}
+
+function eventSourceLabel(value, fallback = "未知来源") {
+  return labelFor("eventSource", value, fallback);
+}
+
+function eventLevelLabel(value, fallback = "未标记") {
+  return labelFor("eventLevel", value, fallback);
+}
+
+function recordSourceLabel(value, fallback = "未知来源") {
+  return labelFor("recordSource", value, fallback);
+}
+
+function schemaLabel(value, fallback = "未知协议") {
+  return inputKindLabel(value, fallback);
+}
+
+function boolLabel(value) {
+  if (value === true || value === "true") return "是";
+  if (value === false || value === "false") return "否";
+  return "全部";
+}
+
+function sortFieldLabel(value) {
+  return {
+    "": "默认排序",
+    created_at: "创建时间",
+    updated_at: "更新时间",
+    priority: "优先级",
+    status: "状态",
+  }[value ?? ""] || value;
+}
+
+function sortOrderLabel(value) {
+  return { "": "默认方向", asc: "升序", desc: "降序" }[value ?? ""] || value;
+}
+
+function logStreamLabel(value) {
+  return { merged: "合并", stdout: "标准输出", stderr: "标准错误" }[value] || value || "合并";
+}
+
+function taskActionLabel(value) {
+  return { start: "启动", stop: "停止", cancel: "取消", retry: "重试", clone: "克隆" }[value] || value;
+}
+
+function groupBy(items, pick) {
+  return (items || []).reduce((accumulator, item) => {
+    const key = pick(item);
+    if (!accumulator[key]) {
+      accumulator[key] = [];
+    }
+    accumulator[key].push(item);
+    return accumulator;
+  }, {});
+}
+
+function renderApiExample(example) {
+  if (typeof example === "string") {
+    return `<pre class="json-block selectable">${escapeHtml(example)}</pre>`;
+  }
+  return `<pre class="json-block selectable">${escapeHtml(JSON.stringify(example, null, 2))}</pre>`;
+}
+
+function renderFieldDocs(fields, emptyMessage, options = {}) {
+  if (!Array.isArray(fields) || !fields.length) {
+    return `<div class="subtle">${escapeHtml(emptyMessage)}</div>`;
+  }
+  const includeLocation = Boolean(options.includeLocation);
+  const includeType = options.includeType !== false;
+  const includeRequired = options.includeRequired !== false;
+  const includeExample = options.includeExample !== false;
+  const resolveExample = typeof options.exampleResolver === "function" ? options.exampleResolver : (field) => field.example;
+  return `
+    <div class="table-wrap">
+      <table class="doc-table">
+        <thead>
+          <tr>
+            <th>字段</th>
+            ${includeLocation ? "<th>位置</th>" : ""}
+            ${includeType ? "<th>类型</th>" : ""}
+            ${includeRequired ? "<th>必填</th>" : ""}
+            <th>说明 / 用途</th>
+            ${includeExample ? "<th>示例</th>" : ""}
+          </tr>
+        </thead>
+        <tbody>
+          ${fields
+            .map(
+              (field) => `
+                <tr>
+                  <td><code class="selectable">${escapeHtml(field.name)}</code></td>
+                  ${includeLocation ? `<td>${escapeHtml(field.location || "—")}</td>` : ""}
+                  ${includeType ? `<td>${escapeHtml(field.type || "—")}</td>` : ""}
+                  ${includeRequired ? `<td>${escapeHtml(requiredLabel(field.required))}</td>` : ""}
+                  <td>${escapeHtml(field.description || "—")}</td>
+                  ${includeExample ? `<td><code class="selectable">${escapeHtml(formatDocExample(resolveExample(field)))}</code></td>` : ""}
+                </tr>
+              `,
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function renderEnumDocs(groups) {
+  if (!groups || !Object.keys(groups).length) {
+    return `<div class="subtle">当前接口没有额外枚举说明。</div>`;
+  }
+  return Object.entries(groups)
+    .map(
+      ([groupName, items]) => `
+        <div class="doc-block">
+          <strong>${escapeHtml(groupName)}</strong>
+          <div class="table-wrap">
+            <table class="doc-table">
+              <thead>
+                <tr>
+                  <th>枚举值</th>
+                  <th>中文说明</th>
+                  <th>补充说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${(items || [])
+                  .map(
+                    (item) => `
+                      <tr>
+                        <td><code class="selectable">${escapeHtml(item.value)}</code></td>
+                        <td>${escapeHtml(item.label || "—")}</td>
+                        <td>${escapeHtml(item.description || "—")}</td>
+                      </tr>
+                    `,
+                  )
+                  .join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function requiredLabel(value) {
+  if (value === undefined) return "—";
+  if (value === true) return "是";
+  if (value === false) return "否";
+  return String(value);
+}
+
+function formatDocExample(value) {
+  if (value === undefined || value === null || value === "") {
+    return "—";
+  }
+  if (typeof value === "object") {
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function lookupDocValue(source, path) {
+  if (source === undefined || source === null || !path) {
+    return undefined;
+  }
+  const parts = String(path)
+    .replace(/\[\]/g, ".0")
+    .split(".")
+    .filter(Boolean);
+  let current = source;
+  for (const part of parts) {
+    if (current === undefined || current === null) {
+      return undefined;
+    }
+    if (Array.isArray(current)) {
+      if (/^\d+$/.test(part)) {
+        current = current[Number(part)];
+      } else {
+        current = current[0];
+        if (current === undefined || current === null) {
+          return undefined;
+        }
+        current = current[part];
+      }
+      continue;
+    }
+    current = current[part];
+  }
+  return current;
+}
+
+function resolveApiPath(path, pathParams = {}) {
+  return path.replace(/\{([^}]+)\}/g, (_match, key) => {
+    const value = pathParams[key];
+    return value === undefined || value === null || value === "" ? `{${key}}` : String(value);
+  });
+}
+
+function buildApiQueryString(query = {}) {
+  const params = new URLSearchParams();
+  Object.entries(query || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === "") {
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => params.append(key, String(item)));
+      return;
+    }
+    params.append(key, String(value));
+  });
+  return params.toString();
+}
+
+function buildFullRequestExample(doc, requestSample = {}) {
+  const path = resolveApiPath(doc.path, requestSample.pathParams);
+  const queryString = buildApiQueryString(requestSample.query);
+  const request = {
+    method: doc.method,
+    url: `${API_EXAMPLE_BASE_URL}${path}${queryString ? `?${queryString}` : ""}`,
+  };
+  if (requestSample.headers && Object.keys(requestSample.headers).length) {
+    request.headers = requestSample.headers;
+  }
+  if (requestSample.pathParams && Object.keys(requestSample.pathParams).length) {
+    request.path_params = requestSample.pathParams;
+  }
+  if (requestSample.query && Object.keys(requestSample.query).length) {
+    request.query = requestSample.query;
+  }
+  if (requestSample.body !== undefined) {
+    request.body = requestSample.body;
+  }
+  return request;
+}
+
+function resolveRequestParamExample(field, requestSample = {}) {
+  if (field.example !== undefined) {
+    return field.example;
+  }
+  if (field.location === "Header") {
+    return requestSample.headers?.[field.name];
+  }
+  if (field.location === "Path") {
+    return requestSample.pathParams?.[field.name];
+  }
+  if (field.location === "Query") {
+    return requestSample.query?.[field.name];
+  }
+  return undefined;
+}
+
+function apiDocKey(doc) {
+  return `${doc.method} ${doc.path}`;
+}
+
 async function copyText(value) {
   try {
-    await navigator.clipboard.writeText(value);
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      copyTextFallback(value);
+    }
     toast("已复制到剪贴板", "success");
   } catch (_error) {
-    toast("复制失败", "error");
+    try {
+      copyTextFallback(value);
+      toast("已复制到剪贴板", "success");
+    } catch (_fallbackError) {
+      toast("复制失败，请手动选中文本复制", "error");
+    }
+  }
+}
+
+function copyTextFallback(value) {
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-9999px";
+  textarea.style.left = "-9999px";
+  document.body.append(textarea);
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+  const copied = document.execCommand("copy");
+  document.body.removeChild(textarea);
+  if (!copied) {
+    throw new Error("copy failed");
   }
 }
 
@@ -3188,10 +4893,10 @@ function toast(message, kind = "success") {
     kind,
   };
   state.toasts = [...state.toasts, item].slice(-4);
-  renderApp();
+  renderApp({ chrome: false, page: false, overlays: false, toasts: true });
   window.setTimeout(() => {
     state.toasts = state.toasts.filter((toastItem) => toastItem.id !== item.id);
-    renderApp();
+    renderApp({ chrome: false, page: false, overlays: false, toasts: true });
   }, 2600);
 }
 

@@ -5,8 +5,10 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${ROOT_DIR}/dist"
 SKIP_IMAGES=0
 
-POSTGRES_SOURCE_IMAGE="postgres:16.4-bookworm@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412"
-ZLM_SOURCE_IMAGE="zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f"
+APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
+CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR:-sparse+https://rsproxy.cn/index/}"
+POSTGRES_SOURCE_IMAGE="${POSTGRES_SOURCE_IMAGE:-postgres:16.4-bookworm@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412}"
+ZLM_SOURCE_IMAGE="${ZLM_SOURCE_IMAGE:-zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f}"
 
 log() {
   printf '[offline-package] %s\n' "$*"
@@ -29,6 +31,12 @@ usage() {
 说明:
   在 macOS arm64 上构建 Linux AMD64 离线部署包。
   默认输出到 ./dist。
+
+环境变量:
+  APT_MIRROR             默认 http://mirrors.tuna.tsinghua.edu.cn；设为空则保留 Debian 官方源。
+  CARGO_REGISTRY_MIRROR  默认 sparse+https://rsproxy.cn/index/；设为空则使用 crates.io 官方源。
+  POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
+  ZLM_SOURCE_IMAGE       可覆盖 ZLMediaKit 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
 EOF
 }
 
@@ -88,6 +96,47 @@ verify_loaded_image_arch() {
   [ "${platform}" = "linux/amd64" ] || fail "镜像 ${image_ref} 平台不是 linux/amd64，而是 ${platform:-unknown}"
 }
 
+local_source_candidate() {
+  local image_ref="$1"
+  if docker image inspect "${image_ref}" >/dev/null 2>&1; then
+    printf '%s\n' "${image_ref}"
+    return 0
+  fi
+  if [[ "${image_ref}" == *"@"* ]]; then
+    local tag_ref="${image_ref%@*}"
+    if docker image inspect "${tag_ref}" >/dev/null 2>&1; then
+      printf '%s\n' "${tag_ref}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+prepare_source_image() {
+  local source_image="$1"
+  local target_image="$2"
+  local label="$3"
+  local local_candidate=""
+  local platform=""
+
+  if local_candidate="$(local_source_candidate "${source_image}")"; then
+    platform="$(docker image inspect "${local_candidate}" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+    if [ "${platform}" = "linux/amd64" ]; then
+      log "复用本地 ${label} 镜像: ${local_candidate}"
+      docker tag "${local_candidate}" "${target_image}"
+      verify_loaded_image_arch "${target_image}"
+      return 0
+    fi
+    log "本地 ${label} 镜像存在但平台是 ${platform:-unknown}，改为联网拉取 linux/amd64"
+  else
+    log "本地未发现 ${label} 镜像，联网拉取 linux/amd64"
+  fi
+
+  docker pull --platform linux/amd64 "${source_image}" >/dev/null
+  docker tag "${source_image}" "${target_image}"
+  verify_loaded_image_arch "${target_image}"
+}
+
 build_or_pull_images() {
   local media_core_image="$1"
   local media_agent_image="$2"
@@ -98,6 +147,8 @@ build_or_pull_images() {
   docker buildx build \
     --platform linux/amd64 \
     --target media-core-runtime \
+    --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+    --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
     --load \
     -t "${media_core_image}" \
     "${ROOT_DIR}"
@@ -107,20 +158,16 @@ build_or_pull_images() {
   docker buildx build \
     --platform linux/amd64 \
     --target media-agent-runtime \
+    --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+    --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
     --load \
     -t "${media_agent_image}" \
     "${ROOT_DIR}"
   verify_loaded_image_arch "${media_agent_image}"
 
-  log "拉取 postgres linux/amd64 镜像"
-  docker pull --platform linux/amd64 "${POSTGRES_SOURCE_IMAGE}" >/dev/null
-  docker tag "${POSTGRES_SOURCE_IMAGE}" "${postgres_image}"
-  verify_loaded_image_arch "${postgres_image}"
+  prepare_source_image "${POSTGRES_SOURCE_IMAGE}" "${postgres_image}" "postgres"
 
-  log "拉取 ZLMediaKit linux/amd64 镜像"
-  docker pull --platform linux/amd64 "${ZLM_SOURCE_IMAGE}" >/dev/null
-  docker tag "${ZLM_SOURCE_IMAGE}" "${zlm_image}"
-  verify_loaded_image_arch "${zlm_image}"
+  prepare_source_image "${ZLM_SOURCE_IMAGE}" "${zlm_image}" "ZLMediaKit"
 }
 
 write_manifest() {
@@ -334,6 +381,18 @@ main() {
   parse_args "$@"
   ensure_macos_arm64
   ensure_tools
+
+  if [ -n "${APT_MIRROR}" ]; then
+    log "使用 APT 镜像: ${APT_MIRROR}"
+  else
+    log "APT 使用 Debian 官方源"
+  fi
+
+  if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then
+    log "使用 Cargo 镜像: ${CARGO_REGISTRY_MIRROR}"
+  else
+    log "Cargo 使用 crates.io 官方源"
+  fi
 
   version="$(workspace_version)"
   [ -n "${version}" ] || fail "无法从 Cargo.toml 解析版本号"

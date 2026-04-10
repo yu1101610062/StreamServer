@@ -17,6 +17,8 @@ const STYLES_CSS: &str = include_str!("../ui/styles.css");
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(root_redirect))
+        .route("/overview", get(shell))
+        .route("/api-docs", get(shell))
         .route("/tasks", get(shell))
         .route("/tasks/{*rest}", get(shell))
         .route("/streams", get(shell))
@@ -60,7 +62,7 @@ pub(crate) async fn preview_task(
 }
 
 async fn root_redirect() -> Redirect {
-    Redirect::temporary("/tasks")
+    Redirect::temporary("/overview")
 }
 
 async fn shell() -> Html<&'static str> {
