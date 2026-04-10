@@ -1,4 +1,4 @@
-const TOKEN_STORAGE_KEY = "streamserver.console.token";
+const REFRESH_TOKEN_STORAGE_KEY = "streamserver.console.refresh_token";
 const THEME_STORAGE_KEY = "streamserver.console.theme";
 const AUTO_REFRESH_MS = 10000;
 const THEME_OPTIONS = ["system", "light", "dark"];
@@ -40,6 +40,12 @@ const NAV_ITEMS = [
     label: "录像中心",
     note: "录像索引、日期检索、路径复制",
     permission: "record_read",
+  },
+  {
+    path: "/security",
+    label: "安全设置",
+    note: "修改密码、维护机器 API 白名单",
+    permission: "security_write",
   },
   {
     path: "/nodes",
@@ -334,7 +340,6 @@ function buildApiDocDetails() {
         profile: "realtime_compat",
         priority: 50,
         common: {
-          tenant_id: "default",
           created_by: "partner-system",
           callback_url: "https://biz.example.com/streamserver/callback",
           labels: ["camera", "vip"],
@@ -402,7 +407,6 @@ function buildApiDocDetails() {
       { name: "template", type: "string", required: false, description: "模板名称。提供任务默认值和约束。" },
       { name: "profile", type: "enum", required: false, description: "任务预设档位。用于实时兼容、归档或组播优化。" },
       { name: "priority", type: "number", required: false, description: "调度优先级，通常 0-100，数字越大越优先。" },
-      { name: "common.tenant_id", type: "string", required: false, description: "租户标识。" },
       { name: "common.created_by", type: "string", required: false, description: "任务创建来源，用于审计和回查。" },
       { name: "common.callback_url", type: "string", required: false, description: "任务事件回调地址。" },
       { name: "common.labels[]", type: "string[]", required: false, description: "业务标签，用于筛选和资源偏好。" },
@@ -814,6 +818,7 @@ const LABELS = {
     LOST: "已丢失",
   },
   route: {
+    login: "登录",
     overview: "系统总览",
     "api-docs": "外部 API 文档",
     tasks: "任务中心",
@@ -821,13 +826,12 @@ const LABELS = {
     streams: "流中心",
     multicast: "组播中心",
     records: "录像中心",
+    security: "安全设置",
     nodes: "节点中心",
     debug: "调试台",
   },
   apiRole: {
-    platform_admin: "平台管理员",
-    tenant_admin: "租户管理员",
-    tenant_viewer: "租户只读",
+    admin: "管理员",
   },
   networkMode: {
     host: "主机网络",
@@ -860,9 +864,11 @@ const LABELS = {
 const API_DOC_DETAILS = buildApiDocDetails();
 
 const state = {
-  token: window.localStorage.getItem(TOKEN_STORAGE_KEY) || "",
+  token: "",
+  refreshToken: window.localStorage.getItem(REFRESH_TOKEN_STORAGE_KEY) || "",
   session: null,
   sessionError: null,
+  sessionLoading: true,
   route: parseRoute(window.location.pathname, window.location.search),
   routeData: null,
   pageError: null,
@@ -886,6 +892,8 @@ const state = {
     createPreview: null,
     createError: null,
     authDraftToken: "",
+    securityAllowlistText: "",
+    securityAllowlistDirty: false,
     scrollPositions: new Map(),
     debug: {
       nodeId: "",
@@ -932,6 +940,7 @@ async function boot() {
   document.addEventListener("change", handleChange);
   document.addEventListener("input", handleInput);
   startAutoRefresh();
+  renderApp();
   await refreshSession(true);
   await refreshRoute({ preserveScroll: false, restoreStoredScroll: true });
 }
@@ -971,12 +980,17 @@ function renderApp(options = {}) {
     ...options,
   };
   ensureShell();
-  if (settings.chrome) {
+  const standalone = shouldUseStandaloneAuthShell();
+  appRoot.className = standalone ? "app-shell auth-shell" : "app-shell";
+  if (standalone) {
+    shell.sidebar.innerHTML = "";
+    shell.topbar.innerHTML = "";
+  } else if (settings.chrome) {
     shell.sidebar.innerHTML = renderSidebar();
     shell.topbar.innerHTML = renderTopbar();
   }
   if (settings.page) {
-    shell.pageBody.innerHTML = renderPageBody();
+    shell.pageBody.innerHTML = standalone ? renderStandalonePage() : renderPageBody();
   }
   if (settings.overlays) {
     shell.drawer.innerHTML = renderCreateDrawer();
@@ -1029,25 +1043,137 @@ function shouldPauseAutoRefresh() {
 }
 
 async function refreshSession(silent) {
+  state.sessionLoading = true;
   try {
-    state.session = await apiRequest("/api/v1/me");
-    state.sessionError = null;
-  } catch (error) {
-    state.session = null;
-    state.sessionError = error;
-    if (!silent && !isAuthError(error)) {
-      toast(errorMessage(error), "error");
+    if (!state.token && state.refreshToken) {
+      try {
+        const tokens = await apiRequest("/api/v1/auth/refresh", {
+          method: "POST",
+          skipAuth: true,
+          body: { refresh_token: state.refreshToken },
+        });
+        applyAuthTokens(tokens);
+      } catch (error) {
+        clearAuthTokens({ clearRefresh: true });
+        if (!silent && !isAuthError(error)) {
+          toast(errorMessage(error), "error");
+        }
+      }
     }
+
+    try {
+      state.session = await apiRequest("/api/v1/me");
+      state.sessionError = null;
+    } catch (error) {
+      state.session = null;
+      state.sessionError = error;
+      if (!silent && !isAuthError(error)) {
+        toast(errorMessage(error), "error");
+      }
+    }
+  } finally {
+    state.sessionLoading = false;
+    syncRouteWithSessionState();
   }
+}
+
+function applyAuthTokens(tokens) {
+  if (!tokens || typeof tokens !== "object") {
+    return;
+  }
+  if (typeof tokens.access_token === "string") {
+    state.token = tokens.access_token;
+  }
+  if (typeof tokens.refresh_token === "string") {
+    state.refreshToken = tokens.refresh_token;
+    window.localStorage.setItem(REFRESH_TOKEN_STORAGE_KEY, state.refreshToken);
+  }
+}
+
+function clearAuthTokens(options = {}) {
+  const { clearRefresh = false } = options;
+  state.token = "";
+  if (clearRefresh) {
+    state.refreshToken = "";
+    window.localStorage.removeItem(REFRESH_TOKEN_STORAGE_KEY);
+  }
+}
+
+function routeHref(route = state.route) {
+  const query = route.searchParams.toString();
+  return `${route.path}${query ? `?${query}` : ""}`;
+}
+
+function sanitizeReturnTo(value) {
+  if (!value || typeof value !== "string") {
+    return "/overview";
+  }
+  try {
+    const url = new URL(value, window.location.origin);
+    if (url.origin !== window.location.origin) {
+      return "/overview";
+    }
+    const candidate = `${url.pathname}${url.search}`;
+    if (!candidate.startsWith("/") || candidate.startsWith("//") || candidate === "/login") {
+      return "/overview";
+    }
+    return candidate;
+  } catch (_) {
+    if (!value.startsWith("/") || value.startsWith("//") || value === "/login") {
+      return "/overview";
+    }
+    return value;
+  }
+}
+
+function buildLoginHref(nextHref) {
+  const params = new URLSearchParams();
+  const sanitizedNext = sanitizeReturnTo(nextHref);
+  if (sanitizedNext && sanitizedNext !== "/overview") {
+    params.set("next", sanitizedNext);
+  }
+  const query = params.toString();
+  return `/login${query ? `?${query}` : ""}`;
+}
+
+function replaceRoute(href) {
+  if (`${window.location.pathname}${window.location.search}` !== href) {
+    window.history.replaceState({}, "", href);
+  }
+  state.route = parseRoute(window.location.pathname, window.location.search);
+}
+
+function syncRouteWithSessionState() {
+  if (state.session) {
+    if (state.route.name === "login") {
+      replaceRoute(sanitizeReturnTo(state.route.searchParams.get("next")));
+      return true;
+    }
+    return false;
+  }
+  if (state.sessionLoading) {
+    return false;
+  }
+  if (state.sessionError && isAuthError(state.sessionError) && state.route.name !== "login") {
+    replaceRoute(buildLoginHref(routeHref()));
+    return true;
+  }
+  return false;
+}
+
+function shouldUseStandaloneAuthShell() {
+  return state.route.name === "login" || state.sessionLoading || (!state.session && isAuthError(state.sessionError));
 }
 
 async function refreshRoute(options = {}) {
   const { preserveScroll = true, restoreStoredScroll = false } = options;
+  syncRouteWithSessionState();
   const routeKey = currentRouteKey();
   if (preserveScroll) {
     rememberRouteScroll(routeKey);
   }
   state.loading = true;
+  state.routeData = null;
   state.pageError = null;
   renderApp();
   try {
@@ -1064,7 +1190,7 @@ async function refreshRoute(options = {}) {
 }
 
 function currentRouteKey() {
-  return `${state.route.path}?${state.route.searchParams.toString()}`;
+  return routeHref();
 }
 
 function rememberRouteScroll(routeKey) {
@@ -1086,6 +1212,7 @@ function restoreRouteScroll(routeKey) {
 
 function renderSidebar() {
   const visibleItems = NAV_ITEMS.filter((item) => canAccess(item.permission));
+  const manualTokenOnly = !state.session || state.session.auth_mode !== "local_password";
   return `
     <aside class="sidebar">
       <div class="brand">
@@ -1100,7 +1227,8 @@ function renderSidebar() {
         <span class="muted">${escapeHtml(sessionSubtitle())}</span>
         <div class="toolbar-actions">
           ${state.session ? renderRolePill(state.session.role) : ""}
-          <button class="ghost-button" data-action="open-auth-modal">令牌</button>
+          ${state.session ? `<button class="ghost-button" data-action="logout">退出</button>` : `<a class="ghost-button" href="/login" data-link>登录</a>`}
+          ${manualTokenOnly ? `<button class="ghost-button" data-action="open-auth-modal">令牌</button>` : ""}
         </div>
       </section>
       <nav class="sidebar-nav">
@@ -1174,7 +1302,28 @@ function renderPageBody() {
   return renderRouteBody(state.route, state.routeData);
 }
 
+function renderStandalonePage() {
+  if (state.sessionLoading && !state.session) {
+    return renderStandaloneState(
+      "正在建立会话",
+      "控制台正在校验现有令牌并尝试恢复登录状态，请稍候。",
+      "正在同步",
+    );
+  }
+  if (state.session) {
+    return renderStandaloneState(
+      "正在进入控制台",
+      `已恢复账号 ${state.session.subject} 的会话，正在跳转到控制台。`,
+      "会话恢复",
+    );
+  }
+  return renderLoginPage();
+}
+
 async function loadRouteData(route) {
+  if (route.name === "login") {
+    return {};
+  }
   if (state.sessionError && isAuthError(state.sessionError)) {
     return { authRequired: true };
   }
@@ -1193,6 +1342,8 @@ async function loadRouteData(route) {
       return await loadMulticastData(route);
     case "records":
       return await loadRecordsData(route);
+    case "security":
+      return await loadSecurityData();
     case "nodes":
       return await loadNodesData(route);
     case "debug":
@@ -1207,6 +1358,8 @@ function renderRouteBody(route, data) {
     return renderAuthRequired();
   }
   switch (route.name) {
+    case "login":
+      return renderLoginPage();
     case "overview":
       return renderOverviewPage(data);
     case "api-docs":
@@ -1221,6 +1374,8 @@ function renderRouteBody(route, data) {
       return renderMulticastPage(data);
     case "records":
       return renderRecordsPage(data);
+    case "security":
+      return renderSecurityPage(data);
     case "nodes":
       return renderNodesPage(data);
     case "debug":
@@ -1433,6 +1588,11 @@ async function loadRecordsData(route) {
   }
   const recordsPage = await apiRequest(`/api/v1/records?${query.toString()}`);
   return { recordsPage };
+}
+
+async function loadSecurityData() {
+  const allowlist = await apiRequest("/api/v1/security/machine-allowlist");
+  return { allowlist };
 }
 
 async function loadNodesData() {
@@ -2564,7 +2724,6 @@ function renderCreateStep(step, draft, templates) {
           ${renderSelectModelField("任务类型", "task_type", TASK_TYPES.map((item) => item.value), draft.task_type, (value) => taskTypeLabel(value))}
           ${renderTextModelField("任务名称", "name", draft.name, "relay-camera-01")}
           ${renderSelectModelField("任务预设", "profile", PROFILE_OPTIONS, draft.profile, (value) => profileLabel(value, "不使用预设"))}
-          ${renderTextModelField("租户", "common.tenant_id", draft.common.tenant_id, "default")}
           ${renderTextModelField("创建人", "common.created_by", draft.common.created_by, "console-user")}
           ${renderTextModelField("优先级", "priority", draft.priority, "0 - 100", "number")}
         </div>
@@ -2738,7 +2897,7 @@ function renderAuthModal() {
         <div>
           <div class="brand-mark">认证</div>
           <h3>访问令牌</h3>
-          <p>当前控制台不内建登录流程。启用鉴权时，请直接粘贴 JWT Bearer Token。</p>
+          <p>兼容 <code>external_jwt</code> 模式。这里输入的 Bearer Token 只保存在当前页面内存，不会写入本地存储。</p>
         </div>
         <div class="section-actions">
           <button class="ghost-button" data-action="close-auth-modal">关闭</button>
@@ -2825,21 +2984,32 @@ async function handleClick(event) {
         break;
       case "save-auth-token":
         state.token = (state.ui.authDraftToken || "").trim();
-        if (state.token) {
-          window.localStorage.setItem(TOKEN_STORAGE_KEY, state.token);
-        } else {
-          window.localStorage.removeItem(TOKEN_STORAGE_KEY);
-        }
         state.ui.authModalOpen = false;
         await refreshSession(false);
         await refreshRoute();
         break;
       case "clear-auth-token":
         state.ui.authDraftToken = "";
-        state.token = "";
-        window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+        clearAuthTokens();
         await refreshSession(true);
         renderApp({ chrome: true, page: false, overlays: true, toasts: false });
+        break;
+      case "logout":
+        if (state.refreshToken) {
+          try {
+            await apiRequest("/api/v1/auth/logout", {
+              method: "POST",
+              skipAuth: true,
+              body: { refresh_token: state.refreshToken },
+            });
+          } catch (error) {
+            console.error(error);
+          }
+        }
+        clearAuthTokens({ clearRefresh: true });
+        state.session = null;
+        state.sessionError = null;
+        await navigate("/login");
         break;
       case "open-create-drawer":
         if (!canAccess("task_write")) {
@@ -2942,6 +3112,9 @@ async function handleSubmit(event) {
   event.preventDefault();
   try {
     switch (form.id) {
+      case "login-form":
+        await submitLogin(new FormData(form));
+        break;
       case "tasks-filter-form":
         await navigate(`/tasks?${buildQueryString(new FormData(form))}`);
         break;
@@ -2983,6 +3156,12 @@ async function handleSubmit(event) {
         break;
       case "debug-snap-form":
         await submitDebugSnap(new FormData(form));
+        break;
+      case "change-password-form":
+        await submitPasswordChange(new FormData(form));
+        break;
+      case "machine-allowlist-form":
+        await submitMachineAllowlist(new FormData(form));
         break;
       default:
         break;
@@ -3034,6 +3213,10 @@ function handleInput(event) {
   if (target.dataset.action === "auth-token-input" && target instanceof HTMLTextAreaElement) {
     state.ui.authDraftToken = target.value;
   }
+  if (target.dataset.action === "machine-allowlist-input" && target instanceof HTMLTextAreaElement) {
+    state.ui.securityAllowlistText = target.value;
+    state.ui.securityAllowlistDirty = true;
+  }
 }
 
 function updateCreateDraftFromElement(target) {
@@ -3067,11 +3250,13 @@ function parseRoute(pathname, search) {
   if (taskMatch) {
     return { name: "task-detail", path: cleanPath, searchParams, params: { id: taskMatch[1] } };
   }
+  if (cleanPath === "/login") return { name: "login", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/overview") return { name: "overview", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/api-docs") return { name: "api-docs", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/streams") return { name: "streams", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/multicast") return { name: "multicast", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/records") return { name: "records", path: cleanPath, searchParams, params: {} };
+  if (cleanPath === "/security") return { name: "security", path: cleanPath, searchParams, params: {} };
   if (cleanPath === "/nodes") return { name: "nodes", path: cleanPath, searchParams, params: {} };
   if (cleanPath.startsWith("/debug")) return { name: "debug", path: cleanPath, searchParams, params: {} };
   if (cleanPath.startsWith("/tasks")) return { name: "tasks", path: "/tasks", searchParams, params: {} };
@@ -3084,6 +3269,8 @@ function currentRouteTitle() {
 
 function currentRouteSubtitle() {
   switch (state.route.name) {
+    case "login":
+      return "本地账号登录与会话恢复入口。";
     case "overview":
       return "系统介绍、整体状态、节点健康、在线流与最近任务动态。";
     case "api-docs":
@@ -3096,6 +3283,8 @@ function currentRouteSubtitle() {
       return "聚合组播任务、上下游绑定、网卡和最近异常。";
     case "records":
       return "按任务、流和时间检索录像文件，并快速复制路径。";
+    case "security":
+      return "修改当前密码，并维护允许直连业务 API 的机器 IP 白名单。";
     case "nodes":
       return "查看节点健康、能力矩阵、当前任务和 ZLM 概览。";
     case "debug":
@@ -3121,13 +3310,12 @@ function sessionSubtitle() {
   if (!state.session) {
     return state.sessionError ? errorMessage(state.sessionError) : "正在建立会话";
   }
-  const tenant = state.session.tenant_id ? `租户 ${state.session.tenant_id}` : "平台范围";
-  return `${apiRoleLabel(state.session.role)} · ${tenant}`;
+  return `${apiRoleLabel(state.session.role)} · ${state.session.auth_mode || "disabled"}`;
 }
 
 async function apiRequest(path, options = {}) {
   const headers = new Headers(options.headers || {});
-  if (state.token) {
+  if (!options.skipAuth && state.token) {
     headers.set("Authorization", `Bearer ${state.token}`);
   }
   let body = options.body;
@@ -3248,6 +3436,51 @@ async function cloneTask(taskId) {
   });
   toast(`已克隆任务 ${shortId(cloned.id)}`, "success");
   await navigate(`/tasks/${cloned.id}`);
+}
+
+async function submitLogin(formData) {
+  const username = String(formData.get("username") || "").trim();
+  const password = String(formData.get("password") || "");
+  const destination = sanitizeReturnTo(state.route.searchParams.get("next"));
+  const tokens = await apiRequest("/api/v1/auth/login", {
+    method: "POST",
+    skipAuth: true,
+    body: { username, password },
+  });
+  applyAuthTokens(tokens);
+  await refreshSession(false);
+  toast(`已登录 ${tokens.subject || username}`, "success");
+  await navigate(destination);
+}
+
+async function submitPasswordChange(formData) {
+  const currentPassword = String(formData.get("current_password") || "");
+  const newPassword = String(formData.get("new_password") || "");
+  await apiRequest("/api/v1/auth/change-password", {
+    method: "POST",
+    body: {
+      current_password: currentPassword,
+      new_password: newPassword,
+    },
+  });
+  clearAuthTokens({ clearRefresh: true });
+  state.session = null;
+  state.sessionError = null;
+  toast("密码已更新，请重新登录", "success");
+  await navigate("/login");
+}
+
+async function submitMachineAllowlist(formData) {
+  const raw = String(formData.get("entries_text") || "").trim();
+  const parsed = parseMachineAllowlistText(raw);
+  const response = await apiRequest("/api/v1/security/machine-allowlist", {
+    method: "PUT",
+    body: { entries: parsed },
+  });
+  state.ui.securityAllowlistDirty = false;
+  state.ui.securityAllowlistText = formatMachineAllowlistEntries(response.entries || []);
+  toast("机器 API 白名单已更新", "success");
+  await refreshRoute({ preserveScroll: true });
 }
 
 async function closeStream(data) {
@@ -3467,7 +3700,6 @@ function buildDraftPayload(draft) {
   setIfPresent(payload, "template", draft.template);
   setIfPresent(payload, "profile", draft.profile);
 
-  setIfPresent(payload.common, "tenant_id", draft.common.tenant_id);
   setIfPresent(payload.common, "created_by", draft.common.created_by);
   setIfPresent(payload.common, "callback_url", draft.common.callback_url);
   setIfList(payload.common, "labels", draft.common.labels_text);
@@ -3546,7 +3778,6 @@ function createDefaultDraft() {
     priority: "50",
     advanced_json: "{}",
     common: {
-      tenant_id: "default",
       created_by: "console",
       callback_url: "",
       labels_text: "",
@@ -4039,9 +4270,181 @@ function renderAuthRequired() {
   return `
     <section class="auth-panel">
       <h3>需要认证</h3>
-      <p>${escapeHtml(errorMessage(state.sessionError) || "当前环境启用了鉴权，请先提供 Bearer Token。")}</p>
+      <p>${escapeHtml(errorMessage(state.sessionError) || "当前环境启用了鉴权，请先登录或提供 Bearer Token。")}</p>
       <div class="actions">
+        <a class="button" href="/login" data-link>前往登录</a>
         <button class="button" data-action="open-auth-modal">输入令牌</button>
+      </div>
+    </section>
+  `;
+}
+
+function renderStandaloneState(title, message, mark = "ACCESS") {
+  return `
+    <section class="auth-stage">
+      <article class="auth-stage-card">
+        <div class="boot-mark">${escapeHtml(mark)}</div>
+        <h1>${escapeHtml(title)}</h1>
+        <p>${escapeHtml(message)}</p>
+      </article>
+    </section>
+  `;
+}
+
+function ensureSecurityAllowlistDraft(data) {
+  if (state.ui.securityAllowlistDirty) {
+    return state.ui.securityAllowlistText;
+  }
+  const entries = Array.isArray(data?.allowlist?.entries) ? data.allowlist.entries : [];
+  const text = formatMachineAllowlistEntries(entries);
+  state.ui.securityAllowlistText = text;
+  return text;
+}
+
+function formatMachineAllowlistEntries(entries) {
+  if (!Array.isArray(entries) || !entries.length) {
+    return "";
+  }
+  return entries
+    .map((entry) => {
+      const cidr = String(entry?.cidr || "").trim();
+      const description = String(entry?.description || "").trim();
+      return description ? `${cidr} # ${description}` : cidr;
+    })
+    .join("\n");
+}
+
+function parseMachineAllowlistText(raw) {
+  const lines = String(raw || "").split(/\r?\n/);
+  const entries = [];
+  lines.forEach((line, index) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      return;
+    }
+    const hashIndex = trimmed.indexOf("#");
+    const body = hashIndex >= 0 ? trimmed.slice(0, hashIndex).trim() : trimmed;
+    const comment = hashIndex >= 0 ? trimmed.slice(hashIndex + 1).trim() : "";
+    if (!body) {
+      return;
+    }
+    const [cidrToken, ...descriptionParts] = body.split(/\s+/);
+    const cidr = (cidrToken || "").trim();
+    const description = [descriptionParts.join(" ").trim(), comment].filter(Boolean).join(" ").trim();
+    if (!cidr) {
+      throw new Error(`第 ${index + 1} 行缺少 CIDR 或 IP`);
+    }
+    entries.push({ cidr, description });
+  });
+  return entries;
+}
+
+function renderLoginPage() {
+  const nextHref = sanitizeReturnTo(state.route.searchParams.get("next"));
+  const returnHint = nextHref !== "/overview"
+    ? `<p class="subtle">登录成功后将返回 ${escapeHtml(nextHref)}</p>`
+    : `<p class="subtle">登录成功后进入控制台总览页。</p>`;
+  const authHint = state.sessionError && isAuthError(state.sessionError)
+    ? `<div class="auth-alert danger-text">${escapeHtml(errorMessage(state.sessionError) || "当前会话无效，请重新登录。")}</div>`
+    : "";
+  return `
+    <section class="auth-stage">
+      <article class="auth-stage-card login-stage">
+        <div class="login-stage-grid">
+          <section class="login-stage-copy">
+            <div class="boot-mark">ACCESS</div>
+            <h1>进入 StreamServer</h1>
+            <p>未建立管理员会话前，控制台页面不会开放。请先完成登录，再进入任务、流、录像、节点和调试页面。</p>
+            ${returnHint}
+            <div class="login-stage-notes">
+              <div class="note-card">
+                <strong>本地账号</strong>
+                <span>适用于 <code>local_password</code>，登录成功后会自动保存 refresh token 并恢复会话。</span>
+              </div>
+              <div class="note-card">
+                <strong>Bearer Token</strong>
+                <span>兼容 <code>external_jwt</code>，可直接在当前页输入临时令牌，不写入本地存储。</span>
+              </div>
+            </div>
+          </section>
+          <section class="auth-panel login-stage-form">
+            <h3>管理员登录</h3>
+            <p>输入用户名和密码建立控制台会话。</p>
+            ${authHint}
+            <form id="login-form" class="stack-form auth-form-grid">
+              <label class="field">
+                <span>用户名</span>
+                <input name="username" autocomplete="username" placeholder="admin" required />
+              </label>
+              <label class="field">
+                <span>密码</span>
+                <input name="password" type="password" autocomplete="current-password" required />
+              </label>
+              <div class="actions">
+                <button class="button" type="submit">登录</button>
+                <button class="ghost-button" type="button" data-action="open-auth-modal">使用 Bearer Token</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      </article>
+    </section>
+  `;
+}
+
+function renderSecurityPage(data) {
+  const allowlistText = ensureSecurityAllowlistDraft(data);
+  return `
+    <section class="stack-section">
+      <div class="overview-grid">
+        ${metricCard("当前账号", state.session?.subject || "—")}
+        ${metricCard("角色", apiRoleLabel(state.session?.role || ""))}
+        ${metricCard("鉴权模式", state.session?.auth_mode || "disabled")}
+        ${metricCard("强制改密", state.session?.must_change_password ? "是" : "否")}
+      </div>
+      <div class="panel">
+        <div class="section-header">
+          <div>
+            <h3>修改当前密码</h3>
+            <p>提交后会吊销当前账号的 refresh token，会话需要重新登录恢复。</p>
+          </div>
+        </div>
+        <form id="change-password-form" class="stack-form auth-form-grid">
+          <label class="field">
+            <span>当前密码</span>
+            <input name="current_password" type="password" autocomplete="current-password" required />
+          </label>
+          <label class="field">
+            <span>新密码</span>
+            <input name="new_password" type="password" autocomplete="new-password" minlength="8" required />
+          </label>
+          <div class="actions">
+            <button class="button" type="submit">更新密码</button>
+          </div>
+        </form>
+      </div>
+      <div class="panel">
+        <div class="section-header">
+          <div>
+            <h3>机器 API 白名单</h3>
+            <p>每行一条，格式为 <code>IP/CIDR # 说明</code>。说明可选，空行和以 <code>#</code> 开头的行会被忽略。</p>
+          </div>
+        </div>
+        <form id="machine-allowlist-form" class="stack-form">
+          <label class="field-block">
+            <span>白名单条目</span>
+            <textarea
+              name="entries_text"
+              rows="14"
+              data-action="machine-allowlist-input"
+              placeholder="192.168.1.10/32 # ingest-gateway&#10;10.0.0.0/24 # office-network"
+            >${escapeHtml(allowlistText)}</textarea>
+          </label>
+          <p class="subtle">示例：<code>192.168.6.20/32 # 采集机</code>，或仅填写 <code>10.0.0.0/24</code>。</p>
+          <div class="actions">
+            <button class="button" type="submit">保存白名单</button>
+          </div>
+        </form>
       </div>
     </section>
   `;
@@ -4404,7 +4807,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
   if (spec.profile !== undefined) draft.profile = String(spec.profile || "");
   if (spec.priority !== undefined) draft.priority = String(spec.priority ?? "");
   applyDraftSectionDefaults(draft.common, spec.common, {
-    tenant_id: "string",
     created_by: "string",
     callback_url: "string",
     labels: "list:labels_text",

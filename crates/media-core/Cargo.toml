@@ -7,6 +7,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+argon2.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
@@ -15,6 +16,7 @@ cron.workspace = true
 jsonwebtoken.workspace = true
 media-domain = { path = "../media-domain" }
 media-rpc = { path = "../media-rpc" }
+rand.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

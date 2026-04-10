@@ -10,16 +10,20 @@ mod ui;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
+    io::{self, Read},
     net::{IpAddr, SocketAddr},
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
 };
 
 use anyhow::Context;
-use auth::{ApiPermission, AuthConfig};
+use auth::{
+    ApiPermission, AuthConfig, generate_refresh_token, hash_password, hash_refresh_token,
+    maybe_extract_bearer_token, verify_password,
+};
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, FromRequestParts, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
@@ -28,7 +32,8 @@ use chrono::{DateTime, Utc};
 use control_plane::{ControlPlaneService, NodeLiveLoad};
 use error::AppError;
 use repository::{
-    CreateTaskResult, HookEventListFilter, NodeSummary, RecordListFilter, StreamListFilter,
+    AuthUser, CreateTaskResult, HookEventListFilter, MachineAllowlistEntry, MachineAllowlistWrite,
+    NewRefreshSession, NodeSummary, RecordListFilter, SecurityAuditEventRecord, StreamListFilter,
     TaskCloneOverride, TaskEventFilter, TaskListFilter, TaskLogFilter, TaskRepository,
     TemplateCreateRequest, TemplateListFilter, ZlmPublishTaskRecord, ZlmRecordFileRecord,
     ZlmStreamEventRecord, ZlmTaskEventHookRecord,
@@ -60,8 +65,36 @@ pub(crate) struct AppState {
     storage_allowlist: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PeerAddress(pub Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for PeerAddress
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let peer = parts.extensions.get::<ConnectInfo<SocketAddr>>().map(|value| value.0);
+        std::future::ready(Ok(Self(peer)))
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CliCommand {
+    BootstrapAdmin { username: String },
+    ResetPassword { username: String },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if let Some(command) = parse_cli_command()? {
+        return run_cli_command(command).await;
+    }
+
     let settings = config::Settings::load()?;
     telemetry::init(&settings.logging);
 
@@ -81,8 +114,12 @@ async fn main() -> anyhow::Result<()> {
     let repository = Arc::new(TaskRepository::new(pool));
     let control_plane = ControlPlaneService::new(repository.clone());
     let hook_source_allowlist = parse_hook_source_allowlist(&settings.core.hook_source_allowlist)?;
-    let auth =
-        AuthConfig::from_public_key(settings.core.auth_enabled, &settings.core.jwt_public_key)?;
+    let auth = AuthConfig::from_settings(&settings.core)?;
+    if auth.supports_local_login() && !repository.has_enabled_admin_user().await? {
+        anyhow::bail!(
+            "local_password auth mode requires at least one enabled admin user; run `media-core auth bootstrap-admin --username <name> --password-stdin` first"
+        );
+    }
 
     let state = AppState {
         repository: repository.clone(),
@@ -142,6 +179,14 @@ async fn main() -> anyhow::Result<()> {
 pub(crate) fn build_app(state: AppState) -> Router {
     let api_router = Router::new()
         .route("/me", get(ui::current_session))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/refresh", post(auth_refresh))
+        .route("/auth/logout", post(auth_logout))
+        .route("/auth/change-password", post(auth_change_password))
+        .route(
+            "/security/machine-allowlist",
+            get(list_machine_allowlist).put(update_machine_allowlist),
+        )
         .route("/tasks/preview", post(ui::preview_task))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", get(get_task))
@@ -206,13 +251,471 @@ async fn ready_health(State(state): State<AppState>) -> Result<Json<HealthRespon
     }))
 }
 
+pub(crate) async fn authorize_business_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    permission: ApiPermission,
+) -> Result<auth::AuthenticatedPrincipal, AppError> {
+    if !state.auth.enabled() {
+        return state.auth.authorize(headers, permission);
+    }
+
+    match maybe_extract_bearer_token(headers)? {
+        Some(_) => state.auth.authorize(headers, permission),
+        None => {
+            let peer_ip = peer
+                .map(|addr| addr.ip())
+                .ok_or_else(|| {
+                    AppError::Forbidden(
+                        "missing Authorization header and peer address is unavailable".to_string(),
+                    )
+                })?;
+            let allowed = state.repository.is_machine_ip_allowlisted(peer_ip).await?;
+            if !allowed {
+                return Err(AppError::Forbidden(
+                    "missing Authorization header and client IP is not allowlisted".to_string(),
+                ));
+            }
+            let principal = auth::AuthenticatedPrincipal::machine_allowlisted(&peer_ip.to_string());
+            principal.require_permission(permission)?;
+            Ok(principal)
+        }
+    }
+}
+
+fn require_local_password_login(state: &AppState) -> Result<(), AppError> {
+    if state.auth.supports_local_login() {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "local password authentication is not enabled".to_string(),
+        ))
+    }
+}
+
+fn user_agent_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalize_username_value(username: &str) -> anyhow::Result<String> {
+    let normalized = username.trim().to_lowercase();
+    anyhow::ensure!(!normalized.is_empty(), "username must not be empty");
+    anyhow::ensure!(
+        normalized
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '@')),
+        "username contains unsupported characters"
+    );
+    Ok(normalized)
+}
+
+fn normalize_username(username: &str) -> Result<String, AppError> {
+    normalize_username_value(username)
+        .map_err(|error| AppError::BadRequest(format!("invalid username: {error}")))
+}
+
+fn normalize_machine_allowlist_entries(
+    entries: Vec<MachineAllowlistWrite>,
+) -> Result<Vec<MachineAllowlistWrite>, AppError> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let cidr = normalize_machine_allowlist_cidr(&entry.cidr)?;
+            Ok(MachineAllowlistWrite {
+                cidr,
+                description: entry.description.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
+fn normalize_machine_allowlist_cidr(value: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest(
+            "machine allowlist cidr must not be empty".to_string(),
+        ));
+    }
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(match ip {
+            IpAddr::V4(ip) => format!("{ip}/32"),
+            IpAddr::V6(ip) => format!("{ip}/128"),
+        });
+    }
+
+    let (ip_text, prefix_text) = trimmed.split_once('/').ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "machine allowlist entry `{trimmed}` must be an IP or CIDR"
+        ))
+    })?;
+    let ip = ip_text.parse::<IpAddr>().map_err(|_| {
+        AppError::BadRequest(format!(
+            "machine allowlist entry `{trimmed}` has an invalid IP address"
+        ))
+    })?;
+    let prefix: u8 = prefix_text.parse().map_err(|_| {
+        AppError::BadRequest(format!(
+            "machine allowlist entry `{trimmed}` has an invalid prefix length"
+        ))
+    })?;
+    let max_prefix = match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        return Err(AppError::BadRequest(format!(
+            "machine allowlist entry `{trimmed}` exceeds prefix length {max_prefix}"
+        )));
+    }
+    Ok(format!("{ip}/{prefix}"))
+}
+
+fn auth_user_role(user: &AuthUser) -> Result<auth::ApiRole, AppError> {
+    match user.role.trim() {
+        "admin" => Ok(auth::ApiRole::Admin),
+        other => Err(AppError::Internal(format!(
+            "unsupported auth user role stored in database: {other}"
+        ))),
+    }
+}
+
+fn invalid_credentials_error() -> AppError {
+    AppError::Forbidden("invalid username or password".to_string())
+}
+
+async fn record_security_event(
+    state: &AppState,
+    event_type: &str,
+    actor: &str,
+    subject: Option<&str>,
+    remote_ip: Option<IpAddr>,
+    user_agent: Option<&str>,
+    payload: Value,
+) -> Result<(), AppError> {
+    state
+        .repository
+        .insert_security_audit_event(SecurityAuditEventRecord {
+            event_type: event_type.to_string(),
+            actor: actor.to_string(),
+            subject: subject.map(str::to_string),
+            remote_ip,
+            user_agent: user_agent.map(str::to_string),
+            payload,
+        })
+        .await?;
+    Ok(())
+}
+
+fn build_auth_tokens_response(
+    user: &AuthUser,
+    issued: auth::IssuedAccessToken,
+    refresh_token: String,
+    refresh_expires_at: DateTime<Utc>,
+) -> AuthTokensResponse {
+    AuthTokensResponse {
+        access_token: issued.token,
+        access_token_expires_at: issued.expires_at,
+        refresh_token,
+        refresh_token_expires_at: refresh_expires_at,
+        subject: user.username.clone(),
+        role: auth::ApiRole::Admin,
+        must_change_password: user.must_change_password,
+    }
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Json(request): Json<AuthLoginRequest>,
+) -> Result<Json<AuthTokensResponse>, AppError> {
+    require_local_password_login(&state)?;
+    let remote_ip = peer.map(|addr| addr.ip());
+    let user_agent = user_agent_from_headers(&headers);
+    let username = normalize_username(&request.username)?;
+    let Some(user) = state
+        .repository
+        .find_auth_user_by_username(&username)
+        .await?
+    else {
+        record_security_event(
+            &state,
+            "login_failed",
+            &username,
+            Some(&username),
+            remote_ip,
+            user_agent.as_deref(),
+            json!({ "reason": "invalid_credentials" }),
+        )
+        .await?;
+        return Err(invalid_credentials_error());
+    };
+    if !user.enabled {
+        record_security_event(
+            &state,
+            "login_failed",
+            &username,
+            Some(&username),
+            remote_ip,
+            user_agent.as_deref(),
+            json!({ "reason": "user_disabled" }),
+        )
+        .await?;
+        return Err(invalid_credentials_error());
+    }
+    let _role = auth_user_role(&user)?;
+    if !verify_password(&user.password_hash, &request.password)
+        .map_err(|error| AppError::Internal(format!("failed to verify password: {error}")))?
+    {
+        record_security_event(
+            &state,
+            "login_failed",
+            &username,
+            Some(&username),
+            remote_ip,
+            user_agent.as_deref(),
+            json!({ "reason": "invalid_credentials" }),
+        )
+        .await?;
+        return Err(invalid_credentials_error());
+    }
+
+    let now = Utc::now();
+    let refresh_token = generate_refresh_token();
+    let refresh_expires_at = now + state.auth.refresh_token_ttl();
+    let issued = state
+        .auth
+        .issue_access_token(&user.username, auth::ApiRole::Admin)
+        .map_err(|error| AppError::Internal(format!("failed to issue access token: {error}")))?;
+    state
+        .repository
+        .insert_refresh_session(NewRefreshSession {
+            id: Uuid::now_v7(),
+            user_id: user.id,
+            token_hash: hash_refresh_token(&refresh_token),
+            expires_at: refresh_expires_at,
+            created_at: now,
+            client_ip: remote_ip,
+            user_agent: user_agent.clone(),
+        })
+        .await?;
+    state.repository.touch_auth_user_login(user.id, now).await?;
+    record_security_event(
+        &state,
+        "login_succeeded",
+        &user.username,
+        Some(&user.username),
+        remote_ip,
+        user_agent.as_deref(),
+        json!({}),
+    )
+    .await?;
+
+    Ok(Json(build_auth_tokens_response(
+        &user,
+        issued,
+        refresh_token,
+        refresh_expires_at,
+    )))
+}
+
+async fn auth_refresh(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Json(request): Json<AuthRefreshRequest>,
+) -> Result<Json<AuthTokensResponse>, AppError> {
+    require_local_password_login(&state)?;
+    let remote_ip = peer.map(|addr| addr.ip());
+    let user_agent = user_agent_from_headers(&headers);
+    let refresh_token = request.refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err(AppError::BadRequest(
+            "refresh_token must not be empty".to_string(),
+        ));
+    }
+    let now = Utc::now();
+    let Some(session) = state
+        .repository
+        .find_refresh_session(&hash_refresh_token(refresh_token))
+        .await?
+    else {
+        return Err(AppError::Forbidden("invalid refresh token".to_string()));
+    };
+    if session.revoked_at.is_some() || session.expires_at <= now || !session.user.enabled {
+        return Err(AppError::Forbidden("invalid refresh token".to_string()));
+    }
+    let _role = auth_user_role(&session.user)?;
+
+    let next_refresh_token = generate_refresh_token();
+    let next_refresh_expires_at = now + state.auth.refresh_token_ttl();
+    let issued = state
+        .auth
+        .issue_access_token(&session.user.username, auth::ApiRole::Admin)
+        .map_err(|error| AppError::Internal(format!("failed to issue access token: {error}")))?;
+    state
+        .repository
+        .rotate_refresh_session(
+            session.id,
+            &hash_refresh_token(&next_refresh_token),
+            next_refresh_expires_at,
+            now,
+            remote_ip,
+            user_agent.as_deref(),
+        )
+        .await?;
+    record_security_event(
+        &state,
+        "refresh_succeeded",
+        &session.user.username,
+        Some(&session.user.username),
+        remote_ip,
+        user_agent.as_deref(),
+        json!({}),
+    )
+    .await?;
+
+    Ok(Json(build_auth_tokens_response(
+        &session.user,
+        issued,
+        next_refresh_token,
+        next_refresh_expires_at,
+    )))
+}
+
+async fn auth_logout(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Json(request): Json<AuthLogoutRequest>,
+) -> Result<StatusCode, AppError> {
+    require_local_password_login(&state)?;
+    let remote_ip = peer.map(|addr| addr.ip());
+    let user_agent = user_agent_from_headers(&headers);
+    let refresh_token = request.refresh_token.trim();
+    if refresh_token.is_empty() {
+        return Err(AppError::BadRequest(
+            "refresh_token must not be empty".to_string(),
+        ));
+    }
+    if let Some(session) = state
+        .repository
+        .find_refresh_session(&hash_refresh_token(refresh_token))
+        .await?
+    {
+        state
+            .repository
+            .revoke_refresh_session(&session.token_hash, Utc::now())
+            .await?;
+        record_security_event(
+            &state,
+            "logout",
+            &session.user.username,
+            Some(&session.user.username),
+            remote_ip,
+            user_agent.as_deref(),
+            json!({}),
+        )
+        .await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn auth_change_password(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Json(request): Json<AuthChangePasswordRequest>,
+) -> Result<StatusCode, AppError> {
+    require_local_password_login(&state)?;
+    let principal = state.auth.session(&headers)?;
+    if principal.is_machine() {
+        return Err(AppError::Forbidden(
+            "machine allowlisted callers cannot change passwords".to_string(),
+        ));
+    }
+    let remote_ip = peer.map(|addr| addr.ip());
+    let user_agent = user_agent_from_headers(&headers);
+    let username = normalize_username(principal.subject())?;
+    let user = state
+        .repository
+        .find_auth_user_by_username(&username)
+        .await?
+        .ok_or_else(|| AppError::Forbidden("current account no longer exists".to_string()))?;
+    if !user.enabled {
+        return Err(AppError::Forbidden(
+            "current account is disabled".to_string(),
+        ));
+    }
+    if !verify_password(&user.password_hash, &request.current_password)
+        .map_err(|error| AppError::Internal(format!("failed to verify password: {error}")))?
+    {
+        return Err(AppError::Forbidden(
+            "current password is incorrect".to_string(),
+        ));
+    }
+    let next_password_hash = hash_password(&request.new_password)
+        .map_err(|error| AppError::BadRequest(error.to_string()))?;
+    state
+        .repository
+        .reset_user_password(
+            &username,
+            &next_password_hash,
+            false,
+            &username,
+            "password_changed",
+            remote_ip,
+            user_agent.as_deref(),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_machine_allowlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MachineAllowlistResponse>, AppError> {
+    let _principal = state.auth.authorize(&headers, ApiPermission::SecurityWrite)?;
+    let entries = state.repository.list_machine_allowlist().await?;
+    Ok(Json(MachineAllowlistResponse { entries }))
+}
+
+async fn update_machine_allowlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateMachineAllowlistRequest>,
+) -> Result<Json<MachineAllowlistResponse>, AppError> {
+    let principal = state.auth.authorize(&headers, ApiPermission::SecurityWrite)?;
+    let entries = normalize_machine_allowlist_entries(request.entries)?;
+    state.repository.replace_machine_allowlist(&entries).await?;
+    record_security_event(
+        &state,
+        "machine_allowlist_updated",
+        principal.subject(),
+        Some(principal.subject()),
+        None,
+        user_agent_from_headers(&headers).as_deref(),
+        json!({ "entries": entries.iter().map(|entry| &entry.cidr).collect::<Vec<_>>() }),
+    )
+    .await?;
+    let updated = state.repository.list_machine_allowlist().await?;
+    Ok(Json(MachineAllowlistResponse { entries: updated }))
+}
+
 async fn create_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Json(task): Json<TaskSpec>,
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
-    principal.ensure_tenant_access(task.tenant_id())?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let request_hash = hash_json(&task)?;
 
@@ -243,46 +746,49 @@ async fn create_task(
 
 async fn list_tasks(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Query(filter): Query<TaskListFilter>,
 ) -> Result<Json<media_domain::Page<repository::TaskSummary>>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskRead)?;
-    let filter = filter.for_principal(principal.tenant_id())?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     let tasks = state.repository.list_tasks(filter).await?;
     Ok(Json(tasks))
 }
 
 async fn get_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<repository::TaskDetail>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskRead)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     let task = state.repository.get_task(task_id).await?;
-    principal.ensure_tenant_access(&task.task.tenant_id)?;
     Ok(Json(task))
 }
 
 async fn get_resolved_spec(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskRead)?;
-    let task = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&task.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     let spec = state.repository.get_resolved_spec(task_id).await?;
     Ok(Json(spec))
 }
 
 async fn start_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let current = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&current.tenant_id)?;
     match current.status {
         media_domain::TaskStatus::Created
         | media_domain::TaskStatus::Failed
@@ -310,12 +816,12 @@ async fn start_task(
 
 async fn stop_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
-    let current = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&current.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let task = state
         .repository
         .transition_task(task_id, TaskOperation::Stop)
@@ -329,12 +835,12 @@ async fn stop_task(
 
 async fn cancel_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
-    let current = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&current.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let task = state
         .repository
         .transition_task(task_id, TaskOperation::Cancel)
@@ -350,25 +856,25 @@ async fn cancel_task(
 
 async fn retry_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<repository::AttemptSummary>), AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
-    let current = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&current.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let attempt = state.repository.retry_task(task_id).await?;
     Ok((StatusCode::ACCEPTED, Json(attempt)))
 }
 
 async fn clone_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
     overrides: Option<Json<TaskCloneOverride>>,
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
-    let current = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&current.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let task = state
         .repository
         .clone_task(task_id, overrides.map(|Json(value)| value))
@@ -378,13 +884,13 @@ async fn clone_task(
 
 async fn get_task_events(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
     Query(filter): Query<TaskEventFilter>,
 ) -> Result<Json<media_domain::Page<repository::TaskEventSummary>>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskRead)?;
-    let task = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&task.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     Ok(Json(
         state.repository.list_task_events(task_id, filter).await?,
     ))
@@ -392,13 +898,13 @@ async fn get_task_events(
 
 async fn get_task_logs(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(task_id): Path<Uuid>,
     Query(filter): Query<TaskLogFilter>,
 ) -> Result<Json<repository::TaskLogResponse>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskRead)?;
-    let task = state.repository.get_task_summary(task_id).await?;
-    principal.ensure_tenant_access(&task.tenant_id)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     Ok(Json(
         state.repository.list_task_logs(task_id, filter).await?,
     ))
@@ -406,12 +912,12 @@ async fn get_task_logs(
 
 async fn create_template(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Json(request): Json<TemplateCreateRequest>,
 ) -> Result<(StatusCode, Json<repository::TaskTemplateDetail>), AppError> {
-    let principal = state
-        .auth
-        .authorize(&headers, ApiPermission::TemplateWrite)?;
+    let principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateWrite).await?;
     let template = state
         .repository
         .create_template(request, principal.subject())
@@ -421,35 +927,35 @@ async fn create_template(
 
 async fn list_templates(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Query(filter): Query<TemplateListFilter>,
 ) -> Result<Json<Vec<repository::TaskTemplateSummary>>, AppError> {
-    let _principal = state
-        .auth
-        .authorize(&headers, ApiPermission::TemplateRead)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateRead).await?;
     Ok(Json(state.repository.list_templates(filter).await?))
 }
 
 async fn get_template(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(template_id): Path<Uuid>,
 ) -> Result<Json<repository::TaskTemplateDetail>, AppError> {
-    let _principal = state
-        .auth
-        .authorize(&headers, ApiPermission::TemplateRead)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateRead).await?;
     Ok(Json(state.repository.get_template(template_id).await?))
 }
 
 async fn render_template(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Path(template_id): Path<Uuid>,
     Json(overrides): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state
-        .auth
-        .authorize(&headers, ApiPermission::TemplateRead)?;
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateRead).await?;
     Ok(Json(
         state
             .repository
@@ -460,13 +966,12 @@ async fn render_template(
 
 async fn list_streams(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
-    Query(mut filter): Query<StreamListFilter>,
+    Query(filter): Query<StreamListFilter>,
 ) -> Result<Json<Vec<repository::StreamSummary>>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskRead)?;
-    if !matches!(principal.role(), auth::ApiRole::PlatformAdmin) {
-        filter.tenant_id = principal.tenant_id().map(str::to_string);
-    }
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     let expected_has_viewer = filter.has_viewer;
     let mut streams = state.repository.list_streams(filter).await?;
     if streams.is_empty() {
@@ -496,13 +1001,12 @@ async fn list_streams(
 
 async fn list_records(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
-    Query(mut filter): Query<RecordListFilter>,
+    Query(filter): Query<RecordListFilter>,
 ) -> Result<Json<media_domain::Page<repository::RecordFileSummary>>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::RecordRead)?;
-    if !matches!(principal.role(), auth::ApiRole::PlatformAdmin) {
-        filter.tenant_id = principal.tenant_id().map(str::to_string);
-    }
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::RecordRead).await?;
     Ok(Json(state.repository.list_record_files(filter).await?))
 }
 
@@ -1764,6 +2268,100 @@ fn parse_hook_source_allowlist(values: &[String]) -> anyhow::Result<Vec<IpAddr>>
         .collect()
 }
 
+fn parse_cli_command() -> anyhow::Result<Option<CliCommand>> {
+    let mut args = std::env::args().skip(1);
+    let Some(command) = args.next() else {
+        return Ok(None);
+    };
+    if command != "auth" {
+        anyhow::bail!("unsupported command `{command}`");
+    }
+    let Some(subcommand) = args.next() else {
+        anyhow::bail!("missing auth subcommand");
+    };
+
+    let mut username = None;
+    let mut expects_password_stdin = false;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--username" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --username"))?;
+                username = Some(value);
+            }
+            "--password-stdin" => expects_password_stdin = true,
+            other => anyhow::bail!("unsupported auth argument `{other}`"),
+        }
+    }
+
+    let username = username.ok_or_else(|| anyhow::anyhow!("--username is required"))?;
+    anyhow::ensure!(
+        expects_password_stdin,
+        "--password-stdin is required for auth commands"
+    );
+
+    let command = match subcommand.as_str() {
+        "bootstrap-admin" => CliCommand::BootstrapAdmin { username },
+        "reset-password" => CliCommand::ResetPassword { username },
+        other => anyhow::bail!("unsupported auth subcommand `{other}`"),
+    };
+    Ok(Some(command))
+}
+
+fn read_password_from_stdin() -> anyhow::Result<String> {
+    let mut password = String::new();
+    io::stdin().read_to_string(&mut password)?;
+    let password = password.trim_end_matches(['\r', '\n']).to_string();
+    anyhow::ensure!(!password.is_empty(), "password must not be empty");
+    Ok(password)
+}
+
+async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
+    let settings = config::Settings::load()?;
+    telemetry::init(&settings.logging);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&settings.core.database_url)
+        .await?;
+    sqlx::migrate!("../../migrations").run(&pool).await?;
+    let repository = TaskRepository::new(pool);
+    let password = read_password_from_stdin()?;
+    let password_hash = hash_password(&password)?;
+
+    match command {
+        CliCommand::BootstrapAdmin { username } => {
+            let username = normalize_username_value(&username)?;
+            anyhow::ensure!(
+                !repository.has_enabled_admin_user().await?,
+                "an enabled admin user already exists"
+            );
+            repository
+                .create_bootstrap_admin(&username, &password_hash, false)
+                .await?;
+            println!("bootstrapped admin user `{username}`");
+        }
+        CliCommand::ResetPassword { username } => {
+            let username = normalize_username_value(&username)?;
+            repository
+                .reset_user_password(
+                    &username,
+                    &password_hash,
+                    true,
+                    "cli",
+                    "password_reset",
+                    None,
+                    None,
+                )
+                .await?;
+            println!("reset password for `{username}`");
+        }
+    }
+
+    Ok(())
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -2007,6 +2605,50 @@ struct DebugSnapResponse {
     data_url: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuthLoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthRefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthLogoutRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthTokensResponse {
+    access_token: String,
+    access_token_expires_at: DateTime<Utc>,
+    refresh_token: String,
+    refresh_token_expires_at: DateTime<Utc>,
+    subject: String,
+    role: auth::ApiRole,
+    must_change_password: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateMachineAllowlistRequest {
+    #[serde(default)]
+    entries: Vec<MachineAllowlistWrite>,
+}
+
+#[derive(Debug, Serialize)]
+struct MachineAllowlistResponse {
+    entries: Vec<MachineAllowlistEntry>,
+}
+
 const fn default_snap_timeout_sec() -> u32 {
     10
 }
@@ -2205,11 +2847,11 @@ mod tests {
         sqlx::query(
             r#"
             insert into tasks (
-              id, tenant_id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, template_id, profile, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, 'default', 'relay-camera-01', 'live_relay'::task_type, 'RUNNING'::task_status, null, null, $2,
+              $1, 'relay-camera-01', 'live_relay'::task_type, 'RUNNING'::task_status, null, null, $2,
               50, $3, $3, 'tester', $4,
               1, 'immediate', $5, $5, $5, null
             )
@@ -2328,7 +2970,6 @@ mod tests {
             "type": "live_relay",
             "priority": 50,
             "common": {
-                "tenant_id": "default",
                 "created_by": "alice"
             },
             "input": {
@@ -2453,7 +3094,6 @@ mod tests {
             "type": "live_relay",
             "priority": 50,
             "common": {
-                "tenant_id": "default",
                 "created_by": "alice"
             },
             "input": {
@@ -2740,7 +3380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_session_returns_platform_admin_when_auth_is_disabled() -> anyhow::Result<()> {
+    async fn current_session_returns_admin_when_auth_is_disabled() -> anyhow::Result<()> {
         let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
         let app = build_app(test_app_state(pool));
 
@@ -2752,7 +3392,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = json_body(response).await;
         assert_eq!(body["auth_enabled"], json!(false));
-        assert_eq!(body["role"], json!("platform_admin"));
+        assert_eq!(body["role"], json!("admin"));
         assert_eq!(body["subject"], json!("auth_disabled"));
         Ok(())
     }
@@ -2816,7 +3456,7 @@ mod tests {
             root.headers()
                 .get(header::LOCATION)
                 .and_then(|value| value.to_str().ok()),
-            Some("/tasks")
+            Some("/overview")
         );
 
         let tasks = app
@@ -3181,7 +3821,7 @@ mod tests {
         let resolved_spec = json!({
             "type": "live_relay",
             "name": "relay-camera-01",
-            "common": {"tenant_id": "default", "created_by": "tester"},
+            "common": {"created_by": "tester"},
             "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
             "publish": {
                 "enable_rtsp": true,
@@ -3249,7 +3889,7 @@ mod tests {
         let resolved_spec = json!({
             "type": "live_relay",
             "name": "relay-camera",
-            "common": {"tenant_id": "default", "created_by": "tester"},
+            "common": {"created_by": "tester"},
             "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
             "publish": {},
             "record": {"enabled": false},

@@ -372,9 +372,6 @@ impl TaskSpec {
     pub fn resolved(&self) -> Self {
         let mut resolved = self.clone();
 
-        if resolved.common.tenant_id.is_none() {
-            resolved.common.tenant_id = Some("default".to_string());
-        }
         resolved.publish.enable_rtsp = Some(resolved.publish.enable_rtsp.unwrap_or(true));
         resolved.publish.enable_rtmp = Some(resolved.publish.enable_rtmp.unwrap_or(true));
         resolved.publish.enable_http_ts = Some(resolved.publish.enable_http_ts.unwrap_or(true));
@@ -409,10 +406,6 @@ impl TaskSpec {
             StartMode::Manual => TaskStatus::Created,
             StartMode::Immediate | StartMode::Cron | StartMode::At => TaskStatus::Validating,
         }
-    }
-
-    pub fn tenant_id(&self) -> &str {
-        self.common.tenant_id.as_deref().unwrap_or("default")
     }
 
     pub fn created_by(&self) -> Option<&str> {
@@ -658,8 +651,6 @@ impl TaskSpec {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CommonSpec {
-    #[serde(default)]
-    pub tenant_id: Option<String>,
     #[serde(default)]
     pub created_by: Option<String>,
     #[serde(default)]
@@ -915,7 +906,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -938,7 +928,6 @@ mod tests {
     fn resolve_applies_documented_defaults() {
         let resolved = sample_task(TaskType::LiveRelay).resolved();
 
-        assert_eq!(resolved.common.tenant_id.as_deref(), Some("default"));
         assert_eq!(resolved.publish.enable_rtsp, Some(true));
         assert_eq!(resolved.publish.enable_rtmp, Some(true));
         assert_eq!(resolved.publish.enable_http_ts, Some(true));
@@ -994,7 +983,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1030,7 +1018,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1067,7 +1054,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1105,7 +1091,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1144,7 +1129,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1184,7 +1168,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1215,7 +1198,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),
@@ -1246,7 +1228,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: None,
                 created_by: Some("alice".to_string()),
                 callback_url: None,
                 labels: Vec::new(),

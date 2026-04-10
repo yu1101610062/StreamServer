@@ -13,32 +13,45 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    networks:
+      streamserver-stack:
+        ipv4_address: ${POSTGRES_IP}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
 
   media-core:
     image: ${MEDIA_CORE_IMAGE}
     restart: unless-stopped
+    network_mode: host
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       STREAMSERVER_ENV: production
-      CORE_HTTP_ADDR: 0.0.0.0:8080
-      CORE_GRPC_ADDR: 0.0.0.0:50051
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      CORE_HTTP_ADDR: 0.0.0.0:${CORE_HTTP_PORT}
+      CORE_GRPC_ADDR: 0.0.0.0:${CORE_GRPC_PORT}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_IP}:5432/${POSTGRES_DB}
       HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
       HOOK_SOURCE_ALLOWLIST: ${HOOK_SOURCE_ALLOWLIST}
       STORAGE_ALLOWLIST: ${STORAGE_ALLOWLIST}
+      AUTH_MODE: ${AUTH_MODE}
       AUTH_ENABLED: ${AUTH_ENABLED}
       JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+      AUTH_JWT_PRIVATE_KEY_PATH: ${AUTH_JWT_PRIVATE_KEY_PATH}
+      AUTH_JWT_PUBLIC_KEY_PATH: ${AUTH_JWT_PUBLIC_KEY_PATH}
+      AUTH_ACCESS_TOKEN_TTL: ${AUTH_ACCESS_TOKEN_TTL}
+      AUTH_REFRESH_TOKEN_TTL: ${AUTH_REFRESH_TOKEN_TTL}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health/ready >/dev/null"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CORE_HTTP_PORT}/health/ready >/dev/null"]
       interval: 5s
       timeout: 3s
       retries: 20
     volumes:
       - ./certs:/certs:ro
-    ports:
-      - "${CORE_HTTP_PORT}:8080"
-      - "${CORE_GRPC_PORT}:50051"
+
+networks:
+  streamserver-stack:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${STACK_SUBNET}

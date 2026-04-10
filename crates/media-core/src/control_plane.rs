@@ -550,6 +550,7 @@ impl ControlPlaneService {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn pick_best_session(&self, source_affinity_ip: Option<IpAddr>) -> Option<SessionTarget> {
         let sessions = self.sessions.lock().await;
         sessions
@@ -1105,7 +1106,6 @@ mod tests {
             profile: None,
             priority: 50,
             common: CommonSpec {
-                tenant_id: Some("default".to_string()),
                 created_by: Some("test".to_string()),
                 callback_url: None,
                 labels: Vec::new(),

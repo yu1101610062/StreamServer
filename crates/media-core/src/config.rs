@@ -1,4 +1,19 @@
-use serde::Deserialize;
+use chrono::Duration;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    Disabled,
+    ExternalJwt,
+    LocalPassword,
+}
+
+impl Default for AuthMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -47,9 +62,17 @@ pub struct CoreSettings {
     #[serde(default)]
     pub database_url: String,
     #[serde(default)]
-    pub auth_enabled: bool,
+    pub auth_mode: AuthMode,
     #[serde(default)]
     pub jwt_public_key: String,
+    #[serde(default)]
+    pub auth_jwt_private_key_path: String,
+    #[serde(default)]
+    pub auth_jwt_public_key_path: String,
+    #[serde(default = "default_auth_access_token_ttl")]
+    pub auth_access_token_ttl: String,
+    #[serde(default = "default_auth_refresh_token_ttl")]
+    pub auth_refresh_token_ttl: String,
     #[serde(default)]
     pub hook_shared_secret: String,
     #[serde(default)]
@@ -69,8 +92,12 @@ impl Default for CoreSettings {
             grpc_tls_key_path: default_grpc_tls_key_path(),
             grpc_tls_client_ca_path: default_grpc_tls_client_ca_path(),
             database_url: String::new(),
-            auth_enabled: false,
+            auth_mode: AuthMode::Disabled,
             jwt_public_key: String::new(),
+            auth_jwt_private_key_path: String::new(),
+            auth_jwt_public_key_path: String::new(),
+            auth_access_token_ttl: default_auth_access_token_ttl(),
+            auth_refresh_token_ttl: default_auth_refresh_token_ttl(),
             hook_shared_secret: String::new(),
             hook_source_allowlist: Vec::new(),
             zlm_auto_close_on_no_reader_enabled: false,
@@ -113,11 +140,28 @@ impl Settings {
             !self.core.database_url.trim().is_empty(),
             "DATABASE_URL must be configured"
         );
-        if self.core.auth_enabled {
-            anyhow::ensure!(
-                !self.core.jwt_public_key.trim().is_empty(),
-                "JWT_PUBLIC_KEY must be configured when auth is enabled"
-            );
+        match self.core.auth_mode {
+            AuthMode::Disabled => {}
+            AuthMode::ExternalJwt => {
+                anyhow::ensure!(
+                    !self.core.jwt_public_key.trim().is_empty(),
+                    "JWT_PUBLIC_KEY must be configured when auth mode is external_jwt"
+                );
+            }
+            AuthMode::LocalPassword => {
+                anyhow::ensure!(
+                    !self.core.auth_jwt_private_key_path.trim().is_empty(),
+                    "AUTH_JWT_PRIVATE_KEY_PATH must be configured when auth mode is local_password"
+                );
+                anyhow::ensure!(
+                    !self.core.auth_jwt_public_key_path.trim().is_empty(),
+                    "AUTH_JWT_PUBLIC_KEY_PATH must be configured when auth mode is local_password"
+                );
+                parse_duration_spec(&self.core.auth_access_token_ttl)
+                    .map_err(|error| anyhow::anyhow!("invalid AUTH_ACCESS_TOKEN_TTL: {error}"))?;
+                parse_duration_spec(&self.core.auth_refresh_token_ttl)
+                    .map_err(|error| anyhow::anyhow!("invalid AUTH_REFRESH_TOKEN_TTL: {error}"))?;
+            }
         }
         anyhow::ensure!(
             !self.core.storage_allowlist.is_empty(),
@@ -158,11 +202,34 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("DATABASE_URL") {
         settings.core.database_url = value;
     }
-    if let Some(value) = env("AUTH_ENABLED") {
-        settings.core.auth_enabled = matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
+    if let Some(value) = env("AUTH_MODE") {
+        settings.core.auth_mode = match value.as_str() {
+            "disabled" => AuthMode::Disabled,
+            "external_jwt" => AuthMode::ExternalJwt,
+            "local_password" => AuthMode::LocalPassword,
+            other => panic!("unsupported AUTH_MODE: {other}"),
+        };
+    } else if let Some(value) = env("AUTH_ENABLED") {
+        settings.core.auth_mode = if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes") {
+            AuthMode::ExternalJwt
+        } else {
+            AuthMode::Disabled
+        };
     }
     if let Some(value) = env("JWT_PUBLIC_KEY") {
         settings.core.jwt_public_key = value;
+    }
+    if let Some(value) = env("AUTH_JWT_PRIVATE_KEY_PATH") {
+        settings.core.auth_jwt_private_key_path = value;
+    }
+    if let Some(value) = env("AUTH_JWT_PUBLIC_KEY_PATH") {
+        settings.core.auth_jwt_public_key_path = value;
+    }
+    if let Some(value) = env("AUTH_ACCESS_TOKEN_TTL") {
+        settings.core.auth_access_token_ttl = value;
+    }
+    if let Some(value) = env("AUTH_REFRESH_TOKEN_TTL") {
+        settings.core.auth_refresh_token_ttl = value;
     }
     if let Some(value) = env("HOOK_SHARED_SECRET") {
         settings.core.hook_shared_secret = value;
@@ -225,9 +292,39 @@ fn default_grpc_tls_client_ca_path() -> String {
     String::new()
 }
 
+fn default_auth_access_token_ttl() -> String {
+    "15m".to_string()
+}
+
+fn default_auth_refresh_token_ttl() -> String {
+    "7d".to_string()
+}
+
 fn default_storage_allowlist() -> Vec<String> {
     vec![
         "/data/media/work".to_string(),
         "/data/zlm/record".to_string(),
     ]
+}
+
+pub fn parse_duration_spec(value: &str) -> anyhow::Result<Duration> {
+    let trimmed = value.trim();
+    anyhow::ensure!(!trimmed.is_empty(), "duration must not be empty");
+    anyhow::ensure!(trimmed.len() >= 2, "duration is too short");
+
+    let (number, unit) = trimmed.split_at(trimmed.len() - 1);
+    let amount: i64 = number
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("duration amount must be an integer"))?;
+    anyhow::ensure!(amount > 0, "duration amount must be positive");
+
+    let duration = match unit {
+        "s" | "S" => Duration::seconds(amount),
+        "m" | "M" => Duration::minutes(amount),
+        "h" | "H" => Duration::hours(amount),
+        "d" | "D" => Duration::days(amount),
+        _ => anyhow::bail!("unsupported duration unit {unit}; use s, m, h or d"),
+    };
+    Ok(duration)
 }

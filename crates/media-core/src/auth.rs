@@ -1,51 +1,96 @@
-use std::sync::Arc;
+use std::{fs, sync::Arc};
 
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::OsRng as PasswordOsRng},
+};
 use axum::http::HeaderMap;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-use crate::error::AppError;
+use crate::{
+    config::{AuthMode, CoreSettings, parse_duration_spec},
+    error::AppError,
+};
 
 #[derive(Clone)]
 pub struct AuthConfig {
-    enabled: bool,
+    mode: AuthMode,
     verifier: Option<Arc<JwtVerifier>>,
+    signer: Option<Arc<JwtSigner>>,
+    access_token_ttl: Duration,
+    refresh_token_ttl: Duration,
 }
 
 impl AuthConfig {
+    #[cfg(test)]
+    pub fn from_public_key(enabled: bool, pem: &str) -> anyhow::Result<Self> {
+        if enabled {
+            Ok(Self {
+                mode: AuthMode::ExternalJwt,
+                verifier: Some(Arc::new(JwtVerifier::from_public_key_pem(pem)?)),
+                signer: None,
+                access_token_ttl: Duration::minutes(15),
+                refresh_token_ttl: Duration::days(7),
+            })
+        } else {
+            Ok(Self::disabled())
+        }
+    }
+
+    pub fn from_settings(settings: &CoreSettings) -> anyhow::Result<Self> {
+        match settings.auth_mode {
+            AuthMode::Disabled => Ok(Self {
+                mode: AuthMode::Disabled,
+                verifier: None,
+                signer: None,
+                access_token_ttl: Duration::minutes(15),
+                refresh_token_ttl: Duration::days(7),
+            }),
+            AuthMode::ExternalJwt => Ok(Self {
+                mode: AuthMode::ExternalJwt,
+                verifier: Some(Arc::new(JwtVerifier::from_public_key_pem(
+                    &settings.jwt_public_key,
+                )?)),
+                signer: None,
+                access_token_ttl: Duration::minutes(15),
+                refresh_token_ttl: Duration::days(7),
+            }),
+            AuthMode::LocalPassword => {
+                let public_pem = fs::read_to_string(&settings.auth_jwt_public_key_path)?;
+                let private_pem = fs::read_to_string(&settings.auth_jwt_private_key_path)?;
+                Ok(Self {
+                    mode: AuthMode::LocalPassword,
+                    verifier: Some(Arc::new(JwtVerifier::from_public_key_pem(&public_pem)?)),
+                    signer: Some(Arc::new(JwtSigner::from_private_key_pem(&private_pem)?)),
+                    access_token_ttl: parse_duration_spec(&settings.auth_access_token_ttl)?,
+                    refresh_token_ttl: parse_duration_spec(&settings.auth_refresh_token_ttl)?,
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub fn disabled() -> Self {
         Self {
-            enabled: false,
+            mode: AuthMode::Disabled,
             verifier: None,
+            signer: None,
+            access_token_ttl: Duration::minutes(15),
+            refresh_token_ttl: Duration::days(7),
         }
-    }
-
-    pub fn from_public_key(enabled: bool, pem: &str) -> anyhow::Result<Self> {
-        if !enabled {
-            return Ok(Self::disabled());
-        }
-
-        let verifier = JwtVerifier::from_public_key_pem(pem)?;
-        Ok(Self {
-            enabled: true,
-            verifier: Some(Arc::new(verifier)),
-        })
-    }
-
-    pub fn authorize(
-        &self,
-        headers: &HeaderMap,
-        permission: ApiPermission,
-    ) -> Result<AuthenticatedPrincipal, AppError> {
-        let principal = self.session(headers)?;
-
-        principal.require_permission(permission)?;
-        Ok(principal)
     }
 
     pub fn session(&self, headers: &HeaderMap) -> Result<AuthenticatedPrincipal, AppError> {
-        if !self.enabled {
-            return Ok(AuthenticatedPrincipal::platform_admin("auth_disabled"));
+        if self.mode == AuthMode::Disabled {
+            return Ok(AuthenticatedPrincipal::disabled_admin());
         }
 
         let verifier = self.verifier.as_ref().ok_or_else(|| {
@@ -54,9 +99,56 @@ impl AuthConfig {
         verifier.verify(headers)
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled
+    pub fn authorize(
+        &self,
+        headers: &HeaderMap,
+        permission: ApiPermission,
+    ) -> Result<AuthenticatedPrincipal, AppError> {
+        let principal = self.session(headers)?;
+        principal.require_permission(permission)?;
+        Ok(principal)
     }
+
+    pub fn enabled(&self) -> bool {
+        self.mode != AuthMode::Disabled
+    }
+
+    pub fn mode(&self) -> AuthMode {
+        self.mode
+    }
+
+    pub fn supports_local_login(&self) -> bool {
+        self.mode == AuthMode::LocalPassword
+    }
+
+    pub fn refresh_token_ttl(&self) -> Duration {
+        self.refresh_token_ttl
+    }
+
+    pub fn issue_access_token(
+        &self,
+        subject: &str,
+        role: ApiRole,
+    ) -> anyhow::Result<IssuedAccessToken> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("access token signing is not available"))?;
+        signer.issue(subject, role, self.access_token_ttl)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IssuedAccessToken {
+    pub token: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrincipalKind {
+    Disabled,
+    User,
+    Machine,
 }
 
 struct JwtVerifier {
@@ -64,11 +156,17 @@ struct JwtVerifier {
     ed_key: Option<DecodingKey>,
 }
 
+struct JwtSigner {
+    algorithm: Algorithm,
+    key: EncodingKey,
+}
+
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthConfig")
-            .field("enabled", &self.enabled)
+            .field("mode", &self.mode)
             .field("verifier", &self.verifier.is_some())
+            .field("signer", &self.signer.is_some())
             .finish()
     }
 }
@@ -78,14 +176,14 @@ impl JwtVerifier {
         let pem = pem.trim();
         anyhow::ensure!(
             !pem.is_empty(),
-            "JWT_PUBLIC_KEY must not be empty when auth is enabled"
+            "JWT public key must not be empty when auth is enabled"
         );
 
         let rsa_key = DecodingKey::from_rsa_pem(pem.as_bytes()).ok();
         let ed_key = DecodingKey::from_ed_pem(pem.as_bytes()).ok();
         anyhow::ensure!(
             rsa_key.is_some() || ed_key.is_some(),
-            "JWT_PUBLIC_KEY must be a valid RSA or Ed25519 public key in PEM format"
+            "JWT public key must be a valid RSA or Ed25519 public key in PEM format"
         );
 
         Ok(Self { rsa_key, ed_key })
@@ -109,15 +207,61 @@ impl JwtVerifier {
         })?;
 
         let mut validation = Validation::new(algorithm);
-        validation.validate_exp = false;
-        validation.validate_nbf = false;
-        validation.required_spec_claims.clear();
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.required_spec_claims = ["exp", "iat", "nbf", "sub"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        validation.leeway = 30;
 
         let claims = decode::<JwtClaims>(token, key, &validation)
             .map_err(|error| AppError::Forbidden(format!("invalid bearer token: {error}")))?
             .claims;
 
         AuthenticatedPrincipal::from_claims(claims)
+    }
+}
+
+impl JwtSigner {
+    fn from_private_key_pem(pem: &str) -> anyhow::Result<Self> {
+        let pem = pem.trim();
+        anyhow::ensure!(
+            !pem.is_empty(),
+            "JWT private key must not be empty when local auth is enabled"
+        );
+
+        if let Ok(key) = EncodingKey::from_rsa_pem(pem.as_bytes()) {
+            return Ok(Self {
+                algorithm: Algorithm::RS256,
+                key,
+            });
+        }
+        if let Ok(key) = EncodingKey::from_ed_pem(pem.as_bytes()) {
+            return Ok(Self {
+                algorithm: Algorithm::EdDSA,
+                key,
+            });
+        }
+
+        anyhow::bail!("JWT private key must be a valid RSA or Ed25519 private key in PEM format")
+    }
+
+    fn issue(&self, subject: &str, role: ApiRole, ttl: Duration) -> anyhow::Result<IssuedAccessToken> {
+        let now = Utc::now();
+        let expires_at = now + ttl;
+        let claims = JwtClaims {
+            sub: subject.to_string(),
+            role,
+            jti: Uuid::now_v7().to_string(),
+            iat: now.timestamp(),
+            nbf: now.timestamp(),
+            exp: expires_at.timestamp(),
+        };
+        let mut header = Header::new(self.algorithm);
+        header.typ = Some("JWT".to_string());
+        let token = encode(&header, &claims, &self.key)?;
+        Ok(IssuedAccessToken { token, expires_at })
     }
 }
 
@@ -130,6 +274,7 @@ pub enum ApiPermission {
     RecordRead,
     NodeRead,
     DebugRead,
+    SecurityWrite,
 }
 
 impl ApiPermission {
@@ -142,11 +287,12 @@ impl ApiPermission {
             Self::RecordRead => "record_read",
             Self::NodeRead => "node_read",
             Self::DebugRead => "debug_read",
+            Self::SecurityWrite => "security_write",
         }
     }
 }
 
-const ALL_PERMISSIONS: [ApiPermission; 7] = [
+const ALL_PERMISSIONS: [ApiPermission; 8] = [
     ApiPermission::TaskRead,
     ApiPermission::TaskWrite,
     ApiPermission::TemplateRead,
@@ -154,29 +300,30 @@ const ALL_PERMISSIONS: [ApiPermission; 7] = [
     ApiPermission::RecordRead,
     ApiPermission::NodeRead,
     ApiPermission::DebugRead,
+    ApiPermission::SecurityWrite,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ApiRole {
-    PlatformAdmin,
-    TenantUser,
-    AuditUser,
+    #[serde(rename = "admin", alias = "platform_admin")]
+    Admin,
 }
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedPrincipal {
     subject: String,
     role: ApiRole,
-    tenant_id: Option<String>,
+    kind: PrincipalKind,
+    must_change_password: bool,
 }
 
 impl AuthenticatedPrincipal {
-    fn platform_admin(subject: &str) -> Self {
+    fn disabled_admin() -> Self {
         Self {
-            subject: subject.to_string(),
-            role: ApiRole::PlatformAdmin,
-            tenant_id: None,
+            subject: "auth_disabled".to_string(),
+            role: ApiRole::Admin,
+            kind: PrincipalKind::Disabled,
+            must_change_password: false,
         }
     }
 
@@ -186,27 +333,22 @@ impl AuthenticatedPrincipal {
                 "bearer token missing subject".to_string(),
             ));
         }
-        if !matches!(claims.role, ApiRole::PlatformAdmin)
-            && claims
-                .tenant_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-        {
-            return Err(AppError::Forbidden(
-                "tenant-scoped bearer token missing tenant_id".to_string(),
-            ));
-        }
 
         Ok(Self {
             subject: claims.sub.trim().to_string(),
             role: claims.role,
-            tenant_id: claims
-                .tenant_id
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
+            kind: PrincipalKind::User,
+            must_change_password: false,
         })
+    }
+
+    pub fn machine_allowlisted(subject: &str) -> Self {
+        Self {
+            subject: subject.to_string(),
+            role: ApiRole::Admin,
+            kind: PrincipalKind::Machine,
+            must_change_password: false,
+        }
     }
 
     pub fn subject(&self) -> &str {
@@ -217,42 +359,34 @@ impl AuthenticatedPrincipal {
         self.role
     }
 
-    pub fn tenant_id(&self) -> Option<&str> {
-        self.tenant_id.as_deref()
+    pub fn must_change_password(&self) -> bool {
+        self.must_change_password
+    }
+
+    pub fn is_machine(&self) -> bool {
+        self.kind == PrincipalKind::Machine
     }
 
     pub fn require_permission(&self, permission: ApiPermission) -> Result<(), AppError> {
-        let allowed = match permission {
-            ApiPermission::TaskRead => true,
-            ApiPermission::TaskWrite => !matches!(self.role, ApiRole::AuditUser),
-            ApiPermission::TemplateRead => true,
-            ApiPermission::TemplateWrite => matches!(self.role, ApiRole::PlatformAdmin),
-            ApiPermission::RecordRead => true,
-            ApiPermission::NodeRead | ApiPermission::DebugRead => {
-                matches!(self.role, ApiRole::PlatformAdmin)
-            }
+        let allowed = match self.kind {
+            PrincipalKind::Disabled | PrincipalKind::User => true,
+            PrincipalKind::Machine => matches!(
+                permission,
+                ApiPermission::TaskRead
+                    | ApiPermission::TaskWrite
+                    | ApiPermission::TemplateRead
+                    | ApiPermission::TemplateWrite
+                    | ApiPermission::RecordRead
+            ),
         };
 
         if allowed {
             Ok(())
         } else {
             Err(AppError::Forbidden(format!(
-                "role {:?} is not allowed to access this endpoint",
-                self.role
+                "principal is not allowed to access {}",
+                permission.as_str()
             )))
-        }
-    }
-
-    pub fn ensure_tenant_access(&self, tenant_id: &str) -> Result<(), AppError> {
-        if matches!(self.role, ApiRole::PlatformAdmin) {
-            return Ok(());
-        }
-
-        match self.tenant_id.as_deref() {
-            Some(current) if current == tenant_id => Ok(()),
-            _ => Err(AppError::Forbidden(format!(
-                "principal is not allowed to access tenant {tenant_id}"
-            ))),
         }
     }
 
@@ -265,15 +399,17 @@ impl AuthenticatedPrincipal {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct JwtClaims {
     sub: String,
     role: ApiRole,
-    #[serde(default)]
-    tenant_id: Option<String>,
+    jti: String,
+    iat: i64,
+    nbf: i64,
+    exp: i64,
 }
 
-fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, AppError> {
+pub fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, AppError> {
     let header = headers
         .get(axum::http::header::AUTHORIZATION)
         .ok_or_else(|| AppError::Forbidden("missing Authorization header".to_string()))?;
@@ -291,61 +427,87 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<&str, AppError> {
     Ok(token)
 }
 
+pub fn maybe_extract_bearer_token(headers: &HeaderMap) -> Result<Option<&str>, AppError> {
+    match headers.get(axum::http::header::AUTHORIZATION) {
+        Some(_) => extract_bearer_token(headers).map(Some),
+        None => Ok(None),
+    }
+}
+
+pub fn hash_refresh_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    BASE64_STANDARD.encode(digest)
+}
+
+pub fn generate_refresh_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    BASE64_STANDARD.encode(bytes)
+}
+
+pub fn hash_password(password: &str) -> anyhow::Result<String> {
+    anyhow::ensure!(!password.trim().is_empty(), "password must not be empty");
+    anyhow::ensure!(
+        password.chars().count() >= 8,
+        "password must be at least 8 characters"
+    );
+    let salt = SaltString::generate(&mut PasswordOsRng);
+    Ok(Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|error| anyhow::anyhow!("failed to hash password: {error}"))?
+        .to_string())
+}
+
+pub fn verify_password(password_hash: &str, password: &str) -> anyhow::Result<bool> {
+    let parsed = PasswordHash::new(password_hash)
+        .map_err(|error| anyhow::anyhow!("invalid password hash: {error}"))?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDRNk+CElS+M3My1DbTUInl9aeU\nYCLza8Uftij7kPTApECFQcy1em6CZwb+PDHjjtFB2i8Ncfbx+dt2S6CbJHSF0dDB\n+GoiaVaYolB9XoQODqA7LXTy/D4e9jdNJQgDVXlzXsTm4k3v1CnC1As7RfUkgdM/\npsbfsbeai7RULN2NnQIDAQAB\n-----END PUBLIC KEY-----";
+    const ED25519_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMAlSI3/XdPzRT72Rw08g6NnTnJ2eaq1JoJoW5Vlbm/T\n-----END PRIVATE KEY-----";
+    const ED25519_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA5Q5gilpT0f2fcLhC7l30Wou7Ng/gESlFWWx8z6TGJw=\n-----END PUBLIC KEY-----";
 
     #[test]
-    fn disabled_auth_returns_platform_admin() {
+    fn disabled_auth_returns_admin() {
         let config = AuthConfig::disabled();
         let principal = config
             .authorize(&HeaderMap::new(), ApiPermission::DebugRead)
             .expect("auth should be bypassed");
 
-        assert_eq!(principal.role(), ApiRole::PlatformAdmin);
+        assert_eq!(principal.role(), ApiRole::Admin);
         assert_eq!(principal.subject(), "auth_disabled");
     }
 
     #[test]
-    fn tenant_user_must_match_tenant() {
-        let principal = AuthenticatedPrincipal {
-            subject: "alice".to_string(),
-            role: ApiRole::TenantUser,
-            tenant_id: Some("tenant-a".to_string()),
-        };
-
-        assert!(principal.ensure_tenant_access("tenant-a").is_ok());
-        assert!(principal.ensure_tenant_access("tenant-b").is_err());
-        assert!(
-            principal
-                .require_permission(ApiPermission::TaskWrite)
-                .is_ok()
-        );
-        assert!(
-            principal
-                .require_permission(ApiPermission::TemplateWrite)
-                .is_err()
-        );
+    fn machine_principal_has_limited_permissions() {
+        let principal = AuthenticatedPrincipal::machine_allowlisted("10.0.0.5");
+        assert!(principal.require_permission(ApiPermission::TaskWrite).is_ok());
+        assert!(principal.require_permission(ApiPermission::TemplateRead).is_ok());
+        assert!(principal.require_permission(ApiPermission::NodeRead).is_err());
+        assert!(principal.require_permission(ApiPermission::DebugRead).is_err());
     }
 
     #[test]
-    fn auth_config_rejects_empty_pem_when_enabled() {
-        let error = AuthConfig::from_public_key(true, "").expect_err("empty key should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("JWT_PUBLIC_KEY must not be empty")
+    fn signer_and_verifier_round_trip() {
+        let signer =
+            JwtSigner::from_private_key_pem(ED25519_PRIVATE_KEY).expect("private key");
+        let verifier = JwtVerifier::from_public_key_pem(ED25519_PUBLIC_KEY).expect("public key");
+        let issued = signer
+            .issue("alice", ApiRole::Admin, Duration::minutes(5))
+            .expect("token should issue");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", issued.token).parse().expect("header"),
         );
-    }
-
-    #[test]
-    fn auth_config_accepts_valid_rsa_pem() {
-        let config =
-            AuthConfig::from_public_key(true, RSA_PUBLIC_KEY).expect("rsa pem should load");
-
-        assert!(config.enabled);
-        assert!(config.verifier.is_some());
+        let principal = verifier.verify(&headers).expect("token should verify");
+        assert_eq!(principal.subject(), "alice");
+        assert_eq!(principal.role(), ApiRole::Admin);
     }
 }

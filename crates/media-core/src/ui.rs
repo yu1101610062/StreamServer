@@ -7,7 +7,10 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::{AppState, auth::ApiPermission, error::AppError, repository::TaskPreview};
+use crate::{
+    AppState, PeerAddress, auth::ApiPermission, authorize_business_request, error::AppError,
+    repository::TaskPreview,
+};
 use media_domain::TaskSpec;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -17,6 +20,7 @@ const STYLES_CSS: &str = include_str!("../ui/styles.css");
 pub(crate) fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(root_redirect))
+        .route("/login", get(shell))
         .route("/overview", get(shell))
         .route("/api-docs", get(shell))
         .route("/tasks", get(shell))
@@ -24,6 +28,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/streams", get(shell))
         .route("/multicast", get(shell))
         .route("/records", get(shell))
+        .route("/security", get(shell))
         .route("/nodes", get(shell))
         .route("/debug", get(shell))
         .route("/debug/{*rest}", get(shell))
@@ -39,9 +44,10 @@ pub(crate) async fn current_session(
     let principal = state.auth.session(&headers)?;
     Ok(Json(CurrentSessionResponse {
         auth_enabled: state.auth.enabled(),
+        auth_mode: state.auth.mode(),
         subject: principal.subject().to_string(),
         role: principal.role(),
-        tenant_id: principal.tenant_id().map(str::to_string),
+        must_change_password: principal.must_change_password(),
         permissions: principal
             .granted_permissions()
             .into_iter()
@@ -53,11 +59,11 @@ pub(crate) async fn current_session(
 
 pub(crate) async fn preview_task(
     State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
     headers: HeaderMap,
     Json(task): Json<TaskSpec>,
 ) -> Result<Json<TaskPreview>, AppError> {
-    let principal = state.auth.authorize(&headers, ApiPermission::TaskWrite)?;
-    principal.ensure_tenant_access(task.tenant_id())?;
+    authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     Ok(Json(state.repository.preview_task_spec(task).await?))
 }
 
@@ -96,9 +102,10 @@ fn asset_response(content_type: &'static str, body: &'static str) -> Response {
 #[derive(Debug, Serialize)]
 pub(crate) struct CurrentSessionResponse {
     auth_enabled: bool,
+    auth_mode: crate::config::AuthMode,
     subject: String,
     role: crate::auth::ApiRole,
-    tenant_id: Option<String>,
+    must_change_password: bool,
     permissions: Vec<&'static str>,
     environment: String,
 }

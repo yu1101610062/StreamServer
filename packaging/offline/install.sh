@@ -112,6 +112,38 @@ prompt_yes_no() {
   done
 }
 
+prompt_secret() {
+  local message="$1"
+  local answer
+  printf '%s: ' "${message}" >&2
+  read -r -s answer
+  printf '\n' >&2
+  printf '%s' "${answer}"
+}
+
+prompt_password_with_confirmation() {
+  local message="$1"
+  local password
+  local confirm
+  while true; do
+    password="$(prompt_secret "${message}")"
+    [ -n "${password}" ] || {
+      echo "输入不能为空。" >&2
+      continue
+    }
+    [ "${#password}" -ge 8 ] || {
+      echo "密码至少需要 8 个字符。" >&2
+      continue
+    }
+    confirm="$(prompt_secret "再次输入以确认")"
+    if [ "${password}" = "${confirm}" ]; then
+      printf '%s' "${password}"
+      return 0
+    fi
+    echo "两次输入的密码不一致，请重试。" >&2
+  done
+}
+
 generate_uuid() {
   if command -v uuidgen >/dev/null 2>&1; then
     uuidgen | tr '[:upper:]' '[:lower:]'
@@ -313,6 +345,145 @@ prepare_install_dir() {
   mkdir -p "${install_dir}/docs"
 }
 
+configure_auth_defaults() {
+  AUTH_MODE="disabled"
+  AUTH_ENABLED="false"
+  JWT_PUBLIC_KEY=""
+  AUTH_JWT_PRIVATE_KEY_PATH=""
+  AUTH_JWT_PUBLIC_KEY_PATH=""
+  AUTH_ACCESS_TOKEN_TTL="15m"
+  AUTH_REFRESH_TOKEN_TTL="7d"
+  AUTH_BOOTSTRAP_ADMIN_USERNAME=""
+  AUTH_BOOTSTRAP_ADMIN_PASSWORD=""
+}
+
+prompt_local_auth_configuration() {
+  configure_auth_defaults
+  if ! prompt_yes_no "是否启用 media-core 内建用户名密码鉴权？" "N"; then
+    return 0
+  fi
+
+  AUTH_MODE="local_password"
+  AUTH_ENABLED="true"
+  AUTH_BOOTSTRAP_ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "admin")"
+  AUTH_BOOTSTRAP_ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
+}
+
+prepare_local_auth_assets() {
+  local install_dir="$1"
+  local auth_dir
+  local private_key_host_path
+  local public_key_host_path
+
+  [ "${AUTH_MODE}" = "local_password" ] || return 0
+
+  require_cmd openssl
+  auth_dir="${install_dir}/certs/auth"
+  private_key_host_path="${auth_dir}/jwt-ed25519-private.pem"
+  public_key_host_path="${auth_dir}/jwt-ed25519-public.pem"
+
+  mkdir -p "${auth_dir}"
+  openssl genpkey -algorithm Ed25519 -out "${private_key_host_path}" >/dev/null 2>&1
+  openssl pkey -in "${private_key_host_path}" -pubout -out "${public_key_host_path}" >/dev/null 2>&1
+  chmod 600 "${private_key_host_path}"
+  chmod 644 "${public_key_host_path}"
+
+  AUTH_JWT_PRIVATE_KEY_PATH="/certs/auth/$(basename "${private_key_host_path}")"
+  AUTH_JWT_PUBLIC_KEY_PATH="/certs/auth/$(basename "${public_key_host_path}")"
+  JWT_PUBLIC_KEY=""
+}
+
+wait_for_compose_service_ready() {
+  local install_dir="$1"
+  local service_name="$2"
+  local timeout_seconds="${3:-90}"
+  local container_id=""
+  local state=""
+  local waited=0
+
+  while [ "${waited}" -lt "${timeout_seconds}" ]; do
+    container_id="$(
+      cd "${install_dir}" &&
+      compose_with_file ps -q "${service_name}" 2>/dev/null | head -n 1
+    )"
+    if [ -n "${container_id}" ]; then
+      state="$(
+        docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${container_id}" 2>/dev/null || true
+      )"
+      case "${state}" in
+        healthy|running)
+          return 0
+          ;;
+        unhealthy|exited|dead)
+          fail "服务 ${service_name} 启动失败，当前状态为 ${state}"
+          ;;
+      esac
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+
+  fail "等待服务 ${service_name} 就绪超时"
+}
+
+bootstrap_local_admin_if_needed() {
+  local install_dir="$1"
+  local output
+  local postgres_container_id=""
+  local postgres_state=""
+  local postgres_was_running=0
+
+  [ "${AUTH_MODE}" = "local_password" ] || return 0
+
+  postgres_container_id="$(
+    cd "${install_dir}" &&
+    compose_with_file ps -q postgres 2>/dev/null | head -n 1
+  )"
+  if [ -n "${postgres_container_id}" ]; then
+    postgres_state="$(
+      docker inspect --format '{{.State.Status}}' "${postgres_container_id}" 2>/dev/null || true
+    )"
+    if [ "${postgres_state}" = "running" ]; then
+      postgres_was_running=1
+    fi
+  fi
+
+  log "已启用本地用户名密码鉴权，准备初始化管理员账号 ${AUTH_BOOTSTRAP_ADMIN_USERNAME}"
+  (
+    cd "${install_dir}"
+    compose_with_file up -d postgres >/dev/null
+  )
+  wait_for_compose_service_ready "${install_dir}" "postgres" 90
+
+  if ! output="$(
+    cd "${install_dir}" &&
+    printf '%s' "${AUTH_BOOTSTRAP_ADMIN_PASSWORD}" | \
+      compose_with_file run --rm --no-deps -T media-core \
+        media-core auth bootstrap-admin --username "${AUTH_BOOTSTRAP_ADMIN_USERNAME}" --password-stdin 2>&1
+  )"; then
+    (
+      cd "${install_dir}"
+      if [ "${postgres_was_running}" -ne 1 ]; then
+        compose_with_file stop postgres >/dev/null 2>&1 || true
+      fi
+    )
+    if printf '%s' "${output}" | grep -q "an enabled admin user already exists"; then
+      log "检测到数据库中已存在启用中的管理员账号，跳过 bootstrap-admin。"
+      return 0
+    fi
+    printf '%s\n' "${output}" >&2
+    fail "初始化管理员账号失败"
+  fi
+
+  log "已完成管理员账号初始化。"
+  (
+    cd "${install_dir}"
+    if [ "${postgres_was_running}" -ne 1 ]; then
+      compose_with_file stop postgres >/dev/null 2>&1 || true
+    fi
+  )
+}
+
 write_control_plane_env() {
   local env_file="$1"
   cat >"${env_file}" <<EOF
@@ -324,11 +495,18 @@ POSTGRES_USER=${POSTGRES_USER}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 CORE_HTTP_PORT=${CORE_HTTP_PORT}
 CORE_GRPC_PORT=${CORE_GRPC_PORT}
+STACK_SUBNET=${STACK_SUBNET}
+POSTGRES_IP=${POSTGRES_IP}
 HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
 HOOK_SOURCE_ALLOWLIST=${HOOK_SOURCE_ALLOWLIST}
 STORAGE_ALLOWLIST=${STORAGE_ALLOWLIST}
+AUTH_MODE=${AUTH_MODE}
 AUTH_ENABLED=${AUTH_ENABLED}
 JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+AUTH_JWT_PRIVATE_KEY_PATH=${AUTH_JWT_PRIVATE_KEY_PATH}
+AUTH_JWT_PUBLIC_KEY_PATH=${AUTH_JWT_PUBLIC_KEY_PATH}
+AUTH_ACCESS_TOKEN_TTL=${AUTH_ACCESS_TOKEN_TTL}
+AUTH_REFRESH_TOKEN_TTL=${AUTH_REFRESH_TOKEN_TTL}
 
 # HTTPS 默认关闭。
 # 当前应用不内置 HTTPS listener，如需 HTTPS，请在反向代理中终止 TLS 后转发到 media-core:8080。
@@ -337,41 +515,6 @@ JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
 # CORE_GRPC_TLS_CERT_PATH=/certs/self-signed/media-core.pem
 # CORE_GRPC_TLS_KEY_PATH=/certs/self-signed/media-core.key
 # CORE_GRPC_TLS_CLIENT_CA_PATH=/certs/self-signed/ca.pem
-EOF
-}
-
-write_worker_bridge_env() {
-  local env_file="$1"
-  cat >"${env_file}" <<EOF
-COMPOSE_PROJECT_NAME=${PROJECT_NAME}
-MEDIA_AGENT_IMAGE=${MEDIA_AGENT_IMAGE}
-ZLM_IMAGE=${ZLM_IMAGE}
-NODE_ID=${NODE_ID}
-AGENT_NODE_NAME=${AGENT_NODE_NAME}
-CORE_HTTP_HOST=${CORE_HTTP_HOST}
-CORE_HTTP_PORT=${CORE_HTTP_PORT}
-CORE_GRPC_HOST=${CORE_GRPC_HOST}
-CORE_GRPC_PORT=${CORE_GRPC_PORT}
-PUBLIC_HOST=${PUBLIC_HOST}
-ZLM_API_HOST=${ZLM_API_HOST}
-AGENT_HTTP_PORT=${AGENT_HTTP_PORT}
-ZLM_HTTP_PORT=${ZLM_HTTP_PORT}
-ZLM_RTMP_PORT=${ZLM_RTMP_PORT}
-ZLM_RTSP_PORT=${ZLM_RTSP_PORT}
-HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
-AGENT_NETWORK_MODE=bridge
-AGENT_LABELS=offline,worker,bridge
-WORK_ROOT=/data/media/work
-STACK_SUBNET=${STACK_SUBNET}
-AGENT_IP=${AGENT_IP}
-ZLM_IP=${ZLM_IP}
-
-# mTLS 默认关闭。如需开启，请将 AGENT_CORE_ENDPOINT 改为 https，并取消以下注释：
-# AGENT_CORE_ENDPOINT=https://${CORE_GRPC_HOST}:${CORE_GRPC_PORT}
-# AGENT_CERT_PATH=/certs/self-signed/media-agent.pem
-# AGENT_KEY_PATH=/certs/self-signed/media-agent.key
-# AGENT_CA_PATH=/certs/self-signed/ca.pem
-# AGENT_TLS_DOMAIN_NAME=streamserver-core.local
 EOF
 }
 
@@ -411,52 +554,6 @@ WORK_ROOT=/data/media/work
 EOF
 }
 
-write_all_in_one_env() {
-  local env_file="$1"
-  cat >"${env_file}" <<EOF
-COMPOSE_PROJECT_NAME=${PROJECT_NAME}
-POSTGRES_IMAGE=${POSTGRES_IMAGE}
-MEDIA_CORE_IMAGE=${MEDIA_CORE_IMAGE}
-MEDIA_AGENT_IMAGE=${MEDIA_AGENT_IMAGE}
-ZLM_IMAGE=${ZLM_IMAGE}
-POSTGRES_DB=${POSTGRES_DB}
-POSTGRES_USER=${POSTGRES_USER}
-POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-CORE_HTTP_PORT=${CORE_HTTP_PORT}
-CORE_GRPC_PORT=${CORE_GRPC_PORT}
-AGENT_HTTP_PORT=${AGENT_HTTP_PORT}
-ZLM_HTTP_PORT=${ZLM_HTTP_PORT}
-ZLM_RTMP_PORT=${ZLM_RTMP_PORT}
-ZLM_RTSP_PORT=${ZLM_RTSP_PORT}
-HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
-PUBLIC_HOST=${PUBLIC_HOST}
-NODE_ID=${NODE_ID}
-AGENT_NODE_NAME=${AGENT_NODE_NAME}
-AGENT_LABELS=offline,all-in-one
-STORAGE_ALLOWLIST=/data/media/work,/data/zlm/record,/data/zlm/www
-AUTH_ENABLED=false
-JWT_PUBLIC_KEY=
-STACK_SUBNET=${STACK_SUBNET}
-CORE_IP=${CORE_IP}
-AGENT_IP=${AGENT_IP}
-ZLM_IP=${ZLM_IP}
-POSTGRES_IP=${POSTGRES_IP}
-
-# HTTPS 默认关闭。
-# 当前应用不内置 HTTPS listener，如需 HTTPS，请在反向代理中终止 TLS 后转发到 media-core:8080。
-#
-# gRPC mTLS 默认关闭。启用时请同时为 media-core 和 media-agent 设置以下变量：
-# CORE_GRPC_TLS_CERT_PATH=/certs/self-signed/media-core.pem
-# CORE_GRPC_TLS_KEY_PATH=/certs/self-signed/media-core.key
-# CORE_GRPC_TLS_CLIENT_CA_PATH=/certs/self-signed/ca.pem
-# AGENT_CORE_ENDPOINT=https://media-core:50051
-# AGENT_CERT_PATH=/certs/self-signed/media-agent.pem
-# AGENT_KEY_PATH=/certs/self-signed/media-agent.key
-# AGENT_CA_PATH=/certs/self-signed/ca.pem
-# AGENT_TLS_DOMAIN_NAME=streamserver-core.local
-EOF
-}
-
 write_all_in_one_host_env() {
   local env_file="$1"
   cat >"${env_file}" <<EOF
@@ -486,8 +583,13 @@ AGENT_MULTICAST_INTERFACE_NAME=${MULTICAST_INTERFACE_NAME}
 AGENT_MULTICAST_INTERFACE_IP=${MULTICAST_INTERFACE_IP}
 AGENT_LABELS=offline,all-in-one,host
 STORAGE_ALLOWLIST=/data/media/work,/data/zlm/record,/data/zlm/www
-AUTH_ENABLED=false
-JWT_PUBLIC_KEY=
+AUTH_MODE=${AUTH_MODE}
+AUTH_ENABLED=${AUTH_ENABLED}
+JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
+AUTH_JWT_PRIVATE_KEY_PATH=${AUTH_JWT_PRIVATE_KEY_PATH}
+AUTH_JWT_PUBLIC_KEY_PATH=${AUTH_JWT_PUBLIC_KEY_PATH}
+AUTH_ACCESS_TOKEN_TTL=${AUTH_ACCESS_TOKEN_TTL}
+AUTH_REFRESH_TOKEN_TTL=${AUTH_REFRESH_TOKEN_TTL}
 STACK_SUBNET=${STACK_SUBNET}
 CORE_IP=${CORE_IP}
 POSTGRES_IP=${POSTGRES_IP}
@@ -634,48 +736,33 @@ select_role() {
     echo "  1) control-plane"
     echo "     用途: 只安装中心控制面，包含 media-core 和 PostgreSQL。"
     echo "     适合: 多工作节点部署中的中心节点，或你已经有独立媒体工作节点的情况。"
-    echo "     网络特性: 不处理媒体组播，只暴露控制面 HTTP/gRPC 端口。"
+    echo "     网络特性: media-core 使用 host；PostgreSQL 保持 bridge。"
     echo
-    echo "  2) worker-bridge"
+    echo "  2) worker-host"
     echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
-    echo "     适合: 普通拉流、转发、录像、RTSP/RTMP/HLS 联调。"
-    echo "     网络特性: 使用 Docker bridge 网络，和宿主网络隔离较好。"
-    echo "     限制: 不推荐用于真实 UDP 组播场景。"
-    echo
-    echo "  3) worker-host"
-    echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
-    echo "     适合: 真实 UDP 组播、需要直接绑定宿主机网卡的工作节点。"
+    echo "     适合: 所有工作节点场景，尤其是组播和需要直接绑定宿主机网卡的情况。"
     echo "     网络特性: media-agent 和 ZLMediaKit 直接使用 host 网络。"
     echo "     注意: 会直接占用宿主机媒体端口，更适合专用媒体节点。"
     echo
-    echo "  4) all-in-one"
-    echo "     用途: 单机安装完整系统，包含 media-core、PostgreSQL、media-agent、ZLMediaKit。"
-    echo "     适合: 单机演示、离线验收、非组播场景的一体化体验。"
-    echo "     网络特性: 全部服务使用 Docker bridge 网络，隔离性最好，对宿主机干扰最小。"
-    echo "     优先推荐: 只要不需要真实组播，单机模式应先选它。"
-    echo "     限制: 不推荐用于真实 UDP 组播。"
-    echo
-    echo "  5) all-in-one-host"
+    echo "  3) all-in-one-host"
     echo "     用途: 单机安装完整系统，但媒体面直连宿主机网络。"
     echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-    echo "     网络特性: media-core/PostgreSQL 保持 bridge；media-agent/ZLMediaKit 使用 host。"
+    echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
     echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
     echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
-    echo "     注意: 仍会直接占用宿主机的 80/554/1935/8081 等媒体相关端口。"
+    echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
     echo
-    echo "输入方式: 直接输入上面的角色编号 1-5 后回车。"
+    echo "输入方式: 直接输入上面的角色编号 1-3 后回车。"
     echo "默认值: 直接回车等同于输入 1（control-plane）。"
-    echo "快速建议: 如果只是单机先跑起来做演示或验收，优先输入 4（all-in-one）。"
+    echo "快速建议: 如果需要单机同时验证控制面和真实组播，优先输入 3（all-in-one-host）。"
   } >&2
   while true; do
-    answer="$(prompt "输入角色编号（1-5）" "1")"
+    answer="$(prompt "输入角色编号（1-3）" "1")"
     case "${answer}" in
       1) printf '%s' "control-plane"; return 0 ;;
-      2) printf '%s' "worker-bridge"; return 0 ;;
-      3) printf '%s' "worker-host"; return 0 ;;
-      4) printf '%s' "all-in-one"; return 0 ;;
-      5) printf '%s' "all-in-one-host"; return 0 ;;
-      *) echo "请输入 1 到 5；如果只是单机演示或验收，通常选 4。" >&2 ;;
+      2) printf '%s' "worker-host"; return 0 ;;
+      3) printf '%s' "all-in-one-host"; return 0 ;;
+      *) echo "请输入 1 到 3。" >&2 ;;
     esac
   done
 }
@@ -696,60 +783,24 @@ configure_control_plane() {
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
   CORE_HTTP_PORT="$(prompt_non_empty "media-core HTTP 暴露端口" "8080")"
   CORE_GRPC_PORT="$(prompt_non_empty "media-core gRPC 暴露端口" "50051")"
+  STACK_SUBNET="172.29.0.0/24"
+  POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "")"
-  AUTH_ENABLED="false"
-  JWT_PUBLIC_KEY=""
   STORAGE_ALLOWLIST="/data/media/work,/data/zlm/record,/data/zlm/www"
+  prompt_local_auth_configuration
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${default_secret}"
 
   prepare_install_dir "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
+  prepare_local_auth_assets "${INSTALL_DIR}"
   copy_compose_template "control-plane" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   write_control_plane_env "${INSTALL_DIR}/.env"
   ensure_images_loaded postgres media-core
+  bootstrap_local_admin_if_needed "${INSTALL_DIR}"
   show_tls_notice "${INSTALL_DIR}" "streamserver-core.local" "${CORE_GRPC_PORT}" || return 0
-  start_stack_if_requested "${INSTALL_DIR}"
-}
-
-configure_worker_bridge() {
-  local default_dir="/opt/streamserver/worker-bridge"
-  local default_ip
-
-  default_ip="$(detect_primary_ip)"
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker")"
-  INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
-  NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
-  AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo worker-1)")"
-  CORE_HTTP_HOST="$(prompt_non_empty "control-plane HTTP 地址或域名" "${default_ip}")"
-  CORE_HTTP_PORT="$(prompt_non_empty "control-plane HTTP 端口" "8080")"
-  CORE_GRPC_HOST="$(prompt_non_empty "control-plane gRPC 地址或域名" "${CORE_HTTP_HOST}")"
-  CORE_GRPC_PORT="$(prompt_non_empty "control-plane gRPC 端口" "50051")"
-  PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "${default_ip}")"
-  HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
-  AGENT_HTTP_PORT="8081"
-  ZLM_HTTP_PORT="80"
-  ZLM_RTMP_PORT="1935"
-  ZLM_RTSP_PORT="554"
-  STACK_SUBNET="172.29.0.0/24"
-  AGENT_IP="172.29.0.30"
-  ZLM_IP="172.29.0.20"
-
-  [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
-
-  prepare_install_dir "${INSTALL_DIR}"
-  copy_common_assets "${INSTALL_DIR}"
-  copy_compose_template "worker-bridge" "${INSTALL_DIR}"
-  prepare_worker_layout "${INSTALL_DIR}"
-  render_zlm_config \
-    "${INSTALL_DIR}" \
-    "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
-    "::1,127.0.0.1,${AGENT_IP}"
-  write_worker_bridge_env "${INSTALL_DIR}/.env"
-  ensure_images_loaded media-agent zlmediakit
-  show_tls_notice "${INSTALL_DIR}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
 }
 
@@ -791,55 +842,6 @@ configure_worker_host() {
   start_stack_if_requested "${INSTALL_DIR}"
 }
 
-configure_all_in_one() {
-  local default_dir="/opt/streamserver/all-in-one"
-  local default_secret
-  local default_password
-  local default_ip
-
-  default_secret="$(generate_secret)"
-  default_password="$(generate_secret)"
-  default_ip="$(detect_primary_ip)"
-
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-all-in-one")"
-  INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
-  NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
-  AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo node-1)")"
-  POSTGRES_DB="$(prompt_non_empty "PostgreSQL 数据库名" "streamserver")"
-  POSTGRES_USER="$(prompt_non_empty "PostgreSQL 用户名" "postgres")"
-  POSTGRES_PASSWORD="$(prompt "PostgreSQL 密码（留空自动生成）" "")"
-  HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
-  PUBLIC_HOST="$(prompt_non_empty "当前主机对外可访问的主机名或 IP" "${default_ip}")"
-  CORE_HTTP_PORT="8080"
-  CORE_GRPC_PORT="50051"
-  AGENT_HTTP_PORT="8081"
-  ZLM_HTTP_PORT="80"
-  ZLM_RTMP_PORT="1935"
-  ZLM_RTSP_PORT="554"
-  STACK_SUBNET="172.29.0.0/24"
-  CORE_IP="172.29.0.10"
-  ZLM_IP="172.29.0.20"
-  AGENT_IP="172.29.0.30"
-  POSTGRES_IP="172.29.0.40"
-
-  [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
-  [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${default_secret}"
-
-  prepare_install_dir "${INSTALL_DIR}"
-  copy_common_assets "${INSTALL_DIR}"
-  copy_compose_template "all-in-one" "${INSTALL_DIR}"
-  prepare_control_plane_layout "${INSTALL_DIR}"
-  prepare_worker_layout "${INSTALL_DIR}"
-  render_zlm_config \
-    "${INSTALL_DIR}" \
-    "http://media-core:8080/internal/hooks/zlm/${NODE_ID}" \
-    "::1,127.0.0.1,${AGENT_IP}"
-  write_all_in_one_env "${INSTALL_DIR}/.env"
-  ensure_images_loaded postgres media-core media-agent zlmediakit
-  show_tls_notice "${INSTALL_DIR}" "media-core" "${CORE_GRPC_PORT}" || return 0
-  start_stack_if_requested "${INSTALL_DIR}"
-}
-
 configure_all_in_one_host() {
   local default_dir="/opt/streamserver/all-in-one-host"
   local default_secret
@@ -871,12 +873,14 @@ configure_all_in_one_host() {
   CORE_IP="172.29.0.10"
   POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST=""
+  prompt_local_auth_configuration
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${default_secret}"
 
   prepare_install_dir "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
+  prepare_local_auth_assets "${INSTALL_DIR}"
   copy_compose_template "all-in-one-host" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
@@ -886,7 +890,8 @@ configure_all_in_one_host() {
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
   write_all_in_one_host_env "${INSTALL_DIR}/.env"
   ensure_images_loaded postgres media-core media-agent zlmediakit
-  log "all-in-one-host 说明: media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  bootstrap_local_admin_if_needed "${INSTALL_DIR}"
+  log "all-in-one-host 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
   log "如果这些端口已被宿主机其他服务占用，请先释放端口，或改用非 host 模式。"
   show_tls_notice "${INSTALL_DIR}" "127.0.0.1" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
@@ -901,9 +906,7 @@ main() {
   role="$(select_role)"
   case "${role}" in
     control-plane) configure_control_plane ;;
-    worker-bridge) configure_worker_bridge ;;
     worker-host) configure_worker_host ;;
-    all-in-one) configure_all_in_one ;;
     all-in-one-host) configure_all_in_one_host ;;
     *) fail "未知角色 ${role}" ;;
   esac
