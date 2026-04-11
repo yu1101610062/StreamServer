@@ -1,4 +1,5 @@
 ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn
+ARG UBUNTU_MIRROR=
 ARG CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
 
 FROM rust:1.85-bookworm AS builder
@@ -111,13 +112,13 @@ CMD ["media-agent-supervisor"]
 
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS media-agent-gpu-runtime
 
-ARG DEBIAN_MIRROR
+ARG UBUNTU_MIRROR
 
 RUN set -eux; \
-    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
+    if [ -n "${UBUNTU_MIRROR:-}" ]; then \
       sed -i \
-        -e "s|http://archive.ubuntu.com/ubuntu|${DEBIAN_MIRROR}/ubuntu|g" \
-        -e "s|http://security.ubuntu.com/ubuntu|${DEBIAN_MIRROR}/ubuntu|g" \
+        -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
         /etc/apt/sources.list; \
     fi; \
     apt-get update \

@@ -6,6 +6,7 @@ OUTPUT_DIR="${ROOT_DIR}/dist"
 SKIP_IMAGES=0
 
 APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
+UBUNTU_APT_MIRROR="${UBUNTU_APT_MIRROR:-}"
 CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR:-sparse+https://rsproxy.cn/index/}"
 POSTGRES_SOURCE_IMAGE="${POSTGRES_SOURCE_IMAGE:-postgres:16.4-bookworm@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412}"
 ZLM_SOURCE_IMAGE="${ZLM_SOURCE_IMAGE:-zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f}"
@@ -34,6 +35,7 @@ usage() {
 
 环境变量:
   APT_MIRROR             默认 http://mirrors.tuna.tsinghua.edu.cn；设为空则保留 Debian 官方源。
+  UBUNTU_APT_MIRROR      默认留空；仅用于 GPU 镜像的 Ubuntu 源覆盖。
   CARGO_REGISTRY_MIRROR  默认 sparse+https://rsproxy.cn/index/；设为空则使用 crates.io 官方源。
   POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
   ZLM_SOURCE_IMAGE       可覆盖 ZLMediaKit 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
@@ -193,6 +195,7 @@ build_or_pull_images() {
     --platform linux/amd64 \
     --target media-agent-gpu-runtime \
     --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+    --build-arg UBUNTU_MIRROR="${UBUNTU_APT_MIRROR}" \
     --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
     --load \
     -t "${media_agent_gpu_image}" \
@@ -430,6 +433,11 @@ main() {
     log "使用 APT 镜像: ${APT_MIRROR}"
   else
     log "APT 使用 Debian 官方源"
+  fi
+  if [ -n "${UBUNTU_APT_MIRROR}" ]; then
+    log "GPU 镜像使用 Ubuntu APT 镜像: ${UBUNTU_APT_MIRROR}"
+  else
+    log "GPU 镜像使用 Ubuntu 官方源"
   fi
 
   if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then
