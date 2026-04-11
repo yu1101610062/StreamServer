@@ -935,6 +935,7 @@ const state = {
   },
 };
 let autoRefreshTimer = null;
+let authRefreshPromise = null;
 
 const appRoot = document.getElementById("app");
 const shell = {
@@ -1071,6 +1072,49 @@ async function refreshSession(silent) {
   state.sessionLoading = true;
   try {
     if (!state.token && state.refreshToken) {
+      await refreshAccessToken(silent);
+    }
+
+    let sessionError = null;
+    try {
+      state.session = await apiRequest("/api/v1/me");
+      state.sessionError = null;
+      return;
+    } catch (error) {
+      sessionError = error;
+    }
+
+    if (
+      isAuthError(sessionError) &&
+      state.refreshToken &&
+      await refreshAccessToken(silent)
+    ) {
+      try {
+        state.session = await apiRequest("/api/v1/me");
+        state.sessionError = null;
+        return;
+      } catch (error) {
+        sessionError = error;
+      }
+    }
+
+    state.session = null;
+    state.sessionError = sessionError;
+    if (!silent && !isAuthError(sessionError)) {
+      toast(errorMessage(sessionError), "error");
+    }
+  } finally {
+    state.sessionLoading = false;
+    syncRouteWithSessionState();
+  }
+}
+
+async function refreshAccessToken(silent) {
+  if (!state.refreshToken) {
+    return false;
+  }
+  if (!authRefreshPromise) {
+    authRefreshPromise = (async () => {
       try {
         const tokens = await apiRequest("/api/v1/auth/refresh", {
           method: "POST",
@@ -1078,28 +1122,19 @@ async function refreshSession(silent) {
           body: { refresh_token: state.refreshToken },
         });
         applyAuthTokens(tokens);
+        return true;
       } catch (error) {
         clearAuthTokens({ clearRefresh: true });
         if (!silent && !isAuthError(error)) {
           toast(errorMessage(error), "error");
         }
+        return false;
+      } finally {
+        authRefreshPromise = null;
       }
-    }
-
-    try {
-      state.session = await apiRequest("/api/v1/me");
-      state.sessionError = null;
-    } catch (error) {
-      state.session = null;
-      state.sessionError = error;
-      if (!silent && !isAuthError(error)) {
-        toast(errorMessage(error), "error");
-      }
-    }
-  } finally {
-    state.sessionLoading = false;
-    syncRouteWithSessionState();
+    })();
   }
+  return await authRefreshPromise;
 }
 
 function applyAuthTokens(tokens) {
