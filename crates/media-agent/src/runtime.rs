@@ -1440,6 +1440,8 @@ fn parse_task_spec(request: &StartTaskRequest) -> Result<TaskSpec, ExecutorError
     })
 }
 
+const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
+const LEGACY_ZLM_RECORD_ROOT: &str = "/data/zlm/record";
 const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
 
 fn path_is_under_root(path: &str, root: &str) -> bool {
@@ -2055,19 +2057,7 @@ fn resolve_transcode_selection(
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
 ) -> TranscodeSelection {
-    let input_family = match video_policy {
-        VideoOutputPolicy::KeepSourceFamily => {
-            probe_primary_video_codec_family(settings, input_url)
-        }
-        VideoOutputPolicy::ForceH264 => VideoCodecFamily::Unknown,
-    };
-    let output_family = match video_policy {
-        VideoOutputPolicy::KeepSourceFamily => match input_family {
-            VideoCodecFamily::Hevc => VideoCodecFamily::Hevc,
-            _ => VideoCodecFamily::H264,
-        },
-        VideoOutputPolicy::ForceH264 => VideoCodecFamily::H264,
-    };
+    let (input_family, output_family) = resolve_video_families(settings, input_url, video_policy);
     let use_gpu = gpu_acceleration_enabled(settings)
         && !probe_gpu_devices(settings).is_empty()
         && ffmpeg_supports_hwaccel(&settings.ffmpeg_bin, "cuda")
@@ -2109,6 +2099,22 @@ fn resolve_transcode_selection(
         video_encoder,
         audio_encoder,
     }
+}
+
+fn resolve_video_families(
+    settings: &AgentSettings,
+    input_url: &str,
+    video_policy: VideoOutputPolicy,
+) -> (VideoCodecFamily, VideoCodecFamily) {
+    let input_family = probe_primary_video_codec_family(settings, input_url);
+    let output_family = match video_policy {
+        VideoOutputPolicy::KeepSourceFamily => match input_family {
+            VideoCodecFamily::Hevc => VideoCodecFamily::Hevc,
+            _ => VideoCodecFamily::H264,
+        },
+        VideoOutputPolicy::ForceH264 => VideoCodecFamily::H264,
+    };
+    (input_family, output_family)
 }
 
 fn maybe_add_cuda_decoder(
@@ -2437,17 +2443,38 @@ fn build_live_relay_recording(
 
 fn normalize_record_root(save_path: Option<&str>, work_dir: &Path) -> String {
     let Some(save_path) = save_path.map(str::trim).filter(|value| !value.is_empty()) else {
-        return work_dir.join("records").to_string_lossy().to_string();
+        return ZLM_RECORD_HTTP_ROOT.to_string();
     };
     let path = PathBuf::from(save_path);
-    if path.extension().is_some() {
+    let root = if path.extension().is_some() {
         path.parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(work_dir)
-            .to_string_lossy()
-            .to_string()
+            .to_path_buf()
     } else {
-        path.to_string_lossy().to_string()
+        path
+    };
+    normalize_record_root_path(&root)
+}
+
+fn normalize_record_root_path(root: &Path) -> String {
+    if root.as_os_str().is_empty() {
+        return ZLM_RECORD_HTTP_ROOT.to_string();
+    }
+
+    if root.is_relative() {
+        return Path::new(ZLM_RECORD_HTTP_ROOT)
+            .join(root)
+            .to_string_lossy()
+            .to_string();
+    }
+
+    match root.strip_prefix(LEGACY_ZLM_RECORD_ROOT) {
+        Ok(suffix) => Path::new(ZLM_RECORD_HTTP_ROOT)
+            .join(suffix)
+            .to_string_lossy()
+            .to_string(),
+        Err(_) => root.to_string_lossy().to_string(),
     }
 }
 
@@ -3981,6 +4008,7 @@ fn parse_bitrate_kbps(value: Option<&String>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn test_settings(work_root: &str) -> AgentSettings {
         AgentSettings {
@@ -4008,6 +4036,55 @@ mod tests {
             max_runtime_slots: 2,
             work_root: work_root.to_string(),
         }
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).expect("script should write");
+        let mut permissions = fs::metadata(path)
+            .expect("script metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("script permissions should update");
+    }
+
+    fn create_mock_ffmpeg_binary(root: &Path) -> String {
+        let path = root.join("mock-ffmpeg.sh");
+        write_executable(
+            &path,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  -version)
+    echo "ffmpeg version mock"
+    ;;
+  -hwaccels)
+    printf '%s\n' "Hardware acceleration methods:" "cuda"
+    ;;
+  -encoders)
+    printf '%s\n' "Encoders:" " V....D h264_nvenc" " V....D hevc_nvenc"
+    ;;
+  -decoders)
+    printf '%s\n' "Decoders:" " V..... h264_cuvid" " V..... hevc_cuvid"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#,
+        );
+        path.to_string_lossy().to_string()
+    }
+
+    fn create_mock_ffprobe_binary(root: &Path, codec_name: &str) -> String {
+        let path = root.join("mock-ffprobe.sh");
+        let body = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+echo "{codec_name}"
+"#
+        );
+        write_executable(&path, &body);
+        path.to_string_lossy().to_string()
     }
 
     #[test]
@@ -4072,6 +4149,51 @@ mod tests {
             plan.output_target,
             "/data/zlm/www/artifacts/transcode/output.mp4"
         );
+    }
+
+    #[test]
+    fn resolve_video_families_keeps_hevc_input_probe_for_force_h264() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-gpu-probe-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc");
+
+        let (input_family, output_family) =
+            resolve_video_families(&settings, "/tmp/input.mp4", VideoOutputPolicy::ForceH264);
+
+        assert_eq!(input_family, VideoCodecFamily::Hevc);
+        assert_eq!(output_family, VideoCodecFamily::H264);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn maybe_add_cuda_decoder_uses_hevc_decoder_when_available() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-gpu-decoder-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffmpeg_bin = create_mock_ffmpeg_binary(&temp_root);
+
+        let mut input_args = Vec::new();
+        maybe_add_cuda_decoder(&mut input_args, &settings, VideoCodecFamily::Hevc);
+
+        assert_eq!(
+            input_args,
+            vec![
+                "-hwaccel".to_string(),
+                "cuda".to_string(),
+                "-hwaccel_output_format".to_string(),
+                "cuda".to_string(),
+                "-c:v".to_string(),
+                "hevc_cuvid".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
@@ -4633,6 +4755,29 @@ mod tests {
             plan.outputs
                 .iter()
                 .any(|output| output == "/var/media/archive")
+        );
+    }
+
+    #[test]
+    fn normalize_record_root_defaults_to_http_record_root() {
+        assert_eq!(
+            normalize_record_root(None, Path::new("/tmp/work")),
+            "/data/zlm/www/record"
+        );
+    }
+
+    #[test]
+    fn normalize_record_root_maps_legacy_record_root_into_http_root() {
+        assert_eq!(
+            normalize_record_root(
+                Some("/data/zlm/record/live/archive.mp4"),
+                Path::new("/tmp/work")
+            ),
+            "/data/zlm/www/record/live"
+        );
+        assert_eq!(
+            normalize_record_root(Some("/data/zlm/record/live"), Path::new("/tmp/work")),
+            "/data/zlm/www/record/live"
         );
     }
 

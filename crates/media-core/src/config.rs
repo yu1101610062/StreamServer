@@ -304,6 +304,7 @@ fn default_storage_allowlist() -> Vec<String> {
     vec![
         "/data/media/work".to_string(),
         "/data/zlm/record".to_string(),
+        "/data/zlm/www".to_string(),
     ]
 }
 

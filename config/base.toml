@@ -18,7 +18,7 @@ auth_refresh_token_ttl = "7d"
 hook_shared_secret = ""
 hook_source_allowlist = []
 zlm_auto_close_on_no_reader_enabled = false
-storage_allowlist = ["/data/media/work", "/data/zlm/record"]
+storage_allowlist = ["/data/media/work", "/data/zlm/record", "/data/zlm/www"]
 
 [agent]
 http_addr = "0.0.0.0:8081"

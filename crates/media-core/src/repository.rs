@@ -4535,6 +4535,8 @@ fn apply_transcode_artifact_filters<'a>(
 }
 
 const ZLM_HTTP_ROOT: &str = "/data/zlm/www";
+const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
+const LEGACY_ZLM_RECORD_ROOT: &str = "/data/zlm/record";
 const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
 
 fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
@@ -4599,19 +4601,41 @@ fn artifact_http_url_from_path(
     let relative = relative_path_under_root(&normalized, ZLM_HTTP_ROOT).ok_or_else(|| {
         validation_error("publish.url", "output path must be under /data/zlm/www")
     })?;
-    let base = Url::parse(agent_stream_addr).map_err(|error| {
-        validation_error(
-            "agent_stream_addr",
-            format!("invalid node stream base {agent_stream_addr}: {error}"),
-        )
-    })?;
-    let joined = base.join(relative).map_err(|error| {
+    absolute_http_url_from_relative(agent_stream_addr, relative).ok_or_else(|| {
         validation_error(
             "publish.url",
-            format!("failed to build artifact URL from {file_path}: {error}"),
+            format!("failed to build artifact URL from {file_path}"),
         )
-    })?;
-    Ok(joined.to_string())
+    })
+}
+
+fn absolute_http_url_from_relative(agent_stream_addr: &str, relative: &str) -> Option<String> {
+    let base = Url::parse(agent_stream_addr)
+        .map_err(|error| {
+            tracing::warn!(
+                %agent_stream_addr,
+                %error,
+                "invalid node stream base while building HTTP URL"
+            );
+        })
+        .ok()?;
+    base.join(relative).ok().map(|value| value.to_string())
+}
+
+fn record_http_url_from_path(agent_stream_addr: &str, file_path: &str) -> Option<String> {
+    let normalized = normalized_absolute_path(file_path).ok()?;
+    if let Some(relative) = relative_path_under_root(&normalized, ZLM_HTTP_ROOT) {
+        return absolute_http_url_from_relative(agent_stream_addr, relative);
+    }
+    let relative = relative_path_under_root(&normalized, LEGACY_ZLM_RECORD_ROOT)?;
+    let record_relative_root =
+        relative_path_under_root(ZLM_RECORD_HTTP_ROOT, ZLM_HTTP_ROOT).unwrap_or("record");
+    let translated = format!(
+        "{}/{}",
+        record_relative_root,
+        relative.trim_start_matches('/')
+    );
+    absolute_http_url_from_relative(agent_stream_addr, &translated)
 }
 
 fn resolve_absolute_http_url(agent_stream_addr: &str, value: &str) -> Option<String> {
@@ -4633,13 +4657,12 @@ async fn resolve_record_http_url(
     server_id: &str,
     record: &ZlmRecordFileRecord,
 ) -> Result<Option<String>, RepoError> {
-    let Some(raw_url) = record.url.as_deref() else {
-        return Ok(None);
-    };
     let Some(node_id) = Uuid::parse_str(server_id.trim()).ok() else {
-        return Ok(Url::parse(raw_url.trim())
-            .ok()
-            .map(|value| value.to_string()));
+        return Ok(record.url.as_deref().and_then(|raw_url| {
+            Url::parse(raw_url.trim())
+                .ok()
+                .map(|value| value.to_string())
+        }));
     };
     let Some(agent_stream_addr) = sqlx::query_scalar::<_, String>(
         r#"
@@ -4652,14 +4675,22 @@ async fn resolve_record_http_url(
     .fetch_optional(&mut **tx)
     .await?
     else {
-        return Ok(Url::parse(raw_url.trim())
-            .ok()
-            .map(|value| value.to_string()));
+        return Ok(record.url.as_deref().and_then(|raw_url| {
+            Url::parse(raw_url.trim())
+                .ok()
+                .map(|value| value.to_string())
+        }));
     };
-    Ok(resolve_absolute_http_url(
-        agent_stream_addr.as_str(),
-        raw_url,
-    ))
+
+    if let Some(http_url) = record_http_url_from_path(agent_stream_addr.as_str(), &record.file_path)
+    {
+        return Ok(Some(http_url));
+    }
+
+    Ok(record
+        .url
+        .as_deref()
+        .and_then(|raw_url| resolve_absolute_http_url(agent_stream_addr.as_str(), raw_url)))
 }
 
 fn normalize_template_default_spec(
@@ -5699,6 +5730,34 @@ mod tests {
         assert_eq!(
             url,
             "http://192.168.1.10:8081/artifacts/transcode/2026/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn record_http_url_from_path_uses_web_root_directly() {
+        let url = record_http_url_from_path(
+            "http://192.168.1.10:8081",
+            "/data/zlm/www/record/live/camera01/clip.mp4",
+        )
+        .expect("record url should build");
+
+        assert_eq!(
+            url,
+            "http://192.168.1.10:8081/record/live/camera01/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn record_http_url_from_path_translates_legacy_record_root() {
+        let url = record_http_url_from_path(
+            "http://192.168.1.10:8081",
+            "/data/zlm/record/live/camera01/clip.mp4",
+        )
+        .expect("legacy record url should translate");
+
+        assert_eq!(
+            url,
+            "http://192.168.1.10:8081/record/live/camera01/clip.mp4"
         );
     }
 

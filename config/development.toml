@@ -3,7 +3,7 @@ level = "debug"
 
 [core]
 hook_source_allowlist = ["127.0.0.1"]
-storage_allowlist = ["./data/media/work", "./data/zlm/record"]
+storage_allowlist = ["./data/media/work", "./data/zlm/record", "./data/zlm/www"]
 
 [agent]
 work_root = "./data/media/work"
