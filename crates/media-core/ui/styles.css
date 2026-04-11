@@ -286,6 +286,7 @@ pre {
   min-width: 0;
   display: grid;
   gap: 18px;
+  align-content: start;
 }
 
 .topbar {
@@ -353,6 +354,7 @@ pre {
   display: grid;
   gap: 18px;
   min-width: 0;
+  align-content: start;
 }
 
 .panel,
@@ -386,6 +388,19 @@ pre {
   align-items: start;
   gap: 14px;
   margin-bottom: 18px;
+}
+
+.panel-header > :first-child,
+.table-toolbar > :first-child,
+.section-header > :first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.panel-header > :only-child,
+.table-toolbar > :only-child,
+.section-header > :only-child {
+  flex-basis: 100%;
 }
 
 .section-header h3,
