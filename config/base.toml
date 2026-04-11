@@ -18,6 +18,12 @@ auth_refresh_token_ttl = "7d"
 hook_shared_secret = ""
 hook_source_allowlist = []
 zlm_auto_close_on_no_reader_enabled = false
+callback_timeout_ms = 5000
+callback_max_attempts = 8
+callback_initial_backoff_ms = 5000
+callback_max_backoff_ms = 300000
+callback_settle_delay_ms = 8000
+callback_shared_secret = ""
 storage_allowlist = ["/data/media/work", "/data/zlm/record", "/data/zlm/www"]
 
 [agent]

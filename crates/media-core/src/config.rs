@@ -79,6 +79,18 @@ pub struct CoreSettings {
     pub hook_source_allowlist: Vec<String>,
     #[serde(default)]
     pub zlm_auto_close_on_no_reader_enabled: bool,
+    #[serde(default = "default_callback_timeout_ms")]
+    pub callback_timeout_ms: u64,
+    #[serde(default = "default_callback_max_attempts")]
+    pub callback_max_attempts: u32,
+    #[serde(default = "default_callback_initial_backoff_ms")]
+    pub callback_initial_backoff_ms: u64,
+    #[serde(default = "default_callback_max_backoff_ms")]
+    pub callback_max_backoff_ms: u64,
+    #[serde(default = "default_callback_settle_delay_ms")]
+    pub callback_settle_delay_ms: u64,
+    #[serde(default)]
+    pub callback_shared_secret: String,
     #[serde(default = "default_storage_allowlist")]
     pub storage_allowlist: Vec<String>,
 }
@@ -101,6 +113,12 @@ impl Default for CoreSettings {
             hook_shared_secret: String::new(),
             hook_source_allowlist: Vec::new(),
             zlm_auto_close_on_no_reader_enabled: false,
+            callback_timeout_ms: default_callback_timeout_ms(),
+            callback_max_attempts: default_callback_max_attempts(),
+            callback_initial_backoff_ms: default_callback_initial_backoff_ms(),
+            callback_max_backoff_ms: default_callback_max_backoff_ms(),
+            callback_settle_delay_ms: default_callback_settle_delay_ms(),
+            callback_shared_secret: String::new(),
             storage_allowlist: default_storage_allowlist(),
         }
     }
@@ -166,6 +184,26 @@ impl Settings {
         anyhow::ensure!(
             !self.core.storage_allowlist.is_empty(),
             "storage allowlist must not be empty"
+        );
+        anyhow::ensure!(
+            self.core.callback_timeout_ms > 0,
+            "CALLBACK_TIMEOUT_MS must be positive"
+        );
+        anyhow::ensure!(
+            self.core.callback_max_attempts > 0,
+            "CALLBACK_MAX_ATTEMPTS must be positive"
+        );
+        anyhow::ensure!(
+            self.core.callback_initial_backoff_ms > 0,
+            "CALLBACK_INITIAL_BACKOFF_MS must be positive"
+        );
+        anyhow::ensure!(
+            self.core.callback_max_backoff_ms >= self.core.callback_initial_backoff_ms,
+            "CALLBACK_MAX_BACKOFF_MS must be greater than or equal to CALLBACK_INITIAL_BACKOFF_MS"
+        );
+        anyhow::ensure!(
+            self.core.callback_settle_delay_ms > 0,
+            "CALLBACK_SETTLE_DELAY_MS must be positive"
         );
         let tls_fields = [
             self.core.grpc_tls_cert_path.trim(),
@@ -241,6 +279,34 @@ fn apply_env_overrides(settings: &mut FileSettings) {
         settings.core.zlm_auto_close_on_no_reader_enabled =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
+    if let Some(value) = env("CALLBACK_TIMEOUT_MS") {
+        settings.core.callback_timeout_ms = value
+            .parse()
+            .expect("CALLBACK_TIMEOUT_MS must be an integer");
+    }
+    if let Some(value) = env("CALLBACK_MAX_ATTEMPTS") {
+        settings.core.callback_max_attempts = value
+            .parse()
+            .expect("CALLBACK_MAX_ATTEMPTS must be an integer");
+    }
+    if let Some(value) = env("CALLBACK_INITIAL_BACKOFF_MS") {
+        settings.core.callback_initial_backoff_ms = value
+            .parse()
+            .expect("CALLBACK_INITIAL_BACKOFF_MS must be an integer");
+    }
+    if let Some(value) = env("CALLBACK_MAX_BACKOFF_MS") {
+        settings.core.callback_max_backoff_ms = value
+            .parse()
+            .expect("CALLBACK_MAX_BACKOFF_MS must be an integer");
+    }
+    if let Some(value) = env("CALLBACK_SETTLE_DELAY_MS") {
+        settings.core.callback_settle_delay_ms = value
+            .parse()
+            .expect("CALLBACK_SETTLE_DELAY_MS must be an integer");
+    }
+    if let Some(value) = env("CALLBACK_SHARED_SECRET") {
+        settings.core.callback_shared_secret = value;
+    }
     if let Some(value) = env("STORAGE_ALLOWLIST") {
         settings.core.storage_allowlist = split_csv(&value);
     }
@@ -306,6 +372,26 @@ fn default_storage_allowlist() -> Vec<String> {
         "/data/zlm/record".to_string(),
         "/data/zlm/www".to_string(),
     ]
+}
+
+fn default_callback_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_callback_max_attempts() -> u32 {
+    8
+}
+
+fn default_callback_initial_backoff_ms() -> u64 {
+    5_000
+}
+
+fn default_callback_max_backoff_ms() -> u64 {
+    300_000
+}
+
+fn default_callback_settle_delay_ms() -> u64 {
+    8_000
 }
 
 pub fn parse_duration_spec(value: &str) -> anyhow::Result<Duration> {

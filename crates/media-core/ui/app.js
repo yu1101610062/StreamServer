@@ -213,7 +213,7 @@ const EXTERNAL_API_DOCS = [
       authHeaderParam(),
       taskIdPathParam(),
     ],
-    responseExample: { task: { id: "0195...", status: "RUNNING", type: "live_relay" }, recent_events: [] },
+    responseExample: { task: { id: "0195...", status: "RUNNING", type: "live_relay" }, callback_delivery: { status: "delivered", callback_url: "https://biz.example.com/streamserver/callback" }, recent_events: [] },
   },
   {
     category: "任务管理",
@@ -411,7 +411,7 @@ function buildApiDocDetails() {
       { name: "profile", type: "enum", required: false, description: "任务预设档位。用于实时兼容、归档或组播优化。" },
       { name: "priority", type: "number", required: false, description: "调度优先级，通常 0-100，数字越大越优先。" },
       { name: "common.created_by", type: "string", required: false, description: "任务创建来源，用于审计和回查。" },
-      { name: "common.callback_url", type: "string", required: false, description: "任务事件回调地址。" },
+      { name: "common.callback_url", type: "string", required: false, description: "任务终态回调地址。任务完成后由 media-core 异步回调，若录像或转码产物稍后入库会自动补发更新回调。" },
       { name: "common.labels[]", type: "string[]", required: false, description: "业务标签，用于筛选和资源偏好。" },
       { name: "input.kind", type: "enum", required: true, description: "输入类型，例如 RTSP、文件、组播或国标 RTP。" },
       { name: "input.url", type: "string", required: false, description: "文件或网络源地址。" },
@@ -521,6 +521,7 @@ function buildApiDocDetails() {
     responseFields: [
       { name: "task", type: "object", description: "任务主信息。" },
       { name: "current_attempt", type: "object", description: "当前 attempt 状态与节点信息。" },
+      { name: "callback_delivery", type: "object", description: "最近一次任务完成回调的状态摘要。" },
       { name: "recent_events[]", type: "array", description: "最近事件。" },
       { name: "requested_spec", type: "object", description: "原始请求规格。" },
       { name: "resolved_spec", type: "object", description: "服务端补全后的最终规格。" },
@@ -2676,6 +2677,8 @@ function renderDebugPage(data) {
 }
 
 function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
+  const callback = detail.callback_delivery;
+  const callbackTime = callback ? formatTime(callback.delivered_at || callback.updated_at) : "—";
   return `
     <div class="overview-grid">
       <div class="metric">
@@ -2697,6 +2700,11 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
         <label>流绑定</label>
         <strong>${escapeHtml(String(streams.length))}</strong>
         <span class="subtle">${escapeHtml(streams.map((item) => `${item.app}/${item.stream}`).join(", ") || "暂无")}</span>
+      </div>
+      <div class="metric">
+        <label>完成回调</label>
+        <strong>${escapeHtml(callback ? callback.status : "未配置")}</strong>
+        <span class="subtle">${escapeHtml(callbackTime)}</span>
       </div>
     </div>
     <div class="split-grid">
@@ -2728,6 +2736,50 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
               : renderInlineEmpty("暂无事件。")
           }
         </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">
+          <div>
+            <h3>回调状态</h3>
+            <p>展示最近一次任务完成回调的地址、状态和错误摘要。</p>
+          </div>
+        </div>
+        ${
+          callback
+            ? `
+              <div class="detail-grid">
+                <div class="detail-item">
+                  <label>回调地址</label>
+                  <div class="mono">${escapeHtml(callback.callback_url)}</div>
+                </div>
+                <div class="detail-item">
+                  <label>最近状态</label>
+                  <div>${escapeHtml(callback.status)}</div>
+                </div>
+                <div class="detail-item">
+                  <label>触发原因</label>
+                  <div>${escapeHtml(callback.reason || "terminal_state")}</div>
+                </div>
+                <div class="detail-item">
+                  <label>最近时间</label>
+                  <div>${escapeHtml(callbackTime)}</div>
+                </div>
+                <div class="detail-item">
+                  <label>尝试次数</label>
+                  <div>${escapeHtml(String(callback.delivery_attempts || 0))}</div>
+                </div>
+                <div class="detail-item">
+                  <label>HTTP 状态</label>
+                  <div>${escapeHtml(callback.last_http_status ? String(callback.last_http_status) : "—")}</div>
+                </div>
+                <div class="detail-item full-width">
+                  <label>最近错误</label>
+                  <div>${escapeHtml(callback.last_error || "—")}</div>
+                </div>
+              </div>
+            `
+            : renderInlineEmpty("当前任务未配置完成回调。")
+        }
       </div>
       <div class="panel">
         <div class="panel-header">

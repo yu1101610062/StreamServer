@@ -1233,6 +1233,7 @@ dependencies = [
  "chrono",
  "config",
  "cron",
+ "hmac",
  "jsonwebtoken",
  "media-domain",
  "media-rpc",

@@ -20,11 +20,22 @@ use uuid::Uuid;
 #[derive(Debug, Clone)]
 pub struct TaskRepository {
     pool: PgPool,
+    callback_settle_delay: chrono::Duration,
 }
 
 impl TaskRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_callback_settle_delay(pool, chrono::Duration::milliseconds(8_000))
+    }
+
+    pub fn with_callback_settle_delay(
+        pool: PgPool,
+        callback_settle_delay: chrono::Duration,
+    ) -> Self {
+        Self {
+            pool,
+            callback_settle_delay,
+        }
     }
 
     pub async fn health_check(&self) -> Result<(), RepoError> {
@@ -692,13 +703,70 @@ impl TaskRepository {
         .map(|row| TaskEventSummary::from_row(&row))
         .collect::<Result<Vec<_>, _>>()?;
 
+        let callback_delivery = sqlx::query(
+            r#"
+            select
+              callback_url,
+              event_type,
+              reason,
+              status,
+              delivery_attempts,
+              last_http_status,
+              last_error,
+              delivered_at,
+              updated_at
+            from task_callback_outbox
+            where task_id = $1
+            order by created_at desc, id desc
+            limit 1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| CallbackDeliverySummary::from_row(&row))
+        .transpose()?;
+
         Ok(TaskDetail {
             task,
             requested_spec,
             resolved_spec,
             current_attempt,
             recent_events,
+            callback_delivery,
         })
+    }
+
+    pub async fn get_task_attempt(
+        &self,
+        task_id: Uuid,
+        attempt_no: i32,
+    ) -> Result<Option<AttemptSummary>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              id,
+              attempt_no,
+              worker_kind::text as worker_kind,
+              status::text as status,
+              node_id,
+              pid,
+              exit_code,
+              failure_code,
+              failure_reason,
+              started_at,
+              ended_at
+            from task_attempts
+            where task_id = $1
+              and attempt_no = $2
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| AttemptSummary::from_row(&row))
+        .transpose()
     }
 
     pub async fn get_task_summary(&self, task_id: Uuid) -> Result<TaskSummary, RepoError> {
@@ -1108,6 +1176,39 @@ impl TaskRepository {
         Ok(Page::new(rows, page, page_size, total))
     }
 
+    pub async fn list_task_record_files(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<RecordFileSummary>, RepoError> {
+        Ok(sqlx::query(
+            r#"
+            select
+              rf.id,
+              rf.task_id,
+              rf.attempt_id,
+              rf.vhost,
+              rf.app,
+              rf.stream,
+              rf.file_path,
+              rf.http_url,
+              rf.file_size,
+              rf.time_len,
+              rf.start_time,
+              rf.source,
+              rf.created_at
+            from record_files rf
+            where rf.task_id = $1
+            order by coalesce(rf.start_time, rf.created_at) desc, rf.id desc
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| RecordFileSummary::from_row(&row))
+        .collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub async fn list_transcode_artifacts(
         &self,
         filter: TranscodeArtifactListFilter,
@@ -1147,6 +1248,35 @@ impl TaskRepository {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Page::new(rows, page, page_size, total))
+    }
+
+    pub async fn list_task_transcode_artifacts(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<TranscodeArtifactSummary>, RepoError> {
+        Ok(sqlx::query(
+            r#"
+            select
+              id,
+              task_id,
+              attempt_id,
+              node_id,
+              file_name,
+              file_path,
+              http_url,
+              file_size,
+              created_at
+            from transcode_artifacts
+            where task_id = $1
+            order by created_at desc, id desc
+            "#,
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| TranscodeArtifactSummary::from_row(&row))
+        .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeSummary>, RepoError> {
@@ -1282,6 +1412,192 @@ impl TaskRepository {
             .into_iter()
             .map(|row| HookEventSummary::from_row(&row))
             .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub async fn list_due_callback_jobs(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<CallbackOutboxJob>, RepoError> {
+        let limit = limit.clamp(1, 100);
+        Ok(sqlx::query(
+            r#"
+            select
+              id,
+              task_id,
+              attempt_id,
+              attempt_no,
+              callback_url,
+              event_type,
+              reason,
+              delivery_attempts
+            from task_callback_outbox
+            where status in ('pending', 'retrying')
+              and deliver_after <= $1
+            order by deliver_after asc, created_at asc, id asc
+            limit $2
+            "#,
+        )
+        .bind(now)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| CallbackOutboxJob::from_row(&row))
+        .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub async fn mark_callback_delivered(
+        &self,
+        job: &CallbackOutboxJob,
+        http_status: i32,
+        response_body: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            update task_callback_outbox
+               set status = 'delivered',
+                   delivery_attempts = delivery_attempts + 1,
+                   last_http_status = $1,
+                   last_error = null,
+                   last_response_body = $2,
+                   updated_at = $3,
+                   delivered_at = $3
+             where id = $4
+            "#,
+        )
+        .bind(http_status)
+        .bind(response_body.clone())
+        .bind(now)
+        .bind(job.id)
+        .execute(&mut *tx)
+        .await?;
+        self.insert_event(
+            &mut tx,
+            job.task_id,
+            job.attempt_id,
+            Some(job.attempt_no),
+            EventSource::Core,
+            "callback_delivered",
+            "info",
+            json!({
+                "callback_url": job.callback_url,
+                "event_type": job.event_type,
+                "reason": job.reason,
+                "http_status": http_status,
+                "response_body": response_body,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn schedule_callback_retry(
+        &self,
+        job: &CallbackOutboxJob,
+        http_status: Option<i32>,
+        response_body: Option<String>,
+        last_error: String,
+        retry_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            update task_callback_outbox
+               set status = 'retrying',
+                   delivery_attempts = delivery_attempts + 1,
+                   last_http_status = $1,
+                   last_error = $2,
+                   last_response_body = $3,
+                   deliver_after = $4,
+                   updated_at = $5
+             where id = $6
+            "#,
+        )
+        .bind(http_status)
+        .bind(&last_error)
+        .bind(response_body.clone())
+        .bind(retry_at)
+        .bind(now)
+        .bind(job.id)
+        .execute(&mut *tx)
+        .await?;
+        self.insert_event(
+            &mut tx,
+            job.task_id,
+            job.attempt_id,
+            Some(job.attempt_no),
+            EventSource::Core,
+            "callback_retry_scheduled",
+            "warn",
+            json!({
+                "callback_url": job.callback_url,
+                "event_type": job.event_type,
+                "reason": job.reason,
+                "http_status": http_status,
+                "response_body": response_body,
+                "last_error": last_error,
+                "retry_at": retry_at,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn mark_callback_dead(
+        &self,
+        job: &CallbackOutboxJob,
+        http_status: Option<i32>,
+        response_body: Option<String>,
+        last_error: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let last_error = last_error.into();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            update task_callback_outbox
+               set status = 'dead',
+                   delivery_attempts = delivery_attempts + 1,
+                   last_http_status = $1,
+                   last_error = $2,
+                   last_response_body = $3,
+                   updated_at = $4
+             where id = $5
+            "#,
+        )
+        .bind(http_status)
+        .bind(&last_error)
+        .bind(response_body.clone())
+        .bind(now)
+        .bind(job.id)
+        .execute(&mut *tx)
+        .await?;
+        self.insert_event(
+            &mut tx,
+            job.task_id,
+            job.attempt_id,
+            Some(job.attempt_no),
+            EventSource::Core,
+            "callback_dead_lettered",
+            "error",
+            json!({
+                "callback_url": job.callback_url,
+                "event_type": job.event_type,
+                "reason": job.reason,
+                "http_status": http_status,
+                "response_body": response_body,
+                "last_error": last_error,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn list_due_at_tasks(&self, now: DateTime<Utc>) -> Result<Vec<Uuid>, RepoError> {
@@ -1554,9 +1870,11 @@ impl TaskRepository {
         )?;
         let merged_spec: TaskSpec = serde_json::from_value(merged_json)?;
         merged_spec.validate()?;
+        validate_task_callback_url(&merged_spec)?;
         validate_transcode_publish_target(&merged_spec)?;
         let resolved_spec = merged_spec.resolved();
         resolved_spec.validate()?;
+        validate_task_callback_url(&resolved_spec)?;
         validate_transcode_publish_target(&resolved_spec)?;
 
         Ok(ResolvedTaskRequest {
@@ -3041,6 +3359,9 @@ impl TaskRepository {
         .execute(&mut **tx)
         .await?;
 
+        self.enqueue_artifact_update_callback_if_needed(tx, snapshot.task_id, snapshot.attempt_no)
+            .await?;
+
         Ok(())
     }
 
@@ -3164,6 +3485,13 @@ impl TaskRepository {
                     "start_time": record.start_time,
                     "source": "hook",
                 }),
+            )
+            .await?;
+
+            self.enqueue_artifact_update_callback_if_needed(
+                &mut tx,
+                binding.task_id,
+                binding.attempt_no,
             )
             .await?;
         }
@@ -3715,6 +4043,141 @@ impl TaskRepository {
         .transpose()
     }
 
+    async fn enqueue_task_completed_callback(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+        reason: &str,
+        deliver_after: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let row = sqlx::query(
+            r#"
+            select
+              ta.id as attempt_id,
+              coalesce(
+                nullif(t.resolved_spec->'common'->>'callback_url', ''),
+                nullif(t.requested_spec->'common'->>'callback_url', '')
+              ) as callback_url
+            from tasks t
+            left join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = $2
+            where t.id = $1
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
+        let callback_url = row
+            .try_get::<Option<String>, _>("callback_url")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let Some(callback_url) = callback_url else {
+            return Ok(());
+        };
+        let attempt_id: Option<Uuid> = row.try_get("attempt_id")?;
+
+        let result = sqlx::query(
+            r#"
+            insert into task_callback_outbox (
+              id, task_id, attempt_id, attempt_no, callback_url, event_type, reason,
+              status, delivery_attempts, deliver_after, created_at, updated_at
+            ) values (
+              $1, $2, $3, $4, $5, 'task.completed', $6,
+              'pending', 0, $7, $8, $8
+            )
+            on conflict do nothing
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(task_id)
+        .bind(attempt_id)
+        .bind(attempt_no)
+        .bind(&callback_url)
+        .bind(reason)
+        .bind(deliver_after)
+        .bind(Utc::now())
+        .execute(&mut **tx)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            self.insert_event(
+                tx,
+                task_id,
+                attempt_id,
+                Some(attempt_no),
+                EventSource::Core,
+                "callback_enqueued",
+                "info",
+                json!({
+                    "callback_url": callback_url,
+                    "event_type": "task.completed",
+                    "reason": reason,
+                    "deliver_after": deliver_after,
+                }),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn enqueue_artifact_update_callback_if_needed(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+    ) -> Result<(), RepoError> {
+        let task_status: Option<String> = sqlx::query_scalar(
+            r#"
+            select status::text
+              from tasks
+             where id = $1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(task_status) = task_status else {
+            return Ok(());
+        };
+        if !matches!(
+            task_status.as_str(),
+            "SUCCEEDED" | "FAILED" | "CANCELED" | "LOST"
+        ) {
+            return Ok(());
+        }
+
+        let terminal_callback_delivered: bool = sqlx::query_scalar(
+            r#"
+            select exists (
+              select 1
+                from task_callback_outbox
+               where task_id = $1
+                 and attempt_no = $2
+                 and event_type = 'task.completed'
+                 and reason = 'terminal_state'
+                 and status = 'delivered'
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !terminal_callback_delivered {
+            return Ok(());
+        }
+
+        self.enqueue_task_completed_callback(tx, task_id, attempt_no, "artifact_update", Utc::now())
+            .await
+    }
+
     async fn delete_task_lease(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -3778,6 +4241,14 @@ impl TaskRepository {
         .await?;
 
         self.delete_task_lease(tx, task_id).await?;
+        self.enqueue_task_completed_callback(
+            tx,
+            task_id,
+            attempt_no,
+            "terminal_state",
+            now + self.callback_settle_delay,
+        )
+        .await?;
         Ok(())
     }
 
@@ -3879,6 +4350,14 @@ impl TaskRepository {
         .await?;
 
         self.delete_task_lease(tx, task_id).await?;
+        self.enqueue_task_completed_callback(
+            tx,
+            task_id,
+            attempt_no,
+            "terminal_state",
+            now + self.callback_settle_delay,
+        )
+        .await?;
         Ok(())
     }
 }
@@ -4588,6 +5067,38 @@ fn validate_transcode_publish_target(spec: &TaskSpec) -> Result<(), RepoError> {
         return Err(validation_error(
             "publish.url",
             format!("file_transcode output must stay under {TRANSCODE_ARTIFACT_ROOT}"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_task_callback_url(spec: &TaskSpec) -> Result<(), RepoError> {
+    let Some(callback_url) = spec
+        .common
+        .callback_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+
+    let url = Url::parse(callback_url).map_err(|_| {
+        validation_error(
+            "common.callback_url",
+            "must be an absolute http:// or https:// URL",
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(validation_error(
+            "common.callback_url",
+            "must use http:// or https://",
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err(validation_error(
+            "common.callback_url",
+            "must include a host",
         ));
     }
     Ok(())
@@ -5354,6 +5865,65 @@ pub struct TaskDetail {
     pub resolved_spec: Option<Value>,
     pub current_attempt: Option<AttemptSummary>,
     pub recent_events: Vec<TaskEventSummary>,
+    pub callback_delivery: Option<CallbackDeliverySummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CallbackDeliverySummary {
+    pub callback_url: String,
+    pub event_type: String,
+    pub reason: String,
+    pub status: String,
+    pub delivery_attempts: u32,
+    pub last_http_status: Option<i32>,
+    pub last_error: Option<String>,
+    pub delivered_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl CallbackDeliverySummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            callback_url: row.try_get("callback_url")?,
+            event_type: row.try_get("event_type")?,
+            reason: row.try_get("reason")?,
+            status: row.try_get("status")?,
+            delivery_attempts: u32::try_from(row.try_get::<i32, _>("delivery_attempts")?)
+                .unwrap_or_default(),
+            last_http_status: row.try_get("last_http_status")?,
+            last_error: row.try_get("last_error")?,
+            delivered_at: row.try_get("delivered_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CallbackOutboxJob {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub attempt_id: Option<Uuid>,
+    pub attempt_no: i32,
+    pub callback_url: String,
+    pub event_type: String,
+    pub reason: String,
+    pub delivery_attempts: u32,
+}
+
+impl CallbackOutboxJob {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            task_id: row.try_get("task_id")?,
+            attempt_id: row.try_get("attempt_id")?,
+            attempt_no: row.try_get("attempt_no")?,
+            callback_url: row.try_get("callback_url")?,
+            event_type: row.try_get("event_type")?,
+            reason: row.try_get("reason")?,
+            delivery_attempts: u32::try_from(row.try_get::<i32, _>("delivery_attempts")?)
+                .unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

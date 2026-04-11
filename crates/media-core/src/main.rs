@@ -1,4 +1,5 @@
 mod auth;
+mod callback;
 mod config;
 mod control_plane;
 mod error;
@@ -114,7 +115,10 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     sqlx::migrate!("../../migrations").run(&pool).await?;
 
-    let repository = Arc::new(TaskRepository::new(pool));
+    let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+        pool,
+        chrono::Duration::milliseconds(settings.core.callback_settle_delay_ms as i64),
+    ));
     let control_plane = ControlPlaneService::new(repository.clone());
     let hook_source_allowlist = parse_hook_source_allowlist(&settings.core.hook_source_allowlist)?;
     let auth = AuthConfig::from_settings(&settings.core)?;
@@ -152,6 +156,21 @@ async fn main() -> anyhow::Result<()> {
         control_plane.clone(),
         shutdown_rx.clone(),
     );
+    let callback_handle = callback::spawn(
+        repository.clone(),
+        Client::new(),
+        callback::CallbackConfig {
+            timeout: std::time::Duration::from_millis(settings.core.callback_timeout_ms),
+            max_attempts: settings.core.callback_max_attempts,
+            initial_backoff: std::time::Duration::from_millis(
+                settings.core.callback_initial_backoff_ms,
+            ),
+            max_backoff: std::time::Duration::from_millis(settings.core.callback_max_backoff_ms),
+            shared_secret: (!settings.core.callback_shared_secret.trim().is_empty())
+                .then(|| settings.core.callback_shared_secret.clone()),
+        },
+        shutdown_rx.clone(),
+    );
     let signal_handle = tokio::spawn(async move {
         shutdown_signal().await;
         let _ = shutdown_tx.send(true);
@@ -174,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
     http_result?;
     grpc_result?;
     let _ = scheduler_handle.await;
+    let _ = callback_handle.await;
     let _ = signal_handle.await;
 
     Ok(())
@@ -1394,7 +1414,7 @@ fn build_stream_runtime_index(
     index
 }
 
-fn build_fallback_play_urls(
+pub(crate) fn build_fallback_play_urls(
     agent_stream_addr: &str,
     schema: &str,
     app: &str,
@@ -1405,7 +1425,7 @@ fn build_fallback_play_urls(
     build_play_urls(agent_stream_addr, &schemas, app, stream)
 }
 
-fn build_play_urls(
+pub(crate) fn build_play_urls(
     agent_stream_addr: &str,
     schemas: &BTreeSet<String>,
     app: &str,
@@ -2980,6 +3000,117 @@ mod tests {
         Ok((format!("http://{addr}"), handle))
     }
 
+    async fn spawn_callback_stub(
+        status: StatusCode,
+    ) -> anyhow::Result<(
+        String,
+        Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>,
+        JoinHandle<()>,
+    )> {
+        use axum::{body::Bytes, extract::State, routing::post};
+
+        #[derive(Clone)]
+        struct CallbackStubState {
+            calls: Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>,
+            status: StatusCode,
+        }
+
+        async fn callback_handler(
+            State(state): State<CallbackStubState>,
+            headers: HeaderMap,
+            body: Bytes,
+        ) -> impl IntoResponse {
+            let payload = serde_json::from_slice::<Value>(&body).unwrap_or_else(|_| json!({}));
+            state.calls.lock().await.push((headers, payload));
+            (state.status, Json(json!({"ok": true})))
+        }
+
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/callback", post(callback_handler))
+            .with_state(CallbackStubState {
+                calls: calls.clone(),
+                status,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("callback stub should run");
+        });
+        Ok((format!("http://{addr}/callback"), calls, handle))
+    }
+
+    async fn wait_for_callback_count(
+        calls: &Arc<tokio::sync::Mutex<Vec<(HeaderMap, Value)>>>,
+        expected: usize,
+    ) -> anyhow::Result<Vec<(HeaderMap, Value)>> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            let snapshot = calls.lock().await.clone();
+            if snapshot.len() >= expected {
+                return Ok(snapshot);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for {expected} callback(s)");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn insert_running_transcode_task(
+        pool: &sqlx::PgPool,
+        node_id: Uuid,
+        resolved_spec: Value,
+    ) -> anyhow::Result<Uuid> {
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, template_id, profile, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'transcode-job-01', 'file_transcode'::task_type, 'RUNNING'::task_status, null, null, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5, null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("transcode-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, $3, 'ffmpeg'::worker_kind, 'RUNNING'::attempt_status,
+              null, null, null, null, null, null,
+              null, null, null, null,
+              null, $4, null, $4
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(task_id)
+    }
+
     fn short_id(value: Uuid) -> String {
         value.simple().to_string()[..8].to_string()
     }
@@ -3895,6 +4026,281 @@ mod tests {
         );
 
         zlm_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_invalid_callback_url() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let app = build_app(test_app_state(db.pool.clone()));
+        let payload = json!({
+            "name": "relay-camera-01",
+            "type": "live_relay",
+            "priority": 50,
+            "common": {
+                "created_by": "alice",
+                "callback_url": "not-a-url"
+            },
+            "input": {
+                "kind": "rtsp",
+                "url": "rtsp://camera.example/live"
+            },
+            "publish": {
+                "enable_rtsp": true
+            },
+            "record": {
+                "enabled": false
+            },
+            "schedule": {
+                "start_mode": "manual"
+            }
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/tasks")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", "task-callback-invalid")
+                    .body(Body::from(serde_json::to_vec(&payload)?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], json!("VALIDATION_TASK_SPEC_INVALID"));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_dispatcher_delivers_terminal_and_artifact_update_callbacks()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+            db.pool.clone(),
+            chrono::Duration::zero(),
+        ));
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-01",
+            "common": {"created_by": "tester", "callback_url": callback_url},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {
+                "enable_rtsp": true,
+                "enable_http_ts": true
+            },
+            "record": {"enabled": true, "format": "mp4"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+        repository
+            .record_agent_task_event(
+                node_id,
+                repository::AgentTaskEventRecord {
+                    task_id,
+                    attempt_no: 1,
+                    event_type: "succeeded".to_string(),
+                    event_level: "info".to_string(),
+                    message: "finished".to_string(),
+                    payload: json!({}),
+                },
+            )
+            .await?;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dispatcher = callback::spawn(
+            repository.clone(),
+            Client::new(),
+            callback::CallbackConfig {
+                timeout: std::time::Duration::from_secs(2),
+                max_attempts: 3,
+                initial_backoff: std::time::Duration::from_millis(50),
+                max_backoff: std::time::Duration::from_millis(200),
+                shared_secret: Some("secret".to_string()),
+            },
+            shutdown_rx,
+        );
+
+        let first_calls = wait_for_callback_count(&calls, 1).await?;
+        assert_eq!(first_calls.len(), 1);
+        assert_eq!(first_calls[0].1["event_type"], json!("task.completed"));
+        assert_eq!(first_calls[0].1["reason"], json!("terminal_state"));
+        assert_eq!(first_calls[0].1["task"]["status"], json!("SUCCEEDED"));
+        assert!(
+            first_calls[0].1["streams"][0]["play_urls"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .any(|value| value == "rtsp://stream.example/live/camera01")
+        );
+        assert_eq!(
+            first_calls[0]
+                .0
+                .get("X-StreamServer-Signature")
+                .and_then(|value| value.to_str().ok())
+                .is_some(),
+            true
+        );
+
+        repository
+            .record_zlm_record_file_hook(
+                &node_id.to_string(),
+                "on_record_mp4",
+                "record-hook-1",
+                json!({}),
+                repository::ZlmRecordFileRecord {
+                    record_format: Some("mp4".to_string()),
+                    schema: Some("rtsp".to_string()),
+                    vhost: "__defaultVhost__".to_string(),
+                    app: "live".to_string(),
+                    stream: "camera01".to_string(),
+                    file_path: "/data/zlm/www/record/live/camera01/clip.mp4".to_string(),
+                    file_size: 4096,
+                    time_len_sec: Some(12),
+                    start_time: Some(Utc::now()),
+                    file_name: Some("clip.mp4".to_string()),
+                    folder: Some("/data/zlm/www/record/live/camera01".to_string()),
+                    url: None,
+                },
+            )
+            .await?;
+
+        let second_calls = wait_for_callback_count(&calls, 2).await?;
+        assert_eq!(second_calls[1].1["reason"], json!("artifact_update"));
+        assert_eq!(
+            second_calls[1].1["records"][0]["http_url"],
+            json!("http://stream.example/record/live/camera01/clip.mp4")
+        );
+
+        let detail = repository.get_task(task_id).await?;
+        assert_eq!(
+            detail
+                .callback_delivery
+                .as_ref()
+                .map(|value| value.status.as_str()),
+            Some("delivered")
+        );
+
+        let _ = shutdown_tx.send(true);
+        dispatcher.abort();
+        callback_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_payload_includes_transcode_artifact_http_url() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+            db.pool.clone(),
+            chrono::Duration::zero(),
+        ));
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+        let resolved_spec = json!({
+            "type": "file_transcode",
+            "name": "transcode-job-01",
+            "common": {"created_by": "tester", "callback_url": callback_url},
+            "input": {"kind": "file", "url": "/tmp/input-hevc.mp4"},
+            "process": {"mode": "copy_or_transcode"},
+            "publish": {"kind": "file", "url": "/data/zlm/www/artifacts/transcode/verify/output.mp4"},
+            "record": {},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id = insert_running_transcode_task(&db.pool, node_id, resolved_spec).await?;
+        repository
+            .record_agent_snapshot(
+                node_id,
+                repository::TaskSnapshotRecord {
+                    runtime_id: Uuid::now_v7(),
+                    task_id,
+                    attempt_no: 1,
+                    worker_kind: "ffmpeg".to_string(),
+                    pid: Some(1234),
+                    state: "RUNNING".to_string(),
+                    command_line: Some("ffmpeg ...".to_string()),
+                    outputs: vec![
+                        "/data/zlm/www/artifacts/transcode/verify/output.mp4".to_string(),
+                    ],
+                    metadata: json!({
+                        "transcode_artifact": {
+                            "file_name": "output.mp4",
+                            "file_path": "/data/zlm/www/artifacts/transcode/verify/output.mp4",
+                            "file_size": 8192
+                        }
+                    }),
+                },
+            )
+            .await?;
+        repository
+            .record_agent_task_event(
+                node_id,
+                repository::AgentTaskEventRecord {
+                    task_id,
+                    attempt_no: 1,
+                    event_type: "succeeded".to_string(),
+                    event_level: "info".to_string(),
+                    message: "finished".to_string(),
+                    payload: json!({}),
+                },
+            )
+            .await?;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dispatcher = callback::spawn(
+            repository.clone(),
+            Client::new(),
+            callback::CallbackConfig {
+                timeout: std::time::Duration::from_secs(2),
+                max_attempts: 3,
+                initial_backoff: std::time::Duration::from_millis(50),
+                max_backoff: std::time::Duration::from_millis(200),
+                shared_secret: None,
+            },
+            shutdown_rx,
+        );
+
+        let delivered = wait_for_callback_count(&calls, 1).await?;
+        assert_eq!(
+            delivered[0].1["transcode_artifacts"][0]["http_url"],
+            json!("http://stream.example/artifacts/transcode/verify/output.mp4")
+        );
+
+        let _ = shutdown_tx.send(true);
+        dispatcher.abort();
+        callback_handle.abort();
         db.cleanup().await?;
         Ok(())
     }

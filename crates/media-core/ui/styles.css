@@ -828,6 +828,32 @@ pre,
   gap: 12px;
 }
 
+.detail-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.detail-item {
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: var(--panel-muted);
+}
+
+.detail-item label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text-soft);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.detail-item.full-width {
+  grid-column: 1 / -1;
+}
+
 .event-item,
 .diff-item,
 .node-detail-card {

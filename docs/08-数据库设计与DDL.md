@@ -260,7 +260,30 @@ create table task_events (
 );
 ```
 
-### 4.11 `task_checkpoints`
+### 4.11 `task_callback_outbox`
+
+```sql
+create table task_callback_outbox (
+  id uuid primary key,
+  task_id uuid not null references tasks(id) on delete cascade,
+  attempt_id uuid references task_attempts(id) on delete set null,
+  attempt_no integer not null,
+  callback_url text not null,
+  event_type text not null,
+  reason text not null,
+  status text not null check (status in ('pending', 'retrying', 'delivered', 'dead')),
+  delivery_attempts integer not null default 0,
+  deliver_after timestamptz not null,
+  last_error text,
+  last_http_status integer,
+  last_response_body text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  delivered_at timestamptz
+);
+```
+
+### 4.12 `task_checkpoints`
 
 ```sql
 create table task_checkpoints (
@@ -274,7 +297,7 @@ create table task_checkpoints (
 );
 ```
 
-### 4.12 `operation_requests`
+### 4.13 `operation_requests`
 
 用于所有写接口的幂等记录。
 
@@ -295,7 +318,7 @@ create table operation_requests (
 );
 ```
 
-### 4.13 `hook_events`
+### 4.14 `hook_events`
 
 保存原始 Hook 负载，便于幂等和审计。
 
@@ -326,6 +349,12 @@ create index idx_task_attempts_task_attempt_no_desc
 create index idx_task_events_task_created_desc
   on task_events(task_id, created_at desc);
 
+create index idx_task_callback_outbox_due
+  on task_callback_outbox(status, deliver_after asc, created_at asc);
+
+create index idx_task_callback_outbox_task_created_desc
+  on task_callback_outbox(task_id, created_at desc);
+
 create index idx_record_files_task_start_time_desc
   on record_files(task_id, start_time desc nulls last);
 
@@ -348,6 +377,7 @@ create index idx_stream_bindings_task_id
 - `record_files.file_path` 全局唯一。
 - `record_files.http_url` 允许为空，兼容历史录像和未携带 URL 的 Hook。
 - `transcode_artifacts` 只记录成功完成且输出到 `/data/zlm/www/artifacts/transcode/...` 的 `file_transcode` 产物。
+- `task_callback_outbox` 用于异步任务完成回调；同一任务同一 Attempt 的同类待发送回调只保留一条未完成记录。
 - `task_events.dedup_key` 允许为空；仅 Hook 或外部重复事件写入时使用。
 
 ## 7. 迁移策略
