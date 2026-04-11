@@ -1,7 +1,7 @@
 use std::{process::Command, time::Duration};
 
 use chrono::Utc;
-use media_domain::CapabilitySnapshot;
+use media_domain::{CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats};
 use reqwest::{Client, Url};
 use serde_json::Value;
 
@@ -37,6 +37,7 @@ impl CapabilityProbe {
         let ffmpeg_decoders =
             probe_ffmpeg_entries(&settings.ffmpeg_bin, &["-decoders"], parse_ffmpeg_codecs);
         let zlm = self.probe_zlm(settings).await.unwrap_or_default();
+        let gpu_devices = probe_gpu_devices(settings);
 
         CapabilitySnapshot {
             ffmpeg_protocols,
@@ -45,7 +46,8 @@ impl CapabilityProbe {
             ffmpeg_decoders,
             zlm_version: zlm.version,
             zlm_api_list: zlm.api_list,
-            gpu: Vec::new(),
+            gpu: summarize_gpu_devices(&gpu_devices),
+            gpu_devices,
             captured_at: Utc::now(),
         }
     }
@@ -95,6 +97,97 @@ pub fn binary_available(binary: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+pub fn gpu_acceleration_enabled(settings: &AgentSettings) -> bool {
+    settings.acceleration_mode.trim() == "gpu"
+}
+
+pub fn probe_gpu_devices(settings: &AgentSettings) -> Vec<GpuDeviceInfo> {
+    if !gpu_acceleration_enabled(settings) {
+        return Vec::new();
+    }
+
+    probe_nvidia_smi_csv(&[
+        "--query-gpu=index,uuid,name,memory.total",
+        "--format=csv,noheader,nounits",
+    ])
+    .into_iter()
+    .filter_map(|row| {
+        let index = row.first()?.trim().parse::<u32>().ok()?;
+        let uuid = row.get(1)?.trim().to_string();
+        let name = row.get(2)?.trim().to_string();
+        let memory_total_mb = row.get(3)?.trim().parse::<u64>().ok()?;
+        if uuid.is_empty() || name.is_empty() {
+            return None;
+        }
+        Some(GpuDeviceInfo {
+            index,
+            uuid,
+            name,
+            memory_total_mb,
+        })
+    })
+    .collect()
+}
+
+pub fn probe_gpu_runtime(settings: &AgentSettings) -> Vec<GpuRuntimeStats> {
+    if !gpu_acceleration_enabled(settings) {
+        return Vec::new();
+    }
+
+    probe_nvidia_smi_csv(&[
+        "--query-gpu=index,utilization.gpu,memory.used,memory.total,utilization.encoder,utilization.decoder",
+        "--format=csv,noheader,nounits",
+    ])
+    .into_iter()
+    .filter_map(|row| {
+        let index = row.first()?.trim().parse::<u32>().ok()?;
+        let gpu_util_percent = parse_metric_percent(row.get(1)?)?;
+        let memory_used_mb = row.get(2)?.trim().parse::<u64>().ok()?;
+        let memory_total_mb = row.get(3)?.trim().parse::<u64>().ok()?;
+        let encoder_util_percent = parse_metric_percent(row.get(4)?)?;
+        let decoder_util_percent = parse_metric_percent(row.get(5)?)?;
+        Some(GpuRuntimeStats {
+            index,
+            gpu_util_percent,
+            memory_used_mb,
+            memory_total_mb,
+            encoder_util_percent,
+            decoder_util_percent,
+        })
+    })
+    .collect()
+}
+
+pub fn summarize_gpu_devices(devices: &[GpuDeviceInfo]) -> Vec<String> {
+    devices
+        .iter()
+        .map(|device| {
+            format!(
+                "{}#{} ({} MB)",
+                device.name, device.index, device.memory_total_mb
+            )
+        })
+        .collect()
+}
+
+pub fn ffmpeg_supports_hwaccel(binary: &str, hwaccel: &str) -> bool {
+    probe_ffmpeg_entries(binary, &["-hwaccels"], parse_ffmpeg_hwaccels)
+        .iter()
+        .any(|value| value == hwaccel)
+}
+
+pub fn ffmpeg_supports_encoder(binary: &str, encoder: &str) -> bool {
+    probe_ffmpeg_entries(binary, &["-encoders"], parse_ffmpeg_codecs)
+        .iter()
+        .any(|value| value == encoder)
+}
+
+pub fn ffmpeg_supports_decoder(binary: &str, decoder: &str) -> bool {
+    probe_ffmpeg_entries(binary, &["-decoders"], parse_ffmpeg_codecs)
+        .iter()
+        .any(|value| value == decoder)
 }
 
 fn probe_ffmpeg_entries(
@@ -175,6 +268,20 @@ fn parse_ffmpeg_codecs(text: &str) -> Vec<String> {
     )
 }
 
+fn parse_ffmpeg_hwaccels(text: &str) -> Vec<String> {
+    normalize(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.starts_with("Hardware acceleration methods:")
+                    && !line.starts_with("Supported hardware device types:")
+            })
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 fn is_format_flag_block(value: &str) -> bool {
     value.len() <= 2 && value.chars().all(|ch| ch == '.' || ch.is_ascii_uppercase())
 }
@@ -187,6 +294,33 @@ fn normalize(mut values: Vec<String>) -> Vec<String> {
     values.sort();
     values.dedup();
     values
+}
+
+fn probe_nvidia_smi_csv(args: &[&str]) -> Vec<Vec<String>> {
+    let output = Command::new("nvidia-smi").args(args).output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(parse_csv_row)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_csv_row(line: &str) -> Vec<String> {
+    line.split(',')
+        .map(|value| value.trim().to_string())
+        .collect()
+}
+
+fn parse_metric_percent(value: &str) -> Option<f64> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("n/a") || trimmed.eq_ignore_ascii_case("[not supported]") {
+        return Some(0.0);
+    }
+    trimmed.parse::<f64>().ok()
 }
 
 fn extract_zlm_version(value: Value) -> Option<String> {

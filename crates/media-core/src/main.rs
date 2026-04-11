@@ -1037,7 +1037,7 @@ async fn list_nodes(
     let mut nodes = state.repository.list_nodes().await?;
     let live_loads = state.control_plane.current_node_loads().await;
     for node in &mut nodes {
-        apply_live_load(node, live_loads.get(&node.id).copied());
+        apply_live_load(node, live_loads.get(&node.id).cloned());
     }
     Ok(Json(nodes))
 }
@@ -1261,6 +1261,7 @@ fn apply_live_load(node: &mut repository::NodeSummary, load: Option<NodeLiveLoad
         node.disk_percent = Some(load.disk_percent);
         node.zlm_alive = Some(load.zlm_alive);
         node.ffmpeg_alive = Some(load.ffmpeg_alive);
+        node.gpu_runtime = Some(load.gpu_runtime);
         node.healthy = load.connected;
     } else {
         node.connected = Some(false);
@@ -3788,6 +3789,7 @@ mod tests {
                     slot_usage: 0.4,
                     zlm_alive: true,
                     ffmpeg_alive: true,
+                    gpu_runtime: Vec::new(),
                 },
             )
             .await?;
@@ -3803,6 +3805,7 @@ mod tests {
                     slot_usage: 0.55,
                     zlm_alive: true,
                     ffmpeg_alive: false,
+                    gpu_runtime: Vec::new(),
                 },
             )
             .await?;

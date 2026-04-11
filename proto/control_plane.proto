@@ -51,6 +51,7 @@ message Heartbeat {
   double slot_usage = 6;
   bool zlm_alive = 7;
   bool ffmpeg_alive = 8;
+  repeated GpuRuntime gpu_runtime = 9;
 }
 
 message CapabilitySnapshot {
@@ -61,6 +62,23 @@ message CapabilitySnapshot {
   string zlm_version = 5;
   repeated string zlm_api_list = 6;
   repeated string gpu = 7;
+  repeated GpuDevice gpu_devices = 8;
+}
+
+message GpuDevice {
+  uint32 index = 1;
+  string uuid = 2;
+  string name = 3;
+  uint64 memory_total_mb = 4;
+}
+
+message GpuRuntime {
+  uint32 index = 1;
+  double gpu_util_percent = 2;
+  uint64 memory_used_mb = 3;
+  uint64 memory_total_mb = 4;
+  double encoder_util_percent = 5;
+  double decoder_util_percent = 6;
 }
 
 message TaskEvent {

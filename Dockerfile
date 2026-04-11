@@ -108,3 +108,29 @@ RUN chmod +x /usr/local/bin/media-agent-supervisor \
     && mkdir -p /data/media/work /data/media/logs
 
 CMD ["media-agent-supervisor"]
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS media-agent-gpu-runtime
+
+ARG DEBIAN_MIRROR
+
+RUN set -eux; \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|${DEBIAN_MIRROR}/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|${DEBIAN_MIRROR}/ubuntu|g" \
+        /etc/apt/sources.list; \
+    fi; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg iproute2 procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
+COPY config ./config
+COPY docker/entrypoints/media-agent-supervisor.sh /usr/local/bin/media-agent-supervisor
+
+RUN chmod +x /usr/local/bin/media-agent-supervisor \
+    && mkdir -p /data/media/work /data/media/logs
+
+CMD ["media-agent-supervisor"]

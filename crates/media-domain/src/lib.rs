@@ -4,8 +4,8 @@ pub mod state_machine;
 pub mod task;
 
 pub use node::{
-    AgentRegistration, CapabilitySnapshot, HeartbeatSnapshot, NetworkMode, RuntimeHandle,
-    RuntimeState,
+    AgentRegistration, CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot,
+    NetworkMode, RuntimeHandle, RuntimeState,
 };
 pub use paging::Page;
 pub use state_machine::{TaskOperation, TaskStateError};

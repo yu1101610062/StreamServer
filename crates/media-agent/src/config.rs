@@ -78,6 +78,8 @@ pub struct AgentSettings {
     pub max_runtime_slots: u32,
     #[serde(default = "default_work_root")]
     pub work_root: String,
+    #[serde(default = "default_acceleration_mode")]
+    pub acceleration_mode: String,
 }
 
 impl Default for AgentSettings {
@@ -105,6 +107,7 @@ impl Default for AgentSettings {
             labels: Vec::new(),
             max_runtime_slots: default_max_runtime_slots(),
             work_root: default_work_root(),
+            acceleration_mode: default_acceleration_mode(),
         }
     }
 }
@@ -184,6 +187,10 @@ impl Settings {
             !self.agent.work_root.trim().is_empty(),
             "WORK_ROOT must not be empty"
         );
+        anyhow::ensure!(
+            matches!(self.agent.acceleration_mode.trim(), "cpu" | "gpu"),
+            "AGENT_ACCELERATION_MODE must be one of cpu/gpu"
+        );
 
         Ok(())
     }
@@ -256,6 +263,9 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("WORK_ROOT") {
         settings.agent.work_root = value;
+    }
+    if let Some(value) = env("AGENT_ACCELERATION_MODE") {
+        settings.agent.acceleration_mode = value;
     }
     if let Some(value) = env("LOG_LEVEL") {
         settings.logging.level = value;
@@ -335,4 +345,8 @@ fn default_max_runtime_slots() -> u32 {
 
 fn default_work_root() -> String {
     "/data/media/work".to_string()
+}
+
+fn default_acceleration_mode() -> String {
+    "cpu".to_string()
 }

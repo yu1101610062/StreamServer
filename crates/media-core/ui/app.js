@@ -333,7 +333,7 @@ function buildApiDocDetails() {
   return {
   "POST /api/v1/tasks": {
     requestSample: {
-      note: "该示例覆盖了创建任务接口的主要可选字段，实际调用时可按任务类型删减无关字段。",
+      note: "该示例覆盖了创建任务接口的主要可选字段。视频编解码器和 GPU/CPU 路径由系统内部自动决定，北向接口不再要求手动指定。",
       headers: {
         Authorization: EXAMPLE_AUTHORIZATION,
         "Idempotency-Key": "task-create-relay-camera-01-20260411",
@@ -365,8 +365,6 @@ function buildApiDocDetails() {
         },
         process: {
           mode: "copy_or_transcode",
-          video_codec: "libx264",
-          audio_codec: "aac",
           bitrate: 4096,
           fps: 25,
           gop: 50,
@@ -403,7 +401,6 @@ function buildApiDocDetails() {
           required_labels: ["edge"],
           preferred_labels: ["multicast", "ssd"],
           network_interface: "eth0",
-          need_gpu: false,
         },
       },
     },
@@ -427,9 +424,7 @@ function buildApiDocDetails() {
       { name: "input.probe_timeout_ms", type: "number", required: false, description: "探测源流超时时间。" },
       { name: "input.tcp_mode", type: "number", required: false, description: "RTP 接收时的 TCP 模式。" },
       { name: "input.ssrc", type: "number", required: false, description: "RTP 接收时的 SSRC。" },
-      { name: "process.mode", type: "string", required: false, description: "处理模式，如 copy_or_transcode。" },
-      { name: "process.video_codec", type: "string", required: false, description: "视频编码。" },
-      { name: "process.audio_codec", type: "string", required: false, description: "音频编码。" },
+      { name: "process.mode", type: "string", required: false, description: "处理模式，如 copy_or_transcode。具体是否走 GPU、使用何种编解码器由系统自动决定。" },
       { name: "process.bitrate", type: "number", required: false, description: "目标码率 kbps。" },
       { name: "process.fps", type: "number", required: false, description: "目标帧率。" },
       { name: "process.gop", type: "number", required: false, description: "关键帧间隔。" },
@@ -456,7 +451,6 @@ function buildApiDocDetails() {
       { name: "resource.required_labels[]", type: "string[]", required: false, description: "节点必需标签。" },
       { name: "resource.preferred_labels[]", type: "string[]", required: false, description: "节点优选标签。" },
       { name: "resource.network_interface", type: "string", required: false, description: "资源网络接口偏好。" },
-      { name: "resource.need_gpu", type: "boolean", required: false, description: "是否需要 GPU。" },
     ],
     responseFields: [
       { name: "id", type: "string", description: "任务 ID。" },
@@ -2980,13 +2974,9 @@ function renderCreateProcessStep(draft) {
   return `
     <div class="create-grid">
       ${showProcess ? renderTextModelField("处理模式", "process.mode", draft.process.mode, "copy_or_transcode") : ""}
-      ${showProcess ? renderTextModelField("视频编码", "process.video_codec", draft.process.video_codec, "h264") : ""}
-      ${showProcess ? renderTextModelField("音频编码", "process.audio_codec", draft.process.audio_codec, "aac") : ""}
       ${showProcess ? renderTextModelField("目标码率", "process.bitrate", draft.process.bitrate, "2000", "number") : ""}
       ${showProcess ? renderTextModelField("帧率", "process.fps", draft.process.fps, "25", "number") : ""}
       ${showProcess ? renderTextModelField("GOP", "process.gop", draft.process.gop, "50", "number") : ""}
-      ${showProcess ? renderTextModelField("编码档位", "process.profile", draft.process.profile, "baseline") : ""}
-      ${showProcess ? renderTextModelField("编码预设", "process.preset", draft.process.preset, "veryfast") : ""}
       ${showPublishKindSelect ? renderSelectModelField("发布类型", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value ? publishKindLabel(value) : "内部流 / 不显式设置") : renderStaticModelField("发布类型", publishKindLabel(publishKind, "内部流"))}
       ${showPublishUrl ? renderTextModelField("发布 URL", "publish.url", draft.publish.url, taskType === "file_transcode" ? "/data/media/output.mp4" : "rtmp://zlm/live/stream") : ""}
       ${showPublishNetwork ? renderTextModelField("发布组播地址", "publish.group", draft.publish.group, "239.1.1.10") : ""}
@@ -3026,7 +3016,6 @@ function renderCreatePolicyStep(draft) {
       ${renderTextareaModelField("必需标签", "resource.required_labels_text", draft.resource.required_labels_text, "逗号分隔")}
       ${renderTextareaModelField("优选标签", "resource.preferred_labels_text", draft.resource.preferred_labels_text, "逗号分隔")}
       ${renderTextModelField("资源网络接口", "resource.network_interface", draft.resource.network_interface, "eth0")}
-      ${renderCheckboxModelField("需要 GPU", "resource.need_gpu", draft.resource.need_gpu)}
       ${renderTextModelField("资源槽位类型", "resource.slot_class", draft.resource.slot_class, "standard")}
       ${renderTextModelField("最大 CPU 百分比", "resource.max_cpu_percent", draft.resource.max_cpu_percent, "80", "number")}
     </div>
@@ -3871,13 +3860,9 @@ function buildDraftPayload(draft) {
   setIfNumber(payload.input, "ssrc", draft.input.ssrc);
 
   setIfPresent(payload.process, "mode", draft.process.mode);
-  setIfPresent(payload.process, "video_codec", draft.process.video_codec);
-  setIfPresent(payload.process, "audio_codec", draft.process.audio_codec);
   setIfNumber(payload.process, "bitrate", draft.process.bitrate);
   setIfNumber(payload.process, "fps", draft.process.fps);
   setIfNumber(payload.process, "gop", draft.process.gop);
-  setIfPresent(payload.process, "profile", draft.process.profile);
-  setIfPresent(payload.process, "preset", draft.process.preset);
 
   setIfPresent(payload.publish, "kind", draft.publish.kind);
   setIfPresent(payload.publish, "url", draft.publish.url);
@@ -3913,7 +3898,6 @@ function buildDraftPayload(draft) {
   setIfList(payload.resource, "required_labels", draft.resource.required_labels_text);
   setIfList(payload.resource, "preferred_labels", draft.resource.preferred_labels_text);
   setIfPresent(payload.resource, "network_interface", draft.resource.network_interface);
-  setIfBoolean(payload.resource, "need_gpu", draft.resource.need_gpu);
   setIfPresent(payload.resource, "slot_class", draft.resource.slot_class);
   setIfNumber(payload.resource, "max_cpu_percent", draft.resource.max_cpu_percent);
 
@@ -3951,13 +3935,9 @@ function createDefaultDraft() {
     },
     process: {
       mode: "",
-      video_codec: "",
-      audio_codec: "",
       bitrate: "",
       fps: "",
       gop: "",
-      profile: "",
-      preset: "",
     },
     publish: {
       kind: "",
@@ -3998,7 +3978,6 @@ function createDefaultDraft() {
       required_labels_text: "",
       preferred_labels_text: "",
       network_interface: "",
-      need_gpu: false,
       slot_class: "",
       max_cpu_percent: "",
     },
@@ -4033,7 +4012,96 @@ function normalizeDraftForTaskType(draft, taskType) {
   }
 }
 
+function listGpuDevices(node) {
+  return Array.isArray(node?.gpu_devices) ? node.gpu_devices : [];
+}
+
+function listGpuRuntime(nodeOrHeartbeat) {
+  return Array.isArray(nodeOrHeartbeat?.gpu_runtime) ? nodeOrHeartbeat.gpu_runtime : [];
+}
+
+function hasGpuTelemetry(node) {
+  return listGpuDevices(node).length > 0 || listGpuRuntime(node).length > 0 || (Array.isArray(node?.gpu) && node.gpu.length > 0);
+}
+
+function mergeGpuTelemetry(devices, runtime) {
+  const merged = new Map();
+  devices.forEach((device) => {
+    const index = Number(device?.index ?? merged.size);
+    merged.set(index, { device, runtime: null });
+  });
+  runtime.forEach((sample) => {
+    const index = Number(sample?.index ?? merged.size);
+    const current = merged.get(index) || { device: null, runtime: null };
+    current.runtime = sample;
+    merged.set(index, current);
+  });
+  return Array.from(merged.entries())
+    .sort((left, right) => left[0] - right[0])
+    .map(([, entry]) => entry);
+}
+
+function formatGpuMemoryUsage(runtime) {
+  if (!runtime) {
+    return "—";
+  }
+  return `${formatBytes((runtime.memory_used_mb || 0) * 1024 * 1024)} / ${formatBytes((runtime.memory_total_mb || 0) * 1024 * 1024)}`;
+}
+
+function formatGpuDeviceTitle(device, runtime, fallbackIndex) {
+  const index = Number.isFinite(Number(device?.index)) ? Number(device.index) : Number(runtime?.index);
+  const suffix = Number.isFinite(index) ? ` #${index}` : ` #${fallbackIndex}`;
+  return `${device?.name || "GPU"}${suffix}`;
+}
+
+function renderGpuRuntimePanel(devices, runtime) {
+  const rows = mergeGpuTelemetry(devices, runtime);
+  if (!rows.length) {
+    return renderInlineEmpty("该节点没有 GPU 遥测。");
+  }
+  return `
+    <div class="event-list">
+      ${rows
+        .map(
+          (entry, index) => `
+            <article class="event-item">
+              <div class="toolbar-actions">
+                <strong>${escapeHtml(formatGpuDeviceTitle(entry.device, entry.runtime, index))}</strong>
+                ${entry.device?.uuid ? `<span class="subtle mono">${escapeHtml(shortId(entry.device.uuid))}</span>` : ""}
+              </div>
+              <div class="inline-list">
+                ${entry.device?.memory_total_mb ? `<span class="tag">显存 ${formatBytes(entry.device.memory_total_mb * 1024 * 1024)}</span>` : ""}
+                ${entry.runtime ? `<span class="tag">GPU ${formatPercent(entry.runtime.gpu_util_percent)}</span>` : ""}
+                ${entry.runtime ? `<span class="tag">ENC ${formatPercent(entry.runtime.encoder_util_percent)}</span>` : ""}
+                ${entry.runtime ? `<span class="tag">DEC ${formatPercent(entry.runtime.decoder_util_percent)}</span>` : ""}
+                ${entry.runtime ? `<span class="tag">显存占用 ${escapeHtml(formatGpuMemoryUsage(entry.runtime))}</span>` : ""}
+              </div>
+            </article>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderGpuHeartbeatTags(runtime) {
+  const rows = mergeGpuTelemetry([], runtime);
+  if (!rows.length) {
+    return "";
+  }
+  return rows
+    .map(
+      (entry, index) => `
+        <span class="tag">${escapeHtml(formatGpuDeviceTitle(entry.device, entry.runtime, index))} ${formatPercent(entry.runtime?.gpu_util_percent)}</span>
+        <span class="tag">ENC ${formatPercent(entry.runtime?.encoder_util_percent)}</span>
+        <span class="tag">DEC ${formatPercent(entry.runtime?.decoder_util_percent)}</span>
+      `,
+    )
+    .join("");
+}
+
 function renderNodeMetric(node) {
+  const gpuDeviceCount = Math.max(listGpuDevices(node).length, Array.isArray(node?.gpu) ? node.gpu.length : 0);
   return `
     <div class="metric-panel">
       <label>${escapeHtml(node.node_name)}</label>
@@ -4044,12 +4112,15 @@ function renderNodeMetric(node) {
         <span class="tag">CPU ${formatPercent(node.cpu_percent)}</span>
         <span class="tag">内存 ${formatPercent(node.mem_percent)}</span>
         <span class="tag">任务 ${escapeHtml(String(node.running_tasks ?? 0))}</span>
+        ${gpuDeviceCount ? `<span class="tag">GPU ${escapeHtml(String(gpuDeviceCount))} 卡</span>` : ""}
       </div>
     </div>
   `;
 }
 
 function renderExpandedNodeInsight(node, insight) {
+  const gpuDevices = listGpuDevices(node);
+  const gpuRuntime = listGpuRuntime(node);
   return `
     <div class="overview-grid">
       ${metricCard("CPU", formatPercent(node.cpu_percent))}
@@ -4057,6 +4128,7 @@ function renderExpandedNodeInsight(node, insight) {
       ${metricCard("磁盘", formatPercent(node.disk_percent))}
       ${metricCard("ZLM", node.zlm_alive === false ? "异常" : "正常")}
       ${metricCard("FFmpeg", node.ffmpeg_alive === false ? "异常" : "正常")}
+      ${metricCard("GPU", hasGpuTelemetry(node) ? `${Math.max(gpuDevices.length, Array.isArray(node.gpu) ? node.gpu.length : 0)} 卡` : "无")}
       ${metricCard("最近心跳", formatTime(node.last_seen_at))}
     </div>
     <div class="split-grid" style="margin-top: 16px;">
@@ -4073,6 +4145,21 @@ function renderExpandedNodeInsight(node, insight) {
         <div class="subtle" style="margin-top: 12px;">编码器：${escapeHtml(node.ffmpeg_encoders.slice(0, 6).join(", ") || "—")}</div>
         <div class="subtle">网卡：${escapeHtml(node.interfaces.join(", ") || "—")}</div>
       </div>
+      ${
+        hasGpuTelemetry(node)
+          ? `
+            <div class="panel">
+              <div class="panel-header">
+                <div>
+                  <h3>GPU 概览</h3>
+                  <p>显卡型号、显存和当前 GPU/编码/解码占用。</p>
+                </div>
+              </div>
+              ${renderGpuRuntimePanel(gpuDevices, gpuRuntime)}
+            </div>
+          `
+          : ""
+      }
       <div class="panel">
         <div class="panel-header">
           <div>
@@ -4246,6 +4333,7 @@ function renderHeartbeatTimeline(heartbeats) {
                 <span class="tag">磁盘 ${formatPercent(item.disk_percent)}</span>
                 <span class="tag">任务 ${escapeHtml(String(item.running_tasks ?? 0))}</span>
                 <span class="tag">槽位 ${formatPercent((item.slot_usage ?? 0) * 100)}</span>
+                ${renderGpuHeartbeatTags(item.gpu_runtime)}
               </div>
             </article>
           `,
@@ -4983,13 +5071,9 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
   });
   applyDraftSectionDefaults(draft.process, spec.process, {
     mode: "string",
-    video_codec: "string",
-    audio_codec: "string",
     bitrate: "number",
     fps: "number",
     gop: "number",
-    profile: "string",
-    preset: "string",
   });
   applyDraftSectionDefaults(draft.publish, spec.publish, {
     kind: "string",
@@ -5030,7 +5114,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     required_labels: "list:required_labels_text",
     preferred_labels: "list:preferred_labels_text",
     network_interface: "string",
-    need_gpu: "boolean",
     slot_class: "string",
     max_cpu_percent: "number",
   });

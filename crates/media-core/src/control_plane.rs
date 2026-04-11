@@ -11,12 +11,14 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use media_domain::{
-    AgentRegistration, CapabilitySnapshot, HeartbeatSnapshot, InputKind, NetworkMode, TaskSpec,
+    AgentRegistration, CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot,
+    InputKind, NetworkMode, TaskSpec, TaskType,
 };
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
-    Heartbeat as RpcHeartbeat, ProbeCapabilities, Register as RpcRegister, TaskEvent, TaskLogBatch,
-    TaskProgress, TaskSnapshot,
+    GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
+    ProbeCapabilities, Register as RpcRegister, TaskEvent, TaskLogBatch, TaskProgress,
+    TaskSnapshot,
     control_plane_server::{ControlPlane, ControlPlaneServer},
 };
 use reqwest::Url;
@@ -51,6 +53,7 @@ struct SessionHandle {
     session_id: u64,
     sender: mpsc::Sender<Result<CoreEnvelope, Status>>,
     registration: AgentRegistration,
+    capabilities: SessionCapabilities,
     load: SessionLoad,
     reservations: VecDeque<DispatchReservation>,
 }
@@ -61,11 +64,14 @@ struct SessionTarget {
     session_id: u64,
     sender: mpsc::Sender<Result<CoreEnvelope, Status>>,
     same_subnet: bool,
+    has_gpu_devices: bool,
+    using_gpu_path: bool,
+    gpu_headroom: Option<f64>,
     slot_usage: f64,
     running_tasks: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SessionLoad {
     slot_usage: f64,
     running_tasks: u32,
@@ -74,6 +80,18 @@ struct SessionLoad {
     disk_percent: f64,
     zlm_alive: bool,
     ffmpeg_alive: bool,
+    gpu_runtime: Vec<GpuRuntimeStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionCapabilities {
+    gpu_devices: Vec<GpuDeviceInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionPreference {
+    CpuOnly,
+    GpuPreferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +99,7 @@ struct DispatchReservation {
     task_id: Uuid,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct NodeLiveLoad {
     pub connected: bool,
     pub slot_usage: f64,
@@ -91,11 +109,13 @@ pub struct NodeLiveLoad {
     pub disk_percent: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
+    pub gpu_runtime: Vec<GpuRuntimeStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct DispatchScore {
     same_subnet: bool,
+    gpu_headroom: Option<f64>,
     slot_usage: f64,
     running_tasks: u32,
     node_id: Uuid,
@@ -119,8 +139,14 @@ impl ControlPlaneService {
         let resolved_spec =
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
         let source_affinity_ip = task_source_affinity_ip(&resolved_spec);
+        let execution_preference = task_execution_preference(&resolved_spec);
         let target = self
-            .claim_best_session(source_affinity_ip, task_id)
+            .claim_best_session(
+                source_affinity_ip,
+                task_id,
+                &resolved_spec,
+                execution_preference,
+            )
             .await
             .ok_or(ControlPlaneError::NoConnectedNode)?;
         let command = match self
@@ -170,7 +196,11 @@ impl ControlPlaneService {
             node_id = %command.node_id,
             attempt_no = command.attempt_no,
             source_affinity_ip = ?source_affinity_ip,
+            execution_preference = ?execution_preference,
+            gpu_dispatched = target.using_gpu_path,
+            gpu_node_used_as_cpu_node = !target.using_gpu_path && target.has_gpu_devices,
             same_subnet = target.same_subnet,
+            gpu_headroom = target.gpu_headroom,
             slot_usage = target.slot_usage,
             running_tasks = target.running_tasks,
             "start_task dispatched to agent"
@@ -245,6 +275,7 @@ impl ControlPlaneService {
                     session_id,
                     sender: sender.clone(),
                     registration: registration.clone(),
+                    capabilities: SessionCapabilities::default(),
                     load: SessionLoad::default(),
                     reservations: VecDeque::new(),
                 },
@@ -377,6 +408,7 @@ impl ControlPlaneService {
             }
             media_rpc::control_plane::agent_envelope::Payload::CapabilitySnapshot(snapshot) => {
                 let snapshot = capability_from_rpc(snapshot);
+                self.update_session_capabilities(node_id, &snapshot).await?;
                 self.repository
                     .upsert_node_capabilities(node_id, &snapshot)
                     .await
@@ -546,97 +578,67 @@ impl ControlPlaneService {
             disk_percent: snapshot.disk_percent,
             zlm_alive: snapshot.zlm_alive,
             ffmpeg_alive: snapshot.ffmpeg_alive,
+            gpu_runtime: snapshot.gpu_runtime.clone(),
+        };
+        Ok(())
+    }
+
+    async fn update_session_capabilities(
+        &self,
+        node_id: Uuid,
+        snapshot: &CapabilitySnapshot,
+    ) -> Result<(), Status> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(&node_id)
+            .ok_or_else(|| Status::unavailable("control-plane session no longer exists"))?;
+        session.capabilities = SessionCapabilities {
+            gpu_devices: snapshot.gpu_devices.clone(),
         };
         Ok(())
     }
 
     #[cfg(test)]
-    async fn pick_best_session(&self, source_affinity_ip: Option<IpAddr>) -> Option<SessionTarget> {
+    async fn pick_best_session(
+        &self,
+        source_affinity_ip: Option<IpAddr>,
+        spec: &TaskSpec,
+        preference: ExecutionPreference,
+    ) -> Option<SessionTarget> {
         let sessions = self.sessions.lock().await;
-        sessions
-            .iter()
-            .filter(|(_, handle)| !session_is_saturated(&handle.load, reservation_count(handle)))
-            .min_by(|(left_id, left_handle), (right_id, right_handle)| {
-                compare_dispatch_score(
-                    dispatch_score(
-                        **left_id,
-                        &left_handle.registration,
-                        &left_handle.load,
-                        source_affinity_ip,
-                        reservation_count(left_handle),
-                    ),
-                    dispatch_score(
-                        **right_id,
-                        &right_handle.registration,
-                        &right_handle.load,
-                        source_affinity_ip,
-                        reservation_count(right_handle),
-                    ),
-                )
-            })
-            .map(|(node_id, handle)| {
-                let score = dispatch_score(
-                    *node_id,
-                    &handle.registration,
-                    &handle.load,
-                    source_affinity_ip,
-                    reservation_count(handle),
-                );
-                SessionTarget {
-                    node_id: *node_id,
-                    session_id: handle.session_id,
-                    sender: handle.sender.clone(),
-                    same_subnet: score.same_subnet,
-                    slot_usage: score.slot_usage,
-                    running_tasks: score.running_tasks,
-                }
-            })
+        pick_best_session_target(&sessions, source_affinity_ip, spec, preference)
     }
 
     async fn claim_best_session(
         &self,
         source_affinity_ip: Option<IpAddr>,
         task_id: Uuid,
+        spec: &TaskSpec,
+        preference: ExecutionPreference,
     ) -> Option<SessionTarget> {
         let mut sessions = self.sessions.lock().await;
-        let best_node_id = sessions
-            .iter()
-            .filter(|(_, handle)| !session_is_saturated(&handle.load, reservation_count(handle)))
-            .min_by(|(left_id, left_handle), (right_id, right_handle)| {
-                compare_dispatch_score(
-                    dispatch_score(
-                        **left_id,
-                        &left_handle.registration,
-                        &left_handle.load,
-                        source_affinity_ip,
-                        reservation_count(left_handle),
-                    ),
-                    dispatch_score(
-                        **right_id,
-                        &right_handle.registration,
-                        &right_handle.load,
-                        source_affinity_ip,
-                        reservation_count(right_handle),
-                    ),
-                )
-            })
-            .map(|(node_id, _)| *node_id)?;
-        let handle = sessions.get_mut(&best_node_id)?;
+        let target = pick_best_session_target(&sessions, source_affinity_ip, spec, preference)?;
+        let handle = sessions.get_mut(&target.node_id)?;
         handle
             .reservations
             .push_back(DispatchReservation { task_id });
         let score = dispatch_score(
-            best_node_id,
+            target.node_id,
             &handle.registration,
+            &handle.capabilities,
             &handle.load,
             source_affinity_ip,
             reservation_count(handle),
+            target.using_gpu_path,
         );
         Some(SessionTarget {
-            node_id: best_node_id,
+            node_id: target.node_id,
             session_id: handle.session_id,
             sender: handle.sender.clone(),
             same_subnet: score.same_subnet,
+            has_gpu_devices: !handle.capabilities.gpu_devices.is_empty(),
+            using_gpu_path: target.using_gpu_path,
+            gpu_headroom: score.gpu_headroom,
             slot_usage: score.slot_usage,
             running_tasks: score.running_tasks,
         })
@@ -671,6 +673,9 @@ impl ControlPlaneService {
             session_id: handle.session_id,
             sender: handle.sender.clone(),
             same_subnet: false,
+            has_gpu_devices: !handle.capabilities.gpu_devices.is_empty(),
+            using_gpu_path: false,
+            gpu_headroom: None,
             slot_usage: handle.load.slot_usage,
             running_tasks: handle.load.running_tasks,
         })
@@ -692,6 +697,7 @@ impl ControlPlaneService {
                         disk_percent: handle.load.disk_percent,
                         zlm_alive: handle.load.zlm_alive,
                         ffmpeg_alive: handle.load.ffmpeg_alive,
+                        gpu_runtime: handle.load.gpu_runtime.clone(),
                     },
                 )
             })
@@ -781,6 +787,11 @@ fn heartbeat_from_rpc(heartbeat: RpcHeartbeat) -> Result<HeartbeatSnapshot, Stat
         slot_usage: heartbeat.slot_usage,
         zlm_alive: heartbeat.zlm_alive,
         ffmpeg_alive: heartbeat.ffmpeg_alive,
+        gpu_runtime: heartbeat
+            .gpu_runtime
+            .into_iter()
+            .map(gpu_runtime_from_rpc)
+            .collect(),
     })
 }
 
@@ -793,7 +804,32 @@ fn capability_from_rpc(snapshot: RpcCapabilitySnapshot) -> CapabilitySnapshot {
         zlm_version: option_string(snapshot.zlm_version),
         zlm_api_list: normalize_strings(snapshot.zlm_api_list),
         gpu: normalize_strings(snapshot.gpu),
+        gpu_devices: snapshot
+            .gpu_devices
+            .into_iter()
+            .map(gpu_device_from_rpc)
+            .collect(),
         captured_at: Utc::now(),
+    }
+}
+
+fn gpu_device_from_rpc(device: RpcGpuDevice) -> GpuDeviceInfo {
+    GpuDeviceInfo {
+        index: device.index,
+        uuid: device.uuid.trim().to_string(),
+        name: device.name.trim().to_string(),
+        memory_total_mb: device.memory_total_mb,
+    }
+}
+
+fn gpu_runtime_from_rpc(runtime: RpcGpuRuntime) -> GpuRuntimeStats {
+    GpuRuntimeStats {
+        index: runtime.index,
+        gpu_util_percent: runtime.gpu_util_percent,
+        memory_used_mb: runtime.memory_used_mb,
+        memory_total_mb: runtime.memory_total_mb,
+        encoder_util_percent: runtime.encoder_util_percent,
+        decoder_util_percent: runtime.decoder_util_percent,
     }
 }
 
@@ -939,6 +975,47 @@ fn reservation_count(handle: &SessionHandle) -> u32 {
     u32::try_from(handle.reservations.len()).unwrap_or(u32::MAX)
 }
 
+fn task_execution_preference(spec: &TaskSpec) -> ExecutionPreference {
+    match spec.task_type {
+        TaskType::FileTranscode | TaskType::FileToLive => {
+            if spec.process.mode.as_deref() == Some("passthrough") {
+                ExecutionPreference::CpuOnly
+            } else {
+                ExecutionPreference::GpuPreferred
+            }
+        }
+        TaskType::MulticastBridge => {
+            if multicast_bridge_requires_video_reencode(spec) {
+                ExecutionPreference::GpuPreferred
+            } else {
+                ExecutionPreference::CpuOnly
+            }
+        }
+        TaskType::LiveRelay | TaskType::RtpReceive => ExecutionPreference::CpuOnly,
+    }
+}
+
+fn multicast_bridge_requires_video_reencode(spec: &TaskSpec) -> bool {
+    let mode = spec.process.mode.as_deref().unwrap_or("passthrough");
+    if mode != "passthrough" {
+        return true;
+    }
+
+    matches!(
+        spec.input.kind,
+        Some(
+            InputKind::Rtsp
+                | InputKind::Rtmp
+                | InputKind::Hls
+                | InputKind::HttpFlv
+                | InputKind::HttpTs
+        )
+    ) && matches!(
+        spec.publish.kind,
+        Some(media_domain::PublishTargetKind::UdpMpegtsMulticast)
+    )
+}
+
 fn effective_running_tasks(load: &SessionLoad, reserved_dispatches: u32) -> u32 {
     load.running_tasks.saturating_add(reserved_dispatches)
 }
@@ -977,20 +1054,147 @@ fn session_is_saturated(load: &SessionLoad, reserved_dispatches: u32) -> bool {
     slot_usage.is_finite() && slot_usage >= 1.0
 }
 
+fn task_requires_zlm(spec: &TaskSpec) -> bool {
+    match spec.task_type {
+        TaskType::FileTranscode => false,
+        TaskType::FileToLive | TaskType::LiveRelay | TaskType::RtpReceive => true,
+        TaskType::MulticastBridge => matches!(
+            spec.publish.kind,
+            Some(media_domain::PublishTargetKind::ZlmIngest)
+        ),
+    }
+}
+
+fn base_execution_eligible(spec: &TaskSpec, load: &SessionLoad, reserved_dispatches: u32) -> bool {
+    if session_is_saturated(load, reserved_dispatches) || !load.ffmpeg_alive {
+        return false;
+    }
+    !task_requires_zlm(spec) || load.zlm_alive
+}
+
+fn gpu_execution_eligible(
+    spec: &TaskSpec,
+    capabilities: &SessionCapabilities,
+    load: &SessionLoad,
+    reserved_dispatches: u32,
+) -> bool {
+    base_execution_eligible(spec, load, reserved_dispatches)
+        && !capabilities.gpu_devices.is_empty()
+        && best_gpu_headroom(&load.gpu_runtime).is_some()
+}
+
+fn best_gpu_headroom(runtime: &[GpuRuntimeStats]) -> Option<f64> {
+    runtime
+        .iter()
+        .filter_map(gpu_runtime_headroom)
+        .max_by(|left, right| left.partial_cmp(right).unwrap_or(CmpOrdering::Equal))
+}
+
+fn gpu_runtime_headroom(runtime: &GpuRuntimeStats) -> Option<f64> {
+    let memory_util = if runtime.memory_total_mb == 0 {
+        100.0
+    } else {
+        (runtime.memory_used_mb as f64 / runtime.memory_total_mb as f64) * 100.0
+    };
+    let hottest = runtime
+        .gpu_util_percent
+        .max(memory_util)
+        .max(runtime.encoder_util_percent)
+        .max(runtime.decoder_util_percent);
+    if hottest >= 95.0 {
+        return None;
+    }
+    Some((100.0 - hottest).max(0.0))
+}
+
 fn event_releases_dispatch_reservation(event_type: &str) -> bool {
     matches!(event_type, "rejected" | "succeeded" | "failed" | "canceled")
+}
+
+fn pick_best_session_target(
+    sessions: &HashMap<Uuid, SessionHandle>,
+    source_affinity_ip: Option<IpAddr>,
+    spec: &TaskSpec,
+    preference: ExecutionPreference,
+) -> Option<SessionTarget> {
+    let select = |gpu_only: bool| {
+        sessions
+            .iter()
+            .filter(|(_, handle)| {
+                let reservations = reservation_count(handle);
+                if gpu_only {
+                    gpu_execution_eligible(spec, &handle.capabilities, &handle.load, reservations)
+                } else {
+                    base_execution_eligible(spec, &handle.load, reservations)
+                }
+            })
+            .min_by(|(left_id, left_handle), (right_id, right_handle)| {
+                compare_dispatch_score(
+                    dispatch_score(
+                        **left_id,
+                        &left_handle.registration,
+                        &left_handle.capabilities,
+                        &left_handle.load,
+                        source_affinity_ip,
+                        reservation_count(left_handle),
+                        gpu_only,
+                    ),
+                    dispatch_score(
+                        **right_id,
+                        &right_handle.registration,
+                        &right_handle.capabilities,
+                        &right_handle.load,
+                        source_affinity_ip,
+                        reservation_count(right_handle),
+                        gpu_only,
+                    ),
+                )
+            })
+            .map(|(node_id, handle)| {
+                let score = dispatch_score(
+                    *node_id,
+                    &handle.registration,
+                    &handle.capabilities,
+                    &handle.load,
+                    source_affinity_ip,
+                    reservation_count(handle),
+                    gpu_only,
+                );
+                SessionTarget {
+                    node_id: *node_id,
+                    session_id: handle.session_id,
+                    sender: handle.sender.clone(),
+                    same_subnet: score.same_subnet,
+                    has_gpu_devices: !handle.capabilities.gpu_devices.is_empty(),
+                    using_gpu_path: gpu_only,
+                    gpu_headroom: score.gpu_headroom,
+                    slot_usage: score.slot_usage,
+                    running_tasks: score.running_tasks,
+                }
+            })
+    };
+
+    match preference {
+        ExecutionPreference::CpuOnly => select(false),
+        ExecutionPreference::GpuPreferred => select(true).or_else(|| select(false)),
+    }
 }
 
 fn dispatch_score(
     node_id: Uuid,
     registration: &AgentRegistration,
+    capabilities: &SessionCapabilities,
     load: &SessionLoad,
     source_affinity_ip: Option<IpAddr>,
     reserved_dispatches: u32,
+    prefer_gpu_headroom: bool,
 ) -> DispatchScore {
     DispatchScore {
         same_subnet: source_affinity_ip
             .is_some_and(|source_ip| node_has_same_subnet(registration, source_ip)),
+        gpu_headroom: (prefer_gpu_headroom && !capabilities.gpu_devices.is_empty())
+            .then(|| best_gpu_headroom(&load.gpu_runtime))
+            .flatten(),
         slot_usage: effective_slot_usage(load, reserved_dispatches),
         running_tasks: effective_running_tasks(load, reserved_dispatches),
         node_id,
@@ -1001,9 +1205,19 @@ fn compare_dispatch_score(left: DispatchScore, right: DispatchScore) -> CmpOrder
     right
         .same_subnet
         .cmp(&left.same_subnet)
+        .then_with(|| compare_gpu_headroom(left.gpu_headroom, right.gpu_headroom))
         .then_with(|| compare_slot_usage(left.slot_usage, right.slot_usage))
         .then_with(|| left.running_tasks.cmp(&right.running_tasks))
         .then_with(|| left.node_id.cmp(&right.node_id))
+}
+
+fn compare_gpu_headroom(left: Option<f64>, right: Option<f64>) -> CmpOrdering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.partial_cmp(&left).unwrap_or(CmpOrdering::Equal),
+        (Some(_), None) => CmpOrdering::Less,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (None, None) => CmpOrdering::Equal,
+    }
 }
 
 fn compare_slot_usage(left: f64, right: f64) -> CmpOrdering {
@@ -1272,6 +1486,33 @@ mod tests {
             slot_usage,
             zlm_alive: true,
             ffmpeg_alive: true,
+            gpu_runtime: Vec::new(),
+        }
+    }
+
+    fn sample_gpu_runtime(
+        gpu_util: f64,
+        encoder_util: f64,
+        decoder_util: f64,
+    ) -> Vec<GpuRuntimeStats> {
+        vec![GpuRuntimeStats {
+            index: 0,
+            gpu_util_percent: gpu_util,
+            memory_used_mb: 1024,
+            memory_total_mb: 8192,
+            encoder_util_percent: encoder_util,
+            decoder_util_percent: decoder_util,
+        }]
+    }
+
+    fn sample_gpu_capabilities() -> SessionCapabilities {
+        SessionCapabilities {
+            gpu_devices: vec![GpuDeviceInfo {
+                index: 0,
+                uuid: "GPU-00000000".to_string(),
+                name: "NVIDIA Test GPU".to_string(),
+                memory_total_mb: 8192,
+            }],
         }
     }
 
@@ -1323,12 +1564,14 @@ mod tests {
     fn compare_dispatch_score_prefers_same_subnet_then_lower_load() {
         let better = DispatchScore {
             same_subnet: true,
+            gpu_headroom: None,
             slot_usage: 0.9,
             running_tasks: 8,
             node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
         };
         let worse = DispatchScore {
             same_subnet: false,
+            gpu_headroom: None,
             slot_usage: 0.1,
             running_tasks: 1,
             node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
@@ -1338,6 +1581,7 @@ mod tests {
 
         let lighter = DispatchScore {
             same_subnet: true,
+            gpu_headroom: None,
             slot_usage: 0.2,
             running_tasks: 5,
             node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
@@ -1350,18 +1594,21 @@ mod tests {
     fn compare_dispatch_score_falls_back_to_load_and_running_tasks() {
         let lighter = DispatchScore {
             same_subnet: false,
+            gpu_headroom: None,
             slot_usage: 0.2,
             running_tasks: 3,
             node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
         };
         let heavier = DispatchScore {
             same_subnet: false,
+            gpu_headroom: None,
             slot_usage: 0.8,
             running_tasks: 1,
             node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap(),
         };
         let same_load_more_tasks = DispatchScore {
             same_subnet: false,
+            gpu_headroom: None,
             slot_usage: 0.2,
             running_tasks: 6,
             node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap(),
@@ -1389,6 +1636,7 @@ mod tests {
                 session_id: 1,
                 sender,
                 registration: sample_registration(node_id),
+                capabilities: SessionCapabilities::default(),
                 load: SessionLoad {
                     slot_usage: 1.0,
                     running_tasks: 1,
@@ -1397,12 +1645,22 @@ mod tests {
                     disk_percent: 0.0,
                     zlm_alive: true,
                     ffmpeg_alive: true,
+                    gpu_runtime: Vec::new(),
                 },
                 reservations: VecDeque::new(),
             },
         );
 
-        assert!(service.pick_best_session(None).await.is_none());
+        assert!(
+            service
+                .pick_best_session(
+                    None,
+                    &sample_immediate_task_spec(),
+                    ExecutionPreference::CpuOnly,
+                )
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1428,7 +1686,12 @@ mod tests {
                         session_id,
                         sender,
                         registration: sample_registration(node_id),
-                        load: SessionLoad::default(),
+                        capabilities: SessionCapabilities::default(),
+                        load: SessionLoad {
+                            zlm_alive: true,
+                            ffmpeg_alive: true,
+                            ..SessionLoad::default()
+                        },
                         reservations: VecDeque::new(),
                     },
                 );
@@ -1439,6 +1702,8 @@ mod tests {
             .claim_best_session(
                 None,
                 Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap(),
+                &sample_immediate_task_spec(),
+                ExecutionPreference::CpuOnly,
             )
             .await
             .expect("first dispatch should find a node");
@@ -1446,12 +1711,141 @@ mod tests {
             .claim_best_session(
                 None,
                 Uuid::parse_str("00000000-0000-0000-0000-000000000102").unwrap(),
+                &sample_immediate_task_spec(),
+                ExecutionPreference::CpuOnly,
             )
             .await
             .expect("second dispatch should find a node");
 
         assert_eq!(first.node_id, first_node);
         assert_eq!(second.node_id, second_node);
+    }
+
+    #[tokio::test]
+    async fn gpu_preferred_tasks_prefer_gpu_eligible_nodes() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let gpu_node = Uuid::parse_str("00000000-0000-0000-0000-000000000021").unwrap();
+        let cpu_node = Uuid::parse_str("00000000-0000-0000-0000-000000000022").unwrap();
+        let (gpu_sender, _gpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let (cpu_sender, _cpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        let mut gpu_load = SessionLoad {
+            zlm_alive: true,
+            ffmpeg_alive: true,
+            ..SessionLoad::default()
+        };
+        gpu_load.gpu_runtime = sample_gpu_runtime(22.0, 18.0, 5.0);
+
+        let mut sessions = service.sessions.lock().await;
+        sessions.insert(
+            gpu_node,
+            SessionHandle {
+                session_id: 1,
+                sender: gpu_sender,
+                registration: sample_registration(gpu_node),
+                capabilities: sample_gpu_capabilities(),
+                load: gpu_load,
+                reservations: VecDeque::new(),
+            },
+        );
+        sessions.insert(
+            cpu_node,
+            SessionHandle {
+                session_id: 2,
+                sender: cpu_sender,
+                registration: sample_registration(cpu_node),
+                capabilities: SessionCapabilities::default(),
+                load: SessionLoad {
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                    ..SessionLoad::default()
+                },
+                reservations: VecDeque::new(),
+            },
+        );
+        drop(sessions);
+
+        let target = service
+            .pick_best_session(
+                None,
+                &sample_immediate_task_spec(),
+                ExecutionPreference::GpuPreferred,
+            )
+            .await
+            .expect("gpu preferred task should find a target");
+
+        assert_eq!(target.node_id, gpu_node);
+        assert!(target.using_gpu_path);
+    }
+
+    #[tokio::test]
+    async fn gpu_nodes_remain_cpu_candidates_when_gpu_is_unavailable() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let gpu_node = Uuid::parse_str("00000000-0000-0000-0000-000000000023").unwrap();
+        let cpu_node = Uuid::parse_str("00000000-0000-0000-0000-000000000024").unwrap();
+        let (gpu_sender, _gpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let (cpu_sender, _cpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        let mut overloaded_gpu_load = SessionLoad {
+            slot_usage: 0.1,
+            running_tasks: 1,
+            zlm_alive: true,
+            ffmpeg_alive: true,
+            ..SessionLoad::default()
+        };
+        overloaded_gpu_load.gpu_runtime = sample_gpu_runtime(99.0, 99.0, 10.0);
+
+        let cpu_load = SessionLoad {
+            slot_usage: 0.7,
+            running_tasks: 4,
+            zlm_alive: true,
+            ffmpeg_alive: true,
+            ..SessionLoad::default()
+        };
+
+        let mut sessions = service.sessions.lock().await;
+        sessions.insert(
+            gpu_node,
+            SessionHandle {
+                session_id: 1,
+                sender: gpu_sender,
+                registration: sample_registration(gpu_node),
+                capabilities: sample_gpu_capabilities(),
+                load: overloaded_gpu_load,
+                reservations: VecDeque::new(),
+            },
+        );
+        sessions.insert(
+            cpu_node,
+            SessionHandle {
+                session_id: 2,
+                sender: cpu_sender,
+                registration: sample_registration(cpu_node),
+                capabilities: SessionCapabilities::default(),
+                load: cpu_load,
+                reservations: VecDeque::new(),
+            },
+        );
+        drop(sessions);
+
+        let target = service
+            .pick_best_session(
+                None,
+                &sample_immediate_task_spec(),
+                ExecutionPreference::GpuPreferred,
+            )
+            .await
+            .expect("gpu preferred task should fall back to a base-eligible node");
+
+        assert_eq!(target.node_id, gpu_node);
+        assert!(!target.using_gpu_path);
+        assert!(target.has_gpu_devices);
     }
 
     #[test]

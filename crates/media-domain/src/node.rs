@@ -70,6 +70,25 @@ pub struct HeartbeatSnapshot {
     pub slot_usage: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
+    pub gpu_runtime: Vec<GpuRuntimeStats>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuDeviceInfo {
+    pub index: u32,
+    pub uuid: String,
+    pub name: String,
+    pub memory_total_mb: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuRuntimeStats {
+    pub index: u32,
+    pub gpu_util_percent: f64,
+    pub memory_used_mb: u64,
+    pub memory_total_mb: u64,
+    pub encoder_util_percent: f64,
+    pub decoder_util_percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +100,7 @@ pub struct CapabilitySnapshot {
     pub zlm_version: Option<String>,
     pub zlm_api_list: Vec<String>,
     pub gpu: Vec<String>,
+    pub gpu_devices: Vec<GpuDeviceInfo>,
     pub captured_at: DateTime<Utc>,
 }
 

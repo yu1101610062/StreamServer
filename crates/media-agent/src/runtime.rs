@@ -32,7 +32,13 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::config::AgentSettings;
+use crate::{
+    capability::{
+        ffmpeg_supports_decoder, ffmpeg_supports_encoder, ffmpeg_supports_hwaccel,
+        gpu_acceleration_enabled, probe_gpu_devices,
+    },
+    config::AgentSettings,
+};
 
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeRegistry {
@@ -1512,8 +1518,16 @@ fn build_file_transcode_plan(
         .format
         .clone()
         .unwrap_or_else(|| infer_file_output_format(&output_path, "mp4"));
-    let mut args = ffmpeg_base_args(input_url, false);
-    append_process_args(&mut args, spec, "copy_or_transcode")?;
+    let mut args = ffmpeg_base_args(input_url.clone(), false);
+    append_process_args(
+        &mut args,
+        settings,
+        spec,
+        "copy_or_transcode",
+        input_url.as_str(),
+        VideoOutputPolicy::KeepSourceFamily,
+        AudioOutputPolicy::Aac,
+    )?;
 
     args.extend([
         "-threads".to_string(),
@@ -1555,8 +1569,16 @@ fn build_file_to_live_plan(
     let mut success_check = publish_output.success_check.clone();
     let mut recording = None;
 
-    let mut args = ffmpeg_base_args(input_url, true);
-    append_process_args(&mut args, spec, "copy_or_transcode")?;
+    let mut args = ffmpeg_base_args(input_url.clone(), true);
+    append_process_args(
+        &mut args,
+        settings,
+        spec,
+        "copy_or_transcode",
+        input_url.as_str(),
+        VideoOutputPolicy::ForceH264,
+        AudioOutputPolicy::Aac,
+    )?;
     args.extend(["-threads".to_string(), "0".to_string()]);
 
     if spec.record.enabled.unwrap_or(false) {
@@ -1625,10 +1647,10 @@ fn build_multicast_bridge_plan(
     let startup_probe = matches!(spec.publish.kind, Some(PublishTargetKind::ZlmIngest))
         .then(|| build_startup_probe(&spec.publish))
         .transpose()?;
-    let mut args = ffmpeg_base_args(input_url, false);
+    let mut args = ffmpeg_base_args(input_url.clone(), false);
     insert_ffmpeg_input_args(
         &mut args,
-        [
+        vec![
             "-use_wallclock_as_timestamps".to_string(),
             "1".to_string(),
             "-fflags".to_string(),
@@ -1639,9 +1661,17 @@ fn build_multicast_bridge_plan(
         // ZLM-published live inputs can surface unset/non-monotonic DTS when copied
         // directly into MPEG-TS. Re-encode video to regenerate timestamps while
         // keeping audio copy so the bridge stays close to passthrough semantics.
-        append_live_mpegts_multicast_bridge_args(&mut args, spec);
+        append_live_mpegts_multicast_bridge_args(&mut args, settings, spec, input_url.as_str());
     } else {
-        append_process_args(&mut args, spec, "passthrough")?;
+        append_process_args(
+            &mut args,
+            settings,
+            spec,
+            "passthrough",
+            input_url.as_str(),
+            VideoOutputPolicy::ForceH264,
+            AudioOutputPolicy::Aac,
+        )?;
     }
     args.extend([
         "-threads".to_string(),
@@ -1682,18 +1712,28 @@ fn should_stabilize_live_mpegts_multicast_bridge(spec: &TaskSpec, output: &Publi
         )
 }
 
-fn append_live_mpegts_multicast_bridge_args(args: &mut Vec<String>, spec: &TaskSpec) {
-    let video_codec = spec
-        .process
-        .video_codec
-        .clone()
-        .unwrap_or_else(|| "libx264".to_string());
+fn append_live_mpegts_multicast_bridge_args(
+    args: &mut Vec<String>,
+    settings: &AgentSettings,
+    spec: &TaskSpec,
+    input_url: &str,
+) {
+    let selection = resolve_transcode_selection(
+        settings,
+        input_url,
+        VideoOutputPolicy::ForceH264,
+        AudioOutputPolicy::Copy,
+    );
+    let video_codec = selection.video_encoder;
+    if !selection.input_args.is_empty() {
+        insert_ffmpeg_input_args(args, selection.input_args);
+    }
 
     args.extend([
         "-c:v".to_string(),
         video_codec.clone(),
         "-c:a".to_string(),
-        "copy".to_string(),
+        selection.audio_encoder,
     ]);
 
     if let Some(bitrate) = spec.process.bitrate {
@@ -1711,16 +1751,8 @@ fn append_live_mpegts_multicast_bridge_args(args: &mut Vec<String>, spec: &TaskS
         "0".to_string(),
     ]);
 
-    if let Some(profile) = spec.process.profile.clone() {
-        args.extend(["-profile:v".to_string(), profile]);
-    }
-
-    match spec.process.preset.clone() {
-        Some(preset) => args.extend(["-preset".to_string(), preset]),
-        None if video_codec == "libx264" => {
-            args.extend(["-preset".to_string(), "ultrafast".to_string()])
-        }
-        None => {}
+    if video_codec == "libx264" {
+        args.extend(["-preset".to_string(), "ultrafast".to_string()]);
     }
 }
 
@@ -1858,12 +1890,38 @@ fn prepare_plan_paths(plan: &ProcessPlan) -> Result<(), ExecutorError> {
     Ok(())
 }
 
-fn insert_ffmpeg_input_args(args: &mut Vec<String>, extra_args: [String; 4]) {
+fn insert_ffmpeg_input_args(args: &mut Vec<String>, extra_args: Vec<String>) {
     let input_index = args
         .iter()
         .position(|arg| arg == "-i")
         .expect("ffmpeg args should always include an input marker");
     args.splice(input_index..input_index, extra_args);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoOutputPolicy {
+    KeepSourceFamily,
+    ForceH264,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioOutputPolicy {
+    Copy,
+    Aac,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoCodecFamily {
+    H264,
+    Hevc,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct TranscodeSelection {
+    input_args: Vec<String>,
+    video_encoder: String,
+    audio_encoder: String,
 }
 
 fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String, ExecutorError> {
@@ -1933,12 +1991,23 @@ fn ffmpeg_base_args(input_url: String, realtime: bool) -> Vec<String> {
     args
 }
 
+fn normalized_process_mode<'a>(spec: &'a TaskSpec, default_mode: &'a str) -> &'a str {
+    match spec.process.mode.as_deref().unwrap_or(default_mode) {
+        "transcode" => "force_transcode",
+        value => value,
+    }
+}
+
 fn append_process_args(
     args: &mut Vec<String>,
+    settings: &AgentSettings,
     spec: &TaskSpec,
     default_mode: &str,
+    input_url: &str,
+    video_policy: VideoOutputPolicy,
+    audio_policy: AudioOutputPolicy,
 ) -> Result<(), ExecutorError> {
-    let mode = spec.process.mode.as_deref().unwrap_or(default_mode);
+    let mode = normalized_process_mode(spec, default_mode);
     match mode {
         "passthrough" => {
             args.extend([
@@ -1949,17 +2018,16 @@ fn append_process_args(
             ]);
         }
         "copy_or_transcode" | "force_transcode" => {
+            let selection =
+                resolve_transcode_selection(settings, input_url, video_policy, audio_policy);
+            if !selection.input_args.is_empty() {
+                insert_ffmpeg_input_args(args, selection.input_args);
+            }
             args.extend([
                 "-c:v".to_string(),
-                spec.process
-                    .video_codec
-                    .clone()
-                    .unwrap_or_else(|| "libx264".to_string()),
+                selection.video_encoder,
                 "-c:a".to_string(),
-                spec.process
-                    .audio_codec
-                    .clone()
-                    .unwrap_or_else(|| "aac".to_string()),
+                selection.audio_encoder,
             ]);
             if let Some(bitrate) = spec.process.bitrate {
                 args.extend(["-b:v".to_string(), format!("{bitrate}k")]);
@@ -1970,12 +2038,6 @@ fn append_process_args(
             if let Some(gop) = spec.process.gop {
                 args.extend(["-g".to_string(), gop.to_string()]);
             }
-            if let Some(profile) = spec.process.profile.clone() {
-                args.extend(["-profile:v".to_string(), profile]);
-            }
-            if let Some(preset) = spec.process.preset.clone() {
-                args.extend(["-preset".to_string(), preset]);
-            }
         }
         other => {
             return Err(ExecutorError::InvalidRequest(format!(
@@ -1985,6 +2047,124 @@ fn append_process_args(
     }
 
     Ok(())
+}
+
+fn resolve_transcode_selection(
+    settings: &AgentSettings,
+    input_url: &str,
+    video_policy: VideoOutputPolicy,
+    audio_policy: AudioOutputPolicy,
+) -> TranscodeSelection {
+    let input_family = match video_policy {
+        VideoOutputPolicy::KeepSourceFamily => {
+            probe_primary_video_codec_family(settings, input_url)
+        }
+        VideoOutputPolicy::ForceH264 => VideoCodecFamily::Unknown,
+    };
+    let output_family = match video_policy {
+        VideoOutputPolicy::KeepSourceFamily => match input_family {
+            VideoCodecFamily::Hevc => VideoCodecFamily::Hevc,
+            _ => VideoCodecFamily::H264,
+        },
+        VideoOutputPolicy::ForceH264 => VideoCodecFamily::H264,
+    };
+    let use_gpu = gpu_acceleration_enabled(settings)
+        && !probe_gpu_devices(settings).is_empty()
+        && ffmpeg_supports_hwaccel(&settings.ffmpeg_bin, "cuda")
+        && matches!(
+            output_family,
+            VideoCodecFamily::H264 | VideoCodecFamily::Hevc
+        );
+
+    let mut input_args = Vec::new();
+    let video_encoder = if use_gpu {
+        match output_family {
+            VideoCodecFamily::Hevc
+                if ffmpeg_supports_encoder(&settings.ffmpeg_bin, "hevc_nvenc") =>
+            {
+                maybe_add_cuda_decoder(&mut input_args, settings, input_family);
+                "hevc_nvenc".to_string()
+            }
+            _ if ffmpeg_supports_encoder(&settings.ffmpeg_bin, "h264_nvenc") => {
+                maybe_add_cuda_decoder(&mut input_args, settings, input_family);
+                "h264_nvenc".to_string()
+            }
+            VideoCodecFamily::Hevc => "libx265".to_string(),
+            _ => "libx264".to_string(),
+        }
+    } else {
+        match output_family {
+            VideoCodecFamily::Hevc => "libx265".to_string(),
+            _ => "libx264".to_string(),
+        }
+    };
+
+    let audio_encoder = match audio_policy {
+        AudioOutputPolicy::Copy => "copy".to_string(),
+        AudioOutputPolicy::Aac => "aac".to_string(),
+    };
+
+    TranscodeSelection {
+        input_args,
+        video_encoder,
+        audio_encoder,
+    }
+}
+
+fn maybe_add_cuda_decoder(
+    input_args: &mut Vec<String>,
+    settings: &AgentSettings,
+    input_family: VideoCodecFamily,
+) {
+    let decoder = match input_family {
+        VideoCodecFamily::H264 if ffmpeg_supports_decoder(&settings.ffmpeg_bin, "h264_cuvid") => {
+            Some("h264_cuvid")
+        }
+        VideoCodecFamily::Hevc if ffmpeg_supports_decoder(&settings.ffmpeg_bin, "hevc_cuvid") => {
+            Some("hevc_cuvid")
+        }
+        _ => None,
+    };
+
+    if let Some(decoder) = decoder {
+        input_args.extend([
+            "-hwaccel".to_string(),
+            "cuda".to_string(),
+            "-hwaccel_output_format".to_string(),
+            "cuda".to_string(),
+            "-c:v".to_string(),
+            decoder.to_string(),
+        ]);
+    }
+}
+
+fn probe_primary_video_codec_family(settings: &AgentSettings, input_url: &str) -> VideoCodecFamily {
+    let output = std::process::Command::new(&settings.ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            input_url,
+        ])
+        .output();
+
+    let Ok(output) = output else {
+        return VideoCodecFamily::Unknown;
+    };
+    if !output.status.success() {
+        return VideoCodecFamily::Unknown;
+    }
+
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "h264" => VideoCodecFamily::H264,
+        "hevc" | "h265" => VideoCodecFamily::Hevc,
+        _ => VideoCodecFamily::Unknown,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3823,6 +4003,7 @@ mod tests {
             multicast_interface_name: String::new(),
             multicast_interface_ip: String::new(),
             network_mode: "bridge".to_string(),
+            acceleration_mode: "cpu".to_string(),
             labels: Vec::new(),
             max_runtime_slots: 2,
             work_root: work_root.to_string(),

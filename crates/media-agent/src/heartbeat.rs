@@ -1,7 +1,7 @@
 use std::{ffi::CString, fs};
 
 use chrono::Utc;
-use media_domain::HeartbeatSnapshot;
+use media_domain::{GpuRuntimeStats, HeartbeatSnapshot};
 
 #[derive(Debug, Clone)]
 pub struct HeartbeatSampler {
@@ -30,6 +30,7 @@ impl HeartbeatSampler {
         running_tasks: u32,
         zlm_alive: bool,
         ffmpeg_alive: bool,
+        gpu_runtime: Vec<GpuRuntimeStats>,
     ) -> HeartbeatSnapshot {
         let cpu_percent = self.sample_cpu_percent().unwrap_or(0.0);
         let mem_percent = sample_mem_percent().unwrap_or(0.0);
@@ -49,6 +50,7 @@ impl HeartbeatSampler {
             slot_usage,
             zlm_alive,
             ffmpeg_alive,
+            gpu_runtime,
         }
     }
 
@@ -138,7 +140,7 @@ mod tests {
         let mut sampler = HeartbeatSampler::new(".", 2);
         sampler.previous_cpu = Some(CpuCounters { total: 10, idle: 5 });
 
-        let heartbeat = sampler.sample(10, true, true);
+        let heartbeat = sampler.sample(10, true, true, Vec::new());
         assert_eq!(heartbeat.slot_usage, 1.0);
     }
 }

@@ -12,8 +12,9 @@ use anyhow::Context;
 use media_domain::{AgentRegistration, NetworkMode, RuntimeHandle, TaskType, WorkerKind};
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
-    Heartbeat as RpcHeartbeat, ProbeCapabilities, Register as RpcRegister, StartTask, StopTask,
-    TaskEvent, TaskSnapshot, control_plane_client::ControlPlaneClient,
+    GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
+    ProbeCapabilities, Register as RpcRegister, StartTask, StopTask, TaskEvent, TaskSnapshot,
+    control_plane_client::ControlPlaneClient,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -26,7 +27,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    capability::{CapabilityProbe, binary_available},
+    capability::{CapabilityProbe, binary_available, probe_gpu_runtime},
     config::Settings,
     heartbeat::HeartbeatSampler,
     runtime::{
@@ -162,6 +163,7 @@ impl AgentController {
             self.runtime_registry.count() as u32,
             zlm_alive,
             ffmpeg_alive,
+            probe_gpu_runtime(&self.settings.agent),
         );
 
         send_agent_message(
@@ -177,6 +179,18 @@ impl AgentController {
                         slot_usage: snapshot.slot_usage,
                         zlm_alive: snapshot.zlm_alive,
                         ffmpeg_alive: snapshot.ffmpeg_alive,
+                        gpu_runtime: snapshot
+                            .gpu_runtime
+                            .iter()
+                            .map(|runtime| RpcGpuRuntime {
+                                index: runtime.index,
+                                gpu_util_percent: runtime.gpu_util_percent,
+                                memory_used_mb: runtime.memory_used_mb,
+                                memory_total_mb: runtime.memory_total_mb,
+                                encoder_util_percent: runtime.encoder_util_percent,
+                                decoder_util_percent: runtime.decoder_util_percent,
+                            })
+                            .collect(),
                     }),
                 ),
             },
@@ -422,6 +436,16 @@ async fn send_capability_snapshot(
                         zlm_version: snapshot.zlm_version.clone().unwrap_or_default(),
                         zlm_api_list: snapshot.zlm_api_list.clone(),
                         gpu: snapshot.gpu.clone(),
+                        gpu_devices: snapshot
+                            .gpu_devices
+                            .iter()
+                            .map(|device| RpcGpuDevice {
+                                index: device.index,
+                                uuid: device.uuid.clone(),
+                                name: device.name.clone(),
+                                memory_total_mb: device.memory_total_mb,
+                            })
+                            .collect(),
                     },
                 ),
             ),

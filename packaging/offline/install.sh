@@ -316,6 +316,7 @@ archive_for_image_key() {
     postgres) printf '%s' "${POSTGRES_IMAGE_ARCHIVE}" ;;
     media-core) printf '%s' "${MEDIA_CORE_IMAGE_ARCHIVE}" ;;
     media-agent) printf '%s' "${MEDIA_AGENT_IMAGE_ARCHIVE}" ;;
+    media-agent-gpu) printf '%s' "${MEDIA_AGENT_GPU_IMAGE_ARCHIVE}" ;;
     zlmediakit) printf '%s' "${ZLM_IMAGE_ARCHIVE}" ;;
     *) fail "未知镜像标识: $1" ;;
   esac
@@ -334,6 +335,13 @@ ensure_images_loaded() {
   for key in "$@"; do
     load_image_archive "$(archive_for_image_key "${key}")"
   done
+}
+
+ensure_nvidia_runtime_ready() {
+  require_cmd nvidia-smi
+  nvidia-smi >/dev/null 2>&1 || fail "NVIDIA 驱动不可用，请先确认宿主机可以正常执行 nvidia-smi"
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"' \
+    || fail "Docker 未检测到 nvidia runtime，请先安装并配置 nvidia-container-toolkit"
 }
 
 prepare_install_dir() {
@@ -520,9 +528,12 @@ EOF
 
 write_worker_host_env() {
   local env_file="$1"
+  local media_agent_image="$2"
+  local acceleration_mode="$3"
+  local agent_labels="$4"
   cat >"${env_file}" <<EOF
 COMPOSE_PROJECT_NAME=${PROJECT_NAME}
-MEDIA_AGENT_IMAGE=${MEDIA_AGENT_IMAGE}
+MEDIA_AGENT_IMAGE=${media_agent_image}
 ZLM_IMAGE=${ZLM_IMAGE}
 NODE_ID=${NODE_ID}
 AGENT_NODE_NAME=${AGENT_NODE_NAME}
@@ -542,7 +553,8 @@ AGENT_MULTICAST_INTERFACE_NAME=${MULTICAST_INTERFACE_NAME}
 AGENT_MULTICAST_INTERFACE_IP=${MULTICAST_INTERFACE_IP}
 HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
 AGENT_NETWORK_MODE=host
-AGENT_LABELS=offline,worker,host
+AGENT_ACCELERATION_MODE=${acceleration_mode}
+AGENT_LABELS=${agent_labels}
 WORK_ROOT=/data/media/work
 
 # mTLS 默认关闭。如需开启，请将 AGENT_CORE_ENDPOINT 改为 https，并取消以下注释：
@@ -556,11 +568,14 @@ EOF
 
 write_all_in_one_host_env() {
   local env_file="$1"
+  local media_agent_image="$2"
+  local acceleration_mode="$3"
+  local agent_labels="$4"
   cat >"${env_file}" <<EOF
 COMPOSE_PROJECT_NAME=${PROJECT_NAME}
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
 MEDIA_CORE_IMAGE=${MEDIA_CORE_IMAGE}
-MEDIA_AGENT_IMAGE=${MEDIA_AGENT_IMAGE}
+MEDIA_AGENT_IMAGE=${media_agent_image}
 ZLM_IMAGE=${ZLM_IMAGE}
 POSTGRES_DB=${POSTGRES_DB}
 POSTGRES_USER=${POSTGRES_USER}
@@ -581,7 +596,8 @@ AGENT_PRIMARY_INTERFACE_NAME=${PRIMARY_INTERFACE_NAME}
 AGENT_PRIMARY_INTERFACE_IP=${PRIMARY_INTERFACE_IP}
 AGENT_MULTICAST_INTERFACE_NAME=${MULTICAST_INTERFACE_NAME}
 AGENT_MULTICAST_INTERFACE_IP=${MULTICAST_INTERFACE_IP}
-AGENT_LABELS=offline,all-in-one,host
+AGENT_ACCELERATION_MODE=${acceleration_mode}
+AGENT_LABELS=${agent_labels}
 STORAGE_ALLOWLIST=/data/media/work,/data/zlm/record,/data/zlm/www
 AUTH_MODE=${AUTH_MODE}
 AUTH_ENABLED=${AUTH_ENABLED}
@@ -744,7 +760,12 @@ select_role() {
     echo "     网络特性: media-agent 和 ZLMediaKit 直接使用 host 网络。"
     echo "     注意: 会直接占用宿主机媒体端口，更适合专用媒体节点。"
     echo
-    echo "  3) all-in-one-host"
+    echo "  3) worker-host-gpu"
+    echo "     用途: 安装支持 NVIDIA GPU 的媒体工作节点。"
+    echo "     适合: 以转码、重编码推流为主，希望优先走 CUDA/NVENC 的场景。"
+    echo "     前提: 宿主机可执行 nvidia-smi，Docker 已配置 nvidia runtime。"
+    echo
+    echo "  4) all-in-one-host"
     echo "     用途: 单机安装完整系统，但媒体面直连宿主机网络。"
     echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
     echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
@@ -752,17 +773,24 @@ select_role() {
     echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
     echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
     echo
-    echo "输入方式: 直接输入上面的角色编号 1-3 后回车。"
+    echo "  5) all-in-one-host-gpu"
+    echo "     用途: 单机安装完整系统，并让工作节点部分支持 NVIDIA GPU。"
+    echo "     适合: 单机联调、单机媒体验证，以及本机 GPU 转码链路验证。"
+    echo "     前提: 宿主机可执行 nvidia-smi，Docker 已配置 nvidia runtime。"
+    echo
+    echo "输入方式: 直接输入上面的角色编号 1-5 后回车。"
     echo "默认值: 直接回车等同于输入 1（control-plane）。"
-    echo "快速建议: 如果需要单机同时验证控制面和真实组播，优先输入 3（all-in-one-host）。"
+    echo "快速建议: 普通工作节点选 2，需要 GPU 工作节点选 3，单机联调选 4，需要单机 GPU 联调选 5。"
   } >&2
   while true; do
-    answer="$(prompt "输入角色编号（1-3）" "1")"
+    answer="$(prompt "输入角色编号（1-5）" "1")"
     case "${answer}" in
       1) printf '%s' "control-plane"; return 0 ;;
       2) printf '%s' "worker-host"; return 0 ;;
-      3) printf '%s' "all-in-one-host"; return 0 ;;
-      *) echo "请输入 1 到 3。" >&2 ;;
+      3) printf '%s' "worker-host-gpu"; return 0 ;;
+      4) printf '%s' "all-in-one-host"; return 0 ;;
+      5) printf '%s' "all-in-one-host-gpu"; return 0 ;;
+      *) echo "请输入 1 到 5。" >&2 ;;
     esac
   done
 }
@@ -836,8 +864,48 @@ configure_worker_host() {
     "${INSTALL_DIR}" \
     "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
-  write_worker_host_env "${INSTALL_DIR}/.env"
+  write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "offline,worker,host"
   ensure_images_loaded media-agent zlmediakit
+  show_tls_notice "${INSTALL_DIR}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}" || return 0
+  start_stack_if_requested "${INSTALL_DIR}"
+}
+
+configure_worker_host_gpu() {
+  local default_dir="/opt/streamserver/worker-host-gpu"
+  local default_ip
+
+  ensure_nvidia_runtime_ready
+
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker-gpu")"
+  INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
+  NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
+  AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo worker-gpu-1)")"
+  configure_host_interface_defaults
+  default_ip="${PRIMARY_INTERFACE_IP}"
+  ZLM_API_HOST="${PRIMARY_INTERFACE_IP}"
+  CORE_HTTP_HOST="$(prompt_non_empty "control-plane HTTP 地址或域名" "${default_ip}")"
+  CORE_HTTP_PORT="$(prompt_non_empty "control-plane HTTP 端口" "8080")"
+  CORE_GRPC_HOST="$(prompt_non_empty "control-plane gRPC 地址或域名" "${CORE_HTTP_HOST}")"
+  CORE_GRPC_PORT="$(prompt_non_empty "control-plane gRPC 端口" "50051")"
+  PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "${default_ip}")"
+  HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
+  AGENT_HTTP_PORT="8081"
+  ZLM_HTTP_PORT="80"
+  ZLM_RTMP_PORT="1935"
+  ZLM_RTSP_PORT="554"
+
+  [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
+
+  prepare_install_dir "${INSTALL_DIR}"
+  copy_common_assets "${INSTALL_DIR}"
+  copy_compose_template "worker-host-gpu" "${INSTALL_DIR}"
+  prepare_worker_layout "${INSTALL_DIR}"
+  render_zlm_config \
+    "${INSTALL_DIR}" \
+    "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
+    "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
+  write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "offline,worker,host,gpu"
+  ensure_images_loaded media-agent-gpu zlmediakit
   show_tls_notice "${INSTALL_DIR}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
 }
@@ -888,11 +956,68 @@ configure_all_in_one_host() {
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
-  write_all_in_one_host_env "${INSTALL_DIR}/.env"
+  write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "offline,all-in-one,host"
   ensure_images_loaded postgres media-core media-agent zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
   log "all-in-one-host 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
   log "如果这些端口已被宿主机其他服务占用，请先释放端口，或改用非 host 模式。"
+  show_tls_notice "${INSTALL_DIR}" "127.0.0.1" "${CORE_GRPC_PORT}" || return 0
+  start_stack_if_requested "${INSTALL_DIR}"
+}
+
+configure_all_in_one_host_gpu() {
+  local default_dir="/opt/streamserver/all-in-one-host-gpu"
+  local default_secret
+  local default_password
+  local default_ip
+
+  ensure_nvidia_runtime_ready
+
+  default_secret="$(generate_secret)"
+  default_password="$(generate_secret)"
+
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-all-in-one-host-gpu")"
+  INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
+  NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
+  AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo node-gpu-1)")"
+  configure_host_interface_defaults
+  default_ip="${PRIMARY_INTERFACE_IP}"
+  ZLM_API_HOST="${PRIMARY_INTERFACE_IP}"
+  POSTGRES_DB="$(prompt_non_empty "PostgreSQL 数据库名" "streamserver")"
+  POSTGRES_USER="$(prompt_non_empty "PostgreSQL 用户名" "postgres")"
+  POSTGRES_PASSWORD="$(prompt "PostgreSQL 密码（留空自动生成）" "")"
+  HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
+  PUBLIC_HOST="$(prompt_non_empty "当前主机对外可访问的主机名或 IP" "${default_ip}")"
+  CORE_HTTP_PORT="8080"
+  CORE_GRPC_PORT="50051"
+  AGENT_HTTP_PORT="8081"
+  ZLM_HTTP_PORT="80"
+  ZLM_RTMP_PORT="1935"
+  ZLM_RTSP_PORT="554"
+  STACK_SUBNET="172.29.0.0/24"
+  CORE_IP="172.29.0.10"
+  POSTGRES_IP="172.29.0.40"
+  HOOK_SOURCE_ALLOWLIST=""
+  prompt_local_auth_configuration
+
+  [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
+  [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${default_secret}"
+
+  prepare_install_dir "${INSTALL_DIR}"
+  copy_common_assets "${INSTALL_DIR}"
+  prepare_local_auth_assets "${INSTALL_DIR}"
+  copy_compose_template "all-in-one-host-gpu" "${INSTALL_DIR}"
+  prepare_control_plane_layout "${INSTALL_DIR}"
+  prepare_worker_layout "${INSTALL_DIR}"
+  render_zlm_config \
+    "${INSTALL_DIR}" \
+    "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
+    "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
+  write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "offline,all-in-one,host,gpu"
+  ensure_images_loaded postgres media-core media-agent-gpu zlmediakit
+  bootstrap_local_admin_if_needed "${INSTALL_DIR}"
+  log "all-in-one-host-gpu 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  log "该模式要求宿主机 NVIDIA 驱动和 Docker nvidia runtime 均已就绪。"
   show_tls_notice "${INSTALL_DIR}" "127.0.0.1" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
 }
@@ -907,7 +1032,9 @@ main() {
   case "${role}" in
     control-plane) configure_control_plane ;;
     worker-host) configure_worker_host ;;
+    worker-host-gpu) configure_worker_host_gpu ;;
     all-in-one-host) configure_all_in_one_host ;;
+    all-in-one-host-gpu) configure_all_in_one_host_gpu ;;
     *) fail "未知角色 ${role}" ;;
   esac
 }

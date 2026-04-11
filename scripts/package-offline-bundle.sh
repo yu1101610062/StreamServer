@@ -162,8 +162,9 @@ prepare_source_image() {
 build_or_pull_images() {
   local media_core_image="$1"
   local media_agent_image="$2"
-  local postgres_image="$3"
-  local zlm_image="$4"
+  local media_agent_gpu_image="$3"
+  local postgres_image="$4"
+  local zlm_image="$5"
 
   log "构建 media-core linux/amd64 镜像"
   docker buildx build \
@@ -187,6 +188,17 @@ build_or_pull_images() {
     "${ROOT_DIR}"
   verify_loaded_image_arch "${media_agent_image}"
 
+  log "构建 media-agent-gpu linux/amd64 镜像"
+  docker buildx build \
+    --platform linux/amd64 \
+    --target media-agent-gpu-runtime \
+    --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+    --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+    --load \
+    -t "${media_agent_gpu_image}" \
+    "${ROOT_DIR}"
+  verify_loaded_image_arch "${media_agent_gpu_image}"
+
   prepare_source_image "${POSTGRES_SOURCE_IMAGE}" "${postgres_image}" "postgres"
 
   prepare_source_image "${ZLM_SOURCE_IMAGE}" "${zlm_image}" "ZLMediaKit"
@@ -197,8 +209,9 @@ write_manifest() {
   local bundle_version="$2"
   local media_core_image="$3"
   local media_agent_image="$4"
-  local postgres_image="$5"
-  local zlm_image="$6"
+  local media_agent_gpu_image="$5"
+  local postgres_image="$6"
+  local zlm_image="$7"
 
   cat >"${bundle_root}/package-manifest.env" <<EOF
 BUNDLE_VERSION=${bundle_version}
@@ -208,6 +221,8 @@ MEDIA_CORE_IMAGE=${media_core_image}
 MEDIA_CORE_IMAGE_ARCHIVE=images/media-core-linux-amd64.tar
 MEDIA_AGENT_IMAGE=${media_agent_image}
 MEDIA_AGENT_IMAGE_ARCHIVE=images/media-agent-linux-amd64.tar
+MEDIA_AGENT_GPU_IMAGE=${media_agent_gpu_image}
+MEDIA_AGENT_GPU_IMAGE_ARCHIVE=images/media-agent-gpu-linux-amd64.tar
 ZLM_IMAGE=${zlm_image}
 ZLM_IMAGE_ARCHIVE=images/zlmediakit-linux-amd64.tar
 EOF
@@ -352,13 +367,15 @@ save_images() {
   local bundle_root="$1"
   local media_core_image="$2"
   local media_agent_image="$3"
-  local postgres_image="$4"
-  local zlm_image="$5"
+  local media_agent_gpu_image="$4"
+  local postgres_image="$5"
+  local zlm_image="$6"
 
   mkdir -p "${bundle_root}/images"
   log "导出离线镜像包"
   docker save -o "${bundle_root}/images/media-core-linux-amd64.tar" "${media_core_image}"
   docker save -o "${bundle_root}/images/media-agent-linux-amd64.tar" "${media_agent_image}"
+  docker save -o "${bundle_root}/images/media-agent-gpu-linux-amd64.tar" "${media_agent_gpu_image}"
   docker save -o "${bundle_root}/images/postgres-linux-amd64.tar" "${postgres_image}"
   docker save -o "${bundle_root}/images/zlmediakit-linux-amd64.tar" "${zlm_image}"
 }
@@ -398,6 +415,7 @@ main() {
   local bundle_version
   local media_core_image
   local media_agent_image
+  local media_agent_gpu_image
   local postgres_image
   local zlm_image
   local stage_dir
@@ -428,6 +446,7 @@ main() {
 
   media_core_image="streamserver/media-core:${version}-linux-amd64"
   media_agent_image="streamserver/media-agent:${version}-linux-amd64"
+  media_agent_gpu_image="streamserver/media-agent-gpu:${version}-linux-amd64"
   postgres_image="streamserver/postgres:16.4-bookworm-linux-amd64"
   zlm_image="streamserver/zlmediakit:master-linux-amd64"
 
@@ -438,7 +457,7 @@ main() {
   mkdir -p "${bundle_root}"
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
-    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${postgres_image}" "${zlm_image}"
+    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}"
   else
     log "跳过镜像构建与导出，仅生成骨架包"
     mkdir -p "${bundle_root}/images"
@@ -447,11 +466,11 @@ main() {
 
   copy_static_assets "${bundle_root}"
   generate_self_signed_certs "${bundle_root}"
-  write_manifest "${bundle_root}" "${bundle_version}" "${media_core_image}" "${media_agent_image}" "${postgres_image}" "${zlm_image}"
+  write_manifest "${bundle_root}" "${bundle_version}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}"
   write_build_info "${bundle_root}" "${bundle_name}" "${version}"
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
-    save_images "${bundle_root}" "${media_core_image}" "${media_agent_image}" "${postgres_image}" "${zlm_image}"
+    save_images "${bundle_root}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}"
   fi
 
   create_archive "${stage_dir}" "${bundle_name}" "${archive_path}"

@@ -6,9 +6,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use media_domain::{
-    AgentRegistration, AttemptStatus, CapabilitySnapshot, EventSource, HeartbeatSnapshot, Page,
-    RecoveryPolicy, StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType,
-    TaskValidationError, ValidationIssue, WorkerKind,
+    AgentRegistration, AttemptStatus, CapabilitySnapshot, EventSource, GpuDeviceInfo,
+    GpuRuntimeStats, HeartbeatSnapshot, Page, RecoveryPolicy, StartMode, TaskOperation, TaskSpec,
+    TaskStateError, TaskStatus, TaskType, TaskValidationError, ValidationIssue, WorkerKind,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -1172,6 +1172,7 @@ impl TaskRepository {
               c.zlm_api_list,
               c.zlm_version,
               c.gpu,
+              c.gpu_devices,
               c.captured_at
             from media_nodes n
             left join node_capabilities c on c.node_id = n.id
@@ -1202,6 +1203,7 @@ impl TaskRepository {
               slot_usage,
               zlm_alive,
               ffmpeg_alive,
+              gpu_runtime,
               node_time,
               received_at
             from node_heartbeats
@@ -2407,10 +2409,10 @@ impl TaskRepository {
             r#"
             insert into node_heartbeats (
               id, node_id, cpu_percent, mem_percent, disk_percent, running_tasks,
-              slot_usage, zlm_alive, ffmpeg_alive, node_time, received_at
+              slot_usage, zlm_alive, ffmpeg_alive, gpu_runtime, node_time, received_at
             ) values (
               $1, $2, $3, $4, $5, $6,
-              $7, $8, $9, $10, $11
+              $7, $8, $9, $10, $11, $12
             )
             "#,
         )
@@ -2423,6 +2425,7 @@ impl TaskRepository {
         .bind(heartbeat.slot_usage)
         .bind(heartbeat.zlm_alive)
         .bind(heartbeat.ffmpeg_alive)
+        .bind(serde_json::to_value(&heartbeat.gpu_runtime)?)
         .bind(heartbeat.node_time)
         .bind(Utc::now())
         .execute(&mut *tx)
@@ -2471,10 +2474,10 @@ impl TaskRepository {
             r#"
             insert into node_capabilities (
               node_id, ffmpeg_protocols, ffmpeg_formats, ffmpeg_encoders,
-              ffmpeg_decoders, zlm_api_list, zlm_version, gpu, captured_at
+              ffmpeg_decoders, zlm_api_list, zlm_version, gpu, gpu_devices, captured_at
             ) values (
               $1, $2, $3, $4,
-              $5, $6, $7, $8, $9
+              $5, $6, $7, $8, $9, $10
             )
             on conflict (node_id) do update
                set ffmpeg_protocols = excluded.ffmpeg_protocols,
@@ -2484,6 +2487,7 @@ impl TaskRepository {
                    zlm_api_list = excluded.zlm_api_list,
                    zlm_version = excluded.zlm_version,
                    gpu = excluded.gpu,
+                   gpu_devices = excluded.gpu_devices,
                    captured_at = excluded.captured_at
             "#,
         )
@@ -2495,6 +2499,7 @@ impl TaskRepository {
         .bind(serde_json::to_value(&snapshot.zlm_api_list)?)
         .bind(snapshot.zlm_version.as_deref())
         .bind(serde_json::to_value(&snapshot.gpu)?)
+        .bind(serde_json::to_value(&snapshot.gpu_devices)?)
         .bind(snapshot.captured_at)
         .execute(&self.pool)
         .await?;
@@ -4260,6 +4265,7 @@ pub struct NodeSummary {
     pub zlm_api_list: Vec<String>,
     pub zlm_version: Option<String>,
     pub gpu: Vec<String>,
+    pub gpu_devices: Vec<GpuDeviceInfo>,
     pub capability_captured_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slot_usage: Option<f64>,
@@ -4277,6 +4283,8 @@ pub struct NodeSummary {
     pub zlm_alive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ffmpeg_alive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_runtime: Option<Vec<GpuRuntimeStats>>,
 }
 
 impl NodeSummary {
@@ -4325,6 +4333,11 @@ impl NodeSummary {
                 .map(serde_json::from_value)
                 .transpose()?
                 .unwrap_or_default(),
+            gpu_devices: row
+                .try_get::<Option<Value>, _>("gpu_devices")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
             capability_captured_at: row.try_get("captured_at")?,
             slot_usage: None,
             running_tasks: None,
@@ -4334,6 +4347,7 @@ impl NodeSummary {
             disk_percent: None,
             zlm_alive: None,
             ffmpeg_alive: None,
+            gpu_runtime: None,
         })
     }
 }
@@ -4348,6 +4362,7 @@ pub struct NodeHeartbeatSummary {
     pub slot_usage: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
+    pub gpu_runtime: Vec<GpuRuntimeStats>,
     pub node_time: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
 }
@@ -4364,6 +4379,11 @@ impl NodeHeartbeatSummary {
             slot_usage: row.try_get("slot_usage")?,
             zlm_alive: row.try_get("zlm_alive")?,
             ffmpeg_alive: row.try_get("ffmpeg_alive")?,
+            gpu_runtime: row
+                .try_get::<Option<Value>, _>("gpu_runtime")?
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default(),
             node_time: row.try_get("node_time")?,
             received_at: row.try_get("received_at")?,
         })
@@ -4691,6 +4711,7 @@ fn build_resolved_task_json(
             merged["profile"] = Value::String(profile.to_string());
         }
     }
+    strip_legacy_dispatch_fields(&mut merged);
     Ok(merged)
 }
 
@@ -4703,9 +4724,7 @@ fn profile_defaults_json(task_type: TaskType, profile: Option<&str>) -> Value {
     let defaults = match profile {
         "realtime_compat" => json!({
             "process": {
-                "mode": "copy_or_transcode",
-                "video_codec": "h264",
-                "audio_codec": "aac"
+                "mode": "copy_or_transcode"
             },
             "publish": {
                 "enable_rtsp": true,
@@ -4718,10 +4737,7 @@ fn profile_defaults_json(task_type: TaskType, profile: Option<&str>) -> Value {
         }),
         "rtc_web_compat" => json!({
             "process": {
-                "mode": "transcode",
-                "video_codec": "h264",
-                "audio_codec": "opus",
-                "profile": "baseline"
+                "mode": "force_transcode"
             },
             "publish": {
                 "enable_rtsp": true,
@@ -4754,9 +4770,7 @@ fn profile_defaults_json(task_type: TaskType, profile: Option<&str>) -> Value {
         }),
         "rtmp_hevc_ext" => json!({
             "process": {
-                "mode": "transcode",
-                "video_codec": "h265",
-                "audio_codec": "aac"
+                "mode": "force_transcode"
             },
             "publish": {
                 "enable_rtmp": true
@@ -4871,25 +4885,9 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
 
     let process = overlay_optional_fields(&[
         ("mode", spec.process.mode.as_ref().map(|value| json!(value))),
-        (
-            "video_codec",
-            spec.process.video_codec.as_ref().map(|value| json!(value)),
-        ),
-        (
-            "audio_codec",
-            spec.process.audio_codec.as_ref().map(|value| json!(value)),
-        ),
         ("bitrate", spec.process.bitrate.map(|value| json!(value))),
         ("fps", spec.process.fps.map(|value| json!(value))),
         ("gop", spec.process.gop.map(|value| json!(value))),
-        (
-            "profile",
-            spec.process.profile.as_ref().map(|value| json!(value)),
-        ),
-        (
-            "preset",
-            spec.process.preset.as_ref().map(|value| json!(value)),
-        ),
     ]);
     if let Some(process) = process {
         overlay.insert("process".to_string(), process);
@@ -5052,9 +5050,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
     {
         resource.insert("network_interface".to_string(), json!(network_interface));
     }
-    if let Some(need_gpu) = spec.resource.need_gpu {
-        resource.insert("need_gpu".to_string(), json!(need_gpu));
-    }
     if let Some(slot_class) = spec
         .resource
         .slot_class
@@ -5071,6 +5066,18 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
     }
 
     Value::Object(overlay)
+}
+
+fn strip_legacy_dispatch_fields(value: &mut Value) {
+    if let Some(process) = value.get_mut("process").and_then(Value::as_object_mut) {
+        process.remove("video_codec");
+        process.remove("audio_codec");
+        process.remove("profile");
+        process.remove("preset");
+    }
+    if let Some(resource) = value.get_mut("resource").and_then(Value::as_object_mut) {
+        resource.remove("need_gpu");
+    }
 }
 
 fn overlay_optional_fields(fields: &[(&str, Option<Value>)]) -> Option<Value> {
@@ -5642,7 +5649,7 @@ mod tests {
         let spec: TaskSpec = serde_json::from_value(merged).expect("task spec should parse");
         let resolved = spec.resolved();
 
-        assert_eq!(resolved.process.video_codec.as_deref(), Some("h264"));
+        assert_eq!(resolved.process.mode.as_deref(), Some("copy_or_transcode"));
         assert_eq!(resolved.publish.enable_rtsp, Some(true));
         assert_eq!(resolved.publish.enable_hls, Some(true));
         assert_eq!(resolved.record.enabled, Some(true));
