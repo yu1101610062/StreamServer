@@ -434,12 +434,12 @@ function buildApiDocDetails() {
       { name: "publish.port", type: "number", required: false, description: "输出端口。" },
       { name: "publish.interface_name", type: "string", required: false, description: "绑定输出网卡名。" },
       { name: "publish.interface_ip", type: "string", required: false, description: "绑定输出本地地址。" },
-      { name: "publish.enable_rtsp", type: "boolean", required: false, description: "是否暴露 RTSP 播放地址。" },
-      { name: "publish.enable_rtmp", type: "boolean", required: false, description: "是否暴露 RTMP 播放地址。" },
-      { name: "publish.enable_http_ts", type: "boolean", required: false, description: "是否暴露 HTTP-TS 播放地址。" },
-      { name: "publish.enable_http_fmp4", type: "boolean", required: false, description: "是否暴露 HTTP-FMP4 播放地址。" },
-      { name: "publish.enable_hls", type: "boolean", required: false, description: "是否暴露 HLS 播放地址。" },
-      { name: "publish.enable_webrtc", type: "boolean", required: false, description: "是否暴露 WebRTC 播放地址。" },
+      { name: "publish.enable_rtsp", type: "boolean", required: false, description: "是否让内部流额外暴露 RTSP 播放地址。" },
+      { name: "publish.enable_rtmp", type: "boolean", required: false, description: "是否让内部流额外暴露 RTMP 播放地址。" },
+      { name: "publish.enable_http_ts", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-TS 播放地址。" },
+      { name: "publish.enable_http_fmp4", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-FMP4 播放地址。" },
+      { name: "publish.enable_hls", type: "boolean", required: false, description: "是否让内部流额外暴露 HLS 播放地址。" },
+      { name: "publish.enable_webrtc", type: "boolean", required: false, description: "仅控制底层 WebRTC 开关映射；当前不会生成 WebRTC 播放地址。" },
       { name: "record.enabled", type: "boolean", required: false, description: "是否开启录像。" },
       { name: "record.format", type: "enum", required: false, description: "录像格式，支持 MP4、HLS 或同时输出。" },
       { name: "record.segment_sec", type: "number", required: false, description: "分段时长（秒）。" },
@@ -2152,6 +2152,7 @@ function renderStreamsPage(data) {
         <div>
           <h3>在线流</h3>
           <p>共 ${data.streams.length} 条。</p>
+          <p class="subtle">播放地址表示同一条内部流当前可暴露的协议集合，不代表任务并行输出了多个独立目标。当前不生成 WebRTC 地址。</p>
         </div>
       </div>
       <div class="table-wrap">
@@ -2993,6 +2994,11 @@ function renderCreateProcessStep(draft) {
       ${showProtocolFlags ? renderCheckboxModelField("enable_webrtc", "publish.enable_webrtc", draft.publish.enable_webrtc) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("无人观看自动停止", "publish.stop_on_no_reader", draft.publish.stop_on_no_reader) : ""}
     </div>
+    ${
+      showProtocolFlags
+        ? `<div class="subtle">这些 <code>publish.enable_*</code> 开关只控制内部流额外暴露哪些播放协议，不会新增一个独立发布目标。例：<code>input.kind=http_ts</code> 是 HTTP-TS 输入源，<code>publish.enable_http_ts=true</code> 是内部流暴露 HTTP-TS 播放地址。</div>`
+        : ""
+    }
   `;
 }
 
