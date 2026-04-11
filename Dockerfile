@@ -103,12 +103,10 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
 COPY config ./config
-COPY docker/entrypoints/media-agent-supervisor.sh /usr/local/bin/media-agent-supervisor
 
-RUN chmod +x /usr/local/bin/media-agent-supervisor \
-    && mkdir -p /data/media/work /data/media/logs
+RUN mkdir -p /data/media/work /data/media/logs
 
-CMD ["media-agent-supervisor"]
+CMD ["media-agent"]
 
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS media-agent-gpu-runtime
 
@@ -129,9 +127,7 @@ WORKDIR /app
 
 COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
 COPY config ./config
-COPY docker/entrypoints/media-agent-supervisor.sh /usr/local/bin/media-agent-supervisor
 
-RUN chmod +x /usr/local/bin/media-agent-supervisor \
-    && mkdir -p /data/media/work /data/media/logs
+RUN mkdir -p /data/media/work /data/media/logs
 
-CMD ["media-agent-supervisor"]
+CMD ["media-agent"]
