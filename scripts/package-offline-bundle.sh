@@ -8,7 +8,7 @@ SKIP_IMAGES=0
 APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
 UBUNTU_APT_MIRROR="${UBUNTU_APT_MIRROR:-}"
 CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR:-sparse+https://rsproxy.cn/index/}"
-POSTGRES_SOURCE_IMAGE="${POSTGRES_SOURCE_IMAGE:-postgres:16.4-bookworm@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412}"
+POSTGRES_SOURCE_IMAGE="${POSTGRES_SOURCE_IMAGE:-postgres:18.3}"
 ZLM_SOURCE_IMAGE="${ZLM_SOURCE_IMAGE:-zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f}"
 
 log() {
@@ -455,7 +455,7 @@ main() {
   media_core_image="streamserver/media-core:${version}-linux-amd64"
   media_agent_image="streamserver/media-agent:${version}-linux-amd64"
   media_agent_gpu_image="streamserver/media-agent-gpu:${version}-linux-amd64"
-  postgres_image="streamserver/postgres:16.4-bookworm-linux-amd64"
+  postgres_image="streamserver/postgres:18.3-linux-amd64"
   zlm_image="streamserver/zlmediakit:master-linux-amd64"
 
   stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/streamserver-offline.XXXXXX")"
