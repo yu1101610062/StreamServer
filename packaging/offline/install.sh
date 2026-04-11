@@ -14,6 +14,11 @@ fi
 # shellcheck disable=SC1090
 . "${MANIFEST_FILE}"
 
+BUNDLE_VARIANT="${BUNDLE_VARIANT:-gpu-enabled}"
+BUNDLE_GPU_SUPPORT="${BUNDLE_GPU_SUPPORT:-true}"
+MEDIA_AGENT_GPU_IMAGE="${MEDIA_AGENT_GPU_IMAGE:-}"
+MEDIA_AGENT_GPU_IMAGE_ARCHIVE="${MEDIA_AGENT_GPU_IMAGE_ARCHIVE:-}"
+
 COMPOSE_CMD=()
 COMPOSE_CMD_DISPLAY=""
 COMPOSE_FILE_NAME="compose.yml"
@@ -754,44 +759,71 @@ select_role() {
     echo "     适合: 多工作节点部署中的中心节点，或你已经有独立媒体工作节点的情况。"
     echo "     网络特性: media-core 使用 host；PostgreSQL 保持 bridge。"
     echo
-    echo "  2) worker-host"
-    echo "     用途: 只安装媒体工作节点，包含 media-agent 和 ZLMediaKit。"
+    echo "  2) worker-host-cpu"
+    echo "     用途: 安装 CPU-only 媒体工作节点，包含 media-agent 和 ZLMediaKit。"
     echo "     适合: 所有工作节点场景，尤其是组播和需要直接绑定宿主机网卡的情况。"
     echo "     网络特性: media-agent 和 ZLMediaKit 直接使用 host 网络。"
     echo "     注意: 会直接占用宿主机媒体端口，更适合专用媒体节点。"
     echo
-    echo "  3) worker-host-gpu"
-    echo "     用途: 安装支持 NVIDIA GPU 的媒体工作节点。"
-    echo "     适合: 以转码、重编码推流为主，希望优先走 CUDA/NVENC 的场景。"
-    echo "     前提: 宿主机可执行 nvidia-smi，Docker 已配置 nvidia runtime。"
-    echo
-    echo "  4) all-in-one-host"
-    echo "     用途: 单机安装完整系统，但媒体面直连宿主机网络。"
-    echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-    echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
-    echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
-    echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
-    echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
-    echo
-    echo "  5) all-in-one-host-gpu"
-    echo "     用途: 单机安装完整系统，并让工作节点部分支持 NVIDIA GPU。"
-    echo "     适合: 单机联调、单机媒体验证，以及本机 GPU 转码链路验证。"
-    echo "     前提: 宿主机可执行 nvidia-smi，Docker 已配置 nvidia runtime。"
-    echo
-    echo "输入方式: 直接输入上面的角色编号 1-5 后回车。"
+    if [ "${BUNDLE_GPU_SUPPORT}" = "true" ]; then
+      echo "  3) worker-host-gpu"
+      echo "     用途: 安装 GPU-enabled 媒体工作节点。"
+      echo "     适合: 以转码、重编码推流为主，希望优先走 CUDA/NVENC 的场景。"
+      echo "     前提: 宿主机可执行 nvidia-smi，Docker 已配置 nvidia runtime。"
+      echo
+      echo "  4) all-in-one-host-cpu"
+      echo "     用途: 单机安装完整系统（CPU-only 工作节点），但媒体面直连宿主机网络。"
+      echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
+      echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
+      echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
+      echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
+      echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
+      echo
+      echo "  5) all-in-one-host-gpu"
+      echo "     用途: 单机安装完整系统，并让工作节点部分支持 NVIDIA GPU。"
+      echo "     适合: 单机联调、单机媒体验证，以及本机 GPU 转码链路验证。"
+      echo "     前提: 宿主机可执行 nvidia-smi，Docker 已配置 nvidia runtime。"
+      echo
+      echo "输入方式: 直接输入上面的角色编号 1-5 后回车。"
+    else
+      echo "  3) all-in-one-host-cpu"
+      echo "     用途: 单机安装完整系统（CPU-only 工作节点），但媒体面直连宿主机网络。"
+      echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
+      echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
+      echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
+      echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
+      echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
+      echo
+      echo "当前离线包为 CPU-only，不包含 GPU 镜像和 GPU 模板。"
+      echo "输入方式: 直接输入上面的角色编号 1-3 后回车。"
+    fi
     echo "默认值: 直接回车等同于输入 1（control-plane）。"
-    echo "快速建议: 普通工作节点选 2，需要 GPU 工作节点选 3，单机联调选 4，需要单机 GPU 联调选 5。"
+    if [ "${BUNDLE_GPU_SUPPORT}" = "true" ]; then
+      echo "快速建议: 普通工作节点选 2，需要 GPU 工作节点选 3，单机联调选 4，需要单机 GPU 联调选 5。"
+    else
+      echo "快速建议: 普通工作节点选 2，需要单机联调选 3。"
+    fi
   } >&2
   while true; do
-    answer="$(prompt "输入角色编号（1-5）" "1")"
-    case "${answer}" in
-      1) printf '%s' "control-plane"; return 0 ;;
-      2) printf '%s' "worker-host"; return 0 ;;
-      3) printf '%s' "worker-host-gpu"; return 0 ;;
-      4) printf '%s' "all-in-one-host"; return 0 ;;
-      5) printf '%s' "all-in-one-host-gpu"; return 0 ;;
-      *) echo "请输入 1 到 5。" >&2 ;;
-    esac
+    if [ "${BUNDLE_GPU_SUPPORT}" = "true" ]; then
+      answer="$(prompt "输入角色编号（1-5）" "1")"
+      case "${answer}" in
+        1) printf '%s' "control-plane"; return 0 ;;
+        2) printf '%s' "worker-host-cpu"; return 0 ;;
+        3) printf '%s' "worker-host-gpu"; return 0 ;;
+        4) printf '%s' "all-in-one-host-cpu"; return 0 ;;
+        5) printf '%s' "all-in-one-host-gpu"; return 0 ;;
+        *) echo "请输入 1 到 5。" >&2 ;;
+      esac
+    else
+      answer="$(prompt "输入角色编号（1-3）" "1")"
+      case "${answer}" in
+        1) printf '%s' "control-plane"; return 0 ;;
+        2) printf '%s' "worker-host-cpu"; return 0 ;;
+        3) printf '%s' "all-in-one-host-cpu"; return 0 ;;
+        *) echo "请输入 1 到 3。" >&2 ;;
+      esac
+    fi
   done
 }
 
@@ -833,10 +865,10 @@ configure_control_plane() {
 }
 
 configure_worker_host() {
-  local default_dir="/opt/streamserver/worker-host"
+  local default_dir="/opt/streamserver/worker-host-cpu"
   local default_ip
 
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker-cpu")"
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo worker-1)")"
@@ -858,7 +890,7 @@ configure_worker_host() {
 
   prepare_install_dir "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
-  copy_compose_template "worker-host" "${INSTALL_DIR}"
+  copy_compose_template "worker-host-cpu" "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
   render_zlm_config \
     "${INSTALL_DIR}" \
@@ -874,6 +906,7 @@ configure_worker_host_gpu() {
   local default_dir="/opt/streamserver/worker-host-gpu"
   local default_ip
 
+  [ "${BUNDLE_GPU_SUPPORT}" = "true" ] || fail "当前离线包为 CPU-only，不支持 GPU 工作节点模板"
   ensure_nvidia_runtime_ready
 
   PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker-gpu")"
@@ -911,7 +944,7 @@ configure_worker_host_gpu() {
 }
 
 configure_all_in_one_host() {
-  local default_dir="/opt/streamserver/all-in-one-host"
+  local default_dir="/opt/streamserver/all-in-one-host-cpu"
   local default_secret
   local default_password
   local default_ip
@@ -919,7 +952,7 @@ configure_all_in_one_host() {
   default_secret="$(generate_secret)"
   default_password="$(generate_secret)"
 
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-all-in-one-host")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-all-in-one-host-cpu")"
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(generate_uuid)")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(hostname -s 2>/dev/null || echo node-1)")"
@@ -949,7 +982,7 @@ configure_all_in_one_host() {
   prepare_install_dir "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
   prepare_local_auth_assets "${INSTALL_DIR}"
-  copy_compose_template "all-in-one-host" "${INSTALL_DIR}"
+  copy_compose_template "all-in-one-host-cpu" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
   render_zlm_config \
@@ -959,7 +992,7 @@ configure_all_in_one_host() {
   write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "offline,all-in-one,host"
   ensure_images_loaded postgres media-core media-agent zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
-  log "all-in-one-host 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  log "all-in-one-host-cpu 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
   log "如果这些端口已被宿主机其他服务占用，请先释放端口，或改用非 host 模式。"
   show_tls_notice "${INSTALL_DIR}" "127.0.0.1" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
@@ -971,6 +1004,7 @@ configure_all_in_one_host_gpu() {
   local default_password
   local default_ip
 
+  [ "${BUNDLE_GPU_SUPPORT}" = "true" ] || fail "当前离线包为 CPU-only，不支持 GPU 一体机模板"
   ensure_nvidia_runtime_ready
 
   default_secret="$(generate_secret)"
@@ -1031,9 +1065,9 @@ main() {
   role="$(select_role)"
   case "${role}" in
     control-plane) configure_control_plane ;;
-    worker-host) configure_worker_host ;;
+    worker-host-cpu) configure_worker_host ;;
     worker-host-gpu) configure_worker_host_gpu ;;
-    all-in-one-host) configure_all_in_one_host ;;
+    all-in-one-host-cpu) configure_all_in_one_host ;;
     all-in-one-host-gpu) configure_all_in_one_host_gpu ;;
     *) fail "未知角色 ${role}" ;;
   esac

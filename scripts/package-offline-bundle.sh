@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${ROOT_DIR}/dist"
 SKIP_IMAGES=0
+GPU_SUPPORT=""
 
 APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
 UBUNTU_APT_MIRROR="${UBUNTU_APT_MIRROR:-}"
@@ -27,7 +28,7 @@ require_cmd() {
 usage() {
   cat <<EOF
 用法:
-  $(basename "$0") [--output-dir DIR] [--skip-images]
+  $(basename "$0") [--output-dir DIR] [--skip-images] [--with-gpu|--without-gpu]
 
 说明:
   在 macOS arm64 或 Linux 主机上构建 Linux AMD64 离线部署包。
@@ -42,6 +43,24 @@ usage() {
 EOF
 }
 
+prompt_yes_no() {
+  local message="$1"
+  local default_value="${2:-Y}"
+  local answer
+  while true; do
+    printf '%s [%s]: ' "${message}" "${default_value}" >&2
+    read -r answer
+    if [ -z "${answer}" ]; then
+      answer="${default_value}"
+    fi
+    case "${answer}" in
+      Y|y|yes|YES) return 0 ;;
+      N|n|no|NO) return 1 ;;
+      *) echo "请输入 Y 或 N。" >&2 ;;
+    esac
+  done
+}
+
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -54,6 +73,14 @@ parse_args() {
         SKIP_IMAGES=1
         shift
         ;;
+      --with-gpu)
+        GPU_SUPPORT="true"
+        shift
+        ;;
+      --without-gpu)
+        GPU_SUPPORT="false"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -63,6 +90,24 @@ parse_args() {
         ;;
     esac
   done
+}
+
+resolve_gpu_support() {
+  if [ -n "${GPU_SUPPORT}" ]; then
+    return 0
+  fi
+
+  if [ -t 0 ]; then
+    if prompt_yes_no "是否打包 GPU 版本（包含 GPU 镜像和 GPU 模板）？" "Y"; then
+      GPU_SUPPORT="true"
+    else
+      GPU_SUPPORT="false"
+    fi
+    return 0
+  fi
+
+  GPU_SUPPORT="true"
+  log "未指定 GPU 选项且当前为非交互环境，默认生成 GPU-enabled 离线包"
 }
 
 ensure_supported_packaging_host() {
@@ -167,6 +212,7 @@ build_or_pull_images() {
   local media_agent_gpu_image="$3"
   local postgres_image="$4"
   local zlm_image="$5"
+  local gpu_support="$6"
 
   log "构建 media-core linux/amd64 镜像"
   docker buildx build \
@@ -190,17 +236,19 @@ build_or_pull_images() {
     "${ROOT_DIR}"
   verify_loaded_image_arch "${media_agent_image}"
 
-  log "构建 media-agent-gpu linux/amd64 镜像"
-  docker buildx build \
-    --platform linux/amd64 \
-    --target media-agent-gpu-runtime \
-    --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
-    --build-arg UBUNTU_MIRROR="${UBUNTU_APT_MIRROR}" \
-    --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
-    --load \
-    -t "${media_agent_gpu_image}" \
-    "${ROOT_DIR}"
-  verify_loaded_image_arch "${media_agent_gpu_image}"
+  if [ "${gpu_support}" = "true" ]; then
+    log "构建 media-agent-gpu linux/amd64 镜像"
+    docker buildx build \
+      --platform linux/amd64 \
+      --target media-agent-gpu-runtime \
+      --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+      --build-arg UBUNTU_MIRROR="${UBUNTU_APT_MIRROR}" \
+      --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+      --load \
+      -t "${media_agent_gpu_image}" \
+      "${ROOT_DIR}"
+    verify_loaded_image_arch "${media_agent_gpu_image}"
+  fi
 
   prepare_source_image "${POSTGRES_SOURCE_IMAGE}" "${postgres_image}" "postgres"
 
@@ -215,17 +263,28 @@ write_manifest() {
   local media_agent_gpu_image="$5"
   local postgres_image="$6"
   local zlm_image="$7"
+  local gpu_support="$8"
+  local bundle_variant="$9"
+  local media_agent_gpu_image_value=""
+  local media_agent_gpu_archive_value=""
+
+  if [ "${gpu_support}" = "true" ]; then
+    media_agent_gpu_image_value="${media_agent_gpu_image}"
+    media_agent_gpu_archive_value="images/media-agent-gpu-linux-amd64.tar"
+  fi
 
   cat >"${bundle_root}/package-manifest.env" <<EOF
 BUNDLE_VERSION=${bundle_version}
+BUNDLE_VARIANT=${bundle_variant}
+BUNDLE_GPU_SUPPORT=${gpu_support}
 POSTGRES_IMAGE=${postgres_image}
 POSTGRES_IMAGE_ARCHIVE=images/postgres-linux-amd64.tar
 MEDIA_CORE_IMAGE=${media_core_image}
 MEDIA_CORE_IMAGE_ARCHIVE=images/media-core-linux-amd64.tar
 MEDIA_AGENT_IMAGE=${media_agent_image}
 MEDIA_AGENT_IMAGE_ARCHIVE=images/media-agent-linux-amd64.tar
-MEDIA_AGENT_GPU_IMAGE=${media_agent_gpu_image}
-MEDIA_AGENT_GPU_IMAGE_ARCHIVE=images/media-agent-gpu-linux-amd64.tar
+MEDIA_AGENT_GPU_IMAGE=${media_agent_gpu_image_value}
+MEDIA_AGENT_GPU_IMAGE_ARCHIVE=${media_agent_gpu_archive_value}
 ZLM_IMAGE=${zlm_image}
 ZLM_IMAGE_ARCHIVE=images/zlmediakit-linux-amd64.tar
 EOF
@@ -235,6 +294,8 @@ write_build_info() {
   local bundle_root="$1"
   local bundle_name="$2"
   local version="$3"
+  local bundle_variant="$4"
+  local gpu_support="$5"
   local commit
 
   commit="$(git -C "${ROOT_DIR}" rev-parse --short HEAD 2>/dev/null || true)"
@@ -246,17 +307,28 @@ built_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 builder_os=$(uname -s)
 builder_arch=$(uname -m)
 git_commit=${commit}
+bundle_variant=${bundle_variant}
+gpu_support=${gpu_support}
 EOF
 }
 
 copy_static_assets() {
   local bundle_root="$1"
+  local gpu_support="$2"
 
   mkdir -p "${bundle_root}/templates"
   mkdir -p "${bundle_root}/docs"
   cp "${ROOT_DIR}/packaging/offline/install.sh" "${bundle_root}/install.sh"
   chmod +x "${bundle_root}/install.sh"
-  cp -R "${ROOT_DIR}/packaging/offline/templates/." "${bundle_root}/templates/"
+  mkdir -p "${bundle_root}/templates/common"
+  cp -R "${ROOT_DIR}/packaging/offline/templates/common/." "${bundle_root}/templates/common/"
+  cp -R "${ROOT_DIR}/packaging/offline/templates/control-plane" "${bundle_root}/templates/control-plane"
+  cp -R "${ROOT_DIR}/packaging/offline/templates/worker-host" "${bundle_root}/templates/worker-host-cpu"
+  cp -R "${ROOT_DIR}/packaging/offline/templates/all-in-one-host" "${bundle_root}/templates/all-in-one-host-cpu"
+  if [ "${gpu_support}" = "true" ]; then
+    cp -R "${ROOT_DIR}/packaging/offline/templates/worker-host-gpu" "${bundle_root}/templates/worker-host-gpu"
+    cp -R "${ROOT_DIR}/packaging/offline/templates/all-in-one-host-gpu" "${bundle_root}/templates/all-in-one-host-gpu"
+  fi
   cp "${ROOT_DIR}/docs/17-离线部署打包与安装.md" "${bundle_root}/docs/"
 }
 
@@ -373,12 +445,15 @@ save_images() {
   local media_agent_gpu_image="$4"
   local postgres_image="$5"
   local zlm_image="$6"
+  local gpu_support="$7"
 
   mkdir -p "${bundle_root}/images"
   log "导出离线镜像包"
   docker save -o "${bundle_root}/images/media-core-linux-amd64.tar" "${media_core_image}"
   docker save -o "${bundle_root}/images/media-agent-linux-amd64.tar" "${media_agent_image}"
-  docker save -o "${bundle_root}/images/media-agent-gpu-linux-amd64.tar" "${media_agent_gpu_image}"
+  if [ "${gpu_support}" = "true" ]; then
+    docker save -o "${bundle_root}/images/media-agent-gpu-linux-amd64.tar" "${media_agent_gpu_image}"
+  fi
   docker save -o "${bundle_root}/images/postgres-linux-amd64.tar" "${postgres_image}"
   docker save -o "${bundle_root}/images/zlmediakit-linux-amd64.tar" "${zlm_image}"
 }
@@ -411,11 +486,27 @@ create_archive() {
   fi
 }
 
+resolve_bundle_name() {
+  local output_dir="$1"
+  local base_name="$2"
+  local candidate="${base_name}"
+  local suffix=2
+
+  while [ -e "${output_dir}/${candidate}.tar.gz" ] || [ -e "${output_dir}/${candidate}.tar.gz.sha256" ]; do
+    candidate="${base_name}-${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  printf '%s' "${candidate}"
+}
+
 main() {
   local version
-  local timestamp
+  local build_date
+  local bundle_name_base
   local bundle_name
   local bundle_version
+  local bundle_variant
   local media_core_image
   local media_agent_image
   local media_agent_gpu_image
@@ -428,6 +519,7 @@ main() {
   parse_args "$@"
   ensure_supported_packaging_host
   ensure_tools
+  resolve_gpu_support
 
   if [ -n "${APT_MIRROR}" ]; then
     log "使用 APT 镜像: ${APT_MIRROR}"
@@ -448,9 +540,12 @@ main() {
 
   version="$(workspace_version)"
   [ -n "${version}" ] || fail "无法从 Cargo.toml 解析版本号"
-  timestamp="$(date '+%Y%m%d%H%M%S')"
+  build_date="$(date '+%Y%m%d')"
   bundle_version="v${version}"
-  bundle_name="streamserver-offline-${bundle_version}-linux-amd64-${timestamp}"
+  bundle_variant="$( [ "${GPU_SUPPORT}" = "true" ] && printf '%s' "gpu-enabled" || printf '%s' "cpu-only" )"
+  bundle_name_base="streamserver-offline-${bundle_version}-linux-amd64-${bundle_variant}-${build_date}"
+  mkdir -p "${OUTPUT_DIR}"
+  bundle_name="$(resolve_bundle_name "${OUTPUT_DIR}" "${bundle_name_base}")"
 
   media_core_image="streamserver/media-core:${version}-linux-amd64"
   media_agent_image="streamserver/media-agent:${version}-linux-amd64"
@@ -465,20 +560,20 @@ main() {
   mkdir -p "${bundle_root}"
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
-    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}"
+    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}"
   else
     log "跳过镜像构建与导出，仅生成骨架包"
     mkdir -p "${bundle_root}/images"
     echo "此包由 --skip-images 生成，未包含任何镜像。" >"${bundle_root}/images/SKIPPED.txt"
   fi
 
-  copy_static_assets "${bundle_root}"
+  copy_static_assets "${bundle_root}" "${GPU_SUPPORT}"
   generate_self_signed_certs "${bundle_root}"
-  write_manifest "${bundle_root}" "${bundle_version}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}"
-  write_build_info "${bundle_root}" "${bundle_name}" "${version}"
+  write_manifest "${bundle_root}" "${bundle_version}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}" "${bundle_variant}"
+  write_build_info "${bundle_root}" "${bundle_name}" "${version}" "${bundle_variant}" "${GPU_SUPPORT}"
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
-    save_images "${bundle_root}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}"
+    save_images "${bundle_root}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}"
   fi
 
   create_archive "${stage_dir}" "${bundle_name}" "${archive_path}"
