@@ -2356,10 +2356,7 @@ fn build_live_relay_api_params(
         ("modify_stamp".to_string(), "2".to_string()),
         (
             "enable_rtsp".to_string(),
-            bool_as_flag(
-                spec.publish.enable_rtsp.unwrap_or(true)
-                    || spec.publish.enable_webrtc.unwrap_or(false),
-            ),
+            bool_as_flag(spec.publish.enable_rtsp.unwrap_or(true)),
         ),
         (
             "enable_rtmp".to_string(),
@@ -2510,7 +2507,7 @@ fn build_startup_probe(publish: &PublishSpec) -> Result<StartupProbe, ExecutorEr
 fn preferred_publish_schema(publish: &PublishSpec) -> String {
     if publish.enable_rtmp.unwrap_or(true) {
         "rtmp".to_string()
-    } else if publish.enable_rtsp.unwrap_or(true) || publish.enable_webrtc.unwrap_or(false) {
+    } else if publish.enable_rtsp.unwrap_or(true) {
         "rtsp".to_string()
     } else if publish.enable_http_ts.unwrap_or(true) {
         "ts".to_string()
@@ -4640,8 +4637,7 @@ echo "{codec_name}"
                     "enable_rtmp": false,
                     "enable_http_ts": false,
                     "enable_http_fmp4": false,
-                    "enable_hls": false,
-                    "enable_webrtc": false
+                    "enable_hls": false
                 },
                 "record": {},
                 "recovery": {},
@@ -4681,7 +4677,6 @@ echo "{codec_name}"
                 "enable_http_ts": false,
                 "enable_http_fmp4": true,
                 "enable_hls": false,
-                "enable_webrtc": true,
                 "stop_on_no_reader": true
             },
             "record": {"enabled": true, "format": "both"},
@@ -4706,7 +4701,7 @@ echo "{codec_name}"
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-        assert_eq!(params.get("enable_rtsp").map(String::as_str), Some("1"));
+        assert_eq!(params.get("enable_rtsp").map(String::as_str), Some("0"));
         assert_eq!(params.get("enable_rtmp").map(String::as_str), Some("1"));
         assert_eq!(params.get("enable_ts").map(String::as_str), Some("0"));
         assert_eq!(params.get("enable_fmp4").map(String::as_str), Some("1"));

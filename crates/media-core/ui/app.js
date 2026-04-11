@@ -94,7 +94,6 @@ const RECOVERY_POLICIES = ["never", "on_failure", "always"];
 const PROFILE_OPTIONS = [
   "",
   "realtime_compat",
-  "rtc_web_compat",
   "archive_quality",
   "multicast_ts",
   "rtmp_hevc_ext",
@@ -381,7 +380,6 @@ function buildApiDocDetails() {
           enable_http_ts: true,
           enable_http_fmp4: true,
           enable_hls: true,
-          enable_webrtc: false,
         },
         record: {
           enabled: true,
@@ -439,7 +437,6 @@ function buildApiDocDetails() {
       { name: "publish.enable_http_ts", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-TS 播放地址。" },
       { name: "publish.enable_http_fmp4", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-FMP4 播放地址。" },
       { name: "publish.enable_hls", type: "boolean", required: false, description: "是否让内部流额外暴露 HLS 播放地址。" },
-      { name: "publish.enable_webrtc", type: "boolean", required: false, description: "仅控制底层 WebRTC 开关映射；当前不会生成 WebRTC 播放地址。" },
       { name: "record.enabled", type: "boolean", required: false, description: "是否开启录像。" },
       { name: "record.format", type: "enum", required: false, description: "录像格式，支持 MP4、HLS 或同时输出。" },
       { name: "record.segment_sec", type: "number", required: false, description: "分段时长（秒）。" },
@@ -760,7 +757,7 @@ const SYSTEM_CAPABILITIES = [
   {
     title: "输出与分发",
     summary: "支持内部流、组播输出和多协议播放暴露。",
-    items: ["内部流发布", "文件输出", "UDP MPEGTS 组播", "RTP 组播", "RTSP 播放", "RTMP 播放", "HTTP-TS", "HTTP-FMP4", "HLS", "WebRTC"],
+    items: ["内部流发布", "文件输出", "UDP MPEGTS 组播", "RTP 组播", "RTSP 播放", "RTMP 播放", "HTTP-TS", "HTTP-FMP4", "HLS"],
   },
   {
     title: "录像能力",
@@ -826,7 +823,6 @@ const LABELS = {
   },
   profile: {
     realtime_compat: "实时兼容",
-    rtc_web_compat: "WebRTC 兼容",
     archive_quality: "归档优先",
     multicast_ts: "组播传输流",
     rtmp_hevc_ext: "RTMP HEVC 扩展",
@@ -2153,7 +2149,7 @@ function renderStreamsPage(data) {
         <div>
           <h3>在线流</h3>
           <p>共 ${data.streams.length} 条。</p>
-          <p class="subtle">播放地址表示同一条内部流当前可暴露的协议集合，不代表任务并行输出了多个独立目标。当前不生成 WebRTC 地址。</p>
+          <p class="subtle">播放地址表示同一条内部流当前可暴露的协议集合，不代表任务并行输出了多个独立目标。</p>
         </div>
       </div>
       <div class="table-wrap">
@@ -3043,7 +3039,6 @@ function renderCreateProcessStep(draft) {
       ${showProtocolFlags ? renderCheckboxModelField("enable_http_ts", "publish.enable_http_ts", draft.publish.enable_http_ts) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("enable_http_fmp4", "publish.enable_http_fmp4", draft.publish.enable_http_fmp4) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("enable_hls", "publish.enable_hls", draft.publish.enable_hls) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("enable_webrtc", "publish.enable_webrtc", draft.publish.enable_webrtc) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("无人观看自动停止", "publish.stop_on_no_reader", draft.publish.stop_on_no_reader) : ""}
     </div>
     ${
@@ -3935,7 +3930,6 @@ function buildDraftPayload(draft) {
   setIfBoolean(payload.publish, "enable_http_ts", draft.publish.enable_http_ts);
   setIfBoolean(payload.publish, "enable_http_fmp4", draft.publish.enable_http_fmp4);
   setIfBoolean(payload.publish, "enable_hls", draft.publish.enable_hls);
-  setIfBoolean(payload.publish, "enable_webrtc", draft.publish.enable_webrtc);
   setIfBoolean(payload.publish, "stop_on_no_reader", draft.publish.stop_on_no_reader);
 
   setIfBoolean(payload.record, "enabled", draft.record.enabled);
@@ -4011,7 +4005,6 @@ function createDefaultDraft() {
       enable_http_ts: true,
       enable_http_fmp4: true,
       enable_hls: false,
-      enable_webrtc: false,
       stop_on_no_reader: false,
     },
     record: {
@@ -5147,7 +5140,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     enable_http_ts: "boolean",
     enable_http_fmp4: "boolean",
     enable_hls: "boolean",
-    enable_webrtc: "boolean",
     stop_on_no_reader: "boolean",
   });
   applyDraftSectionDefaults(draft.record, spec.record, {

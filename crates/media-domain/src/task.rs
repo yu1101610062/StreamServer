@@ -377,7 +377,6 @@ impl TaskSpec {
         resolved.publish.enable_http_ts = Some(resolved.publish.enable_http_ts.unwrap_or(true));
         resolved.publish.enable_http_fmp4 = Some(resolved.publish.enable_http_fmp4.unwrap_or(true));
         resolved.publish.enable_hls = Some(resolved.publish.enable_hls.unwrap_or(false));
-        resolved.publish.enable_webrtc = Some(resolved.publish.enable_webrtc.unwrap_or(false));
         resolved.publish.stop_on_no_reader =
             Some(resolved.publish.stop_on_no_reader.unwrap_or(false));
         if matches!(resolved.input.kind, Some(InputKind::GbRtp)) {
@@ -751,8 +750,6 @@ pub struct PublishSpec {
     pub enable_http_fmp4: Option<bool>,
     #[serde(default)]
     pub enable_hls: Option<bool>,
-    #[serde(default)]
-    pub enable_webrtc: Option<bool>,
     #[serde(default)]
     pub stop_on_no_reader: Option<bool>,
 }

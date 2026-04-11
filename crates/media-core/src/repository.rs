@@ -5273,21 +5273,7 @@ fn profile_defaults_json(task_type: TaskType, profile: Option<&str>) -> Value {
                 "enable_rtmp": true,
                 "enable_http_ts": true,
                 "enable_http_fmp4": true,
-                "enable_hls": false,
-                "enable_webrtc": false
-            }
-        }),
-        "rtc_web_compat" => json!({
-            "process": {
-                "mode": "force_transcode"
-            },
-            "publish": {
-                "enable_rtsp": true,
-                "enable_rtmp": false,
-                "enable_http_ts": false,
-                "enable_http_fmp4": true,
-                "enable_hls": false,
-                "enable_webrtc": true
+                "enable_hls": false
             }
         }),
         "archive_quality" => json!({
@@ -5489,10 +5475,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
         (
             "enable_hls",
             spec.publish.enable_hls.map(|value| json!(value)),
-        ),
-        (
-            "enable_webrtc",
-            spec.publish.enable_webrtc.map(|value| json!(value)),
         ),
         (
             "stop_on_no_reader",

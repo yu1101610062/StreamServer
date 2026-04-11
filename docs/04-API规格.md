@@ -122,7 +122,6 @@
 - `publish.kind` 表示任务直接写出的目标类型；当前只支持 `file`、`zlm_ingest`、`udp_mpegts_multicast`、`rtp_multicast`。
 - `publish.enable_*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
 - 例如 `input.kind=http_ts` 表示“HTTP-TS 作为输入源”，`publish.enable_http_ts=true` 表示“内部流额外暴露 HTTP-TS 播放地址”，两者不是同一件事。
-- `enable_webrtc` 当前只影响底层 ZLM 的 RTSP/WebRTC 开关映射；控制面不会生成 WebRTC `play_urls`，因此不能把它视作已经完整支持 WebRTC 播放输出。
 
 当前能力矩阵：
 

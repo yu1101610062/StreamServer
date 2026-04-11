@@ -129,7 +129,6 @@ Agent 将其转换为 `task_progress` 事件。
 | Profile | 默认策略 |
 | --- | --- |
 | `realtime_compat` | `H264 + AAC`，偏实时兼容 |
-| `rtc_web_compat` | `H264 baseline + opus`，关闭 B 帧 |
 | `archive_quality` | 优先 `copy`，失败再转码 |
 | `multicast_ts` | `mpegts + pkt_size=1316 + ttl=1 + reuse=true` |
 | `rtmp_hevc_ext` | 仅在模板显式声明时启用 |
