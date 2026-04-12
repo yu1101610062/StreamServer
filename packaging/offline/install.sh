@@ -684,7 +684,17 @@ copy_compose_template() {
 
 prepare_control_plane_layout() {
   local install_dir="$1"
-  mkdir -p "${install_dir}/data/postgres"
+  # PostgreSQL 18 re-executes the entrypoint as the postgres user after
+  # creating PGDATA=/var/lib/postgresql/18/docker. If the version directory is
+  # auto-created with a restrictive umask (for example 750), the second pass
+  # cannot traverse it and startup fails with "mkdir ... /var/lib/postgresql/18:
+  # Permission denied". Pre-create the versioned layout on the host so the
+  # parent directory remains traversable.
+  mkdir -p "${install_dir}/data/postgres/18/docker"
+  chmod 755 \
+    "${install_dir}/data/postgres" \
+    "${install_dir}/data/postgres/18" \
+    "${install_dir}/data/postgres/18/docker" 2>/dev/null || true
 }
 
 prepare_worker_layout() {
