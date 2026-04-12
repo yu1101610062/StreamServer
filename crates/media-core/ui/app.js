@@ -68,11 +68,9 @@ const NAV_ITEMS = [
 ];
 
 const TASK_TYPES = [
-  { value: "live_relay", label: "实时拉流转发", note: "拉取实时源并发布为平台流" },
+  { value: "stream_ingest", label: "流接入", note: "接入源为平台内部流，可选暴露播放协议与录制" },
+  { value: "stream_bridge", label: "流桥接", note: "把源桥接到文件或组播等显式输出目标" },
   { value: "file_transcode", label: "文件转码", note: "离线转码并生成目标文件" },
-  { value: "file_to_live", label: "文件转直播", note: "把文件实时推送为直播流" },
-  { value: "multicast_bridge", label: "组播桥接", note: "组播与平台流互转" },
-  { value: "rtp_receive", label: "RTP 接收", note: "接收国标/RTP 并发布为内部流" },
 ];
 
 const INPUT_KINDS = [
@@ -88,17 +86,12 @@ const INPUT_KINDS = [
   "gb_rtp",
 ];
 
-const PUBLISH_KINDS = ["file", "zlm_ingest", "udp_mpegts_multicast", "rtp_multicast"];
+const SOURCE_MODES = ["live", "vod"];
+const PUBLISH_KINDS = ["file", "udp_mpegts_multicast", "rtp_multicast"];
 const START_MODES = ["immediate", "manual", "cron", "at"];
 const RECORD_FORMATS = ["mp4", "hls", "both"];
-const RECOVERY_POLICIES = ["never", "on_failure", "always"];
-const PROFILE_OPTIONS = [
-  "",
-  "realtime_compat",
-  "archive_quality",
-  "multicast_ts",
-  "rtmp_hevc_ext",
-];
+const RECOVERY_POLICIES = ["never", "auto"];
+const PROCESS_MODES = ["passthrough", "copy_or_transcode", "force_transcode"];
 const API_EXAMPLE_BASE_URL = "http://media-core.example.com:8080";
 const EXAMPLE_TASK_ID = "019d77d3-a942-7c91-8e82-ff963ccf1222";
 const EXAMPLE_NODE_ID = "f8995794-b5af-440b-b1f4-742c6c7f1641";
@@ -190,7 +183,7 @@ const EXTERNAL_API_DOCS = [
     params: [
       authHeaderParam(),
       { name: "status", location: "Query", type: "enum", required: false, description: "任务状态筛选。适合只同步运行中、失败或待处理任务。 ", example: "RUNNING" },
-      { name: "type", location: "Query", type: "enum", required: false, description: "任务类型筛选。适合按业务场景拆分任务列表。", example: "live_relay" },
+      { name: "type", location: "Query", type: "enum", required: false, description: "任务类型筛选。适合按业务场景拆分任务列表。", example: "stream_ingest" },
       { name: "assigned_node_id", location: "Query", type: "string", required: false, description: "执行节点 ID。用于查看某个工作节点承担的任务。", example: EXAMPLE_NODE_ID },
       { name: "keyword", location: "Query", type: "string", required: false, description: "任务名或任务 ID 关键字，用于模糊检索。", example: "camera-01" },
       { name: "created_from", location: "Query", type: "datetime", required: false, description: "创建时间起点，ISO 8601。用于限定查询窗口。", example: "2026-04-11T00:00:00+08:00" },
@@ -213,7 +206,7 @@ const EXTERNAL_API_DOCS = [
       authHeaderParam(),
       taskIdPathParam(),
     ],
-    responseExample: { task: { id: "0195...", status: "RUNNING", type: "live_relay" }, callback_delivery: { event_type: "task.status", status: "delivered", callback_url: "https://biz.example.com/streamserver/callback" }, recent_events: [] },
+    responseExample: { task: { id: "0195...", status: "RUNNING", type: "stream_ingest" }, callback_delivery: { event_type: "task.status", status: "delivered", callback_url: "https://biz.example.com/streamserver/callback" }, recent_events: [] },
   },
   {
     category: "任务管理",
@@ -260,7 +253,7 @@ const EXTERNAL_API_DOCS = [
     path: "/api/v1/tasks/{id}/clone",
     title: "克隆任务",
     summary: "复制既有任务并按需覆盖少量字段。",
-    description: "适合快速复制既有模板化任务。",
+    description: "适合快速复制既有任务。",
     params: [
       authHeaderParam(),
       taskIdPathParam(),
@@ -341,9 +334,7 @@ function buildApiDocDetails() {
       },
       body: {
         name: "relay-camera-01",
-        type: "live_relay",
-        template: "default-live-relay",
-        profile: "realtime_compat",
+        type: "stream_ingest",
         priority: 50,
         common: {
           created_by: "partner-system",
@@ -352,6 +343,7 @@ function buildApiDocDetails() {
         },
         input: {
           kind: "rtsp",
+          source_mode: "live",
           url: "rtsp://camera.example.com/live/01",
           group: "239.10.10.31",
           port: 12361,
@@ -369,13 +361,12 @@ function buildApiDocDetails() {
           fps: 25,
           gop: 50,
         },
-        publish: {
-          kind: "zlm_ingest",
-          url: "rtmp://media-core.example.com/live/relay-camera-01",
-          group: "239.10.10.31",
-          port: 12361,
-          interface_name: "eth1",
-          interface_ip: "172.17.13.196",
+        stream: {
+          app: "live",
+          name: "relay-camera-01",
+          vhost: "__defaultVhost__",
+        },
+        expose: {
           enable_rtsp: true,
           enable_rtmp: true,
           enable_http_ts: true,
@@ -390,7 +381,7 @@ function buildApiDocDetails() {
           save_path: "/data/records/relay-camera-01",
         },
         recovery: {
-          policy: "on_failure",
+          policy: "auto",
         },
         schedule: {
           start_mode: "immediate",
@@ -406,8 +397,6 @@ function buildApiDocDetails() {
     requestFields: [
       { name: "name", type: "string", required: true, description: "任务名称，建议由业务系统保证同类任务内可读且可检索。" },
       { name: "type", type: "enum", required: true, description: "任务类型。决定输入、处理与发布结构。" },
-      { name: "template", type: "string", required: false, description: "模板名称。提供任务默认值和约束。" },
-      { name: "profile", type: "enum", required: false, description: "任务预设档位。用于实时兼容、归档或组播优化。" },
       { name: "priority", type: "number", required: false, description: "调度优先级，通常 0-100，数字越大越优先。" },
       { name: "common.created_by", type: "string", required: false, description: "任务创建来源，用于审计和回查。" },
       { name: "common.callback_url", type: "string", required: false, description: "任务终态回调地址。任务完成后由 media-core 异步回调，若录像或转码产物稍后入库会自动补发更新回调。" },
@@ -423,21 +412,24 @@ function buildApiDocDetails() {
       { name: "input.probe_timeout_ms", type: "number", required: false, description: "探测源流超时时间。" },
       { name: "input.tcp_mode", type: "number", required: false, description: "RTP 接收时的 TCP 模式。" },
       { name: "input.ssrc", type: "number", required: false, description: "RTP 接收时的 SSRC。" },
-      { name: "process.mode", type: "string", required: false, description: "处理模式，如 copy_or_transcode。具体是否走 GPU、使用何种编解码器由系统自动决定。" },
+      { name: "process.mode", type: "enum", required: false, description: "处理模式，如 passthrough、copy_or_transcode、force_transcode。具体是否走 GPU、使用何种编解码器由系统自动决定。" },
       { name: "process.bitrate", type: "number", required: false, description: "目标码率 kbps。" },
       { name: "process.fps", type: "number", required: false, description: "目标帧率。" },
       { name: "process.gop", type: "number", required: false, description: "关键帧间隔。" },
-      { name: "publish.kind", type: "enum", required: false, description: "发布类型，可输出到内部流、文件或组播。" },
-      { name: "publish.url", type: "string", required: false, description: "目标文件路径或推流地址。" },
+      { name: "stream.app", type: "string", required: false, description: "内部流 app，默认 live。" },
+      { name: "stream.name", type: "string", required: false, description: "内部流名称，缺省时由系统生成。" },
+      { name: "stream.vhost", type: "string", required: false, description: "内部流 vhost，默认 __defaultVhost__。" },
+      { name: "expose.enable_rtsp", type: "boolean", required: false, description: "是否让内部流额外暴露 RTSP 播放地址。" },
+      { name: "expose.enable_rtmp", type: "boolean", required: false, description: "是否让内部流额外暴露 RTMP 播放地址。" },
+      { name: "expose.enable_http_ts", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-TS 播放地址。" },
+      { name: "expose.enable_http_fmp4", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-FMP4 播放地址。" },
+      { name: "expose.enable_hls", type: "boolean", required: false, description: "是否让内部流额外暴露 HLS 播放地址。" },
+      { name: "publish.kind", type: "enum", required: false, description: "直接输出目标类型，仅对 stream_bridge / file_transcode 生效。" },
+      { name: "publish.url", type: "string", required: false, description: "目标文件路径。" },
       { name: "publish.group", type: "string", required: false, description: "输出组播组地址。" },
       { name: "publish.port", type: "number", required: false, description: "输出端口。" },
       { name: "publish.interface_name", type: "string", required: false, description: "绑定输出网卡名。" },
       { name: "publish.interface_ip", type: "string", required: false, description: "绑定输出本地地址。" },
-      { name: "publish.enable_rtsp", type: "boolean", required: false, description: "是否让内部流额外暴露 RTSP 播放地址。" },
-      { name: "publish.enable_rtmp", type: "boolean", required: false, description: "是否让内部流额外暴露 RTMP 播放地址。" },
-      { name: "publish.enable_http_ts", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-TS 播放地址。" },
-      { name: "publish.enable_http_fmp4", type: "boolean", required: false, description: "是否让内部流额外暴露 HTTP-FMP4 播放地址。" },
-      { name: "publish.enable_hls", type: "boolean", required: false, description: "是否让内部流额外暴露 HLS 播放地址。" },
       { name: "record.enabled", type: "boolean", required: false, description: "是否开启录像。" },
       { name: "record.format", type: "enum", required: false, description: "录像格式，支持 MP4、HLS 或同时输出。" },
       { name: "record.duration_sec", type: "number", required: false, description: "总录制时长（秒）。离线源按媒体时长截取，在线源按现实时间计时。" },
@@ -477,7 +469,7 @@ function buildApiDocDetails() {
       },
       query: {
         status: "RUNNING",
-        type: "live_relay",
+        type: "stream_ingest",
         assigned_node_id: EXAMPLE_NODE_ID,
         keyword: "camera-01",
         created_from: "2026-04-11T00:00:00+08:00",
@@ -803,9 +795,17 @@ const LABELS = {
   },
   publishKind: {
     file: "文件输出",
-    zlm_ingest: "内部流发布",
     udp_mpegts_multicast: "UDP MPEGTS 组播",
     rtp_multicast: "RTP 组播",
+  },
+  sourceMode: {
+    live: "实时源",
+    vod: "离线源",
+  },
+  processMode: {
+    passthrough: "直通",
+    copy_or_transcode: "拷贝优先，必要时转码",
+    force_transcode: "强制转码",
   },
   startMode: {
     immediate: "立即启动",
@@ -820,14 +820,9 @@ const LABELS = {
   },
   recoveryPolicy: {
     never: "不恢复",
-    on_failure: "失败时恢复",
-    always: "始终恢复",
-  },
-  profile: {
-    realtime_compat: "实时兼容",
-    archive_quality: "归档优先",
-    multicast_ts: "组播传输流",
-    rtmp_hevc_ext: "RTMP HEVC 扩展",
+    auto: "恢复",
+    on_failure: "恢复",
+    always: "恢复",
   },
   status: {
     CREATED: "已创建",
@@ -903,8 +898,6 @@ const state = {
   toasts: [],
   cache: {
     taskDetails: new Map(),
-    templates: null,
-    templateDetails: new Map(),
     nodes: null,
     nodeInsights: new Map(),
   },
@@ -1458,12 +1451,11 @@ async function loadTasksData(route) {
   if (!query.get("page_size")) {
     query.set("page_size", DEFAULT_PAGE_SIZE);
   }
-  const [tasksPage, nodes, templates] = await Promise.all([
+  const [tasksPage, nodes] = await Promise.all([
     apiRequest(`/api/v1/tasks?${query.toString()}`),
     canAccess("node_read") ? fetchNodesCached(false) : Promise.resolve([]),
-    canAccess("template_read") ? fetchTemplatesCached(false) : Promise.resolve([]),
   ]);
-  return { tasksPage, nodes, templates };
+  return { tasksPage, nodes };
 }
 
 async function loadOverviewData() {
@@ -1619,7 +1611,7 @@ async function loadStreamsData(route) {
 async function loadMulticastData(route) {
   const params = route.searchParams;
   const query = new URLSearchParams();
-  query.set("type", "multicast_bridge");
+  query.set("type", "stream_bridge");
   query.set("page_size", params.get("page_size") || "100");
   if (params.get("status")) {
     query.set("status", params.get("status"));
@@ -2008,7 +2000,6 @@ function renderApiDocModal() {
 function renderTasksPage(data) {
   const params = state.route.searchParams;
   const nodeOptions = data.nodes || [];
-  const templateLookup = new Map((data.templates || []).map((template) => [template.id, template.name]));
   return `
     <section class="hero-panel">
       <div class="section-header">
@@ -2056,7 +2047,6 @@ function renderTasksPage(data) {
               <th>状态</th>
               <th>优先级</th>
               <th>节点</th>
-              <th>模板</th>
               <th>创建人</th>
               <th>创建时间</th>
               <th>更新时间</th>
@@ -2080,7 +2070,6 @@ function renderTasksPage(data) {
                           <td>${statusPill(task.status)}</td>
                           <td>${escapeHtml(String(task.priority))}</td>
                           <td>${escapeHtml(nodeLabel(node))}</td>
-                          <td>${escapeHtml(templateLookup.get(task.template_id) || task.template_id || "—")}</td>
                           <td>${escapeHtml(task.created_by || "—")}</td>
                           <td>${escapeHtml(formatTime(task.created_at))}</td>
                           <td>${escapeHtml(formatTime(task.updated_at))}</td>
@@ -2089,7 +2078,7 @@ function renderTasksPage(data) {
                       `;
                     })
                     .join("")
-                : `<tr><td colspan="11">${renderInlineEmpty("没有命中条件的任务。")}</td></tr>`
+                : `<tr><td colspan="10">${renderInlineEmpty("没有命中条件的任务。")}</td></tr>`
             }
           </tbody>
         </table>
@@ -2257,7 +2246,7 @@ function renderMulticastPage(data) {
       <div class="table-toolbar">
         <div>
           <h3>组播任务</h3>
-          <p>共 ${data.tasksPage.total} 条 multicast_bridge 任务。</p>
+          <p>共 ${data.tasksPage.total} 条 stream_bridge 任务。</p>
         </div>
       </div>
       <div class="table-wrap">
@@ -2308,7 +2297,7 @@ function renderMulticastPage(data) {
                       `;
                     })
                     .join("")
-                : `<tr><td colspan="9">${renderInlineEmpty("当前没有 multicast_bridge 任务。")}</td></tr>`
+                : `<tr><td colspan="9">${renderInlineEmpty("当前没有 stream_bridge 任务。")}</td></tr>`
             }
           </tbody>
         </table>
@@ -2898,8 +2887,11 @@ function renderTaskLogsTab(taskId, logs, params) {
 
 function renderCreateDrawer() {
   const open = state.ui.createOpen;
-  const templates = state.cache.templates || [];
   const draft = state.ui.createDraft;
+  const steps = getCreateWizardSteps(draft);
+  const activeStep = Math.max(1, Math.min(state.ui.createStep, steps.length));
+  const activeStepId = steps[activeStep - 1]?.id || "type";
+  const stepSummary = steps.map((step) => step.title).join("、");
   return `
     <div class="drawer-backdrop ${open ? "open" : ""}" data-action="close-create-drawer"></div>
     <aside class="drawer ${open ? "open" : ""}">
@@ -2907,26 +2899,26 @@ function renderCreateDrawer() {
         <div>
           <div class="brand-mark">创建任务</div>
           <h3>任务创建向导</h3>
-          <p>共 7 步：任务类型、模板、输入源、处理与发布、恢复与调度、规格预览、提交创建。</p>
+          <p>共 ${steps.length} 步：${escapeHtml(stepSummary)}。</p>
         </div>
         <div class="section-actions">
           <button class="ghost-button" data-action="close-create-drawer">关闭</button>
         </div>
       </div>
       <div class="wizard-steps">
-        ${["类型", "模板", "输入源", "处理发布", "恢复调度", "规格预览", "提交"]
+        ${steps
           .map(
-            (label, index) => `
-              <div class="wizard-step ${state.ui.createStep === index + 1 ? "active" : ""}">
+            (step, index) => `
+              <div class="wizard-step ${activeStep === index + 1 ? "active" : ""}">
                 <strong>0${index + 1}</strong>
-                <span>${escapeHtml(label)}</span>
+                <span>${escapeHtml(step.short)}</span>
               </div>
             `,
           )
           .join("")}
       </div>
       <div class="panel">
-        ${renderCreateStep(state.ui.createStep, draft, templates)}
+        ${renderCreateStep(activeStepId, draft)}
       </div>
       ${
         state.ui.createError
@@ -2934,10 +2926,10 @@ function renderCreateDrawer() {
           : ""
       }
       <div class="modal-actions">
-        <button class="ghost-button" data-action="create-prev-step" ${state.ui.createStep === 1 ? "disabled" : ""}>上一步</button>
+        <button class="ghost-button" data-action="create-prev-step" ${activeStep === 1 ? "disabled" : ""}>上一步</button>
         ${
-          state.ui.createStep < 7
-            ? `<button class="button" data-action="create-next-step">${state.ui.createStep === 6 ? "进入提交" : "下一步"}</button>`
+          activeStep < steps.length
+            ? `<button class="button" data-action="create-next-step">${activeStepId === "preview" ? "进入提交" : "下一步"}</button>`
             : `<button class="button" data-action="create-submit">提交创建</button>`
         }
       </div>
@@ -2945,41 +2937,53 @@ function renderCreateDrawer() {
   `;
 }
 
-function renderCreateStep(step, draft, templates) {
-  switch (step) {
-    case 1:
+function getCreateWizardSteps(draft) {
+  const steps = [
+    { id: "type", short: "类型", title: "任务类型" },
+    { id: "input", short: "输入源", title: "输入源" },
+    { id: "process", short: "处理输出", title: "处理与输出" },
+  ];
+  if (draft.task_type === "stream_ingest") {
+    steps.push({ id: "record", short: "录制", title: "录制" });
+  }
+  steps.push(
+    { id: "recovery", short: "恢复", title: "恢复策略" },
+    { id: "schedule", short: "调度", title: "启动调度" },
+    { id: "preview", short: "规格预览", title: "规格预览" },
+    { id: "submit", short: "提交", title: "提交创建" },
+  );
+  return steps;
+}
+
+function renderCreateStep(stepId, draft) {
+  switch (stepId) {
+    case "type":
       return `
         <div class="create-grid">
           ${renderSelectModelField("任务类型", "task_type", TASK_TYPES.map((item) => item.value), draft.task_type, (value) => taskTypeLabel(value))}
           ${renderTextModelField("任务名称", "name", draft.name, "relay-camera-01")}
-          ${renderSelectModelField("任务预设", "profile", PROFILE_OPTIONS, draft.profile, (value) => profileLabel(value, "不使用预设"))}
           ${renderTextModelField("创建人", "common.created_by", draft.common.created_by, "console-user")}
           ${renderTextModelField("优先级", "priority", draft.priority, "0 - 100", "number")}
-        </div>
-      `;
-    case 2: {
-      const templateOptions = ["", ...templates.filter((item) => item.type === draft.task_type).map((item) => item.name)];
-      return `
-        <div class="create-grid">
-          ${renderSelectModelField("模板", "template", templateOptions, draft.template || "", (value) => value || "不使用模板")}
           ${renderTextareaModelField("标签", "common.labels_text", draft.common.labels_text, "逗号分隔") }
           ${renderTextModelField("回调地址", "common.callback_url", draft.common.callback_url, "可选")}
         </div>
-        <div class="subtle">模板切换会立刻把默认值回填到向导字段，最终提交前仍会通过服务端 <code>resolved_spec</code> 预览再次校验。</div>
       `;
-    }
-    case 3:
+    case "input":
       return renderCreateInputStep(draft);
-    case 4:
+    case "process":
       return renderCreateProcessStep(draft);
-    case 5:
-      return renderCreatePolicyStep(draft);
-    case 6:
+    case "record":
+      return renderCreateRecordStep(draft);
+    case "recovery":
+      return renderCreateRecoveryStep(draft);
+    case "schedule":
+      return renderCreateScheduleStep(draft);
+    case "preview":
       return `
         <div class="section-header">
           <div>
             <h3>解析规格预览</h3>
-            <p>提交前由服务端计算最终规格，方便确认模板和默认值的实际落点。</p>
+            <p>提交前由服务端计算最终规格，方便确认默认值和条件字段的实际落点。</p>
           </div>
           <div class="section-actions">
             <button class="button" data-action="create-preview">生成预览</button>
@@ -2987,17 +2991,16 @@ function renderCreateStep(step, draft, templates) {
         </div>
         <div class="field-block">
           <label>高级 JSON 覆盖</label>
-          <textarea data-model="advanced_json" placeholder='{"publish":{"enable_hls":true}}'>${escapeHtml(draft.advanced_json)}</textarea>
+          <textarea data-model="advanced_json" placeholder='{"expose":{"enable_hls":true}}'>${escapeHtml(draft.advanced_json)}</textarea>
         </div>
         <pre class="json-block">${escapeHtml(JSON.stringify(state.ui.createPreview?.resolved_spec || {}, null, 2) || "{}")}</pre>
       `;
-    case 7:
+    case "submit":
       return `
         <div class="overview-grid">
           ${metricCard("任务类型", taskTypeLabel(draft.task_type))}
           ${metricCard("任务名称", draft.name || "未填写")}
           ${metricCard("启动模式", startModeLabel(draft.schedule.start_mode || "immediate"))}
-          ${metricCard("模板", draft.template || "无")}
         </div>
         <pre class="json-block">${escapeHtml(JSON.stringify(state.ui.createPreview?.resolved_spec || buildDraftPayload(draft), null, 2))}</pre>
         <div class="subtle">提交将调用 <code>POST /api/v1/tasks</code>。如果服务端返回验证错误，会保留当前向导状态。</div>
@@ -3009,38 +3012,29 @@ function renderCreateStep(step, draft, templates) {
 
 function renderCreateInputStep(draft) {
   const taskType = draft.task_type;
-  const fixedInputKind =
-    taskType === "file_transcode"
-      ? "file"
-      : taskType === "rtp_receive"
-        ? "gb_rtp"
-        : "";
   const selectableInputKinds =
-    taskType === "live_relay"
-      ? ["rtsp", "rtmp", "hls", "http_flv", "http_ts"]
-      : taskType === "file_to_live"
-        ? ["file", "http_mp4", "hls", "http_ts"]
-      : taskType === "multicast_bridge"
-        ? ["rtsp", "rtmp", "hls", "http_flv", "http_ts", "file", "udp_mpegts_multicast", "rtp_multicast"]
+    taskType === "file_transcode"
+      ? ["file", "http_mp4", "hls", "http_ts"]
+      : taskType === "stream_bridge"
+        ? ["rtsp", "rtmp", "hls", "http_mp4", "http_flv", "http_ts", "file", "udp_mpegts_multicast", "rtp_multicast"]
         : INPUT_KINDS;
-  const inputKind = fixedInputKind || draft.input.kind || "";
+  const inputKind = draft.input.kind || "";
+  const fixedSourceMode = defaultSourceModeForInputKind(inputKind);
+  const showSourceMode = inputKindSupportsExplicitSourceMode(inputKind);
   const showUrl = ["rtsp", "rtmp", "hls", "http_mp4", "http_flv", "http_ts", "file"].includes(inputKind);
   const showMulticastInput = ["udp_mpegts_multicast", "rtp_multicast"].includes(inputKind);
-  const showRtpInput = taskType === "rtp_receive";
+  const showRtpInput = inputKind === "gb_rtp";
   return `
     <div class="create-grid">
-      ${
-        fixedInputKind
-          ? renderStaticModelField("输入类型", inputKindLabel(fixedInputKind))
-          : renderSelectModelField("输入类型", "input.kind", selectableInputKinds, draft.input.kind || "", (value) => inputKindLabel(value))
-      }
+      ${renderSelectModelField("输入类型", "input.kind", selectableInputKinds, draft.input.kind || "", (value) => inputKindLabel(value))}
+      ${showSourceMode ? renderSelectModelField("源语义", "input.source_mode", SOURCE_MODES, draft.input.source_mode || "", (value) => sourceModeLabel(value)) : renderStaticModelField("源语义", sourceModeLabel(fixedSourceMode || "", "自动判定"))}
       ${showUrl ? renderTextModelField("输入 URL", "input.url", draft.input.url, inputKind === "file" ? "/data/media/input.mp4" : inputKind === "http_mp4" ? "http://vod.example.com/archive.mp4" : "rtsp://camera/live") : ""}
       ${showMulticastInput ? renderTextModelField("组播地址", "input.group", draft.input.group, "239.0.0.1") : ""}
       ${(showMulticastInput || showRtpInput) ? renderTextModelField("端口", "input.port", draft.input.port, showRtpInput ? "30000" : "5004", "number") : ""}
       ${showMulticastInput ? renderTextModelField("绑定网卡名", "input.interface_name", draft.input.interface_name, "留空则使用节点默认组播网卡") : ""}
       ${showMulticastInput ? renderTextModelField("绑定本地地址", "input.interface_ip", draft.input.interface_ip, "可选，本地监听地址") : ""}
       ${showMulticastInput ? renderTextModelField("TTL", "input.ttl", draft.input.ttl, "1", "number") : ""}
-      ${taskType !== "rtp_receive" ? renderTextModelField("探测超时（毫秒）", "input.probe_timeout_ms", draft.input.probe_timeout_ms, "7000", "number") : ""}
+      ${inputKind !== "gb_rtp" ? renderTextModelField("探测超时（毫秒）", "input.probe_timeout_ms", draft.input.probe_timeout_ms, "7000", "number") : ""}
       ${showRtpInput ? renderTextModelField("TCP 模式", "input.tcp_mode", draft.input.tcp_mode, "0 / 1 / 2", "number") : ""}
       ${showRtpInput ? renderTextModelField("SSRC", "input.ssrc", draft.input.ssrc, "可选", "number") : ""}
       ${(showMulticastInput || showRtpInput) ? renderCheckboxModelField("端口重用", "input.reuse", draft.input.reuse) : ""}
@@ -3050,21 +3044,15 @@ function renderCreateInputStep(draft) {
 
 function renderCreateProcessStep(draft) {
   const taskType = draft.task_type;
-  const publishKind =
-    taskType === "file_transcode"
-      ? "file"
-      : taskType === "file_to_live"
-        ? "zlm_ingest"
-        : taskType === "rtp_receive" || taskType === "live_relay"
-          ? ""
-          : draft.publish.kind || "";
-  const showProcess = ["file_transcode", "file_to_live", "multicast_bridge"].includes(taskType);
-  const showPublishKindSelect = taskType === "multicast_bridge";
-  const showPublishUrl = taskType === "file_transcode" || taskType === "file_to_live" || ["file", "zlm_ingest"].includes(publishKind);
+  const publishKind = taskType === "file_transcode" ? "file" : draft.publish.kind || "";
+  const showProcess = true;
+  const showStreamSettings = taskType === "stream_ingest";
+  const showExposeSettings = taskType === "stream_ingest";
+  const showPublishKindSelect = taskType === "stream_bridge";
+  const showPublishUrl = taskType === "file_transcode" || publishKind === "file";
   const showPublishNetwork = ["udp_mpegts_multicast", "rtp_multicast"].includes(publishKind);
-  const showProtocolFlags = taskType === "live_relay" || taskType === "file_to_live" || taskType === "rtp_receive" || publishKind === "zlm_ingest";
-  const publishTargetLabel = publishKind === "file" ? "输出文件路径" : publishKind === "zlm_ingest" ? "推流目标 URL" : "发布 URL";
-  const publishTargetPlaceholder = publishKind === "file" ? "/data/media/output.mp4" : "rtmp://zlm/live/stream";
+  const publishTargetLabel = "输出文件路径";
+  const publishTargetPlaceholder = "/data/media/output.mp4";
   const publishFormatPlaceholder =
     showPublishNetwork
       ? publishKind === "rtp_multicast"
@@ -3072,23 +3060,25 @@ function renderCreateProcessStep(draft) {
         : "mpegts"
       : publishKind === "file"
         ? "可留空，按文件名推断"
-        : publishKind === "zlm_ingest"
-          ? "可留空，按 URL 协议推断"
-          : "mpegts";
-  const directOutputHint = showPublishUrl
-    ? publishKind === "file"
+        : "mpegts";
+  const outputHint =
+    showPublishUrl
       ? `<div class="subtle">当前任务会直接写文件；这里填最终输出文件路径。<code>输出封装格式</code>通常可以留空，系统会按文件名自动推断。</div>`
-      : `<div class="subtle">当前任务会把结果直接推到目标地址；这里填实际推流 URL。<code>输出封装格式</code>通常可以留空，系统会按 URL 协议自动推断。</div>`
-    : showPublishNetwork
-      ? `<div class="subtle">当前任务会直接发组播；填写目标组播地址和端口即可，<code>输出封装格式</code>通常保持默认。</div>`
-      : `<div class="subtle">当前任务默认只维护内部流，不额外指定一个直接输出目标。</div>`;
+      : showPublishNetwork
+        ? `<div class="subtle">当前任务会直接发组播；填写目标组播地址和端口即可，<code>输出封装格式</code>通常保持默认。</div>`
+        : showStreamSettings
+          ? `<div class="subtle">当前任务产出平台内部流，不再填写“推流目标 URL”。内部流标识由 <code>stream.app/name/vhost</code> 定义，对外播放协议由 <code>expose</code> 控制。</div>`
+          : `<div class="subtle">当前任务只做内部处理，不额外指定直接输出目标。</div>`;
   return `
     <div class="create-grid">
-      ${showProcess ? renderTextModelField("处理模式", "process.mode", draft.process.mode, "copy_or_transcode") : ""}
+      ${showProcess ? renderSelectModelField("处理模式", "process.mode", ["", ...PROCESS_MODES], draft.process.mode || "", (value) => value ? processModeLabel(value) : "默认") : ""}
       ${showProcess ? renderTextModelField("目标码率", "process.bitrate", draft.process.bitrate, "2000", "number") : ""}
       ${showProcess ? renderTextModelField("帧率", "process.fps", draft.process.fps, "25", "number") : ""}
       ${showProcess ? renderTextModelField("GOP", "process.gop", draft.process.gop, "50", "number") : ""}
-      ${showPublishKindSelect ? renderSelectModelField("直接输出目标", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value ? publishKindLabel(value) : "仅内部流（不额外输出）") : renderStaticModelField("直接输出目标", publishKindLabel(publishKind, "仅内部流"))}
+      ${showStreamSettings ? renderTextModelField("流应用名", "stream.app", draft.stream.app, "live") : ""}
+      ${showStreamSettings ? renderTextModelField("流名称", "stream.name", draft.stream.name, "默认使用 task_id") : ""}
+      ${showStreamSettings ? renderTextModelField("流虚拟主机", "stream.vhost", draft.stream.vhost, "__defaultVhost__") : ""}
+      ${showPublishKindSelect ? renderSelectModelField("直接输出目标", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value ? publishKindLabel(value) : "请选择") : (!showStreamSettings ? renderStaticModelField("直接输出目标", publishKindLabel(publishKind, "未设置")) : "")}
       ${showPublishUrl ? renderTextModelField(publishTargetLabel, "publish.url", draft.publish.url, publishTargetPlaceholder) : ""}
       ${showPublishNetwork ? renderTextModelField("发布组播地址", "publish.group", draft.publish.group, "239.1.1.10") : ""}
       ${showPublishNetwork ? renderTextModelField("发布端口", "publish.port", draft.publish.port, "1234", "number") : ""}
@@ -3096,25 +3086,22 @@ function renderCreateProcessStep(draft) {
       ${showPublishNetwork ? renderTextModelField("发布本地地址", "publish.interface_ip", draft.publish.interface_ip, "可选，本地发送地址") : ""}
       ${showPublishNetwork ? renderTextModelField("发布 TTL", "publish.ttl", draft.publish.ttl, "1", "number") : ""}
       ${showPublishUrl || showPublishNetwork ? renderTextModelField("输出封装格式（可选）", "publish.format", draft.publish.format, publishFormatPlaceholder) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("enable_rtsp", "publish.enable_rtsp", draft.publish.enable_rtsp) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("enable_rtmp", "publish.enable_rtmp", draft.publish.enable_rtmp) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("enable_http_ts", "publish.enable_http_ts", draft.publish.enable_http_ts) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("enable_http_fmp4", "publish.enable_http_fmp4", draft.publish.enable_http_fmp4) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("enable_hls", "publish.enable_hls", draft.publish.enable_hls) : ""}
-      ${showProtocolFlags ? renderCheckboxModelField("无人观看自动停止", "publish.stop_on_no_reader", draft.publish.stop_on_no_reader) : ""}
+      ${showExposeSettings ? renderCheckboxModelField("暴露 RTSP", "expose.enable_rtsp", draft.expose.enable_rtsp) : ""}
+      ${showExposeSettings ? renderCheckboxModelField("暴露 RTMP", "expose.enable_rtmp", draft.expose.enable_rtmp) : ""}
+      ${showExposeSettings ? renderCheckboxModelField("暴露 HTTP-TS", "expose.enable_http_ts", draft.expose.enable_http_ts) : ""}
+      ${showExposeSettings ? renderCheckboxModelField("暴露 HTTP-FMP4", "expose.enable_http_fmp4", draft.expose.enable_http_fmp4) : ""}
+      ${showExposeSettings ? renderCheckboxModelField("暴露 HLS", "expose.enable_hls", draft.expose.enable_hls) : ""}
+      ${showExposeSettings ? renderCheckboxModelField("无人观看自动停止", "expose.stop_on_no_reader", draft.expose.stop_on_no_reader) : ""}
     </div>
-    ${directOutputHint}
-    ${
-      showProtocolFlags
-        ? `<div class="subtle">这些 <code>publish.enable_*</code> 开关只控制内部流额外暴露哪些播放协议，不会新增一个直接输出目标。例：<code>input.kind=http_ts</code> 是 HTTP-TS 输入源，<code>publish.enable_http_ts=true</code> 是内部流暴露 HTTP-TS 播放地址。</div>`
-        : ""
-    }
+    ${outputHint}
   `;
 }
 
-function renderCreatePolicyStep(draft) {
+function renderCreateRecordStep(draft) {
+  if (draft.task_type !== "stream_ingest") {
+    return `<div class="subtle">当前任务类型不支持录制，已自动跳过。</div>`;
+  }
   const showRecordFields = Boolean(draft.record.enabled);
-  const startMode = draft.schedule.start_mode || "immediate";
   return `
     <div class="create-grid">
       ${renderCheckboxModelField("启用录制", "record.enabled", draft.record.enabled)}
@@ -3123,15 +3110,33 @@ function renderCreatePolicyStep(draft) {
       ${showRecordFields ? renderTextModelField("录制切片秒数", "record.segment_sec", draft.record.segment_sec, "60", "number") : ""}
       ${showRecordFields ? renderTextModelField("录制路径", "record.save_path", draft.record.save_path, "/data/zlm/record") : ""}
       ${showRecordFields ? renderCheckboxModelField("按播放器口径记账", "record.as_player", draft.record.as_player) : ""}
+    </div>
+    <div class="subtle">录制属于内部流能力，只对 <code>stream_ingest</code> 生效。在线源按现实时间计时，离线源按媒体时长截取。</div>
+  `;
+}
+
+function renderCreateRecoveryStep(draft) {
+  return `
+    <div class="create-grid">
       ${renderSelectModelField("恢复策略", "recovery.policy", ["", ...RECOVERY_POLICIES], draft.recovery.policy || "", (value) => value ? recoveryPolicyLabel(value) : "默认")}
       ${renderTextModelField("恢复模式", "recovery.resume_mode", draft.recovery.resume_mode, "auto")}
       ${renderTextModelField("最大连续失败", "recovery.max_consecutive_failures", draft.recovery.max_consecutive_failures, "3", "number")}
+    </div>
+    <div class="subtle">恢复策略只影响任务运行后的失败恢复，不决定任务创建后的首次启动时机。</div>
+  `;
+}
+
+function renderCreateScheduleStep(draft) {
+  const startMode = draft.schedule.start_mode || "immediate";
+  return `
+    <div class="create-grid">
       ${renderSelectModelField("启动模式", "schedule.start_mode", START_MODES, draft.schedule.start_mode, (value) => startModeLabel(value))}
       ${startMode === "at" ? renderTextModelField("指定启动时间", "schedule.start_at", draft.schedule.start_at, "2026-03-30T12:00:00Z") : ""}
       ${startMode === "cron" ? renderTextModelField("Cron 表达式", "schedule.cron", draft.schedule.cron, "0 */5 * * * *") : ""}
       ${renderTextareaModelField("必需标签", "resource.required_labels_text", draft.resource.required_labels_text, "逗号分隔")}
       ${renderTextareaModelField("优选标签", "resource.preferred_labels_text", draft.resource.preferred_labels_text, "逗号分隔")}
     </div>
+    <div class="subtle">启动模式控制任务创建后的首次启动时机；节点标签用于调度阶段筛选和倾向节点。</div>
   `;
 }
 
@@ -3262,7 +3267,6 @@ async function handleClick(event) {
         if (!canAccess("task_write")) {
           return;
         }
-        await ensureTemplatesLoaded();
         state.ui.createOpen = true;
         state.ui.createError = null;
         renderApp({ chrome: false, page: false, overlays: true, toasts: false });
@@ -3276,11 +3280,15 @@ async function handleClick(event) {
         renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
       case "create-next-step":
-        if (state.ui.createStep === 6 && !state.ui.createPreview) {
-          await requestTaskPreview();
-        }
-        if (state.ui.createStep < 7) {
-          state.ui.createStep += 1;
+        {
+          const steps = getCreateWizardSteps(state.ui.createDraft);
+          const currentStep = steps[Math.max(1, Math.min(state.ui.createStep, steps.length)) - 1]?.id;
+          if (currentStep === "preview" && !state.ui.createPreview) {
+            await requestTaskPreview();
+          }
+          if (state.ui.createStep < steps.length) {
+            state.ui.createStep += 1;
+          }
         }
         renderApp({ chrome: false, page: false, overlays: true, toasts: false });
         break;
@@ -3436,9 +3444,6 @@ async function handleChange(event) {
       if (shouldRerenderCreateModalOnModelChange(target)) {
         renderApp({ chrome: false, page: false, overlays: true, toasts: false });
       }
-      if (target.dataset.model === "template" && target instanceof HTMLSelectElement) {
-        await applySelectedTemplate(target.value);
-      }
     }
     if (target.id === "debug-node-id" && target instanceof HTMLSelectElement) {
       state.ui.debug.nodeId = target.value;
@@ -3487,7 +3492,10 @@ function updateCreateDraftFromElement(target) {
   setPath(state.ui.createDraft, path, value);
   if (path === "task_type") {
     normalizeDraftForTaskType(state.ui.createDraft, value);
-    state.ui.createDraft.template = "";
+  }
+  if (path === "input.kind") {
+    const fixedSourceMode = defaultSourceModeForInputKind(value);
+    state.ui.createDraft.input.source_mode = fixedSourceMode || "";
   }
   state.ui.createPreview = null;
   state.ui.createError = null;
@@ -3632,50 +3640,6 @@ async function fetchNodesCached(force) {
   const nodes = await apiRequest("/api/v1/nodes");
   state.cache.nodes = nodes;
   return nodes;
-}
-
-async function fetchTemplatesCached(force) {
-  if (!force && state.cache.templates) {
-    return state.cache.templates;
-  }
-  const templates = await apiRequest("/api/v1/templates");
-  state.cache.templates = templates;
-  return templates;
-}
-
-async function fetchTemplateDetail(templateId, force) {
-  if (!force && state.cache.templateDetails.has(templateId)) {
-    return state.cache.templateDetails.get(templateId);
-  }
-  const detail = await apiRequest(`/api/v1/templates/${templateId}`);
-  state.cache.templateDetails.set(templateId, detail);
-  return detail;
-}
-
-async function ensureTemplatesLoaded() {
-  if (!canAccess("template_read")) {
-    state.cache.templates = [];
-    return [];
-  }
-  return await fetchTemplatesCached(true);
-}
-
-async function applySelectedTemplate(templateName) {
-  if (!templateName) {
-    return;
-  }
-  const summary = (state.cache.templates || []).find((item) => item.name === templateName);
-  if (!summary) {
-    return;
-  }
-  const detail = await fetchTemplateDetail(summary.id, false);
-  applyTaskSpecDefaultsToDraft(state.ui.createDraft, detail.default_spec || {});
-  if (detail.profile) {
-    state.ui.createDraft.profile = detail.profile;
-  }
-  state.ui.createPreview = null;
-  state.ui.createError = null;
-  renderApp({ chrome: false, page: false, overlays: true, toasts: false });
 }
 
 async function performTaskAction(taskId, action) {
@@ -3959,6 +3923,8 @@ function buildDraftPayload(draft) {
     common: {},
     input: {},
     process: {},
+    stream: {},
+    expose: {},
     publish: {},
     record: {},
     recovery: {},
@@ -3966,14 +3932,12 @@ function buildDraftPayload(draft) {
     resource: {},
   };
 
-  setIfPresent(payload, "template", draft.template);
-  setIfPresent(payload, "profile", draft.profile);
-
   setIfPresent(payload.common, "created_by", draft.common.created_by);
   setIfPresent(payload.common, "callback_url", draft.common.callback_url);
   setIfList(payload.common, "labels", draft.common.labels_text);
 
   setIfPresent(payload.input, "kind", draft.input.kind);
+  setIfPresent(payload.input, "source_mode", draft.input.source_mode);
   setIfPresent(payload.input, "url", draft.input.url);
   setIfPresent(payload.input, "group", draft.input.group);
   setIfNumber(payload.input, "port", draft.input.port);
@@ -3990,6 +3954,17 @@ function buildDraftPayload(draft) {
   setIfNumber(payload.process, "fps", draft.process.fps);
   setIfNumber(payload.process, "gop", draft.process.gop);
 
+  setIfPresent(payload.stream, "app", draft.stream.app);
+  setIfPresent(payload.stream, "name", draft.stream.name);
+  setIfPresent(payload.stream, "vhost", draft.stream.vhost);
+
+  setIfBoolean(payload.expose, "enable_rtsp", draft.expose.enable_rtsp);
+  setIfBoolean(payload.expose, "enable_rtmp", draft.expose.enable_rtmp);
+  setIfBoolean(payload.expose, "enable_http_ts", draft.expose.enable_http_ts);
+  setIfBoolean(payload.expose, "enable_http_fmp4", draft.expose.enable_http_fmp4);
+  setIfBoolean(payload.expose, "enable_hls", draft.expose.enable_hls);
+  setIfBoolean(payload.expose, "stop_on_no_reader", draft.expose.stop_on_no_reader);
+
   setIfPresent(payload.publish, "kind", draft.publish.kind);
   setIfPresent(payload.publish, "url", draft.publish.url);
   setIfPresent(payload.publish, "group", draft.publish.group);
@@ -3998,12 +3973,6 @@ function buildDraftPayload(draft) {
   setIfPresent(payload.publish, "interface_ip", draft.publish.interface_ip);
   setIfNumber(payload.publish, "ttl", draft.publish.ttl);
   setIfPresent(payload.publish, "format", draft.publish.format);
-  setIfBoolean(payload.publish, "enable_rtsp", draft.publish.enable_rtsp);
-  setIfBoolean(payload.publish, "enable_rtmp", draft.publish.enable_rtmp);
-  setIfBoolean(payload.publish, "enable_http_ts", draft.publish.enable_http_ts);
-  setIfBoolean(payload.publish, "enable_http_fmp4", draft.publish.enable_http_fmp4);
-  setIfBoolean(payload.publish, "enable_hls", draft.publish.enable_hls);
-  setIfBoolean(payload.publish, "stop_on_no_reader", draft.publish.stop_on_no_reader);
 
   setIfBoolean(payload.record, "enabled", draft.record.enabled);
   setIfPresent(payload.record, "format", draft.record.format);
@@ -4031,9 +4000,7 @@ function buildDraftPayload(draft) {
 
 function createDefaultDraft() {
   const draft = {
-    task_type: "live_relay",
-    template: "",
-    profile: "",
+    task_type: "stream_ingest",
     name: "",
     priority: "50",
     advanced_json: "{}",
@@ -4044,6 +4011,7 @@ function createDefaultDraft() {
     },
     input: {
       kind: "rtsp",
+      source_mode: "live",
       url: "",
       group: "",
       port: "",
@@ -4061,6 +4029,19 @@ function createDefaultDraft() {
       fps: "",
       gop: "",
     },
+    stream: {
+      app: "live",
+      name: "",
+      vhost: "__defaultVhost__",
+    },
+    expose: {
+      enable_rtsp: true,
+      enable_rtmp: true,
+      enable_http_ts: true,
+      enable_http_fmp4: true,
+      enable_hls: false,
+      stop_on_no_reader: false,
+    },
     publish: {
       kind: "",
       url: "",
@@ -4070,12 +4051,6 @@ function createDefaultDraft() {
       interface_ip: "",
       ttl: "",
       format: "",
-      enable_rtsp: true,
-      enable_rtmp: true,
-      enable_http_ts: true,
-      enable_http_fmp4: true,
-      enable_hls: false,
-      stop_on_no_reader: false,
     },
     record: {
       enabled: false,
@@ -4106,28 +4081,50 @@ function createDefaultDraft() {
 
 function normalizeDraftForTaskType(draft, taskType) {
   draft.task_type = taskType;
-  switch (taskType) {
-    case "file_transcode":
+  if (taskType === "file_transcode") {
+    if (!["file", "http_mp4", "hls", "http_ts"].includes(draft.input.kind)) {
       draft.input.kind = "file";
-      draft.publish.kind = "file";
-      break;
-    case "file_to_live":
-      draft.input.kind = draft.input.kind || "file";
-      draft.publish.kind = "zlm_ingest";
-      break;
-    case "multicast_bridge":
-      draft.input.kind = "udp_mpegts_multicast";
-      draft.publish.kind = "zlm_ingest";
-      break;
-    case "rtp_receive":
-      draft.input.kind = "gb_rtp";
-      draft.publish.kind = "";
-      break;
-    default:
-      draft.input.kind = draft.input.kind || "rtsp";
-      draft.publish.kind = draft.publish.kind || "";
-      break;
+    }
+    draft.publish.kind = "file";
+    draft.record.enabled = false;
+  } else if (taskType === "stream_bridge") {
+    if (draft.input.kind === "gb_rtp" || !draft.input.kind) {
+      draft.input.kind = "rtsp";
+    }
+    draft.publish.kind = draft.publish.kind || "file";
+    draft.record.enabled = false;
+  } else {
+    draft.input.kind = draft.input.kind || "rtsp";
+    draft.publish.kind = "";
   }
+
+  const fixedSourceMode = defaultSourceModeForInputKind(draft.input.kind);
+  if (fixedSourceMode) {
+    draft.input.source_mode = fixedSourceMode;
+  } else if (!["live", "vod"].includes(draft.input.source_mode)) {
+    draft.input.source_mode = "";
+  }
+}
+
+function defaultSourceModeForInputKind(kind) {
+  switch (kind) {
+    case "rtsp":
+    case "rtmp":
+    case "http_flv":
+    case "udp_mpegts_multicast":
+    case "rtp_multicast":
+    case "gb_rtp":
+      return "live";
+    case "file":
+    case "http_mp4":
+      return "vod";
+    default:
+      return "";
+  }
+}
+
+function inputKindSupportsExplicitSourceMode(kind) {
+  return kind === "hls" || kind === "http_ts";
 }
 
 function listGpuDevices(node) {
@@ -5167,7 +5164,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     normalizeDraftForTaskType(draft, String(spec.type));
   }
   if (spec.name !== undefined) draft.name = String(spec.name || "");
-  if (spec.profile !== undefined) draft.profile = String(spec.profile || "");
   if (spec.priority !== undefined) draft.priority = String(spec.priority ?? "");
   applyDraftSectionDefaults(draft.common, spec.common, {
     created_by: "string",
@@ -5176,6 +5172,7 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
   });
   applyDraftSectionDefaults(draft.input, spec.input, {
     kind: "string",
+    source_mode: "string",
     url: "string",
     group: "string",
     port: "number",
@@ -5193,6 +5190,19 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     fps: "number",
     gop: "number",
   });
+  applyDraftSectionDefaults(draft.stream, spec.stream, {
+    app: "string",
+    name: "string",
+    vhost: "string",
+  });
+  applyDraftSectionDefaults(draft.expose, spec.expose, {
+    enable_rtsp: "boolean",
+    enable_rtmp: "boolean",
+    enable_http_ts: "boolean",
+    enable_http_fmp4: "boolean",
+    enable_hls: "boolean",
+    stop_on_no_reader: "boolean",
+  });
   applyDraftSectionDefaults(draft.publish, spec.publish, {
     kind: "string",
     url: "string",
@@ -5202,12 +5212,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
     interface_ip: "string",
     ttl: "number",
     format: "string",
-    enable_rtsp: "boolean",
-    enable_rtmp: "boolean",
-    enable_http_ts: "boolean",
-    enable_http_fmp4: "boolean",
-    enable_hls: "boolean",
-    stop_on_no_reader: "boolean",
   });
   applyDraftSectionDefaults(draft.record, spec.record, {
     enabled: "boolean",
@@ -5322,6 +5326,14 @@ function publishKindLabel(value, fallback = "未设置") {
   return labelFor("publishKind", value, fallback);
 }
 
+function sourceModeLabel(value, fallback = "未设置") {
+  return labelFor("sourceMode", value, fallback);
+}
+
+function processModeLabel(value, fallback = "未设置") {
+  return labelFor("processMode", value, fallback);
+}
+
 function startModeLabel(value, fallback = "未设置") {
   return labelFor("startMode", value, fallback);
 }
@@ -5332,10 +5344,6 @@ function recordFormatLabel(value, fallback = "未设置") {
 
 function recoveryPolicyLabel(value, fallback = "未设置") {
   return labelFor("recoveryPolicy", value, fallback);
-}
-
-function profileLabel(value, fallback = "未设置") {
-  return labelFor("profile", value, fallback);
 }
 
 function taskStatusLabel(value, fallback = "未设置") {

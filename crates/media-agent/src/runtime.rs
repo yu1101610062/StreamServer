@@ -17,8 +17,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use media_domain::{
-    InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy, RuntimeHandle,
-    RuntimeState, TaskSpec, TaskType, WorkerKind,
+    ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy,
+    RuntimeHandle, RuntimeState, SourceMode, TaskSpec, TaskType, WorkerKind,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -218,6 +218,13 @@ struct StartupProbe {
     stream: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskRuntimeMode {
+    ManagedProcess,
+    ZlmProxy,
+    ZlmRtpServer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ZlmRecordKind {
@@ -262,7 +269,6 @@ const STARTUP_PROBE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const ZLM_RUNTIME_VHOST: &str = "__defaultVhost__";
-const LIVE_RELAY_APP: &str = "relay";
 
 #[derive(Debug, Clone)]
 pub enum RuntimeNotification {
@@ -340,10 +346,11 @@ impl LocalExecutor for ManagedProcessExecutor {
             }
         }
 
-        match request.task_type {
-            TaskType::LiveRelay => self.start_live_relay_task(request),
-            TaskType::RtpReceive => self.start_rtp_receive_task(request),
-            _ => self.start_process_task(request),
+        let spec = parse_task_spec(request)?;
+        match task_runtime_mode(&spec) {
+            TaskRuntimeMode::ZlmProxy => self.start_live_relay_task(request),
+            TaskRuntimeMode::ZlmRtpServer => self.start_rtp_receive_task(request),
+            TaskRuntimeMode::ManagedProcess => self.start_process_task(request),
         }
     }
 
@@ -366,7 +373,6 @@ impl LocalExecutor for ManagedProcessExecutor {
                 attempt_no: request.attempt_no,
             })?;
 
-        let task_type = task_type_from_handle(&handle);
         runtime.stop_requested.store(true, Ordering::Relaxed);
         let registry = self.registry.clone();
         let runtime_id = handle.runtime_id;
@@ -395,10 +401,16 @@ impl LocalExecutor for ManagedProcessExecutor {
         if let Some(pid) = runtime.pid {
             signal_pid(pid, libc::SIGTERM)
                 .map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
-        } else if matches!(task_type, Some(TaskType::LiveRelay)) {
+        } else if matches!(
+            task_runtime_mode_from_handle(&handle),
+            Some(TaskRuntimeMode::ZlmProxy)
+        ) {
             self.stop_live_relay_recording(&handle)?;
             self.close_live_relay(&handle, true)?;
-        } else if matches!(task_type, Some(TaskType::RtpReceive)) {
+        } else if matches!(
+            task_runtime_mode_from_handle(&handle),
+            Some(TaskRuntimeMode::ZlmRtpServer)
+        ) {
             let stopping_handle = self.registry.get(runtime_id).unwrap_or(handle.clone());
             let work_dir = attempt_work_dir(&self.settings, request.task_id, request.attempt_no);
             let _ = persist_runtime_state(
@@ -440,7 +452,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                     attempt_no: exited_handle.attempt_no,
                     event_type: "canceled".to_string(),
                     event_level: "info".to_string(),
-                    message: "rtp_receive server stopped".to_string(),
+                    message: "stream_ingest rtp server stopped".to_string(),
                     payload: json!({
                         "runtime_id": exited_handle.runtime_id,
                         "rtp_stream_id": rtp_stream_id_from_handle(&exited_handle),
@@ -544,8 +556,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                 continue;
             }
 
-            match task_type_from_handle(&persisted.handle) {
-                Some(TaskType::RtpReceive) => {
+            match task_runtime_mode_from_handle(&persisted.handle) {
+                Some(TaskRuntimeMode::ZlmRtpServer) => {
                     let Some(rtp_server) = rtp_server_from_handle(&persisted.handle) else {
                         continue;
                     };
@@ -584,7 +596,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                                     attempt_no: handle.attempt_no,
                                     event_type: "adopted".to_string(),
                                     event_level: "info".to_string(),
-                                    message: "reattached persisted rtp_receive runtime".to_string(),
+                                    message: "reattached persisted stream_ingest rtp runtime"
+                                        .to_string(),
                                     payload: json!({
                                         "runtime_id": handle.runtime_id,
                                         "orphaned": true,
@@ -619,15 +632,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                     seen.insert(key);
                     continue;
                 }
-                Some(TaskType::LiveRelay) => {}
+                Some(TaskRuntimeMode::ZlmProxy) => {}
                 _ => continue,
-            }
-
-            if !matches!(
-                task_type_from_handle(&persisted.handle),
-                Some(TaskType::LiveRelay)
-            ) {
-                continue;
             }
 
             let Some(startup_probe) = startup_probe_from_handle(&persisted.handle) else {
@@ -669,7 +675,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                         attempt_no: handle.attempt_no,
                         event_type: "adopted".to_string(),
                         event_level: "info".to_string(),
-                        message: "reattached persisted live_relay runtime".to_string(),
+                        message: "reattached persisted stream_ingest runtime".to_string(),
                         payload: json!({
                             "runtime_id": handle.runtime_id,
                             "orphaned": true,
@@ -740,7 +746,7 @@ impl ManagedProcessExecutor {
             runtime_id,
             task_id: request.task_id,
             attempt_no: request.attempt_no,
-            worker_kind: request.task_type.default_worker_kind(),
+            worker_kind: WorkerKind::ZlmProxy,
             pid: Some(pid),
             started_at: Utc::now(),
             last_progress_at: None,
@@ -1152,7 +1158,7 @@ impl ManagedProcessExecutor {
                 attempt_no: handle.attempt_no,
                 event_type: "zlm_proxy_created".to_string(),
                 event_level: "info".to_string(),
-                message: "live_relay proxy created in ZLM".to_string(),
+                message: "stream_ingest proxy created in ZLM".to_string(),
                 payload: json!({
                     "runtime_id": handle.runtime_id,
                     "vhost": plan.startup_probe.vhost,
@@ -1201,7 +1207,7 @@ impl ManagedProcessExecutor {
             runtime_id,
             task_id: request.task_id,
             attempt_no: request.attempt_no,
-            worker_kind: request.task_type.default_worker_kind(),
+            worker_kind: WorkerKind::ZlmRtpServer,
             pid: None,
             started_at: Utc::now(),
             last_progress_at: None,
@@ -1241,7 +1247,7 @@ impl ManagedProcessExecutor {
                 attempt_no: handle.attempt_no,
                 event_type: "rtp_server_opened".to_string(),
                 event_level: "info".to_string(),
-                message: "rtp_receive server opened in ZLM".to_string(),
+                message: "stream_ingest rtp server opened in ZLM".to_string(),
                 payload: json!({
                     "runtime_id": handle.runtime_id,
                     "rtp_stream_id": handle.metadata["rtp_stream_id"],
@@ -1483,11 +1489,15 @@ fn build_process_plan(
 
     match request.task_type {
         TaskType::FileTranscode => build_file_transcode_plan(settings, request, &spec),
-        TaskType::FileToLive => build_file_to_live_plan(settings, request, &spec),
-        TaskType::MulticastBridge => build_multicast_bridge_plan(settings, request, &spec),
-        other => Err(ExecutorError::InvalidRequest(format!(
-            "task type {other} is not yet supported by the managed executor"
-        ))),
+        TaskType::StreamBridge => build_multicast_bridge_plan(settings, request, &spec),
+        TaskType::StreamIngest => {
+            if task_runtime_mode(&spec) != TaskRuntimeMode::ManagedProcess {
+                return Err(ExecutorError::InvalidRequest(
+                    "stream_ingest task should not run in the managed process executor".to_string(),
+                ));
+            }
+            build_file_to_live_plan(settings, request, &spec)
+        }
     }
 }
 
@@ -1495,6 +1505,22 @@ fn parse_task_spec(request: &StartTaskRequest) -> Result<TaskSpec, ExecutorError
     serde_json::from_value(request.resolved_spec.clone()).map_err(|error| {
         ExecutorError::InvalidRequest(format!("invalid resolved_spec for task execution: {error}"))
     })
+}
+
+fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
+    match spec.task_type {
+        TaskType::FileTranscode | TaskType::StreamBridge => TaskRuntimeMode::ManagedProcess,
+        TaskType::StreamIngest => match (spec.input.kind, spec.input.source_mode) {
+            (Some(InputKind::GbRtp), _) => TaskRuntimeMode::ZlmRtpServer,
+            (Some(InputKind::Rtsp | InputKind::Rtmp | InputKind::HttpFlv), _) => {
+                TaskRuntimeMode::ZlmProxy
+            }
+            (Some(InputKind::Hls | InputKind::HttpTs), Some(SourceMode::Live)) => {
+                TaskRuntimeMode::ZlmProxy
+            }
+            _ => TaskRuntimeMode::ManagedProcess,
+        },
+    }
 }
 
 const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
@@ -1613,19 +1639,10 @@ fn build_file_to_live_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<ProcessPlan, ExecutorError> {
-    let input_url = match spec.input.kind {
-        Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs) => {
-            build_input_url(settings, &spec.input)?
-        }
-        _ => {
-            return Err(ExecutorError::InvalidRequest(
-                "file_to_live requires input.kind=file|http_mp4|hls|http_ts".to_string(),
-            ));
-        }
-    };
+    let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let publish_output = build_publish_output(settings, &spec.publish)?;
-    let startup_probe = build_startup_probe(&spec.publish)?;
+    let startup_probe = build_startup_probe(request.task_id, spec)?;
+    let publish_output = build_internal_stream_output(settings, &startup_probe);
     let mut outputs = vec![publish_output.target.clone()];
     let mut success_check = publish_output.success_check.clone();
     let mut recording = None;
@@ -1708,10 +1725,13 @@ fn build_multicast_bridge_plan(
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
     let output = build_publish_output(settings, &spec.publish)?;
-    let startup_probe = matches!(spec.publish.kind, Some(PublishTargetKind::ZlmIngest))
-        .then(|| build_startup_probe(&spec.publish))
-        .transpose()?;
-    let mut args = ffmpeg_base_args(input_url.clone(), false);
+    let startup_probe = None;
+    let realtime = spec.input.source_mode == Some(SourceMode::Vod)
+        && matches!(
+            spec.publish.kind,
+            Some(PublishTargetKind::UdpMpegtsMulticast | PublishTargetKind::RtpMulticast)
+        );
+    let mut args = ffmpeg_base_args(input_url.clone(), realtime);
     insert_ffmpeg_input_args(
         &mut args,
         vec![
@@ -1825,32 +1845,8 @@ fn build_live_relay_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<LiveRelayPlan, ExecutorError> {
-    let input_url = match spec.input.kind {
-        Some(
-            InputKind::Rtsp
-            | InputKind::Rtmp
-            | InputKind::Hls
-            | InputKind::HttpFlv
-            | InputKind::HttpTs,
-        ) => required_nonempty("input.url", spec.input.url.as_deref())?,
-        Some(_) => {
-            return Err(ExecutorError::InvalidRequest(
-                "live_relay requires a network input kind".to_string(),
-            ));
-        }
-        None => {
-            return Err(ExecutorError::InvalidRequest(
-                "input.kind must be provided for live_relay".to_string(),
-            ));
-        }
-    };
-
-    let startup_probe = StartupProbe {
-        schema: Some(preferred_publish_schema(&spec.publish)),
-        vhost: ZLM_RUNTIME_VHOST.to_string(),
-        app: LIVE_RELAY_APP.to_string(),
-        stream: request.task_id.to_string(),
-    };
+    let input_url = required_nonempty("input.url", spec.input.url.as_deref())?;
+    let startup_probe = build_startup_probe(request.task_id, spec)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
     let recording = build_live_relay_recording(spec, &work_dir)?;
     let command_line = format!(
@@ -1880,9 +1876,9 @@ fn build_rtp_receive_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<RtpReceivePlan, ExecutorError> {
-    if spec.input.kind != Some(InputKind::GbRtp) {
+    if spec.task_type != TaskType::StreamIngest || spec.input.kind != Some(InputKind::GbRtp) {
         return Err(ExecutorError::InvalidRequest(
-            "rtp_receive requires input.kind=gb_rtp".to_string(),
+            "stream_ingest rtp mode requires input.kind=gb_rtp".to_string(),
         ));
     }
     let requested_port = spec
@@ -2243,6 +2239,22 @@ struct PublishOutput {
     success_check: SuccessCheck,
 }
 
+fn build_internal_stream_output(settings: &AgentSettings, probe: &StartupProbe) -> PublishOutput {
+    PublishOutput {
+        success_check: SuccessCheck::ProcessExit,
+        target: build_internal_stream_target(settings, probe),
+        format: probe.schema.clone().unwrap_or_else(|| "flv".to_string()),
+    }
+}
+
+fn build_internal_stream_target(settings: &AgentSettings, probe: &StartupProbe) -> String {
+    let host = Url::parse(&settings.zlm_api_base)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("rtmp://{host}/{}/{}", probe.app, probe.stream)
+}
+
 fn build_publish_output(
     settings: &AgentSettings,
     publish: &PublishSpec,
@@ -2256,18 +2268,6 @@ fn build_publish_output(
                 .unwrap_or_else(|| infer_file_output_format(&target, "mpegts"));
             Ok(PublishOutput {
                 success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
-                target,
-                format,
-            })
-        }
-        Some(PublishTargetKind::ZlmIngest) => {
-            let target = required_nonempty("publish.url", publish.url.as_deref())?;
-            let format = publish
-                .format
-                .clone()
-                .unwrap_or_else(|| infer_url_output_format(&target));
-            Ok(PublishOutput {
-                success_check: SuccessCheck::ProcessExit,
                 target,
                 format,
             })
@@ -2419,23 +2419,23 @@ fn build_live_relay_api_params(
         ("modify_stamp".to_string(), "2".to_string()),
         (
             "enable_rtsp".to_string(),
-            bool_as_flag(spec.publish.enable_rtsp.unwrap_or(true)),
+            bool_as_flag(spec.expose.enable_rtsp.unwrap_or(true)),
         ),
         (
             "enable_rtmp".to_string(),
-            bool_as_flag(spec.publish.enable_rtmp.unwrap_or(true)),
+            bool_as_flag(spec.expose.enable_rtmp.unwrap_or(true)),
         ),
         (
             "enable_hls".to_string(),
-            bool_as_flag(spec.publish.enable_hls.unwrap_or(false) || spec.record.wants_hls()),
+            bool_as_flag(spec.expose.enable_hls.unwrap_or(false) || spec.record.wants_hls()),
         ),
         (
             "enable_ts".to_string(),
-            bool_as_flag(spec.publish.enable_http_ts.unwrap_or(true)),
+            bool_as_flag(spec.expose.enable_http_ts.unwrap_or(true)),
         ),
         (
             "enable_fmp4".to_string(),
-            bool_as_flag(spec.publish.enable_http_fmp4.unwrap_or(true)),
+            bool_as_flag(spec.expose.enable_http_fmp4.unwrap_or(true)),
         ),
         (
             "enable_mp4".to_string(),
@@ -2542,45 +2542,45 @@ fn normalize_record_root_path(root: &Path) -> String {
     }
 }
 
-fn build_startup_probe(publish: &PublishSpec) -> Result<StartupProbe, ExecutorError> {
-    let url = required_nonempty("publish.url", publish.url.as_deref())?;
-    let url = Url::parse(&url).map_err(|error| {
-        ExecutorError::InvalidRequest(format!("publish.url must be a valid URL: {error}"))
-    })?;
-    let mut segments = url
-        .path_segments()
-        .ok_or_else(|| {
-            ExecutorError::InvalidRequest(
-                "publish.url must include /<app>/<stream> path segments".to_string(),
-            )
-        })?
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.len() < 2 {
-        return Err(ExecutorError::InvalidRequest(
-            "publish.url must include /<app>/<stream> path segments".to_string(),
-        ));
-    }
-    let stream = segments.pop().expect("checked len").to_string();
-    let app = segments.pop().expect("checked len").to_string();
+fn build_startup_probe(task_id: Uuid, spec: &TaskSpec) -> Result<StartupProbe, ExecutorError> {
+    let app = spec
+        .stream
+        .app
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("live")
+        .to_string();
+    let stream = spec
+        .stream
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| task_id.to_string());
     Ok(StartupProbe {
-        schema: Some(url.scheme().to_ascii_lowercase()),
-        vhost: ZLM_RUNTIME_VHOST.to_string(),
+        schema: Some(preferred_publish_schema(&spec.expose)),
+        vhost: spec
+            .stream
+            .vhost
+            .clone()
+            .unwrap_or_else(|| ZLM_RUNTIME_VHOST.to_string()),
         app,
         stream,
     })
 }
 
-fn preferred_publish_schema(publish: &PublishSpec) -> String {
-    if publish.enable_rtmp.unwrap_or(true) {
+fn preferred_publish_schema(expose: &ExposeSpec) -> String {
+    if expose.enable_rtmp.unwrap_or(true) {
         "rtmp".to_string()
-    } else if publish.enable_rtsp.unwrap_or(true) {
+    } else if expose.enable_rtsp.unwrap_or(true) {
         "rtsp".to_string()
-    } else if publish.enable_http_ts.unwrap_or(true) {
+    } else if expose.enable_http_ts.unwrap_or(true) {
         "ts".to_string()
-    } else if publish.enable_http_fmp4.unwrap_or(true) {
+    } else if expose.enable_http_fmp4.unwrap_or(true) {
         "fmp4".to_string()
-    } else if publish.enable_hls.unwrap_or(false) {
+    } else if expose.enable_hls.unwrap_or(false) {
         "hls".to_string()
     } else {
         "rtmp".to_string()
@@ -2687,20 +2687,6 @@ fn infer_file_output_format(path: &str, default_format: &str) -> String {
         Some("flv") => "flv".to_string(),
         Some("mov") => "mov".to_string(),
         _ => default_format.to_string(),
-    }
-}
-
-fn infer_url_output_format(url: &str) -> String {
-    match url
-        .split_once("://")
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("rtmp") | Some("rtmps") => "flv".to_string(),
-        Some("rtsp") => "rtsp".to_string(),
-        Some("udp") => "mpegts".to_string(),
-        Some("rtp") => "rtp_mpegts".to_string(),
-        _ => "flv".to_string(),
     }
 }
 
@@ -2843,7 +2829,7 @@ fn mark_recording_completion(
 }
 
 fn live_relay_auto_close_enabled(settings: &AgentSettings, spec: &TaskSpec) -> bool {
-    settings.zlm_auto_close_on_no_reader_enabled && spec.publish.stop_on_no_reader.unwrap_or(false)
+    settings.zlm_auto_close_on_no_reader_enabled && spec.expose.stop_on_no_reader.unwrap_or(false)
 }
 
 fn live_relay_auto_close_enabled_from_handle(
@@ -2874,7 +2860,8 @@ fn should_auto_restart_process(
     status: &Result<std::process::ExitStatus, std::io::Error>,
 ) -> bool {
     if was_stopped
-        || task_type_from_handle(handle) != Some(TaskType::FileToLive)
+        || task_type_from_handle(handle) != Some(TaskType::StreamIngest)
+        || task_runtime_mode_from_handle(handle) != Some(TaskRuntimeMode::ManagedProcess)
         || !stream_online(handle)
         || fatal_recording_error_from_handle(handle).is_some()
     {
@@ -2883,7 +2870,7 @@ fn should_auto_restart_process(
 
     if !matches!(
         recovery_policy_from_handle(handle),
-        Some(RecoveryPolicy::Always | RecoveryPolicy::OnFailure)
+        Some(RecoveryPolicy::Auto)
     ) {
         return false;
     }
@@ -4343,15 +4330,20 @@ fn classify_adopted_exit(
             }),
         ),
         SuccessCheck::ProcessExit => match task_type_from_handle(handle) {
-            Some(TaskType::FileToLive) => (
-                "succeeded",
-                "info",
-                "adopted file_to_live process exited; treating as completed".to_string(),
-                json!({
-                    "output_target": output_target,
-                    "orphaned": true,
-                }),
-            ),
+            Some(TaskType::StreamIngest)
+                if task_runtime_mode_from_handle(handle)
+                    == Some(TaskRuntimeMode::ManagedProcess) =>
+            {
+                (
+                    "succeeded",
+                    "info",
+                    "adopted stream_ingest process exited; treating as completed".to_string(),
+                    json!({
+                        "output_target": output_target,
+                        "orphaned": true,
+                    }),
+                )
+            }
             _ => (
                 "failed",
                 "error",
@@ -4371,6 +4363,18 @@ fn task_type_from_handle(handle: &RuntimeHandle) -> Option<TaskType> {
         .get("task_type")
         .and_then(Value::as_str)
         .and_then(|value| TaskType::from_str(value).ok())
+}
+
+fn resolved_spec_from_handle(handle: &RuntimeHandle) -> Option<TaskSpec> {
+    handle
+        .metadata
+        .get("resolved_spec")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskSpec>(value).ok())
+}
+
+fn task_runtime_mode_from_handle(handle: &RuntimeHandle) -> Option<TaskRuntimeMode> {
+    resolved_spec_from_handle(handle).map(|spec| task_runtime_mode(&spec))
 }
 
 fn startup_probe_from_handle(handle: &RuntimeHandle) -> Option<StartupProbe> {
@@ -4724,9 +4728,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
-            task_type: TaskType::MulticastBridge,
+            task_type: TaskType::StreamBridge,
             resolved_spec: json!({
-                "type": "multicast_bridge",
+                "type": "stream_bridge",
                 "name": "bridge",
                 "common": {"created_by": "tester"},
                 "input": {
@@ -4804,9 +4808,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
-            task_type: TaskType::MulticastBridge,
+            task_type: TaskType::StreamBridge,
             resolved_spec: json!({
-                "type": "multicast_bridge",
+                "type": "stream_bridge",
                 "name": "bridge-live-to-mcast",
                 "common": {"created_by": "tester"},
                 "input": {
@@ -4866,9 +4870,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
-            task_type: TaskType::MulticastBridge,
+            task_type: TaskType::StreamBridge,
             resolved_spec: json!({
-                "type": "multicast_bridge",
+                "type": "stream_bridge",
                 "name": "bridge-to-zlm",
                 "common": {"created_by": "tester"},
                 "input": {
@@ -4922,9 +4926,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
-            task_type: TaskType::MulticastBridge,
+            task_type: TaskType::StreamBridge,
             resolved_spec: json!({
-                "type": "multicast_bridge",
+                "type": "stream_bridge",
                 "name": "bridge-default-multicast",
                 "common": {"created_by": "tester"},
                 "input": {
@@ -5008,9 +5012,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
-            task_type: TaskType::FileToLive,
+            task_type: TaskType::StreamIngest,
             resolved_spec: json!({
-                "type": "file_to_live",
+                "type": "stream_ingest",
                 "name": "file-live",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "file", "url": "/tmp/input.mp4"},
@@ -5054,9 +5058,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
-            task_type: TaskType::FileToLive,
+            task_type: TaskType::StreamIngest,
             resolved_spec: json!({
-                "type": "file_to_live",
+                "type": "stream_ingest",
                 "name": "file-live-http",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "http_mp4", "url": "http://vod.example.com/archive.mp4"},
@@ -5099,9 +5103,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id,
             attempt_no: 1,
-            task_type: TaskType::LiveRelay,
+            task_type: TaskType::StreamIngest,
             resolved_spec: json!({
-                "type": "live_relay",
+                "type": "stream_ingest",
                 "name": "relay",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "rtsp", "url": "rtsp://camera.example/live"},
@@ -5140,7 +5144,7 @@ echo "{codec_name}"
         let mut settings = test_settings("/tmp/work");
         settings.zlm_auto_close_on_no_reader_enabled = true;
         let spec = serde_json::from_value::<TaskSpec>(json!({
-            "type": "live_relay",
+            "type": "stream_ingest",
             "name": "relay",
             "common": {"created_by": "tester"},
             "input": {"kind": "rtsp", "url": "rtsp://camera.example/live", "probe_timeout_ms": 7000},
@@ -5190,9 +5194,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::now_v7(),
             attempt_no: 1,
-            task_type: TaskType::LiveRelay,
+            task_type: TaskType::StreamIngest,
             resolved_spec: json!({
-                "type": "live_relay",
+                "type": "stream_ingest",
                 "name": "relay-record",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "rtsp", "url": "rtsp://camera.example/live"},
@@ -5342,9 +5346,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id,
             attempt_no: 3,
-            task_type: TaskType::RtpReceive,
+            task_type: TaskType::StreamIngest,
             resolved_spec: json!({
-                "type": "rtp_receive",
+                "type": "stream_ingest",
                 "name": "gb28181",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "gb_rtp", "port": 0},
@@ -5387,9 +5391,9 @@ echo "{codec_name}"
         let request = StartTaskRequest {
             task_id: Uuid::now_v7(),
             attempt_no: 1,
-            task_type: TaskType::RtpReceive,
+            task_type: TaskType::StreamIngest,
             resolved_spec: json!({
-                "type": "rtp_receive",
+                "type": "stream_ingest",
                 "name": "gb28181",
                 "common": {"created_by": "tester"},
                 "input": {

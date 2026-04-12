@@ -124,16 +124,7 @@ Agent 将其转换为 `task_progress` 事件。
 | `OUTPUT_BACKPRESSURE` | 某输出持续阻塞导致失败 |
 | `RESOURCE_EXHAUSTED` | CPU、内存、磁盘或句柄耗尽 |
 
-## 10. 内置 Profile
-
-| Profile | 默认策略 |
-| --- | --- |
-| `realtime_compat` | `H264 + AAC`，偏实时兼容 |
-| `archive_quality` | 优先 `copy`，失败再转码 |
-| `multicast_ts` | `mpegts + pkt_size=1316 + ttl=1 + reuse=true` |
-| `rtmp_hevc_ext` | 仅在模板显式声明时启用 |
-
-## 11. 产物收集
+## 10. 产物收集
 
 产物收集器固定支持：
 

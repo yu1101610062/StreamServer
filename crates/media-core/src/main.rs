@@ -36,8 +36,7 @@ use repository::{
     AuthUser, CreateTaskResult, HookEventListFilter, MachineAllowlistEntry, MachineAllowlistWrite,
     NewRefreshSession, NodeSummary, RecordListFilter, SecurityAuditEventRecord, StreamListFilter,
     TaskCloneOverride, TaskEventFilter, TaskListFilter, TaskLogFilter, TaskRepository,
-    TemplateCreateRequest, TemplateListFilter, ZlmPublishTaskRecord, ZlmRecordFileRecord,
-    ZlmStreamEventRecord, ZlmTaskEventHookRecord,
+    ZlmPublishTaskRecord, ZlmRecordFileRecord, ZlmStreamEventRecord, ZlmTaskEventHookRecord,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -221,9 +220,6 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/tasks/{id}/retry", post(retry_task))
         .route("/tasks/{id}/clone", post(clone_task))
-        .route("/templates", post(create_template).get(list_templates))
-        .route("/templates/{id}", get(get_template))
-        .route("/templates/{id}/render", post(render_template))
         .route("/streams", get(list_streams))
         .route("/records", get(list_records))
         .route("/transcode-artifacts", get(list_transcode_artifacts))
@@ -933,60 +929,6 @@ async fn get_task_logs(
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskRead).await?;
     Ok(Json(
         state.repository.list_task_logs(task_id, filter).await?,
-    ))
-}
-
-async fn create_template(
-    State(state): State<AppState>,
-    PeerAddress(peer): PeerAddress,
-    headers: HeaderMap,
-    Json(request): Json<TemplateCreateRequest>,
-) -> Result<(StatusCode, Json<repository::TaskTemplateDetail>), AppError> {
-    let principal =
-        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateWrite).await?;
-    let template = state
-        .repository
-        .create_template(request, principal.subject())
-        .await?;
-    Ok((StatusCode::CREATED, Json(template)))
-}
-
-async fn list_templates(
-    State(state): State<AppState>,
-    PeerAddress(peer): PeerAddress,
-    headers: HeaderMap,
-    Query(filter): Query<TemplateListFilter>,
-) -> Result<Json<Vec<repository::TaskTemplateSummary>>, AppError> {
-    let _principal =
-        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateRead).await?;
-    Ok(Json(state.repository.list_templates(filter).await?))
-}
-
-async fn get_template(
-    State(state): State<AppState>,
-    PeerAddress(peer): PeerAddress,
-    headers: HeaderMap,
-    Path(template_id): Path<Uuid>,
-) -> Result<Json<repository::TaskTemplateDetail>, AppError> {
-    let _principal =
-        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateRead).await?;
-    Ok(Json(state.repository.get_template(template_id).await?))
-}
-
-async fn render_template(
-    State(state): State<AppState>,
-    PeerAddress(peer): PeerAddress,
-    headers: HeaderMap,
-    Path(template_id): Path<Uuid>,
-    Json(overrides): Json<Value>,
-) -> Result<Json<Value>, AppError> {
-    let _principal =
-        authorize_business_request(&state, &headers, peer, ApiPermission::TemplateRead).await?;
-    Ok(Json(
-        state
-            .repository
-            .render_template(template_id, overrides)
-            .await?,
     ))
 }
 
@@ -1726,7 +1668,9 @@ async fn process_zlm_hook(
                         "failed to deserialize resolved_spec for on_publish: {error}"
                     ))
                 })?;
-                let is_rtp_receive = resolved_spec.task_type == media_domain::TaskType::RtpReceive;
+                let is_rtp_receive = resolved_spec.task_type
+                    == media_domain::TaskType::StreamIngest
+                    && resolved_spec.input.kind == Some(media_domain::InputKind::GbRtp);
                 let _ = state
                     .repository
                     .record_zlm_publish_hook(
@@ -2163,9 +2107,9 @@ fn build_publish_hook_response(
     auto_close_enabled: bool,
 ) -> serde_json::Value {
     let resolved = spec.cloned().map(|value| value.resolved());
-    let publish = resolved
+    let expose = resolved
         .as_ref()
-        .map(|value| &value.publish)
+        .map(|value| &value.expose)
         .cloned()
         .unwrap_or_default();
     let record = resolved
@@ -2179,17 +2123,17 @@ fn build_publish_hook_response(
         "msg": "success",
         "enable_audio": true,
         "add_mute_audio": true,
-        "enable_rtsp": publish.enable_rtsp.unwrap_or(true),
-        "enable_rtmp": publish.enable_rtmp.unwrap_or(true),
-        "enable_ts": publish.enable_http_ts.unwrap_or(true),
-        "enable_fmp4": publish.enable_http_fmp4.unwrap_or(true),
-        "enable_hls": publish.enable_hls.unwrap_or(false) || record.wants_hls(),
+        "enable_rtsp": expose.enable_rtsp.unwrap_or(true),
+        "enable_rtmp": expose.enable_rtmp.unwrap_or(true),
+        "enable_ts": expose.enable_http_ts.unwrap_or(true),
+        "enable_fmp4": expose.enable_http_fmp4.unwrap_or(true),
+        "enable_hls": expose.enable_hls.unwrap_or(false) || record.wants_hls(),
         "enable_hls_fmp4": false,
         "enable_mp4": record.wants_mp4(),
         "modify_stamp": 2,
         "continue_push_ms": 15_000,
         "mp4_as_player": record.as_player.unwrap_or(false),
-        "auto_close": auto_close_enabled && publish.stop_on_no_reader.unwrap_or(false),
+        "auto_close": auto_close_enabled && expose.stop_on_no_reader.unwrap_or(false),
         "stream_replace": "",
     })
 }
@@ -2887,11 +2831,11 @@ mod tests {
         sqlx::query(
             r#"
             insert into tasks (
-              id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, 'relay-camera-01', 'live_relay'::task_type, 'RUNNING'::task_status, null, null, $2,
+              $1, 'relay-camera-01', 'stream_ingest'::task_type, 'RUNNING'::task_status, $2,
               50, $3, $3, 'tester', $4,
               1, 'immediate', $5, $5, $5, null
             )
@@ -2960,11 +2904,11 @@ mod tests {
         sqlx::query(
             r#"
             insert into tasks (
-              id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, 'relay-camera-01', 'live_relay'::task_type, 'STARTING'::task_status, null, null, $2,
+              $1, 'relay-camera-01', 'stream_ingest'::task_type, 'STARTING'::task_status, $2,
               50, $3, $3, 'tester', $4,
               1, 'immediate', $5, $5, $5, null
             )
@@ -3126,11 +3070,11 @@ mod tests {
         sqlx::query(
             r#"
             insert into tasks (
-              id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, 'transcode-job-01', 'file_transcode'::task_type, 'RUNNING'::task_status, null, null, $2,
+              $1, 'transcode-job-01', 'file_transcode'::task_type, 'RUNNING'::task_status, $2,
               50, $3, $3, 'tester', $4,
               1, 'immediate', $5, $5, $5, null
             )
@@ -3174,16 +3118,17 @@ mod tests {
     fn sample_create_task_payload(start_mode: &str) -> serde_json::Value {
         json!({
             "name": "relay-camera-01",
-            "type": "live_relay",
+            "type": "stream_ingest",
             "priority": 50,
             "common": {
                 "created_by": "alice"
             },
             "input": {
                 "kind": "rtsp",
+                "source_mode": "live",
                 "url": "rtsp://192.168.1.10/live"
             },
-            "publish": {
+            "expose": {
                 "enable_rtsp": true,
                 "enable_rtmp": true
             },
@@ -3298,16 +3243,17 @@ mod tests {
         let first_body = serde_json::to_vec(&sample_create_task_payload("manual"))?;
         let second_body = serde_json::to_vec(&json!({
             "name": "relay-camera-02",
-            "type": "live_relay",
+            "type": "stream_ingest",
             "priority": 50,
             "common": {
                 "created_by": "alice"
             },
             "input": {
                 "kind": "rtsp",
+                "source_mode": "live",
                 "url": "rtsp://192.168.1.11/live"
             },
-            "publish": {
+            "expose": {
                 "enable_rtsp": true,
                 "enable_rtmp": true
             },
@@ -3368,7 +3314,7 @@ mod tests {
                     .header("Idempotency-Key", "task-create-invalid")
                     .body(Body::from(serde_json::to_vec(&json!({
                         "name": "",
-                        "type": "live_relay",
+                        "type": "stream_ingest",
                         "common": {
                             "created_by": ""
                         },
@@ -3442,7 +3388,6 @@ mod tests {
                     .body(Body::from(serde_json::to_vec(&json!({
                         "name": "relay-camera-01-copy",
                         "priority": 15,
-                        "profile": "archival",
                         "common": { "created_by": "bob" },
                         "schedule": { "start_mode": "manual" }
                     }))?))?,
@@ -3454,21 +3399,15 @@ mod tests {
 
         assert_eq!(body["name"], json!("relay-camera-01-copy"));
         assert_eq!(body["priority"], json!(15));
-        assert_eq!(body["profile"], json!("archival"));
         assert_eq!(body["status"], json!("CREATED"));
 
         let detail = repository.get_task(cloned_id).await?;
         assert_eq!(detail.task.name, "relay-camera-01-copy");
         assert_eq!(detail.task.priority, 15);
-        assert_eq!(detail.task.profile.as_deref(), Some("archival"));
         assert_eq!(detail.requested_spec["common"]["created_by"], json!("bob"));
         assert_eq!(
             detail.requested_spec["schedule"]["start_mode"],
             json!("manual")
-        );
-        assert_eq!(
-            detail.resolved_spec.as_ref().unwrap()["profile"],
-            json!("archival")
         );
 
         let source_detail = repository.get_task(source_task.id).await?;

@@ -87,12 +87,6 @@ impl IntoResponse for AppError {
                     format!("task {task_id} was not found"),
                     Value::Null,
                 ),
-                RepoError::TemplateNotFound(template_id) => (
-                    StatusCode::NOT_FOUND,
-                    "TEMPLATE_NOT_FOUND",
-                    format!("template {template_id} was not found"),
-                    Value::Null,
-                ),
                 RepoError::TaskMissingResolvedSpec(task_id) => (
                     StatusCode::CONFLICT,
                     "TASK_MISSING_RESOLVED_SPEC",

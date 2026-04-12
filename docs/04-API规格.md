@@ -92,8 +92,7 @@
 ```json
 {
   "name": "relay-camera-01",
-  "type": "live_relay",
-  "template": "tpl_default_rtsp",
+  "type": "stream_ingest",
   "priority": 50,
   "common": {
     "tenant_id": "default",
@@ -101,9 +100,14 @@
   },
   "input": {
     "kind": "rtsp",
+    "source_mode": "live",
     "url": "rtsp://camera.example/live"
   },
-  "publish": {
+  "stream": {
+    "app": "live",
+    "name": "relay-camera-01"
+  },
+  "expose": {
     "enable_rtsp": true,
     "enable_rtmp": true
   },
@@ -119,64 +123,33 @@
 能力边界说明：
 
 - `input.kind` 表示任务直接接收的输入源类型。
-- `publish.kind` 表示任务直接写出的目标类型；当前只支持 `file`、`zlm_ingest`、`udp_mpegts_multicast`、`rtp_multicast`。
-- `publish.enable_*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
-- 例如 `input.kind=http_ts` 表示“HTTP-TS 作为输入源”，`publish.enable_http_ts=true` 表示“内部流额外暴露 HTTP-TS 播放地址”，两者不是同一件事。
-- `record.duration_sec` 表示总录制时长：`file_to_live` 按媒体时间截取，`live_relay` 按现实时间计时；到点后任务整体成功结束。
+- `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；其他输入类型按规则自动推断。
+- `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
+- `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
+- `publish.kind` 表示任务直接写出的外部目标类型；当前只支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`。
+- `record.duration_sec` 表示总录制时长：`stream_ingest + source_mode=vod` 按媒体时间截取，`stream_ingest + source_mode=live` 按现实时间计时；到点后任务整体成功结束。
 
 当前能力矩阵：
 
-| 任务类型 | 支持的 `input.kind` | 支持的 `publish.kind` | 支持的 `publish.enable_*` 播放协议暴露 |
+| 任务类型 | 支持的 `input.kind` | 支持的 `publish.kind` | 支持的内部流协议暴露 |
 | --- | --- | --- | --- |
-| `live_relay` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` | 无显式 `publish.kind`，默认内部流 | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
-| `file_to_live` | `file` `http_mp4` `hls` `http_ts` | `zlm_ingest` | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
-| `file_transcode` | `file` | `file` | 不适用 |
-| `multicast_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `zlm_ingest` `udp_mpegts_multicast` `rtp_multicast` | 仅当 `publish.kind=zlm_ingest` 时支持 `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
-| `rtp_receive` | `gb_rtp` | 不允许设置 | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
+| `stream_ingest` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` `gb_rtp` | 不允许设置 | `expose.enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
+| `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` | 不适用 |
+| `file_transcode` | `file` `http_mp4` `hls(vod)` `http_ts(vod)` | `file` | 不适用 |
 
 返回：
 
 - `201 CREATED`
 - 响应体为完整 Task 摘要
 
-`rtp_receive` 请求约束：
+`stream_ingest` 中的 `gb_rtp` 请求约束：
 
 - `input.kind` 必须为 `gb_rtp`
 - `input.port` 必须提供，允许为 `0` 以便由节点动态分配端口
 - `input.tcp_mode` 可选，`0=udp`、`1=tcp_passive`、`2=tcp_active`，默认 `0`
 - `input.reuse` 可选，对应 ZLM `re_use_port`
 - `input.ssrc` 可选，对应 ZLM `ssrc`
-- `publish.kind` 不允许设置；`publish.enable_*` 仅用于控制 ZLM 内部流发布协议
-
-示例：
-
-```json
-{
-  "name": "gb28181-recv-01",
-  "type": "rtp_receive",
-  "priority": 50,
-  "common": {
-    "tenant_id": "default",
-    "created_by": "alice"
-  },
-  "input": {
-    "kind": "gb_rtp",
-    "port": 0,
-    "tcp_mode": 0,
-    "reuse": true,
-    "ssrc": 123456
-  },
-  "publish": {
-    "enable_rtsp": true,
-    "enable_rtmp": true,
-    "enable_http_ts": true,
-    "enable_http_fmp4": true
-  },
-  "schedule": {
-    "start_mode": "immediate"
-  }
-}
-```
+- `publish.kind` 不允许设置；内部流协议暴露统一走 `expose.*`
 
 ### 3.2 `GET /tasks/{id}`
 
@@ -369,7 +342,7 @@
 
 - 允许状态：`SUCCEEDED`, `FAILED`, `CANCELED`, `LOST`
 - 生成新 Task
-- 支持可选请求体覆盖少量字段：`name`、`priority`、`profile`、`common.created_by`、`schedule.start_mode`
+- 支持可选请求体覆盖少量字段：`name`、`priority`、`common.created_by`、`schedule.start_mode`
 
 示例：
 
@@ -377,7 +350,6 @@
 {
   "name": "relay-camera-01-copy",
   "priority": 15,
-  "profile": "archival",
   "common": {
     "created_by": "bob"
   },
@@ -387,41 +359,9 @@
 }
 ```
 
-## 4. 模板接口
+## 4. 运行时接口
 
-### 4.1 `POST /templates`
-
-请求体：
-
-```json
-{
-  "name": "tpl_default_rtsp",
-  "type": "live_relay",
-  "profile": "realtime_compat",
-  "default_spec": {
-    "publish": {
-      "enable_rtsp": true,
-      "enable_rtmp": true
-    }
-  }
-}
-```
-
-### 4.2 `GET /templates`
-
-支持按 `type`, `keyword` 过滤。
-
-### 4.3 `GET /templates/{id}`
-
-返回模板详情和最后一次更新时间。
-
-### 4.4 `POST /templates/{id}/render`
-
-输入临时覆盖字段，返回渲染后的 `resolved_spec`，不落库。
-
-## 5. 运行时接口
-
-### 5.1 `GET /streams`
+### 4.1 `GET /streams`
 
 支持字段：
 
@@ -438,7 +378,7 @@
 - `bitrate_kbps`：从节点 ZLM `getMediaList.bytesSpeed` 换算得到的实时码率
 - `play_urls`：ControlPlane 根据节点 `agent_stream_addr` 和当前在线 schema 生成的播放地址列表
 
-### 5.2 `GET /records`
+### 4.2 `GET /records`
 
 支持字段：
 
@@ -587,7 +527,6 @@
 | 接口组 | 平台管理员 | 业务调用方 | 审计用户 |
 | --- | --- | --- | --- |
 | 任务增删改查 | 允许 | 允许本租户 | 只读 |
-| 模板管理 | 允许 | 只读 | 只读 |
 | 节点与调试 | 允许 | 禁止 | 禁止 |
 | 录像浏览 | 允许 | 允许本租户 | 只读 |
 

@@ -977,25 +977,56 @@ fn reservation_count(handle: &SessionHandle) -> u32 {
 
 fn task_execution_preference(spec: &TaskSpec) -> ExecutionPreference {
     match spec.task_type {
-        TaskType::FileTranscode | TaskType::FileToLive => {
+        TaskType::FileTranscode => {
             if spec.process.mode.as_deref() == Some("passthrough") {
                 ExecutionPreference::CpuOnly
             } else {
                 ExecutionPreference::GpuPreferred
             }
         }
-        TaskType::MulticastBridge => {
-            if multicast_bridge_requires_video_reencode(spec) {
+        TaskType::StreamBridge => {
+            if stream_bridge_requires_video_reencode(spec) {
                 ExecutionPreference::GpuPreferred
             } else {
                 ExecutionPreference::CpuOnly
             }
         }
-        TaskType::LiveRelay | TaskType::RtpReceive => ExecutionPreference::CpuOnly,
+        TaskType::StreamIngest => match stream_ingest_execution_mode(spec) {
+            StreamIngestExecutionMode::ZlmProxy | StreamIngestExecutionMode::RtpServer => {
+                ExecutionPreference::CpuOnly
+            }
+            StreamIngestExecutionMode::ManagedProcess => {
+                if spec.process.mode.as_deref() == Some("passthrough") {
+                    ExecutionPreference::CpuOnly
+                } else {
+                    ExecutionPreference::GpuPreferred
+                }
+            }
+        },
     }
 }
 
-fn multicast_bridge_requires_video_reencode(spec: &TaskSpec) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamIngestExecutionMode {
+    ZlmProxy,
+    RtpServer,
+    ManagedProcess,
+}
+
+fn stream_ingest_execution_mode(spec: &TaskSpec) -> StreamIngestExecutionMode {
+    match (spec.input.kind, spec.input.source_mode) {
+        (Some(InputKind::GbRtp), _) => StreamIngestExecutionMode::RtpServer,
+        (Some(InputKind::Rtsp | InputKind::Rtmp | InputKind::HttpFlv), _) => {
+            StreamIngestExecutionMode::ZlmProxy
+        }
+        (Some(InputKind::Hls | InputKind::HttpTs), Some(media_domain::SourceMode::Live)) => {
+            StreamIngestExecutionMode::ZlmProxy
+        }
+        _ => StreamIngestExecutionMode::ManagedProcess,
+    }
+}
+
+fn stream_bridge_requires_video_reencode(spec: &TaskSpec) -> bool {
     let mode = spec.process.mode.as_deref().unwrap_or("passthrough");
     if mode != "passthrough" {
         return true;
@@ -1056,12 +1087,8 @@ fn session_is_saturated(load: &SessionLoad, reserved_dispatches: u32) -> bool {
 
 fn task_requires_zlm(spec: &TaskSpec) -> bool {
     match spec.task_type {
-        TaskType::FileTranscode => false,
-        TaskType::FileToLive | TaskType::LiveRelay | TaskType::RtpReceive => true,
-        TaskType::MulticastBridge => matches!(
-            spec.publish.kind,
-            Some(media_domain::PublishTargetKind::ZlmIngest)
-        ),
+        TaskType::StreamIngest => true,
+        TaskType::StreamBridge | TaskType::FileTranscode => false,
     }
 }
 
@@ -1306,18 +1333,16 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use media_domain::{
-        CommonSpec, InputSpec, PublishSpec, RecordSpec, RecoverySpec, ResourceSpec, ScheduleSpec,
-        TaskStatus, TaskType,
+        CommonSpec, ExposeSpec, InputSpec, PublishSpec, RecordSpec, RecoverySpec, ResourceSpec,
+        ScheduleSpec, StreamSpec, TaskStatus, TaskType,
     };
     use sqlx::{PgPool, Row, postgres::PgPoolOptions};
     use tokio::{net::TcpStream, sync::mpsc, time::timeout};
 
     fn sample_spec(kind: InputKind, url: Option<&str>, interface_ip: Option<&str>) -> TaskSpec {
         TaskSpec {
-            task_type: TaskType::LiveRelay,
-            template: None,
+            task_type: TaskType::StreamIngest,
             name: "camera".to_string(),
-            profile: None,
             priority: 50,
             common: CommonSpec {
                 created_by: Some("test".to_string()),
@@ -1326,6 +1351,7 @@ mod tests {
             },
             input: InputSpec {
                 kind: Some(kind),
+                source_mode: kind.default_source_mode(),
                 url: url.map(str::to_string),
                 group: None,
                 port: None,
@@ -1341,6 +1367,8 @@ mod tests {
                 tcp_mode: None,
                 ssrc: None,
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: Default::default(),
             publish: PublishSpec::default(),
             record: RecordSpec::default(),

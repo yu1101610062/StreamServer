@@ -15,11 +15,9 @@
 
 ```sql
 create type task_type as enum (
-  'live_relay',
-  'file_transcode',
-  'file_to_live',
-  'multicast_bridge',
-  'rtp_receive'
+  'stream_ingest',
+  'stream_bridge',
+  'file_transcode'
 );
 
 create type task_status as enum (
@@ -103,33 +101,14 @@ create table node_capabilities (
 );
 ```
 
-### 4.3 `task_templates`
-
-```sql
-create table task_templates (
-  id uuid primary key,
-  name text not null unique,
-  type task_type not null,
-  profile text,
-  default_spec jsonb not null,
-  enabled boolean not null default true,
-  created_by text not null,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-);
-```
-
-### 4.4 `tasks`
+### 4.3 `tasks`
 
 ```sql
 create table tasks (
   id uuid primary key,
-  tenant_id text not null default 'default',
   name text not null,
   type task_type not null,
   status task_status not null,
-  template_id uuid references task_templates(id),
-  profile text,
   idempotency_key text not null,
   priority integer not null default 50 check (priority between 0 and 100),
   requested_spec jsonb not null,
@@ -383,8 +362,9 @@ create index idx_stream_bindings_task_id
 ## 7. 迁移策略
 
 - 使用 `sqlx migrate` 管理 PostgreSQL 迁移。
-- 每次表结构变更必须伴随迁移文件和文档更新。
-- 禁止在生产依赖自动 `DROP COLUMN`；破坏性变更采用“两阶段迁移”。
+- 当前仓库将控制面 schema 折叠为单一基线迁移：[migrations/0001_init.sql](/home/0x7c00/RustroverProjects/StreamServer/migrations/0001_init.sql)。
+- 重建环境时应直接从该基线初始化；旧数据库若要切换到新基线，建议先完成数据导出，再清库重建。
+- 每次表结构变更仍必须伴随迁移脚本和文档更新；若继续维持单文件策略，就直接更新基线迁移内容。
 
 ## 8. SQLite 开发约束
 

@@ -420,7 +420,6 @@ impl TaskRepository {
         let resolved = self.resolve_requested_task(&requested_spec).await?;
         let requested_spec = resolved.requested_spec;
         let resolved_spec = resolved.resolved_spec;
-        let template_id = resolved.template_id;
 
         let created_by = resolved_spec.created_by().unwrap_or("system").to_string();
         let status = resolved_spec.initial_status();
@@ -432,8 +431,6 @@ impl TaskRepository {
             name: resolved_spec.name.clone(),
             task_type: resolved_spec.task_type,
             status,
-            template_id,
-            profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
             created_by: created_by.clone(),
             assigned_node_id: None,
@@ -492,13 +489,13 @@ impl TaskRepository {
         sqlx::query(
             r#"
             insert into tasks (
-              id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, $2, $3::task_type, $4::task_status, $5, $6, $7,
-              $8, $9, $10, $11, null,
-              0, $12, $13, $14, null, null
+              $1, $2, $3::task_type, $4::task_status, $5,
+              $6, $7, $8, $9, null,
+              0, $10, $11, $12, null, null
             )
             "#,
         )
@@ -506,8 +503,6 @@ impl TaskRepository {
         .bind(&resolved_spec.name)
         .bind(resolved_spec.task_type.as_str())
         .bind(status.as_str())
-        .bind(template_id)
-        .bind(resolved_spec.profile.as_deref())
         .bind(idempotency_key)
         .bind(i32::from(resolved_spec.priority))
         .bind(requested_spec_json)
@@ -568,7 +563,6 @@ impl TaskRepository {
     ) -> Result<TaskPreview, RepoError> {
         let resolved = self.resolve_requested_task(&requested_spec).await?;
         Ok(TaskPreview {
-            template_id: resolved.template_id,
             requested_spec: serde_json::to_value(&resolved.requested_spec)?,
             resolved_spec: serde_json::to_value(&resolved.resolved_spec)?,
         })
@@ -586,8 +580,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               created_by,
               assigned_node_id,
@@ -629,8 +621,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               created_by,
               assigned_node_id,
@@ -908,140 +898,6 @@ impl TaskRepository {
             next_cursor: last_cursor,
             lines,
         })
-    }
-
-    pub async fn create_template(
-        &self,
-        request: TemplateCreateRequest,
-        created_by: &str,
-    ) -> Result<TaskTemplateDetail, RepoError> {
-        if request.name.trim().is_empty() {
-            return Err(validation_error("name", "must not be empty"));
-        }
-
-        let now = Utc::now();
-        let template_id = Uuid::now_v7();
-        let default_spec = normalize_template_default_spec(
-            request.task_type,
-            request.profile.as_deref(),
-            request.default_spec,
-        )?;
-        sqlx::query(
-            r#"
-            insert into task_templates (
-              id, name, type, profile, default_spec, enabled, created_by, created_at, updated_at
-            ) values (
-              $1, $2, $3::task_type, $4, $5, $6, $7, $8, $8
-            )
-            "#,
-        )
-        .bind(template_id)
-        .bind(request.name.trim())
-        .bind(request.task_type.as_str())
-        .bind(request.profile.as_deref())
-        .bind(&default_spec)
-        .bind(request.enabled)
-        .bind(created_by)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-
-        self.get_template(template_id).await
-    }
-
-    pub async fn list_templates(
-        &self,
-        filter: TemplateListFilter,
-    ) -> Result<Vec<TaskTemplateSummary>, RepoError> {
-        let mut builder = QueryBuilder::<Postgres>::new(
-            r#"
-            select
-              id,
-              name,
-              type::text as task_type,
-              profile,
-              enabled,
-              created_by,
-              created_at,
-              updated_at
-            from task_templates
-            where 1 = 1
-            "#,
-        );
-        if let Some(task_type) = filter.task_type {
-            builder.push(" and type = ");
-            builder.push_bind(task_type.as_str());
-            builder.push("::task_type");
-        }
-        if let Some(keyword) = filter
-            .keyword
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let pattern = format!("%{keyword}%");
-            builder.push(" and (name ilike ");
-            builder.push_bind(pattern.clone());
-            builder.push(" or coalesce(profile, '') ilike ");
-            builder.push_bind(pattern);
-            builder.push(")");
-        }
-        builder.push(" order by updated_at desc, name asc");
-
-        builder
-            .build()
-            .fetch_all(&self.pool)
-            .await?
-            .into_iter()
-            .map(|row| TaskTemplateSummary::from_row(&row))
-            .collect()
-    }
-
-    pub async fn get_template(&self, template_id: Uuid) -> Result<TaskTemplateDetail, RepoError> {
-        sqlx::query(
-            r#"
-            select
-              id,
-              name,
-              type::text as task_type,
-              profile,
-              default_spec,
-              enabled,
-              created_by,
-              created_at,
-              updated_at
-            from task_templates
-            where id = $1
-            "#,
-        )
-        .bind(template_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| RepoError::TemplateNotFound(template_id.to_string()))
-        .and_then(|row| TaskTemplateDetail::from_row(&row))
-    }
-
-    pub async fn render_template(
-        &self,
-        template_id: Uuid,
-        overrides: Value,
-    ) -> Result<Value, RepoError> {
-        let template = self.fetch_template_by_id(template_id).await?;
-        let task_type = template.task_type();
-        let profile = overrides
-            .get("profile")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| template.profile().map(str::to_string));
-        let merged = build_resolved_task_json(
-            task_type,
-            profile.as_deref(),
-            Some(&template.default_spec),
-            &overrides,
-        )?;
-        let spec: TaskSpec = serde_json::from_value(merged.clone())?;
-        spec.validate()?;
-        Ok(serde_json::to_value(spec.resolved())?)
     }
 
     pub async fn list_streams(
@@ -1686,8 +1542,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               created_by,
               assigned_node_id,
@@ -1727,7 +1581,7 @@ impl TaskRepository {
             return Ok(None);
         }
 
-        let parent = TaskSummary::from_row(&row)?;
+        let _parent = TaskSummary::from_row(&row)?;
         let mut requested_spec: TaskSpec = serde_json::from_value(row.try_get("requested_spec")?)?;
         requested_spec.schedule.start_mode = Some(StartMode::Immediate);
         requested_spec.schedule.start_at = None;
@@ -1736,7 +1590,6 @@ impl TaskRepository {
         let resolved = self.resolve_requested_task(&requested_spec).await?;
         let requested_spec = resolved.requested_spec;
         let resolved_spec = resolved.resolved_spec;
-        let template_id = resolved.template_id.or(parent.template_id);
         let created_by = resolved_spec
             .created_by()
             .unwrap_or("scheduler")
@@ -1748,8 +1601,6 @@ impl TaskRepository {
             name: resolved_spec.name.clone(),
             task_type: resolved_spec.task_type,
             status: resolved_spec.initial_status(),
-            template_id,
-            profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
             created_by: created_by.clone(),
             assigned_node_id: None,
@@ -1763,13 +1614,13 @@ impl TaskRepository {
         sqlx::query(
             r#"
             insert into tasks (
-              id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, $2, $3::task_type, $4::task_status, $5, $6, $7,
-              $8, $9, $10, $11, null,
-              0, 'immediate', $12, $12, null, null
+              $1, $2, $3::task_type, $4::task_status, $5,
+              $6, $7, $8, $9, null,
+              0, 'immediate', $10, $10, null, null
             )
             "#,
         )
@@ -1777,8 +1628,6 @@ impl TaskRepository {
         .bind(&summary.name)
         .bind(summary.task_type.as_str())
         .bind(summary.status.as_str())
-        .bind(summary.template_id)
-        .bind(summary.profile.as_deref())
         .bind(format!("cron-{parent_task_id}-{}", scheduled_for.timestamp()))
         .bind(i32::from(summary.priority))
         .bind(serde_json::to_value(&requested_spec)?)
@@ -1828,49 +1677,8 @@ impl TaskRepository {
         &self,
         requested_spec: &TaskSpec,
     ) -> Result<ResolvedTaskRequest, RepoError> {
-        let template = if let Some(name) = requested_spec
-            .template
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(self.fetch_template_by_name(name).await?)
-        } else {
-            None
-        };
-
-        if let Some(template) = &template {
-            if template.task_type() != requested_spec.task_type {
-                return Err(validation_error(
-                    "template",
-                    format!(
-                        "template {} is for type {}, but request is {}",
-                        template.name(),
-                        template.task_type(),
-                        requested_spec.task_type
-                    ),
-                ));
-            }
-        }
-
-        let effective_profile = requested_spec
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                template
-                    .as_ref()
-                    .and_then(|value| value.profile().map(str::to_string))
-            });
         let overlay = task_spec_overlay(requested_spec);
-        let merged_json = build_resolved_task_json(
-            requested_spec.task_type,
-            effective_profile.as_deref(),
-            template.as_ref().map(|value| &value.default_spec),
-            &overlay,
-        )?;
+        let merged_json = build_resolved_task_json(requested_spec.task_type, &overlay)?;
         let merged_spec: TaskSpec = serde_json::from_value(merged_json)?;
         merged_spec.validate()?;
         validate_task_callback_url(&merged_spec)?;
@@ -1883,7 +1691,6 @@ impl TaskRepository {
         Ok(ResolvedTaskRequest {
             requested_spec: merged_spec,
             resolved_spec,
-            template_id: template.map(|value| value.id()),
         })
     }
 
@@ -2208,8 +2015,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               assigned_node_id,
               current_attempt_no,
@@ -2232,7 +2037,6 @@ impl TaskRepository {
         let source = TaskSummary::from_row(&row)?;
         source.status.apply_operation(TaskOperation::Clone)?;
 
-        let template_id: Option<Uuid> = row.try_get("template_id")?;
         let requested_spec_value: Value = row.try_get("requested_spec")?;
         let mut requested_spec: TaskSpec = serde_json::from_value(requested_spec_value)?;
         if let Some(overrides) = overrides {
@@ -2241,7 +2045,6 @@ impl TaskRepository {
         let resolved = self.resolve_requested_task(&requested_spec).await?;
         let requested_spec = resolved.requested_spec;
         let resolved_spec = resolved.resolved_spec;
-        let template_id = resolved.template_id.or(template_id);
 
         let created_by = resolved_spec.created_by().unwrap_or("system").to_string();
         let initial_status = requested_spec.initial_status();
@@ -2253,8 +2056,6 @@ impl TaskRepository {
             name: resolved_spec.name.clone(),
             task_type: resolved_spec.task_type,
             status: initial_status,
-            template_id,
-            profile: resolved_spec.profile.clone(),
             priority: resolved_spec.priority,
             created_by: created_by.clone(),
             assigned_node_id: None,
@@ -2269,13 +2070,13 @@ impl TaskRepository {
         sqlx::query(
             r#"
             insert into tasks (
-              id, name, type, status, template_id, profile, idempotency_key,
+              id, name, type, status, idempotency_key,
               priority, requested_spec, resolved_spec, created_by, assigned_node_id,
               current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
             ) values (
-              $1, $2, $3::task_type, $4::task_status, $5, $6, $7,
-              $8, $9, $10, $11, null,
-              0, $12, $13, $14, null, null
+              $1, $2, $3::task_type, $4::task_status, $5,
+              $6, $7, $8, $9, null,
+              0, $10, $11, $12, null, null
             )
             "#,
         )
@@ -2283,8 +2084,6 @@ impl TaskRepository {
         .bind(&summary.name)
         .bind(summary.task_type.as_str())
         .bind(summary.status.as_str())
-        .bind(summary.template_id)
-        .bind(summary.profile.as_deref())
         .bind(format!("clone-{new_id}"))
         .bind(i32::from(summary.priority))
         .bind(serde_json::to_value(&requested_spec)?)
@@ -2327,8 +2126,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               created_by,
               assigned_node_id,
@@ -2406,8 +2203,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               created_by,
               assigned_node_id,
@@ -3667,7 +3462,7 @@ impl TaskRepository {
                 continue;
             };
             let spec = serde_json::from_value::<TaskSpec>(resolved_spec.clone())?;
-            if publish_stream_matches(&spec, app, stream)
+            if publish_stream_matches(task_id, attempt_no, &spec, app, stream)
                 || rtp_stream_matches(task_id, attempt_no, &spec, stream)
             {
                 return Ok(Some(PublishTaskTarget {
@@ -3737,8 +3532,6 @@ impl TaskRepository {
               name,
               type::text as task_type,
               status::text as status,
-              template_id,
-              profile,
               priority,
               created_by,
               assigned_node_id,
@@ -3808,38 +3601,6 @@ impl TaskRepository {
         let row = builder.build().fetch_one(&self.pool).await?;
         let total: i64 = row.try_get("total")?;
         Ok(total as u64)
-    }
-
-    async fn fetch_template_by_name(&self, name: &str) -> Result<TaskTemplateDetail, RepoError> {
-        sqlx::query(
-            r#"
-            select
-              id,
-              name,
-              type::text as task_type,
-              profile,
-              default_spec,
-              enabled,
-              created_by,
-              created_at,
-              updated_at
-            from task_templates
-            where name = $1
-              and enabled = true
-            "#,
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| RepoError::TemplateNotFound(name.to_string()))
-        .and_then(|row| TaskTemplateDetail::from_row(&row))
-    }
-
-    async fn fetch_template_by_id(
-        &self,
-        template_id: Uuid,
-    ) -> Result<TaskTemplateDetail, RepoError> {
-        self.get_template(template_id).await
     }
 
     fn apply_filters<'a>(
@@ -4470,8 +4231,6 @@ pub struct TaskCloneOverride {
     #[serde(default)]
     pub priority: Option<u8>,
     #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
     pub common: TaskCloneCommonOverride,
     #[serde(default)]
     pub schedule: TaskCloneScheduleOverride,
@@ -4513,7 +4272,6 @@ pub struct StopCommand {
 struct ResolvedTaskRequest {
     requested_spec: TaskSpec,
     resolved_spec: TaskSpec,
-    template_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4558,91 +4316,8 @@ pub struct TaskLogResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskPreview {
-    pub template_id: Option<Uuid>,
     pub requested_spec: Value,
     pub resolved_spec: Value,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TemplateCreateRequest {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub task_type: TaskType,
-    #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
-    pub default_spec: Value,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct TemplateListFilter {
-    #[serde(default, rename = "type")]
-    pub task_type: Option<TaskType>,
-    #[serde(default)]
-    pub keyword: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TaskTemplateSummary {
-    pub id: Uuid,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub task_type: TaskType,
-    pub profile: Option<String>,
-    pub enabled: bool,
-    pub created_by: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl TaskTemplateSummary {
-    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
-        Ok(Self {
-            id: row.try_get("id")?,
-            name: row.try_get("name")?,
-            task_type: TaskType::from_str(row.try_get::<&str, _>("task_type")?)
-                .map_err(RepoError::ParseEnum)?,
-            profile: row.try_get("profile")?,
-            enabled: row.try_get("enabled")?,
-            created_by: row.try_get("created_by")?,
-            created_at: row.try_get("created_at")?,
-            updated_at: row.try_get("updated_at")?,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TaskTemplateDetail {
-    #[serde(flatten)]
-    pub summary: TaskTemplateSummary,
-    pub default_spec: Value,
-}
-
-impl TaskTemplateDetail {
-    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
-        Ok(Self {
-            summary: TaskTemplateSummary::from_row(row)?,
-            default_spec: row.try_get("default_spec")?,
-        })
-    }
-
-    fn id(&self) -> Uuid {
-        self.summary.id
-    }
-
-    fn name(&self) -> &str {
-        &self.summary.name
-    }
-
-    fn task_type(&self) -> TaskType {
-        self.summary.task_type
-    }
-
-    fn profile(&self) -> Option<&str> {
-        self.summary.profile.as_deref()
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5004,10 +4679,6 @@ pub struct CronScheduleEntry {
     pub last_scheduled_for: Option<DateTime<Utc>>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 fn validation_error(field: &'static str, message: impl Into<String>) -> RepoError {
     RepoError::Validation(TaskValidationError {
         issues: vec![ValidationIssue::new(field, message)],
@@ -5290,36 +4961,8 @@ async fn resolve_record_http_url(
         .and_then(|raw_url| resolve_absolute_http_url(agent_stream_addr.as_str(), raw_url)))
 }
 
-fn normalize_template_default_spec(
-    task_type: TaskType,
-    profile: Option<&str>,
-    default_spec: Value,
-) -> Result<Value, RepoError> {
-    if !default_spec.is_object() {
-        return Err(validation_error(
-            "default_spec",
-            "template default_spec must be a JSON object",
-        ));
-    }
-    build_resolved_task_json(task_type, profile, None, &default_spec)
-}
-
-fn build_resolved_task_json(
-    task_type: TaskType,
-    profile: Option<&str>,
-    template_defaults: Option<&Value>,
-    request_overrides: &Value,
-) -> Result<Value, RepoError> {
-    let mut merged = profile_defaults_json(task_type, profile);
-    if let Some(template_defaults) = template_defaults {
-        if !template_defaults.is_object() {
-            return Err(validation_error(
-                "template.default_spec",
-                "template default_spec must be a JSON object",
-            ));
-        }
-        deep_merge(&mut merged, template_defaults.clone());
-    }
+fn build_resolved_task_json(task_type: TaskType, request_overrides: &Value) -> Result<Value, RepoError> {
+    let mut merged = json!({});
     if !request_overrides.is_object() {
         return Err(validation_error(
             "task",
@@ -5328,81 +4971,8 @@ fn build_resolved_task_json(
     }
     deep_merge(&mut merged, request_overrides.clone());
     merged["type"] = Value::String(task_type.as_str().to_string());
-    if merged
-        .get("profile")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-    {
-        if let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) {
-            merged["profile"] = Value::String(profile.to_string());
-        }
-    }
     strip_legacy_dispatch_fields(&mut merged);
     Ok(merged)
-}
-
-fn profile_defaults_json(task_type: TaskType, profile: Option<&str>) -> Value {
-    let mut value = json!({});
-    let Some(profile) = profile.map(str::trim).filter(|value| !value.is_empty()) else {
-        return value;
-    };
-
-    let defaults = match profile {
-        "realtime_compat" => json!({
-            "process": {
-                "mode": "copy_or_transcode"
-            },
-            "publish": {
-                "enable_rtsp": true,
-                "enable_rtmp": true,
-                "enable_http_ts": true,
-                "enable_http_fmp4": true,
-                "enable_hls": false
-            }
-        }),
-        "archive_quality" => json!({
-            "process": {
-                "mode": "copy_or_transcode"
-            },
-            "record": {
-                "enabled": true,
-                "format": "mp4"
-            }
-        }),
-        "multicast_ts" => json!({
-            "process": {
-                "mode": "copy_or_transcode"
-            },
-            "publish": {
-                "format": "mpegts",
-                "ttl": 1,
-                "reuse": true,
-                "pkt_size": 1316
-            }
-        }),
-        "rtmp_hevc_ext" => json!({
-            "process": {
-                "mode": "force_transcode"
-            },
-            "publish": {
-                "enable_rtmp": true
-            }
-        }),
-        _ => json!({}),
-    };
-    deep_merge(&mut value, defaults);
-
-    if !value.is_object() {
-        return json!({});
-    }
-
-    if task_type == TaskType::FileTranscode {
-        value["recovery"] = json!({"policy": "on_failure"});
-    }
-
-    value
 }
 
 fn task_spec_overlay(spec: &TaskSpec) -> Value {
@@ -5413,26 +4983,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
     );
     overlay.insert("name".to_string(), Value::String(spec.name.clone()));
     overlay.insert("priority".to_string(), json!(spec.priority));
-    if let Some(template) = spec
-        .template
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        overlay.insert(
-            "template".to_string(),
-            Value::String(template.trim().to_string()),
-        );
-    }
-    if let Some(profile) = spec
-        .profile
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        overlay.insert(
-            "profile".to_string(),
-            Value::String(profile.trim().to_string()),
-        );
-    }
 
     let mut common = serde_json::Map::new();
     if let Some(created_by) = spec
@@ -5466,6 +5016,10 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
 
     let input = overlay_optional_fields(&[
         ("kind", spec.input.kind.map(|value| json!(value))),
+        (
+            "source_mode",
+            spec.input.source_mode.map(|value| json!(value)),
+        ),
         ("url", spec.input.url.as_ref().map(|value| json!(value))),
         ("group", spec.input.group.as_ref().map(|value| json!(value))),
         ("port", spec.input.port.map(|value| json!(value))),
@@ -5507,6 +5061,48 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
         overlay.insert("process".to_string(), process);
     }
 
+    let stream = overlay_optional_fields(&[
+        ("app", spec.stream.app.as_ref().map(|value| json!(value))),
+        ("name", spec.stream.name.as_ref().map(|value| json!(value))),
+        (
+            "vhost",
+            spec.stream.vhost.as_ref().map(|value| json!(value)),
+        ),
+    ]);
+    if let Some(stream) = stream {
+        overlay.insert("stream".to_string(), stream);
+    }
+
+    let expose = overlay_optional_fields(&[
+        (
+            "enable_rtsp",
+            spec.expose.enable_rtsp.map(|value| json!(value)),
+        ),
+        (
+            "enable_rtmp",
+            spec.expose.enable_rtmp.map(|value| json!(value)),
+        ),
+        (
+            "enable_http_ts",
+            spec.expose.enable_http_ts.map(|value| json!(value)),
+        ),
+        (
+            "enable_http_fmp4",
+            spec.expose.enable_http_fmp4.map(|value| json!(value)),
+        ),
+        (
+            "enable_hls",
+            spec.expose.enable_hls.map(|value| json!(value)),
+        ),
+        (
+            "stop_on_no_reader",
+            spec.expose.stop_on_no_reader.map(|value| json!(value)),
+        ),
+    ]);
+    if let Some(expose) = expose {
+        overlay.insert("expose".to_string(), expose);
+    }
+
     let publish = overlay_optional_fields(&[
         ("kind", spec.publish.kind.map(|value| json!(value))),
         ("url", spec.publish.url.as_ref().map(|value| json!(value))),
@@ -5541,30 +5137,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
         (
             "format",
             spec.publish.format.as_ref().map(|value| json!(value)),
-        ),
-        (
-            "enable_rtsp",
-            spec.publish.enable_rtsp.map(|value| json!(value)),
-        ),
-        (
-            "enable_rtmp",
-            spec.publish.enable_rtmp.map(|value| json!(value)),
-        ),
-        (
-            "enable_http_ts",
-            spec.publish.enable_http_ts.map(|value| json!(value)),
-        ),
-        (
-            "enable_http_fmp4",
-            spec.publish.enable_http_fmp4.map(|value| json!(value)),
-        ),
-        (
-            "enable_hls",
-            spec.publish.enable_hls.map(|value| json!(value)),
-        ),
-        (
-            "stop_on_no_reader",
-            spec.publish.stop_on_no_reader.map(|value| json!(value)),
         ),
     ]);
     if let Some(publish) = publish {
@@ -5864,8 +5436,6 @@ pub struct TaskSummary {
     #[serde(rename = "type")]
     pub task_type: TaskType,
     pub status: TaskStatus,
-    pub template_id: Option<Uuid>,
-    pub profile: Option<String>,
     pub priority: u8,
     pub created_by: String,
     pub assigned_node_id: Option<Uuid>,
@@ -5893,8 +5463,6 @@ impl TaskSummary {
             name: row.try_get("name")?,
             task_type,
             status,
-            template_id: row.try_get("template_id")?,
-            profile: row.try_get("profile")?,
             priority: u8::try_from(priority).unwrap_or(50),
             created_by: row.try_get("created_by")?,
             assigned_node_id: row.try_get("assigned_node_id")?,
@@ -6144,8 +5712,6 @@ pub struct SecurityAuditEventRecord {
 pub enum RepoError {
     #[error("task {0} was not found")]
     TaskNotFound(Uuid),
-    #[error("template {0} was not found")]
-    TemplateNotFound(String),
     #[error("auth user {0} was not found")]
     AuthUserNotFound(String),
     #[error("node {0} was not found")]
@@ -6204,9 +5770,6 @@ fn apply_clone_overrides(spec: &mut TaskSpec, overrides: TaskCloneOverride) {
     if let Some(priority) = overrides.priority {
         spec.priority = priority;
     }
-    if let Some(profile) = overrides.profile {
-        spec.profile = Some(profile);
-    }
     if let Some(created_by) = overrides.common.created_by {
         spec.common.created_by = Some(created_by);
     }
@@ -6222,7 +5785,33 @@ fn normalize_event_level(value: &str) -> String {
     }
 }
 
-fn publish_stream_matches(spec: &TaskSpec, app: &str, stream: &str) -> bool {
+fn publish_stream_matches(
+    task_id: Uuid,
+    _attempt_no: i32,
+    spec: &TaskSpec,
+    app: &str,
+    stream: &str,
+) -> bool {
+    if spec.task_type == TaskType::StreamIngest
+        && spec.input.kind != Some(media_domain::InputKind::GbRtp)
+    {
+        let publish_app = spec.stream.app.as_deref().unwrap_or("live");
+        let mut task_id_buf = Uuid::encode_buffer();
+        let publish_stream = spec
+            .stream
+            .name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                task_id
+                    .as_hyphenated()
+                    .encode_lower(&mut task_id_buf)
+                    .to_string()
+            });
+        return publish_app == app && publish_stream == stream;
+    }
+
     let Some(url) = spec.publish.url.as_deref() else {
         return false;
     };
@@ -6233,7 +5822,9 @@ fn publish_stream_matches(spec: &TaskSpec, app: &str, stream: &str) -> bool {
 }
 
 fn rtp_stream_matches(task_id: Uuid, attempt_no: i32, spec: &TaskSpec, stream_id: &str) -> bool {
-    spec.task_type == TaskType::RtpReceive && build_rtp_stream_id(task_id, attempt_no) == stream_id
+    spec.task_type == TaskType::StreamIngest
+        && spec.input.kind == Some(media_domain::InputKind::GbRtp)
+        && build_rtp_stream_id(task_id, attempt_no) == stream_id
 }
 
 fn parse_publish_stream_url(value: &str) -> Option<(String, String)> {
@@ -6267,19 +5858,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_resolved_task_json_applies_profile_template_then_request() {
+    fn build_resolved_task_json_applies_request_defaults() {
         let merged = build_resolved_task_json(
-            TaskType::LiveRelay,
-            Some("realtime_compat"),
-            Some(&json!({
-                "publish": {
-                    "enable_rtsp": false,
-                    "enable_hls": true
-                },
-                "record": {
-                    "enabled": true
-                }
-            })),
+            TaskType::StreamIngest,
             &json!({
                 "name": "relay-camera-01",
                 "common": {
@@ -6287,9 +5868,10 @@ mod tests {
                 },
                 "input": {
                     "kind": "rtsp",
+                    "source_mode": "live",
                     "url": "rtsp://camera.example/live"
                 },
-                "publish": {
+                "expose": {
                     "enable_rtsp": true
                 }
             }),
@@ -6299,19 +5881,17 @@ mod tests {
         let spec: TaskSpec = serde_json::from_value(merged).expect("task spec should parse");
         let resolved = spec.resolved();
 
-        assert_eq!(resolved.process.mode.as_deref(), Some("copy_or_transcode"));
-        assert_eq!(resolved.publish.enable_rtsp, Some(true));
-        assert_eq!(resolved.publish.enable_hls, Some(true));
-        assert_eq!(resolved.record.enabled, Some(true));
+        assert_eq!(resolved.process.mode, None);
+        assert_eq!(resolved.expose.enable_rtsp, Some(true));
+        assert_eq!(resolved.expose.enable_hls, Some(false));
+        assert_eq!(resolved.record.enabled, Some(false));
     }
 
     #[test]
     fn task_spec_overlay_skips_empty_option_fields() {
         let spec = TaskSpec {
-            task_type: TaskType::LiveRelay,
-            template: Some("tpl_default_rtsp".to_string()),
+            task_type: TaskType::StreamIngest,
             name: "relay-camera-01".to_string(),
-            profile: None,
             priority: 50,
             common: media_domain::CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -6320,9 +5900,12 @@ mod tests {
             },
             input: media_domain::InputSpec {
                 kind: Some(media_domain::InputKind::Rtsp),
+                source_mode: Some(media_domain::SourceMode::Live),
                 url: Some("rtsp://camera.example/live".to_string()),
                 ..Default::default()
             },
+            stream: Default::default(),
+            expose: Default::default(),
             process: Default::default(),
             publish: Default::default(),
             record: Default::default(),
@@ -6333,7 +5916,6 @@ mod tests {
 
         let overlay = task_spec_overlay(&spec);
 
-        assert_eq!(overlay["template"], json!("tpl_default_rtsp"));
         assert_eq!(overlay["common"]["created_by"], json!("alice"));
         assert!(overlay["publish"].is_null());
     }
@@ -6341,10 +5923,8 @@ mod tests {
     #[test]
     fn task_spec_overlay_preserves_record_duration_sec() {
         let mut spec = TaskSpec {
-            task_type: TaskType::FileToLive,
-            template: None,
+            task_type: TaskType::StreamIngest,
             name: "duration-check".to_string(),
-            profile: None,
             priority: 50,
             common: media_domain::CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -6353,15 +5933,14 @@ mod tests {
             },
             input: media_domain::InputSpec {
                 kind: Some(media_domain::InputKind::HttpMp4),
+                source_mode: Some(media_domain::SourceMode::Vod),
                 url: Some("http://127.0.0.1/test.mp4".to_string()),
                 ..Default::default()
             },
+            stream: Default::default(),
+            expose: Default::default(),
             process: Default::default(),
-            publish: media_domain::PublishSpec {
-                kind: Some(media_domain::PublishTargetKind::ZlmIngest),
-                url: Some("rtmp://127.0.0.1/live/test".to_string()),
-                ..Default::default()
-            },
+            publish: Default::default(),
             record: Default::default(),
             recovery: Default::default(),
             schedule: Default::default(),

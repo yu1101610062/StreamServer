@@ -274,8 +274,6 @@ impl JwtSigner {
 pub enum ApiPermission {
     TaskRead,
     TaskWrite,
-    TemplateRead,
-    TemplateWrite,
     RecordRead,
     NodeRead,
     DebugRead,
@@ -287,8 +285,6 @@ impl ApiPermission {
         match self {
             Self::TaskRead => "task_read",
             Self::TaskWrite => "task_write",
-            Self::TemplateRead => "template_read",
-            Self::TemplateWrite => "template_write",
             Self::RecordRead => "record_read",
             Self::NodeRead => "node_read",
             Self::DebugRead => "debug_read",
@@ -297,11 +293,9 @@ impl ApiPermission {
     }
 }
 
-const ALL_PERMISSIONS: [ApiPermission; 8] = [
+const ALL_PERMISSIONS: [ApiPermission; 6] = [
     ApiPermission::TaskRead,
     ApiPermission::TaskWrite,
-    ApiPermission::TemplateRead,
-    ApiPermission::TemplateWrite,
     ApiPermission::RecordRead,
     ApiPermission::NodeRead,
     ApiPermission::DebugRead,
@@ -379,8 +373,6 @@ impl AuthenticatedPrincipal {
                 permission,
                 ApiPermission::TaskRead
                     | ApiPermission::TaskWrite
-                    | ApiPermission::TemplateRead
-                    | ApiPermission::TemplateWrite
                     | ApiPermission::RecordRead
             ),
         };
@@ -499,7 +491,7 @@ mod tests {
         );
         assert!(
             principal
-                .require_permission(ApiPermission::TemplateRead)
+                .require_permission(ApiPermission::RecordRead)
                 .is_ok()
         );
         assert!(

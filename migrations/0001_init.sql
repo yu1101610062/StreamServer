@@ -1,9 +1,7 @@
 create type task_type as enum (
-  'live_relay',
-  'file_transcode',
-  'file_to_live',
-  'multicast_bridge',
-  'rtp_receive'
+  'stream_ingest',
+  'stream_bridge',
+  'file_transcode'
 );
 
 create type task_status as enum (
@@ -51,10 +49,11 @@ create type event_source as enum (
 
 create table media_nodes (
   id uuid primary key,
-  node_name text not null unique,
+  node_name text not null,
   hostname text not null,
   labels jsonb not null default '[]'::jsonb,
   zlm_api_base text not null,
+  zlm_api_secret text not null default '',
   agent_stream_addr text not null,
   network_mode text not null check (network_mode in ('bridge', 'host', 'macvlan')),
   interfaces jsonb not null default '[]'::jsonb,
@@ -73,30 +72,31 @@ create table node_capabilities (
   zlm_api_list jsonb not null default '[]'::jsonb,
   zlm_version text,
   gpu jsonb not null default '[]'::jsonb,
+  gpu_devices jsonb not null default '[]'::jsonb,
   captured_at timestamptz not null default now()
 );
 
-create table task_templates (
+create table node_heartbeats (
   id uuid primary key,
-  name text not null unique,
-  type task_type not null,
-  profile text,
-  default_spec jsonb not null,
-  enabled boolean not null default true,
-  created_by text not null,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  node_id uuid not null references media_nodes(id) on delete cascade,
+  cpu_percent double precision not null,
+  mem_percent double precision not null,
+  disk_percent double precision not null,
+  running_tasks integer not null,
+  slot_usage double precision not null,
+  zlm_alive boolean not null,
+  ffmpeg_alive boolean not null,
+  node_time timestamptz not null,
+  received_at timestamptz not null default now(),
+  gpu_runtime jsonb not null default '[]'::jsonb
 );
 
 create table tasks (
   id uuid primary key,
-  tenant_id text not null default 'default',
   name text not null,
   type task_type not null,
   status task_status not null,
-  template_id uuid references task_templates(id),
-  profile text,
-  idempotency_key text not null,
+  idempotency_key text not null unique,
   priority integer not null default 50 check (priority between 0 and 100),
   requested_spec jsonb not null,
   resolved_spec jsonb,
@@ -108,8 +108,7 @@ create table tasks (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   started_at timestamptz,
-  finished_at timestamptz,
-  unique (tenant_id, idempotency_key)
+  finished_at timestamptz
 );
 
 create table task_attempts (
@@ -168,10 +167,24 @@ create table record_files (
   app text,
   stream text,
   file_path text not null,
+  http_url text,
   file_size bigint not null default 0,
   time_len integer,
   start_time timestamptz,
   source text not null,
+  created_at timestamptz not null default now(),
+  unique (file_path)
+);
+
+create table transcode_artifacts (
+  id uuid primary key,
+  task_id uuid not null references tasks(id) on delete cascade,
+  attempt_id uuid references task_attempts(id) on delete set null,
+  node_id uuid not null references media_nodes(id),
+  file_name text not null,
+  file_path text not null,
+  http_url text not null,
+  file_size bigint not null default 0,
   created_at timestamptz not null default now(),
   unique (file_path)
 );
@@ -201,7 +214,6 @@ create table task_checkpoints (
 
 create table operation_requests (
   id uuid primary key,
-  tenant_id text not null,
   operation_key text not null,
   method text not null,
   path text not null,
@@ -211,7 +223,7 @@ create table operation_requests (
   response_status integer,
   response_body jsonb,
   created_at timestamptz not null default now(),
-  unique (tenant_id, operation_key, method, path)
+  unique (operation_key, method, path)
 );
 
 create table hook_events (
@@ -224,6 +236,70 @@ create table hook_events (
   processed_at timestamptz
 );
 
+create table auth_users (
+  id uuid primary key,
+  username text not null unique,
+  password_hash text not null,
+  role text not null check (role in ('admin')),
+  enabled boolean not null default true,
+  must_change_password boolean not null default false,
+  last_login_at timestamptz,
+  password_changed_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table auth_refresh_sessions (
+  id uuid primary key,
+  user_id uuid not null references auth_users(id) on delete cascade,
+  token_hash text not null unique,
+  expires_at timestamptz not null,
+  revoked_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  last_used_at timestamptz,
+  client_ip inet,
+  user_agent text
+);
+
+create table machine_api_allowlist (
+  id uuid primary key,
+  cidr cidr not null unique,
+  description text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table security_audit_events (
+  id uuid primary key,
+  event_type text not null,
+  actor text not null,
+  subject text,
+  remote_ip inet,
+  user_agent text,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now()
+);
+
+create table task_callback_outbox (
+  id uuid primary key,
+  task_id uuid not null references tasks(id) on delete cascade,
+  attempt_id uuid references task_attempts(id) on delete set null,
+  attempt_no integer not null,
+  callback_url text not null,
+  event_type text not null,
+  reason text not null,
+  status text not null check (status in ('pending', 'retrying', 'delivered', 'dead')),
+  delivery_attempts integer not null default 0,
+  deliver_after timestamptz not null,
+  last_error text,
+  last_http_status integer,
+  last_response_body text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  delivered_at timestamptz
+);
+
 create index idx_tasks_status_priority_created_at
   on tasks(status, priority desc, created_at asc);
 
@@ -233,11 +309,39 @@ create index idx_tasks_assigned_node_status
 create index idx_task_attempts_task_attempt_no_desc
   on task_attempts(task_id, attempt_no desc);
 
-create index idx_task_events_task_created_desc
-  on task_events(task_id, created_at desc);
+create index idx_stream_bindings_task_id
+  on stream_bindings(task_id);
 
 create index idx_record_files_task_start_time_desc
   on record_files(task_id, start_time desc nulls last);
 
-create index idx_stream_bindings_task_id
-  on stream_bindings(task_id);
+create index idx_transcode_artifacts_task_created_desc
+  on transcode_artifacts(task_id, created_at desc);
+
+create index idx_transcode_artifacts_created_desc
+  on transcode_artifacts(created_at desc);
+
+create index idx_task_events_task_created_desc
+  on task_events(task_id, created_at desc);
+
+create index idx_node_heartbeats_node_received_desc
+  on node_heartbeats(node_id, received_at desc);
+
+create index idx_auth_refresh_sessions_user_id
+  on auth_refresh_sessions(user_id);
+
+create index idx_auth_refresh_sessions_expires_at
+  on auth_refresh_sessions(expires_at);
+
+create index idx_security_audit_events_created_at
+  on security_audit_events(created_at desc);
+
+create index idx_task_callback_outbox_due
+  on task_callback_outbox(status, deliver_after asc, created_at asc);
+
+create index idx_task_callback_outbox_task_created_desc
+  on task_callback_outbox(task_id, created_at desc);
+
+create unique index idx_task_callback_outbox_pending_unique
+  on task_callback_outbox(task_id, attempt_no, event_type, reason)
+  where status in ('pending', 'retrying');

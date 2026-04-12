@@ -7,31 +7,25 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskType {
-    LiveRelay,
+    StreamIngest,
+    StreamBridge,
     FileTranscode,
-    FileToLive,
-    MulticastBridge,
-    RtpReceive,
 }
 
 impl TaskType {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::LiveRelay => "live_relay",
+            Self::StreamIngest => "stream_ingest",
+            Self::StreamBridge => "stream_bridge",
             Self::FileTranscode => "file_transcode",
-            Self::FileToLive => "file_to_live",
-            Self::MulticastBridge => "multicast_bridge",
-            Self::RtpReceive => "rtp_receive",
         }
     }
 
     pub const fn default_worker_kind(self) -> WorkerKind {
         match self {
-            Self::LiveRelay => WorkerKind::ZlmProxy,
+            Self::StreamIngest => WorkerKind::Hybrid,
+            Self::StreamBridge => WorkerKind::Ffmpeg,
             Self::FileTranscode => WorkerKind::Ffmpeg,
-            Self::FileToLive => WorkerKind::Hybrid,
-            Self::MulticastBridge => WorkerKind::Ffmpeg,
-            Self::RtpReceive => WorkerKind::ZlmRtpServer,
         }
     }
 }
@@ -47,11 +41,9 @@ impl FromStr for TaskType {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "live_relay" => Ok(Self::LiveRelay),
+            "stream_ingest" => Ok(Self::StreamIngest),
+            "stream_bridge" => Ok(Self::StreamBridge),
             "file_transcode" => Ok(Self::FileTranscode),
-            "file_to_live" => Ok(Self::FileToLive),
-            "multicast_bridge" => Ok(Self::MulticastBridge),
-            "rtp_receive" => Ok(Self::RtpReceive),
             _ => Err(ParseEnumError::new("task_type", value)),
         }
     }
@@ -278,6 +270,21 @@ pub enum InputKind {
 }
 
 impl InputKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rtsp => "rtsp",
+            Self::Rtmp => "rtmp",
+            Self::Hls => "hls",
+            Self::HttpMp4 => "http_mp4",
+            Self::HttpFlv => "http_flv",
+            Self::HttpTs => "http_ts",
+            Self::File => "file",
+            Self::UdpMpegtsMulticast => "udp_mpegts_multicast",
+            Self::RtpMulticast => "rtp_multicast",
+            Self::GbRtp => "gb_rtp",
+        }
+    }
+
     pub const fn is_url_based(self) -> bool {
         matches!(
             self,
@@ -290,15 +297,43 @@ impl InputKind {
                 | Self::File
         )
     }
+
+    pub const fn default_source_mode(self) -> Option<SourceMode> {
+        match self {
+            Self::Rtsp
+            | Self::Rtmp
+            | Self::HttpFlv
+            | Self::UdpMpegtsMulticast
+            | Self::RtpMulticast
+            | Self::GbRtp => Some(SourceMode::Live),
+            Self::HttpMp4 | Self::File => Some(SourceMode::Vod),
+            Self::Hls | Self::HttpTs => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishTargetKind {
     File,
-    ZlmIngest,
     UdpMpegtsMulticast,
     RtpMulticast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceMode {
+    Live,
+    Vod,
+}
+
+impl SourceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Vod => "vod",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -325,16 +360,13 @@ impl StartMode {
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPolicy {
     Never,
-    OnFailure,
-    Always,
+    #[serde(alias = "on_failure", alias = "always")]
+    Auto,
 }
 
 impl RecoveryPolicy {
-    pub const fn default_for(task_type: TaskType) -> Self {
-        match task_type {
-            TaskType::FileTranscode => Self::OnFailure,
-            _ => Self::Always,
-        }
+    pub const fn default_for(_task_type: TaskType) -> Self {
+        Self::Auto
     }
 }
 
@@ -350,17 +382,17 @@ pub enum RecordFormat {
 pub struct TaskSpec {
     #[serde(rename = "type")]
     pub task_type: TaskType,
-    #[serde(default)]
-    pub template: Option<String>,
     pub name: String,
-    #[serde(default)]
-    pub profile: Option<String>,
     #[serde(default = "default_priority")]
     pub priority: u8,
     #[serde(default)]
     pub common: CommonSpec,
     #[serde(default)]
     pub input: InputSpec,
+    #[serde(default)]
+    pub stream: StreamSpec,
+    #[serde(default)]
+    pub expose: ExposeSpec,
     #[serde(default)]
     pub process: ProcessSpec,
     #[serde(default)]
@@ -379,13 +411,31 @@ impl TaskSpec {
     pub fn resolved(&self) -> Self {
         let mut resolved = self.clone();
 
-        resolved.publish.enable_rtsp = Some(resolved.publish.enable_rtsp.unwrap_or(true));
-        resolved.publish.enable_rtmp = Some(resolved.publish.enable_rtmp.unwrap_or(true));
-        resolved.publish.enable_http_ts = Some(resolved.publish.enable_http_ts.unwrap_or(true));
-        resolved.publish.enable_http_fmp4 = Some(resolved.publish.enable_http_fmp4.unwrap_or(true));
-        resolved.publish.enable_hls = Some(resolved.publish.enable_hls.unwrap_or(false));
-        resolved.publish.stop_on_no_reader =
-            Some(resolved.publish.stop_on_no_reader.unwrap_or(false));
+        if resolved.input.source_mode.is_none() {
+            resolved.input.source_mode =
+                resolved.input.kind.and_then(InputKind::default_source_mode);
+        }
+        resolved.stream.app = Some(
+            resolved
+                .stream
+                .app
+                .clone()
+                .unwrap_or_else(|| "live".to_string()),
+        );
+        resolved.stream.vhost = Some(
+            resolved
+                .stream
+                .vhost
+                .clone()
+                .unwrap_or_else(|| "__defaultVhost__".to_string()),
+        );
+        resolved.expose.enable_rtsp = Some(resolved.expose.enable_rtsp.unwrap_or(true));
+        resolved.expose.enable_rtmp = Some(resolved.expose.enable_rtmp.unwrap_or(true));
+        resolved.expose.enable_http_ts = Some(resolved.expose.enable_http_ts.unwrap_or(true));
+        resolved.expose.enable_http_fmp4 = Some(resolved.expose.enable_http_fmp4.unwrap_or(true));
+        resolved.expose.enable_hls = Some(resolved.expose.enable_hls.unwrap_or(false));
+        resolved.expose.stop_on_no_reader =
+            Some(resolved.expose.stop_on_no_reader.unwrap_or(false));
         if matches!(resolved.input.kind, Some(InputKind::GbRtp)) {
             resolved.input.tcp_mode = Some(resolved.input.tcp_mode.unwrap_or(0));
         }
@@ -443,6 +493,7 @@ impl TaskSpec {
                 "must be provided",
             ));
         }
+
         if let Some(duration_sec) = self.record.duration_sec {
             if !self.record.enabled.unwrap_or(false) {
                 issues.push(ValidationIssue::new(
@@ -456,10 +507,10 @@ impl TaskSpec {
                     "must be greater than 0",
                 ));
             }
-            if !matches!(self.task_type, TaskType::LiveRelay | TaskType::FileToLive) {
+            if self.task_type != TaskType::StreamIngest {
                 issues.push(ValidationIssue::new(
                     "record.duration_sec",
-                    "is only supported for live_relay and file_to_live",
+                    "is only supported for stream_ingest",
                 ));
             }
         }
@@ -519,12 +570,180 @@ impl TaskSpec {
             Some(_) => {}
         }
 
+        match (self.input.kind, self.input.source_mode) {
+            (Some(InputKind::Hls | InputKind::HttpTs), None) => issues.push(ValidationIssue::new(
+                "input.source_mode",
+                "must be provided for hls and http_ts input",
+            )),
+            (Some(kind), Some(mode)) => {
+                if let Some(expected) = kind.default_source_mode() {
+                    if expected != mode {
+                        issues.push(ValidationIssue::new(
+                            "input.source_mode",
+                            format!(
+                                "{} input requires source_mode={}",
+                                kind.as_str(),
+                                expected.as_str()
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+
         match self.task_type {
-            TaskType::FileTranscode => {
-                if self.input.kind != Some(InputKind::File) {
+            TaskType::StreamIngest => {
+                if !matches!(
+                    self.input.kind,
+                    Some(
+                        InputKind::Rtsp
+                            | InputKind::Rtmp
+                            | InputKind::Hls
+                            | InputKind::HttpFlv
+                            | InputKind::HttpTs
+                            | InputKind::HttpMp4
+                            | InputKind::File
+                            | InputKind::UdpMpegtsMulticast
+                            | InputKind::RtpMulticast
+                            | InputKind::GbRtp
+                    )
+                ) {
                     issues.push(ValidationIssue::new(
                         "input.kind",
-                        "file_transcode requires file input",
+                        "stream_ingest requires a supported ingest input kind",
+                    ));
+                }
+                if self.publish.is_configured() {
+                    issues.push(ValidationIssue::new(
+                        "publish.kind",
+                        "stream_ingest does not accept publish settings",
+                    ));
+                }
+                if self
+                    .stream
+                    .app
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    issues.push(ValidationIssue::new(
+                        "stream.app",
+                        "must not be empty when provided",
+                    ));
+                }
+                if self
+                    .stream
+                    .name
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    issues.push(ValidationIssue::new(
+                        "stream.name",
+                        "must not be empty when provided",
+                    ));
+                }
+                if self
+                    .stream
+                    .vhost
+                    .as_deref()
+                    .is_some_and(|value| value.trim().is_empty())
+                {
+                    issues.push(ValidationIssue::new(
+                        "stream.vhost",
+                        "must not be empty when provided",
+                    ));
+                }
+            }
+            TaskType::StreamBridge => {
+                if self.input.kind == Some(InputKind::GbRtp) {
+                    issues.push(ValidationIssue::new(
+                        "input.kind",
+                        "stream_bridge does not accept gb_rtp input",
+                    ));
+                }
+                match self.publish.kind {
+                    Some(PublishTargetKind::File) => {
+                        if self.input.source_mode == Some(SourceMode::Vod) {
+                            issues.push(ValidationIssue::new(
+                                "publish.kind",
+                                "stream_bridge does not support file output for vod input; use file_transcode instead",
+                            ));
+                        }
+                        if self
+                            .publish
+                            .url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_none()
+                        {
+                            issues.push(ValidationIssue::new(
+                                "publish.url",
+                                "must be provided for file publish",
+                            ));
+                        }
+                    }
+                    Some(
+                        PublishTargetKind::UdpMpegtsMulticast | PublishTargetKind::RtpMulticast,
+                    ) => {
+                        if self
+                            .publish
+                            .group
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_none()
+                        {
+                            issues.push(ValidationIssue::new(
+                                "publish.group",
+                                "must be provided for multicast publish",
+                            ));
+                        }
+                        if self.publish.port.is_none() {
+                            issues.push(ValidationIssue::new(
+                                "publish.port",
+                                "must be provided for multicast publish",
+                            ));
+                        }
+                    }
+                    None => issues.push(ValidationIssue::new(
+                        "publish.kind",
+                        "must be provided for stream_bridge",
+                    )),
+                }
+                if self.stream.is_configured() {
+                    issues.push(ValidationIssue::new(
+                        "stream",
+                        "stream_bridge does not accept stream settings",
+                    ));
+                }
+                if self.expose.is_configured() {
+                    issues.push(ValidationIssue::new(
+                        "expose",
+                        "stream_bridge does not accept expose settings",
+                    ));
+                }
+                if self.record.is_configured() {
+                    issues.push(ValidationIssue::new(
+                        "record",
+                        "stream_bridge does not accept recording settings",
+                    ));
+                }
+            }
+            TaskType::FileTranscode => {
+                if !matches!(
+                    self.input.kind,
+                    Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs)
+                ) {
+                    issues.push(ValidationIssue::new(
+                        "input.kind",
+                        "file_transcode requires file, http_mp4, hls, or http_ts input",
+                    ));
+                }
+                if self.input.source_mode != Some(SourceMode::Vod) {
+                    issues.push(ValidationIssue::new(
+                        "input.source_mode",
+                        "file_transcode requires source_mode=vod",
                     ));
                 }
                 match self.publish.kind {
@@ -545,120 +764,32 @@ impl TaskSpec {
                     }
                     Some(_) => issues.push(ValidationIssue::new(
                         "publish.kind",
-                        "file_transcode currently requires file output",
+                        "file_transcode requires file output",
                     )),
                     None => issues.push(ValidationIssue::new(
                         "publish.kind",
                         "must be provided for file_transcode",
                     )),
                 }
-            }
-            TaskType::LiveRelay => match self.input.kind {
-                Some(
-                    InputKind::Rtsp
-                    | InputKind::Rtmp
-                    | InputKind::Hls
-                    | InputKind::HttpFlv
-                    | InputKind::HttpTs,
-                ) => {}
-                Some(_) => issues.push(ValidationIssue::new(
-                    "input.kind",
-                    "live_relay requires a network input kind",
-                )),
-                None => {}
-            },
-            TaskType::FileToLive => {
-                if !matches!(
-                    self.input.kind,
-                    Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs)
-                ) {
+                if self.stream.is_configured() {
                     issues.push(ValidationIssue::new(
-                        "input.kind",
-                        "file_to_live requires file, http_mp4, hls, or http_ts input",
+                        "stream",
+                        "file_transcode does not accept stream settings",
                     ));
                 }
-                match self.publish.kind {
-                    Some(PublishTargetKind::ZlmIngest) => {
-                        if self
-                            .publish
-                            .url
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .is_none()
-                        {
-                            issues.push(ValidationIssue::new(
-                                "publish.url",
-                                "must be provided for file_to_live publish target",
-                            ));
-                        }
-                    }
-                    Some(_) => issues.push(ValidationIssue::new(
-                        "publish.kind",
-                        "file_to_live currently requires zlm_ingest",
-                    )),
-                    None => issues.push(ValidationIssue::new(
-                        "publish.kind",
-                        "must be provided for file_to_live",
-                    )),
-                }
-            }
-            TaskType::RtpReceive => {
-                if self.input.kind != Some(InputKind::GbRtp) {
+                if self.expose.is_configured() {
                     issues.push(ValidationIssue::new(
-                        "input.kind",
-                        "rtp_receive requires gb_rtp input",
+                        "expose",
+                        "file_transcode does not accept expose settings",
                     ));
                 }
-                if self.publish.kind.is_some() {
+                if self.record.is_configured() {
                     issues.push(ValidationIssue::new(
-                        "publish.kind",
-                        "rtp_receive uses internal stream publication and does not accept publish.kind",
+                        "record",
+                        "file_transcode does not accept recording settings",
                     ));
                 }
             }
-            TaskType::MulticastBridge => match self.publish.kind {
-                None => issues.push(ValidationIssue::new(
-                    "publish.kind",
-                    "must be provided for multicast_bridge",
-                )),
-                Some(PublishTargetKind::File | PublishTargetKind::ZlmIngest) => {
-                    if self
-                        .publish
-                        .url
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .is_none()
-                    {
-                        issues.push(ValidationIssue::new(
-                            "publish.url",
-                            "must be provided for the selected publish kind",
-                        ));
-                    }
-                }
-                Some(PublishTargetKind::UdpMpegtsMulticast | PublishTargetKind::RtpMulticast) => {
-                    if self
-                        .publish
-                        .group
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .is_none()
-                    {
-                        issues.push(ValidationIssue::new(
-                            "publish.group",
-                            "must be provided for multicast publish",
-                        ));
-                    }
-                    if self.publish.port.is_none() {
-                        issues.push(ValidationIssue::new(
-                            "publish.port",
-                            "must be provided for multicast publish",
-                        ));
-                    }
-                }
-            },
         }
 
         if issues.is_empty() {
@@ -683,6 +814,8 @@ pub struct CommonSpec {
 pub struct InputSpec {
     #[serde(default)]
     pub kind: Option<InputKind>,
+    #[serde(default)]
+    pub source_mode: Option<SourceMode>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
@@ -711,6 +844,49 @@ pub struct InputSpec {
     pub tcp_mode: Option<u8>,
     #[serde(default)]
     pub ssrc: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamSpec {
+    #[serde(default)]
+    pub app: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub vhost: Option<String>,
+}
+
+impl StreamSpec {
+    pub fn is_configured(&self) -> bool {
+        self.app.is_some() || self.name.is_some() || self.vhost.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExposeSpec {
+    #[serde(default)]
+    pub enable_rtsp: Option<bool>,
+    #[serde(default)]
+    pub enable_rtmp: Option<bool>,
+    #[serde(default)]
+    pub enable_http_ts: Option<bool>,
+    #[serde(default)]
+    pub enable_http_fmp4: Option<bool>,
+    #[serde(default)]
+    pub enable_hls: Option<bool>,
+    #[serde(default)]
+    pub stop_on_no_reader: Option<bool>,
+}
+
+impl ExposeSpec {
+    pub fn is_configured(&self) -> bool {
+        self.enable_rtsp.is_some()
+            || self.enable_rtmp.is_some()
+            || self.enable_http_ts.is_some()
+            || self.enable_http_fmp4.is_some()
+            || self.enable_hls.is_some()
+            || self.stop_on_no_reader.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -761,18 +937,24 @@ pub struct PublishSpec {
     pub fifo_size: Option<u32>,
     #[serde(default)]
     pub format: Option<String>,
-    #[serde(default)]
-    pub enable_rtsp: Option<bool>,
-    #[serde(default)]
-    pub enable_rtmp: Option<bool>,
-    #[serde(default)]
-    pub enable_http_ts: Option<bool>,
-    #[serde(default)]
-    pub enable_http_fmp4: Option<bool>,
-    #[serde(default)]
-    pub enable_hls: Option<bool>,
-    #[serde(default)]
-    pub stop_on_no_reader: Option<bool>,
+}
+
+impl PublishSpec {
+    pub fn is_configured(&self) -> bool {
+        self.kind.is_some()
+            || self.url.is_some()
+            || self.group.is_some()
+            || self.port.is_some()
+            || self.interface_name.is_some()
+            || self.interface_ip.is_some()
+            || self.ttl.is_some()
+            || self.reuse.is_some()
+            || self.pkt_size.is_some()
+            || self.dscp.is_some()
+            || self.buffer_size.is_some()
+            || self.fifo_size.is_some()
+            || self.format.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -810,6 +992,17 @@ impl RecordSpec {
                 self.format.unwrap_or(RecordFormat::Mp4),
                 RecordFormat::Hls | RecordFormat::Both
             )
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.enabled.is_some()
+            || self.format.is_some()
+            || self.duration_sec.is_some()
+            || self.segment_sec.is_some()
+            || self.save_path.is_some()
+            || self.as_player.is_some()
+            || self.archive_policy.is_some()
+            || self.retention_days.is_some()
     }
 }
 
@@ -912,9 +1105,7 @@ mod tests {
     fn sample_task(task_type: TaskType) -> TaskSpec {
         TaskSpec {
             task_type,
-            template: Some("tpl_default".to_string()),
             name: "relay-camera-01".to_string(),
-            profile: None,
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -924,8 +1115,11 @@ mod tests {
             input: InputSpec {
                 kind: Some(InputKind::Rtsp),
                 url: Some("rtsp://camera.example/live".to_string()),
+                source_mode: Some(SourceMode::Live),
                 ..InputSpec::default()
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec::default(),
             record: RecordSpec::default(),
@@ -937,35 +1131,45 @@ mod tests {
 
     #[test]
     fn resolve_applies_documented_defaults() {
-        let resolved = sample_task(TaskType::LiveRelay).resolved();
+        let resolved = sample_task(TaskType::StreamIngest).resolved();
 
-        assert_eq!(resolved.publish.enable_rtsp, Some(true));
-        assert_eq!(resolved.publish.enable_rtmp, Some(true));
-        assert_eq!(resolved.publish.enable_http_ts, Some(true));
-        assert_eq!(resolved.publish.enable_http_fmp4, Some(true));
-        assert_eq!(resolved.publish.enable_hls, Some(false));
-        assert_eq!(resolved.publish.stop_on_no_reader, Some(false));
+        assert_eq!(resolved.stream.app.as_deref(), Some("live"));
+        assert_eq!(resolved.stream.vhost.as_deref(), Some("__defaultVhost__"));
+        assert_eq!(resolved.expose.enable_rtsp, Some(true));
+        assert_eq!(resolved.expose.enable_rtmp, Some(true));
+        assert_eq!(resolved.expose.enable_http_ts, Some(true));
+        assert_eq!(resolved.expose.enable_http_fmp4, Some(true));
+        assert_eq!(resolved.expose.enable_hls, Some(false));
+        assert_eq!(resolved.expose.stop_on_no_reader, Some(false));
         assert_eq!(resolved.record.enabled, Some(false));
-        assert_eq!(resolved.recovery.policy, Some(RecoveryPolicy::Always));
+        assert_eq!(resolved.recovery.policy, Some(RecoveryPolicy::Auto));
         assert_eq!(resolved.schedule.start_mode, Some(StartMode::Immediate));
     }
 
     #[test]
-    fn file_transcode_defaults_to_on_failure_recovery() {
+    fn file_transcode_defaults_to_auto_recovery() {
         let resolved = sample_task(TaskType::FileTranscode).resolved();
-        assert_eq!(resolved.recovery.policy, Some(RecoveryPolicy::OnFailure));
+        assert_eq!(resolved.recovery.policy, Some(RecoveryPolicy::Auto));
+    }
+
+    #[test]
+    fn recovery_policy_deserializes_legacy_aliases() {
+        let on_failure: RecoveryPolicy = serde_json::from_str("\"on_failure\"").unwrap();
+        let always: RecoveryPolicy = serde_json::from_str("\"always\"").unwrap();
+        assert_eq!(on_failure, RecoveryPolicy::Auto);
+        assert_eq!(always, RecoveryPolicy::Auto);
     }
 
     #[test]
     fn validate_rejects_missing_input_and_creator() {
         let task = TaskSpec {
-            task_type: TaskType::LiveRelay,
-            template: None,
+            task_type: TaskType::StreamIngest,
             name: " ".to_string(),
-            profile: None,
             priority: 101,
             common: CommonSpec::default(),
             input: InputSpec::default(),
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec::default(),
             record: RecordSpec::default(),
@@ -986,12 +1190,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_multicast_input_without_explicit_interface_binding() {
+    fn validate_allows_stream_bridge_multicast_input_without_explicit_interface_binding() {
         let task = TaskSpec {
-            task_type: TaskType::MulticastBridge,
-            template: None,
+            task_type: TaskType::StreamBridge,
             name: "bridge".to_string(),
-            profile: None,
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -1002,8 +1204,11 @@ mod tests {
                 kind: Some(InputKind::UdpMpegtsMulticast),
                 group: Some("239.0.0.1".to_string()),
                 port: Some(1234),
+                source_mode: Some(SourceMode::Live),
                 ..InputSpec::default()
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec {
                 kind: Some(PublishTargetKind::File),
@@ -1021,48 +1226,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_multicast_input_with_interface_name_only() {
-        let task = TaskSpec {
-            task_type: TaskType::MulticastBridge,
-            template: None,
-            name: "bridge".to_string(),
-            profile: None,
-            priority: 50,
-            common: CommonSpec {
-                created_by: Some("alice".to_string()),
-                callback_url: None,
-                labels: Vec::new(),
-            },
-            input: InputSpec {
-                kind: Some(InputKind::UdpMpegtsMulticast),
-                group: Some("239.0.0.1".to_string()),
-                port: Some(1234),
-                interface_name: Some("eth1".to_string()),
-                ..InputSpec::default()
-            },
-            process: ProcessSpec::default(),
-            publish: PublishSpec {
-                kind: Some(PublishTargetKind::File),
-                url: Some("/tmp/out.ts".to_string()),
-                ..PublishSpec::default()
-            },
-            record: RecordSpec::default(),
-            recovery: RecoverySpec::default(),
-            schedule: ScheduleSpec::default(),
-            resource: ResourceSpec::default(),
-        };
+    fn validate_rejects_stream_ingest_with_publish_settings() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.publish.kind = Some(PublishTargetKind::File);
+        task.publish.url = Some("/tmp/out.ts".to_string());
 
-        task.validate()
-            .expect("validation should accept multicast interface_name");
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.kind")
+        );
     }
 
     #[test]
-    fn validate_rejects_multicast_bridge_without_publish_target() {
+    fn validate_rejects_stream_bridge_without_publish_target() {
         let task = TaskSpec {
-            task_type: TaskType::MulticastBridge,
-            template: None,
+            task_type: TaskType::StreamBridge,
             name: "bridge".to_string(),
-            profile: None,
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -1073,9 +1255,11 @@ mod tests {
                 kind: Some(InputKind::UdpMpegtsMulticast),
                 group: Some("239.0.0.1".to_string()),
                 port: Some(1234),
-                interface_ip: Some("192.168.1.10".to_string()),
+                source_mode: Some(SourceMode::Live),
                 ..InputSpec::default()
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec::default(),
             record: RecordSpec::default(),
@@ -1094,12 +1278,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_file_to_live_without_zlm_ingest_target() {
+    fn validate_rejects_stream_bridge_gb_rtp_input() {
         let task = TaskSpec {
-            task_type: TaskType::FileToLive,
-            template: None,
-            name: "file-live".to_string(),
-            profile: None,
+            task_type: TaskType::StreamBridge,
+            name: "bridge".to_string(),
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -1107,89 +1289,20 @@ mod tests {
                 labels: Vec::new(),
             },
             input: InputSpec {
-                kind: Some(InputKind::File),
-                url: Some("/tmp/input.mp4".to_string()),
+                kind: Some(InputKind::GbRtp),
+                source_mode: Some(SourceMode::Live),
+                port: Some(30000),
                 ..InputSpec::default()
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec {
                 kind: Some(PublishTargetKind::UdpMpegtsMulticast),
+                group: Some("239.0.0.1".to_string()),
+                port: Some(1234),
                 ..PublishSpec::default()
             },
-            record: RecordSpec::default(),
-            recovery: RecoverySpec::default(),
-            schedule: ScheduleSpec::default(),
-            resource: ResourceSpec::default(),
-        };
-
-        let error = task.validate().expect_err("validation should fail");
-        assert!(
-            error
-                .issues
-                .iter()
-                .any(|issue| issue.field == "publish.kind")
-        );
-    }
-
-    #[test]
-    fn validate_rejects_file_transcode_without_file_output() {
-        let task = TaskSpec {
-            task_type: TaskType::FileTranscode,
-            template: None,
-            name: "file-transcode".to_string(),
-            profile: None,
-            priority: 50,
-            common: CommonSpec {
-                created_by: Some("alice".to_string()),
-                callback_url: None,
-                labels: Vec::new(),
-            },
-            input: InputSpec {
-                kind: Some(InputKind::File),
-                url: Some("/tmp/input.mp4".to_string()),
-                ..InputSpec::default()
-            },
-            process: ProcessSpec::default(),
-            publish: PublishSpec {
-                kind: Some(PublishTargetKind::ZlmIngest),
-                url: Some("rtmp://zlm/live/out".to_string()),
-                ..PublishSpec::default()
-            },
-            record: RecordSpec::default(),
-            recovery: RecoverySpec::default(),
-            schedule: ScheduleSpec::default(),
-            resource: ResourceSpec::default(),
-        };
-
-        let error = task.validate().expect_err("validation should fail");
-        assert!(
-            error
-                .issues
-                .iter()
-                .any(|issue| issue.field == "publish.kind")
-        );
-    }
-
-    #[test]
-    fn validate_rejects_live_relay_with_file_input() {
-        let task = TaskSpec {
-            task_type: TaskType::LiveRelay,
-            template: None,
-            name: "relay-file".to_string(),
-            profile: None,
-            priority: 50,
-            common: CommonSpec {
-                created_by: Some("alice".to_string()),
-                callback_url: None,
-                labels: Vec::new(),
-            },
-            input: InputSpec {
-                kind: Some(InputKind::File),
-                url: Some("/tmp/input.mp4".to_string()),
-                ..InputSpec::default()
-            },
-            process: ProcessSpec::default(),
-            publish: PublishSpec::default(),
             record: RecordSpec::default(),
             recovery: RecoverySpec::default(),
             schedule: ScheduleSpec::default(),
@@ -1201,12 +1314,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_allows_file_to_live_with_http_mp4_input() {
+    fn validate_rejects_stream_bridge_vod_file_output() {
         let task = TaskSpec {
-            task_type: TaskType::FileToLive,
-            template: None,
-            name: "file-live".to_string(),
-            profile: None,
+            task_type: TaskType::StreamBridge,
+            name: "vod-bridge".to_string(),
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -1215,13 +1326,56 @@ mod tests {
             },
             input: InputSpec {
                 kind: Some(InputKind::HttpMp4),
+                source_mode: Some(SourceMode::Vod),
                 url: Some("http://vod.example.com/archive.mp4".to_string()),
                 ..InputSpec::default()
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec {
-                kind: Some(PublishTargetKind::ZlmIngest),
-                url: Some("rtmp://127.0.0.1/live/out".to_string()),
+                kind: Some(PublishTargetKind::File),
+                url: Some("/tmp/out.mp4".to_string()),
+                ..PublishSpec::default()
+            },
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.kind")
+        );
+    }
+
+    #[test]
+    fn validate_allows_file_transcode_with_http_mp4_vod_input() {
+        let task = TaskSpec {
+            task_type: TaskType::FileTranscode,
+            name: "file-transcode".to_string(),
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::HttpMp4),
+                source_mode: Some(SourceMode::Vod),
+                url: Some("http://vod.example.com/archive.mp4".to_string()),
+                ..InputSpec::default()
+            },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
+            process: ProcessSpec::default(),
+            publish: PublishSpec {
+                kind: Some(PublishTargetKind::File),
+                url: Some("/tmp/out.mp4".to_string()),
                 ..PublishSpec::default()
             },
             record: RecordSpec::default(),
@@ -1231,12 +1385,47 @@ mod tests {
         };
 
         task.validate()
-            .expect("validation should allow http_mp4 file_to_live input");
+            .expect("validation should allow http_mp4 file_transcode input");
+    }
+
+    #[test]
+    fn validate_rejects_hls_without_source_mode() {
+        let task = TaskSpec {
+            task_type: TaskType::StreamIngest,
+            name: "hls-ingest".to_string(),
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::Hls),
+                url: Some("http://vod.example.com/index.m3u8".to_string()),
+                ..InputSpec::default()
+            },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
+            process: ProcessSpec::default(),
+            publish: PublishSpec::default(),
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "input.source_mode")
+        );
     }
 
     #[test]
     fn validate_rejects_record_duration_for_unsupported_task_types() {
-        let mut task = sample_task(TaskType::MulticastBridge);
+        let mut task = sample_task(TaskType::StreamBridge);
         task.publish.kind = Some(PublishTargetKind::File);
         task.publish.url = Some("/tmp/out.ts".to_string());
         task.record.enabled = Some(true);
@@ -1253,7 +1442,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_positive_record_duration() {
-        let mut task = sample_task(TaskType::LiveRelay);
+        let mut task = sample_task(TaskType::StreamIngest);
         task.record.enabled = Some(true);
         task.record.duration_sec = Some(0);
 
@@ -1269,10 +1458,8 @@ mod tests {
     #[test]
     fn resolve_defaults_gb_rtp_tcp_mode_to_udp() {
         let task = TaskSpec {
-            task_type: TaskType::RtpReceive,
-            template: None,
+            task_type: TaskType::StreamIngest,
             name: "rtp-recv".to_string(),
-            profile: None,
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -1284,6 +1471,8 @@ mod tests {
                 port: Some(0),
                 ..InputSpec::default()
             },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec::default(),
             record: RecordSpec::default(),
@@ -1297,12 +1486,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_rtp_receive_with_invalid_tcp_mode_and_publish_target() {
+    fn validate_rejects_file_transcode_with_stream_settings() {
         let task = TaskSpec {
-            task_type: TaskType::RtpReceive,
-            template: None,
-            name: "rtp-recv".to_string(),
-            profile: None,
+            task_type: TaskType::FileTranscode,
+            name: "file-transcode".to_string(),
             priority: 50,
             common: CommonSpec {
                 created_by: Some("alice".to_string()),
@@ -1310,14 +1497,20 @@ mod tests {
                 labels: Vec::new(),
             },
             input: InputSpec {
-                kind: Some(InputKind::GbRtp),
-                port: Some(30000),
-                tcp_mode: Some(9),
+                kind: Some(InputKind::File),
+                source_mode: Some(SourceMode::Vod),
+                url: Some("/tmp/input.mp4".to_string()),
                 ..InputSpec::default()
             },
+            stream: StreamSpec {
+                name: Some("should-not-be-here".to_string()),
+                ..StreamSpec::default()
+            },
+            expose: ExposeSpec::default(),
             process: ProcessSpec::default(),
             publish: PublishSpec {
-                kind: Some(PublishTargetKind::ZlmIngest),
+                kind: Some(PublishTargetKind::File),
+                url: Some("/tmp/out.mp4".to_string()),
                 ..PublishSpec::default()
             },
             record: RecordSpec::default(),
@@ -1327,17 +1520,6 @@ mod tests {
         };
 
         let error = task.validate().expect_err("validation should fail");
-        assert!(
-            error
-                .issues
-                .iter()
-                .any(|issue| issue.field == "input.tcp_mode")
-        );
-        assert!(
-            error
-                .issues
-                .iter()
-                .any(|issue| issue.field == "publish.kind")
-        );
+        assert!(error.issues.iter().any(|issue| issue.field == "stream"));
     }
 }
