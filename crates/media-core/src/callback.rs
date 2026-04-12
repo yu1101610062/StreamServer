@@ -84,68 +84,30 @@ async fn deliver_job(
     config: &CallbackConfig,
     job: CallbackOutboxJob,
 ) -> anyhow::Result<()> {
-    let detail = repository.get_task(job.task_id).await?;
-    if !is_terminal(detail.task.status) {
-        repository
-            .mark_callback_dead(
-                &job,
-                None,
-                None,
-                "task is no longer in a terminal state",
-                Utc::now(),
-            )
-            .await?;
-        return Ok(());
-    }
-
-    let attempt = repository
-        .get_task_attempt(job.task_id, job.attempt_no)
-        .await?
-        .unwrap_or_else(|| synthetic_attempt(&detail, &job));
-
-    let nodes = repository.list_nodes().await?;
-    let node_lookup = nodes
-        .into_iter()
-        .map(|node| (node.id, node))
-        .collect::<HashMap<_, _>>();
-    let streams = repository
-        .list_streams(StreamListFilter {
-            schema: None,
-            app: None,
-            stream: None,
-            task_id: Some(job.task_id),
-            node_id: None,
-            has_viewer: None,
-        })
-        .await?;
-    let records = repository.list_task_record_files(job.task_id).await?;
-    let transcode_artifacts = repository
-        .list_task_transcode_artifacts(job.task_id)
-        .await?;
-
-    let payload = TaskCompletedCallbackPayload {
-        event_id: job.id,
-        event_type: "task.completed".to_string(),
-        reason: job.reason.clone(),
-        event_time: Utc::now(),
-        task: TaskCallbackTask::from_detail(&detail),
-        attempt: TaskCallbackAttempt::from_summary(&attempt),
-        streams: streams
-            .into_iter()
-            .map(|stream| TaskCallbackStream::from_summary(stream, &node_lookup))
-            .collect(),
-        records: records
-            .into_iter()
-            .map(TaskCallbackRecord::from_summary)
-            .collect(),
-        transcode_artifacts: transcode_artifacts
-            .into_iter()
-            .map(TaskCallbackTranscodeArtifact::from_summary)
-            .collect(),
-        latest_event: select_latest_business_event(&detail.recent_events)
-            .map(TaskCallbackLatestEvent::from_summary),
+    let body = match job.event_type.as_str() {
+        "task.completed" => {
+            let Some(payload) = build_task_completed_callback_payload(repository, &job).await?
+            else {
+                return Ok(());
+            };
+            serde_json::to_vec(&payload)?
+        }
+        "task.status" => {
+            serde_json::to_vec(&build_task_status_callback_payload(repository, &job).await?)?
+        }
+        _ => {
+            repository
+                .mark_callback_dead(
+                    &job,
+                    None,
+                    None,
+                    format!("unsupported callback event type: {}", job.event_type),
+                    Utc::now(),
+                )
+                .await?;
+            return Ok(());
+        }
     };
-    let body = serde_json::to_vec(&payload)?;
     let headers = build_headers(&job, &body, config.shared_secret.as_deref())?;
 
     let response = client
@@ -245,7 +207,7 @@ fn build_headers(
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(
         "X-StreamServer-Event",
-        HeaderValue::from_static("task.completed"),
+        HeaderValue::from_str(job.event_type.as_str())?,
     );
     headers.insert(
         "X-StreamServer-Event-Id",
@@ -344,6 +306,112 @@ fn synthetic_attempt(detail: &TaskDetail, job: &CallbackOutboxJob) -> AttemptSum
     }
 }
 
+fn synthetic_running_attempt(detail: &TaskDetail, job: &CallbackOutboxJob) -> AttemptSummary {
+    AttemptSummary {
+        id: Uuid::nil(),
+        attempt_no: job.attempt_no,
+        worker_kind: detail.task.task_type.default_worker_kind(),
+        status: AttemptStatus::Running,
+        node_id: detail.task.assigned_node_id,
+        pid: None,
+        exit_code: None,
+        failure_code: None,
+        failure_reason: None,
+        started_at: detail.task.started_at,
+        ended_at: None,
+    }
+}
+
+async fn build_task_completed_callback_payload(
+    repository: &TaskRepository,
+    job: &CallbackOutboxJob,
+) -> anyhow::Result<Option<TaskCompletedCallbackPayload>> {
+    let detail = repository.get_task(job.task_id).await?;
+    if !is_terminal(detail.task.status) {
+        repository
+            .mark_callback_dead(
+                job,
+                None,
+                None,
+                "task is no longer in a terminal state",
+                Utc::now(),
+            )
+            .await?;
+        return Ok(None);
+    }
+
+    let attempt = repository
+        .get_task_attempt(job.task_id, job.attempt_no)
+        .await?
+        .unwrap_or_else(|| synthetic_attempt(&detail, job));
+
+    let nodes = repository.list_nodes().await?;
+    let node_lookup = nodes
+        .into_iter()
+        .map(|node| (node.id, node))
+        .collect::<HashMap<_, _>>();
+    let streams = repository
+        .list_streams(StreamListFilter {
+            schema: None,
+            app: None,
+            stream: None,
+            task_id: Some(job.task_id),
+            node_id: None,
+            has_viewer: None,
+        })
+        .await?;
+    let records = repository.list_task_record_files(job.task_id).await?;
+    let transcode_artifacts = repository
+        .list_task_transcode_artifacts(job.task_id)
+        .await?;
+
+    Ok(Some(TaskCompletedCallbackPayload {
+        event_id: job.id,
+        event_type: "task.completed".to_string(),
+        reason: job.reason.clone(),
+        event_time: Utc::now(),
+        task: TaskCallbackTask::from_detail(&detail),
+        attempt: TaskCallbackAttempt::from_summary(&attempt),
+        streams: streams
+            .into_iter()
+            .map(|stream| TaskCallbackStream::from_summary(stream, &node_lookup))
+            .collect(),
+        records: records
+            .into_iter()
+            .map(TaskCallbackRecord::from_summary)
+            .collect(),
+        transcode_artifacts: transcode_artifacts
+            .into_iter()
+            .map(TaskCallbackTranscodeArtifact::from_summary)
+            .collect(),
+        latest_event: select_latest_business_event(&detail.recent_events)
+            .map(TaskCallbackLatestEvent::from_summary),
+    }))
+}
+
+async fn build_task_status_callback_payload(
+    repository: &TaskRepository,
+    job: &CallbackOutboxJob,
+) -> anyhow::Result<TaskStatusCallbackPayload> {
+    let detail = repository.get_task(job.task_id).await?;
+    let attempt = repository
+        .get_task_attempt(job.task_id, job.attempt_no)
+        .await?
+        .unwrap_or_else(|| synthetic_running_attempt(&detail, job));
+
+    Ok(TaskStatusCallbackPayload {
+        event_id: job.id,
+        event_type: "task.status".to_string(),
+        reason: job.reason.clone(),
+        event_time: Utc::now(),
+        status: TaskStatus::Running,
+        task: TaskCallbackTask::from_running_detail(&detail),
+        attempt: TaskCallbackAttempt::from_running_summary(&attempt, &detail),
+        latest_event: select_status_callback_event(&detail.recent_events, &job.reason)
+            .map(TaskCallbackLatestEvent::from_summary),
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskCompletedCallbackPayload {
     pub event_id: Uuid,
@@ -355,6 +423,18 @@ pub struct TaskCompletedCallbackPayload {
     pub streams: Vec<TaskCallbackStream>,
     pub records: Vec<TaskCallbackRecord>,
     pub transcode_artifacts: Vec<TaskCallbackTranscodeArtifact>,
+    pub latest_event: Option<TaskCallbackLatestEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskStatusCallbackPayload {
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub reason: String,
+    pub event_time: DateTime<Utc>,
+    pub status: TaskStatus,
+    pub task: TaskCallbackTask,
+    pub attempt: TaskCallbackAttempt,
     pub latest_event: Option<TaskCallbackLatestEvent>,
 }
 
@@ -388,6 +468,29 @@ impl TaskCallbackTask {
             finished_at: detail.task.finished_at,
         }
     }
+
+    fn from_running_detail(detail: &TaskDetail) -> Self {
+        Self {
+            id: detail.task.id,
+            name: detail.task.name.clone(),
+            task_type: detail.task.task_type,
+            status: TaskStatus::Running,
+            priority: detail.task.priority,
+            created_by: detail.task.created_by.clone(),
+            assigned_node_id: detail
+                .current_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.node_id)
+                .or(detail.task.assigned_node_id),
+            created_at: detail.task.created_at,
+            started_at: detail
+                .current_attempt
+                .as_ref()
+                .and_then(|attempt| attempt.started_at)
+                .or(detail.task.started_at),
+            finished_at: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -415,6 +518,20 @@ impl TaskCallbackAttempt {
             ended_at: summary.ended_at,
             failure_code: summary.failure_code.clone(),
             failure_reason: summary.failure_reason.clone(),
+        }
+    }
+
+    fn from_running_summary(summary: &AttemptSummary, detail: &TaskDetail) -> Self {
+        Self {
+            id: summary.id,
+            no: summary.attempt_no,
+            status: AttemptStatus::Running,
+            node_id: summary.node_id.or(detail.task.assigned_node_id),
+            worker_kind: summary.worker_kind,
+            started_at: summary.started_at.or(detail.task.started_at),
+            ended_at: None,
+            failure_code: None,
+            failure_reason: None,
         }
     }
 }
@@ -535,5 +652,20 @@ impl TaskCallbackLatestEvent {
             message,
             created_at: summary.created_at,
         }
+    }
+}
+
+fn select_status_callback_event(
+    events: &[TaskEventSummary],
+    reason: &str,
+) -> Option<TaskEventSummary> {
+    if reason == "running" {
+        events
+            .iter()
+            .find(|event| matches!(event.event_type.as_str(), "running" | "task_progress"))
+            .cloned()
+            .or_else(|| select_latest_business_event(events))
+    } else {
+        select_latest_business_event(events)
     }
 }

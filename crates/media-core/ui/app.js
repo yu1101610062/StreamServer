@@ -212,7 +212,7 @@ const EXTERNAL_API_DOCS = [
       authHeaderParam(),
       taskIdPathParam(),
     ],
-    responseExample: { task: { id: "0195...", status: "RUNNING", type: "live_relay" }, callback_delivery: { status: "delivered", callback_url: "https://biz.example.com/streamserver/callback" }, recent_events: [] },
+    responseExample: { task: { id: "0195...", status: "RUNNING", type: "live_relay" }, callback_delivery: { event_type: "task.status", status: "delivered", callback_url: "https://biz.example.com/streamserver/callback" }, recent_events: [] },
   },
   {
     category: "任务管理",
@@ -518,7 +518,7 @@ function buildApiDocDetails() {
     responseFields: [
       { name: "task", type: "object", description: "任务主信息。" },
       { name: "current_attempt", type: "object", description: "当前 attempt 状态与节点信息。" },
-      { name: "callback_delivery", type: "object", description: "最近一次任务完成回调的状态摘要。" },
+      { name: "callback_delivery", type: "object", description: "最近一次任务回调的状态摘要。" },
       { name: "recent_events[]", type: "array", description: "最近事件。" },
       { name: "requested_spec", type: "object", description: "原始请求规格。" },
       { name: "resolved_spec", type: "object", description: "服务端补全后的最终规格。" },
@@ -2733,7 +2733,7 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
         <span class="subtle">${escapeHtml(streams.map((item) => `${item.app}/${item.stream}`).join(", ") || "暂无")}</span>
       </div>
       <div class="metric">
-        <label>完成回调</label>
+        <label>最近回调</label>
         <strong>${escapeHtml(callback ? callback.status : "未配置")}</strong>
         <span class="subtle">${escapeHtml(callbackTime)}</span>
       </div>
@@ -2772,7 +2772,7 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
         <div class="panel-header">
           <div>
             <h3>回调状态</h3>
-            <p>展示最近一次任务完成回调的地址、状态和错误摘要。</p>
+            <p>展示最近一次任务回调的事件类型、状态和错误摘要。</p>
           </div>
         </div>
         ${
@@ -2782,6 +2782,10 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
                 <div class="detail-item">
                   <label>回调地址</label>
                   <div class="mono">${escapeHtml(callback.callback_url)}</div>
+                </div>
+                <div class="detail-item">
+                  <label>事件类型</label>
+                  <div>${escapeHtml(callback.event_type || "task.completed")}</div>
                 </div>
                 <div class="detail-item">
                   <label>最近状态</label>
@@ -2809,7 +2813,7 @@ function renderTaskOverview(detail, recordsPage, streams, diffPaths) {
                 </div>
               </div>
             `
-            : renderInlineEmpty("当前任务未配置完成回调。")
+            : renderInlineEmpty("当前任务未配置回调。")
         }
       </div>
       <div class="panel">

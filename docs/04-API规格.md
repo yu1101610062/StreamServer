@@ -179,34 +179,69 @@
 
 ### 3.2 `GET /tasks/{id}`
 
-返回任务主信息、当前 Attempt 摘要、最近事件摘要，以及最近一次任务完成回调状态摘要。
+返回任务主信息、当前 Attempt 摘要、最近事件摘要，以及最近一次任务回调状态摘要。
 
 新增字段：
 
-- `callback_delivery`：最近一次任务完成回调状态；未配置 `common.callback_url` 时为 `null`
+- `callback_delivery`：最近一次任务回调状态；未配置 `common.callback_url` 时为 `null`
 
-### 3.3 任务完成回调
+### 3.3 任务回调
 
-当任务配置了 `common.callback_url`，且任务进入终态 `SUCCEEDED`、`FAILED`、`CANCELED`、`LOST` 时，`media-core` 会异步向该地址发起回调。
+当任务配置了 `common.callback_url` 时，`media-core` 会异步向该地址发起回调。
+
+回调事件：
+
+- `task.status`：任务某个 Attempt 首次进入 `RUNNING` 时立即发送，`reason=running`
+- `task.completed`：任务进入终态 `SUCCEEDED`、`FAILED`、`CANCELED`、`LOST` 时发送，`reason=terminal_state`
 
 回调规则：
 
 - 方法固定 `POST`
 - `Content-Type: application/json`
-- 默认在任务终态后延迟 `8s` 发送，给录像和转码产物留出入库窗口
-- 若录像文件或转码产物在首次完成回调之后才入库，会自动补发一次 `reason=artifact_update` 的刷新回调
+- `task.status` 默认即时发送
+- `task.completed` 默认在任务终态后延迟 `8s` 发送，给录像和转码产物留出入库窗口
+- 若录像文件或转码产物在首次 `task.completed(reason=terminal_state)` 回调之后才入库，会自动补发一次 `task.completed(reason=artifact_update)` 的刷新回调
 - 网络错误、超时、`429` 和 `5xx` 会自动重试
 - 其他 `4xx` 不重试
 
 固定请求头：
 
-- `X-StreamServer-Event: task.completed`
+- `X-StreamServer-Event`：`task.status` 或 `task.completed`
 - `X-StreamServer-Event-Id`
 - `X-StreamServer-Task-Id`
 - `X-StreamServer-Attempt-No`
 - 若配置 `CALLBACK_SHARED_SECRET`，额外携带 `X-StreamServer-Signature: sha256=<hex>`
 
-回调体：
+`task.status` 回调体：
+
+```json
+{
+  "event_id": "019d....",
+  "event_type": "task.status",
+  "reason": "running",
+  "event_time": "2026-04-12T10:21:33Z",
+  "status": "RUNNING",
+  "task": {
+    "id": "019d....",
+    "name": "relay-camera-01",
+    "type": "file_to_live",
+    "status": "RUNNING"
+  },
+  "attempt": {
+    "id": "019d....",
+    "no": 1,
+    "status": "RUNNING",
+    "worker_kind": "hybrid"
+  },
+  "latest_event": {
+    "event_type": "running",
+    "event_level": "info",
+    "message": "task is running"
+  }
+}
+```
+
+`task.completed` 回调体：
 
 ```json
 {

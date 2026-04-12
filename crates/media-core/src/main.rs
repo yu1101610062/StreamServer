@@ -2947,6 +2947,62 @@ mod tests {
         Ok(task_id)
     }
 
+    async fn insert_starting_stream_task(
+        pool: &sqlx::PgPool,
+        node_id: Uuid,
+        resolved_spec: Value,
+        app: &str,
+        stream: &str,
+    ) -> anyhow::Result<Uuid> {
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, template_id, profile, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'relay-camera-01', 'live_relay'::task_type, 'STARTING'::task_status, null, null, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5, null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("stream-starting-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'STARTING'::attempt_status,
+              null, null, 'rtsp', '__defaultVhost__', $4, $5,
+              null, null, null, null,
+              null, $6, null, $6
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(app)
+        .bind(stream)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(task_id)
+    }
+
     async fn spawn_zlm_stub() -> anyhow::Result<(String, JoinHandle<()>)> {
         async fn media_list() -> Json<Value> {
             Json(json!({
@@ -4201,6 +4257,222 @@ mod tests {
                 .map(|value| value.status.as_str()),
             Some("delivered")
         );
+
+        let _ = shutdown_tx.send(true);
+        dispatcher.abort();
+        callback_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn callback_dispatcher_delivers_running_status_callback() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+            db.pool.clone(),
+            chrono::Duration::zero(),
+        ));
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-01",
+            "common": {"created_by": "tester", "callback_url": callback_url},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {
+                "enable_rtsp": true,
+                "enable_http_ts": true
+            },
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_starting_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+        repository
+            .record_agent_task_event(
+                node_id,
+                repository::AgentTaskEventRecord {
+                    task_id,
+                    attempt_no: 1,
+                    event_type: "running".to_string(),
+                    event_level: "info".to_string(),
+                    message: "task is running".to_string(),
+                    payload: json!({}),
+                },
+            )
+            .await?;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dispatcher = callback::spawn(
+            repository.clone(),
+            Client::new(),
+            callback::CallbackConfig {
+                timeout: std::time::Duration::from_secs(2),
+                max_attempts: 3,
+                initial_backoff: std::time::Duration::from_millis(50),
+                max_backoff: std::time::Duration::from_millis(200),
+                shared_secret: None,
+            },
+            shutdown_rx,
+        );
+
+        let delivered = wait_for_callback_count(&calls, 1).await?;
+        assert_eq!(
+            delivered[0]
+                .0
+                .get("X-StreamServer-Event")
+                .and_then(|value| value.to_str().ok()),
+            Some("task.status")
+        );
+        assert_eq!(delivered[0].1["event_type"], json!("task.status"));
+        assert_eq!(delivered[0].1["reason"], json!("running"));
+        assert_eq!(delivered[0].1["status"], json!("RUNNING"));
+        assert_eq!(delivered[0].1["task"]["status"], json!("RUNNING"));
+        assert_eq!(delivered[0].1["attempt"]["status"], json!("RUNNING"));
+        assert_eq!(
+            delivered[0].1["latest_event"]["event_type"],
+            json!("running")
+        );
+        assert!(delivered[0].1.get("streams").is_none());
+        assert!(delivered[0].1.get("records").is_none());
+        assert!(delivered[0].1.get("transcode_artifacts").is_none());
+
+        let detail = repository.get_task(task_id).await?;
+        assert_eq!(
+            detail
+                .callback_delivery
+                .as_ref()
+                .map(|value| value.event_type.as_str()),
+            Some("task.status")
+        );
+        assert_eq!(
+            detail
+                .callback_delivery
+                .as_ref()
+                .map(|value| value.reason.as_str()),
+            Some("running")
+        );
+
+        let _ = shutdown_tx.send(true);
+        dispatcher.abort();
+        callback_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn running_status_callback_is_not_duplicated_after_delivery() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+            db.pool.clone(),
+            chrono::Duration::zero(),
+        ));
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-01",
+            "common": {"created_by": "tester", "callback_url": callback_url},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {
+                "enable_rtsp": true
+            },
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_starting_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dispatcher = callback::spawn(
+            repository.clone(),
+            Client::new(),
+            callback::CallbackConfig {
+                timeout: std::time::Duration::from_secs(2),
+                max_attempts: 3,
+                initial_backoff: std::time::Duration::from_millis(50),
+                max_backoff: std::time::Duration::from_millis(200),
+                shared_secret: None,
+            },
+            shutdown_rx,
+        );
+
+        repository
+            .record_agent_task_event(
+                node_id,
+                repository::AgentTaskEventRecord {
+                    task_id,
+                    attempt_no: 1,
+                    event_type: "running".to_string(),
+                    event_level: "info".to_string(),
+                    message: "task is running".to_string(),
+                    payload: json!({}),
+                },
+            )
+            .await?;
+
+        let delivered = wait_for_callback_count(&calls, 1).await?;
+        assert_eq!(delivered.len(), 1);
+
+        repository
+            .record_agent_progress(
+                node_id,
+                repository::TaskProgressRecord {
+                    task_id,
+                    attempt_no: 1,
+                    frame: 10,
+                    fps: 25.0,
+                    bitrate_kbps: 3200.0,
+                    speed: 1.0,
+                    out_time_ms: 400,
+                    dup_frames: 0,
+                    drop_frames: 0,
+                },
+            )
+            .await?;
+
+        let callback_count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*)
+              from task_callback_outbox
+             where task_id = $1
+               and attempt_no = 1
+               and event_type = 'task.status'
+               and reason = 'running'
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(callback_count, 1);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let final_calls = calls.lock().await.clone();
+        assert_eq!(final_calls.len(), 1);
 
         let _ = shutdown_tx.send(true);
         dispatcher.abort();

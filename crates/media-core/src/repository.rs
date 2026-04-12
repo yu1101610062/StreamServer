@@ -13,7 +13,10 @@ use media_domain::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{PgPool, Postgres, QueryBuilder, Row, postgres::PgRow};
+use sqlx::{
+    PgPool, Postgres, QueryBuilder, Row,
+    postgres::{PgQueryResult, PgRow},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -2921,38 +2924,8 @@ impl TaskRepository {
                 .await?;
             }
             "running" => {
-                sqlx::query(
-                    r#"
-                    update tasks
-                       set status = 'RUNNING'::task_status,
-                           assigned_node_id = $1,
-                           started_at = coalesce(started_at, $2),
-                           updated_at = $2
-                     where id = $3
-                    "#,
-                )
-                .bind(node_id)
-                .bind(now)
-                .bind(event.task_id)
-                .execute(&mut *tx)
-                .await?;
-
-                sqlx::query(
-                    r#"
-                    update task_attempts
-                       set status = 'RUNNING'::attempt_status,
-                           node_id = $1,
-                           started_at = coalesce(started_at, $2)
-                     where task_id = $3
-                       and attempt_no = $4
-                    "#,
-                )
-                .bind(node_id)
-                .bind(now)
-                .bind(event.task_id)
-                .bind(event.attempt_no)
-                .execute(&mut *tx)
-                .await?;
+                self.promote_task_running(&mut tx, event.task_id, event.attempt_no, node_id, now)
+                    .await?;
             }
             "stopping" => {
                 sqlx::query(
@@ -3122,35 +3095,17 @@ impl TaskRepository {
         )
         .await?;
 
-        sqlx::query(
-            r#"
-            update tasks
-               set status = 'RUNNING'::task_status,
-                   assigned_node_id = $1,
-                   started_at = coalesce(started_at, $2),
-                   updated_at = $2
-             where id = $3
-            "#,
-        )
-        .bind(node_id)
-        .bind(now)
-        .bind(progress.task_id)
-        .execute(&mut *tx)
-        .await?;
+        self.promote_task_running(&mut tx, progress.task_id, progress.attempt_no, node_id, now)
+            .await?;
 
         sqlx::query(
             r#"
             update task_attempts
-               set status = 'RUNNING'::attempt_status,
-                   node_id = $1,
-                   started_at = coalesce(started_at, $2),
-                   checkpoint_json = $3
-             where task_id = $4
-               and attempt_no = $5
+               set checkpoint_json = $1
+             where task_id = $2
+               and attempt_no = $3
             "#,
         )
-        .bind(node_id)
-        .bind(now)
         .bind(payload)
         .bind(progress.task_id)
         .bind(progress.attempt_no)
@@ -4051,59 +4006,24 @@ impl TaskRepository {
         reason: &str,
         deliver_after: DateTime<Utc>,
     ) -> Result<(), RepoError> {
-        let row = sqlx::query(
-            r#"
-            select
-              ta.id as attempt_id,
-              coalesce(
-                nullif(t.resolved_spec->'common'->>'callback_url', ''),
-                nullif(t.requested_spec->'common'->>'callback_url', '')
-              ) as callback_url
-            from tasks t
-            left join task_attempts ta
-              on ta.task_id = t.id
-             and ta.attempt_no = $2
-            where t.id = $1
-            "#,
-        )
-        .bind(task_id)
-        .bind(attempt_no)
-        .fetch_optional(&mut **tx)
-        .await?;
-        let Some(row) = row else {
+        let Some((attempt_id, callback_url)) = self
+            .callback_target_for_attempt(tx, task_id, attempt_no)
+            .await?
+        else {
             return Ok(());
         };
-        let callback_url = row
-            .try_get::<Option<String>, _>("callback_url")?
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        let Some(callback_url) = callback_url else {
-            return Ok(());
-        };
-        let attempt_id: Option<Uuid> = row.try_get("attempt_id")?;
-
-        let result = sqlx::query(
-            r#"
-            insert into task_callback_outbox (
-              id, task_id, attempt_id, attempt_no, callback_url, event_type, reason,
-              status, delivery_attempts, deliver_after, created_at, updated_at
-            ) values (
-              $1, $2, $3, $4, $5, 'task.completed', $6,
-              'pending', 0, $7, $8, $8
+        let result = self
+            .enqueue_callback_job(
+                tx,
+                task_id,
+                attempt_id,
+                attempt_no,
+                &callback_url,
+                "task.completed",
+                reason,
+                deliver_after,
             )
-            on conflict do nothing
-            "#,
-        )
-        .bind(Uuid::now_v7())
-        .bind(task_id)
-        .bind(attempt_id)
-        .bind(attempt_no)
-        .bind(&callback_url)
-        .bind(reason)
-        .bind(deliver_after)
-        .bind(Utc::now())
-        .execute(&mut **tx)
-        .await?;
+            .await?;
 
         if result.rows_affected() > 0 {
             self.insert_event(
@@ -4117,6 +4037,64 @@ impl TaskRepository {
                 json!({
                     "callback_url": callback_url,
                     "event_type": "task.completed",
+                    "reason": reason,
+                    "deliver_after": deliver_after,
+                }),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn enqueue_task_status_callback_if_needed(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+        reason: &str,
+        deliver_after: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let event_type = "task.status";
+        if self
+            .callback_job_exists(tx, task_id, attempt_no, event_type, reason)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let Some((attempt_id, callback_url)) = self
+            .callback_target_for_attempt(tx, task_id, attempt_no)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        let result = self
+            .enqueue_callback_job(
+                tx,
+                task_id,
+                attempt_id,
+                attempt_no,
+                &callback_url,
+                event_type,
+                reason,
+                deliver_after,
+            )
+            .await?;
+
+        if result.rows_affected() > 0 {
+            self.insert_event(
+                tx,
+                task_id,
+                attempt_id,
+                Some(attempt_no),
+                EventSource::Core,
+                "callback_enqueued",
+                "info",
+                json!({
+                    "callback_url": callback_url,
+                    "event_type": event_type,
                     "reason": reason,
                     "deliver_after": deliver_after,
                 }),
@@ -4188,6 +4166,111 @@ impl TaskRepository {
             .execute(&mut **tx)
             .await?;
         Ok(())
+    }
+
+    async fn callback_target_for_attempt(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+    ) -> Result<Option<(Option<Uuid>, String)>, RepoError> {
+        let row = sqlx::query(
+            r#"
+            select
+              ta.id as attempt_id,
+              coalesce(
+                nullif(t.resolved_spec->'common'->>'callback_url', ''),
+                nullif(t.requested_spec->'common'->>'callback_url', '')
+              ) as callback_url
+            from tasks t
+            left join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = $2
+            where t.id = $1
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let callback_url = row
+            .try_get::<Option<String>, _>("callback_url")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let Some(callback_url) = callback_url else {
+            return Ok(None);
+        };
+        let attempt_id: Option<Uuid> = row.try_get("attempt_id")?;
+        Ok(Some((attempt_id, callback_url)))
+    }
+
+    async fn callback_job_exists(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+        event_type: &str,
+        reason: &str,
+    ) -> Result<bool, RepoError> {
+        sqlx::query_scalar(
+            r#"
+            select exists (
+              select 1
+                from task_callback_outbox
+               where task_id = $1
+                 and attempt_no = $2
+                 and event_type = $3
+                 and reason = $4
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .bind(event_type)
+        .bind(reason)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn enqueue_callback_job(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_id: Option<Uuid>,
+        attempt_no: i32,
+        callback_url: &str,
+        event_type: &str,
+        reason: &str,
+        deliver_after: DateTime<Utc>,
+    ) -> Result<PgQueryResult, RepoError> {
+        sqlx::query(
+            r#"
+            insert into task_callback_outbox (
+              id, task_id, attempt_id, attempt_no, callback_url, event_type, reason,
+              status, delivery_attempts, deliver_after, created_at, updated_at
+            ) values (
+              $1, $2, $3, $4, $5, $6, $7,
+              'pending', 0, $8, $9, $9
+            )
+            on conflict do nothing
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(task_id)
+        .bind(attempt_id)
+        .bind(attempt_no)
+        .bind(callback_url)
+        .bind(event_type)
+        .bind(reason)
+        .bind(deliver_after)
+        .bind(Utc::now())
+        .execute(&mut **tx)
+        .await
+        .map_err(Into::into)
     }
 
     async fn complete_task_attempt(
@@ -4294,6 +4377,9 @@ impl TaskRepository {
         .bind(attempt_no)
         .execute(&mut **tx)
         .await?;
+
+        self.enqueue_task_status_callback_if_needed(tx, task_id, attempt_no, "running", now)
+            .await?;
 
         Ok(())
     }

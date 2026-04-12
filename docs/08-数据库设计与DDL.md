@@ -377,7 +377,7 @@ create index idx_stream_bindings_task_id
 - `record_files.file_path` 全局唯一。
 - `record_files.http_url` 允许为空，兼容历史录像和未携带 URL 的 Hook。
 - `transcode_artifacts` 只记录成功完成且输出到 `/data/zlm/www/artifacts/transcode/...` 的 `file_transcode` 产物。
-- `task_callback_outbox` 用于异步任务完成回调；同一任务同一 Attempt 的同类待发送回调只保留一条未完成记录。
+- `task_callback_outbox` 用于异步任务回调（如 `task.status`、`task.completed`）；同一任务同一 Attempt 的同类待发送回调只保留一条未完成记录。
 - `task_events.dedup_key` 允许为空；仅 Hook 或外部重复事件写入时使用。
 
 ## 7. 迁移策略
