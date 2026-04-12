@@ -28,7 +28,7 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| `kind` | `file`, `rtsp`, `rtmp`, `hls`, `udp_mpegts_multicast`, `rtp_multicast` |
+| `kind` | `file`, `rtsp`, `rtmp`, `hls`, `http_mp4`, `udp_mpegts_multicast`, `rtp_multicast` |
 | `url` | 规范化后的输入地址 |
 | `input_options` | 输入级 FFmpeg 参数键值对 |
 | `network_binding` | 本地网卡、`localaddr`、`reuse`、`ttl` 等 |

@@ -79,6 +79,7 @@ const INPUT_KINDS = [
   "rtsp",
   "rtmp",
   "hls",
+  "http_mp4",
   "http_flv",
   "http_ts",
   "file",
@@ -384,6 +385,7 @@ function buildApiDocDetails() {
         record: {
           enabled: true,
           format: "both",
+          duration_sec: 300,
           segment_sec: 300,
           save_path: "/data/records/relay-camera-01",
         },
@@ -398,7 +400,6 @@ function buildApiDocDetails() {
         resource: {
           required_labels: ["edge"],
           preferred_labels: ["multicast", "ssd"],
-          network_interface: "eth0",
         },
       },
     },
@@ -411,7 +412,7 @@ function buildApiDocDetails() {
       { name: "common.created_by", type: "string", required: false, description: "任务创建来源，用于审计和回查。" },
       { name: "common.callback_url", type: "string", required: false, description: "任务终态回调地址。任务完成后由 media-core 异步回调，若录像或转码产物稍后入库会自动补发更新回调。" },
       { name: "common.labels[]", type: "string[]", required: false, description: "业务标签，用于筛选和资源偏好。" },
-      { name: "input.kind", type: "enum", required: true, description: "输入类型，例如 RTSP、文件、组播或国标 RTP。" },
+      { name: "input.kind", type: "enum", required: true, description: "输入类型，例如 RTSP、HTTP MP4、文件、组播或国标 RTP。" },
       { name: "input.url", type: "string", required: false, description: "文件或网络源地址。" },
       { name: "input.group", type: "string", required: false, description: "组播组地址。组播输入时使用。" },
       { name: "input.port", type: "number", required: false, description: "输入端口。" },
@@ -439,6 +440,7 @@ function buildApiDocDetails() {
       { name: "publish.enable_hls", type: "boolean", required: false, description: "是否让内部流额外暴露 HLS 播放地址。" },
       { name: "record.enabled", type: "boolean", required: false, description: "是否开启录像。" },
       { name: "record.format", type: "enum", required: false, description: "录像格式，支持 MP4、HLS 或同时输出。" },
+      { name: "record.duration_sec", type: "number", required: false, description: "总录制时长（秒）。离线源按媒体时长截取，在线源按现实时间计时。" },
       { name: "record.segment_sec", type: "number", required: false, description: "分段时长（秒）。" },
       { name: "record.save_path", type: "string", required: false, description: "录像根路径。" },
       { name: "recovery.policy", type: "enum", required: false, description: "失败后的恢复策略。" },
@@ -447,7 +449,6 @@ function buildApiDocDetails() {
       { name: "schedule.cron", type: "string", required: false, description: "Cron 表达式。" },
       { name: "resource.required_labels[]", type: "string[]", required: false, description: "节点必需标签。" },
       { name: "resource.preferred_labels[]", type: "string[]", required: false, description: "节点优选标签。" },
-      { name: "resource.network_interface", type: "string", required: false, description: "资源网络接口偏好。" },
     ],
     responseFields: [
       { name: "id", type: "string", description: "任务 ID。" },
@@ -792,6 +793,7 @@ const LABELS = {
     rtsp: "RTSP",
     rtmp: "RTMP",
     hls: "HLS",
+    http_mp4: "HTTP-MP4",
     http_flv: "HTTP-FLV",
     http_ts: "HTTP-TS",
     file: "文件",
@@ -3008,7 +3010,7 @@ function renderCreateStep(step, draft, templates) {
 function renderCreateInputStep(draft) {
   const taskType = draft.task_type;
   const fixedInputKind =
-    taskType === "file_transcode" || taskType === "file_to_live"
+    taskType === "file_transcode"
       ? "file"
       : taskType === "rtp_receive"
         ? "gb_rtp"
@@ -3016,11 +3018,13 @@ function renderCreateInputStep(draft) {
   const selectableInputKinds =
     taskType === "live_relay"
       ? ["rtsp", "rtmp", "hls", "http_flv", "http_ts"]
+      : taskType === "file_to_live"
+        ? ["file", "http_mp4", "hls", "http_ts"]
       : taskType === "multicast_bridge"
         ? ["rtsp", "rtmp", "hls", "http_flv", "http_ts", "file", "udp_mpegts_multicast", "rtp_multicast"]
         : INPUT_KINDS;
   const inputKind = fixedInputKind || draft.input.kind || "";
-  const showUrl = ["rtsp", "rtmp", "hls", "http_flv", "http_ts", "file"].includes(inputKind);
+  const showUrl = ["rtsp", "rtmp", "hls", "http_mp4", "http_flv", "http_ts", "file"].includes(inputKind);
   const showMulticastInput = ["udp_mpegts_multicast", "rtp_multicast"].includes(inputKind);
   const showRtpInput = taskType === "rtp_receive";
   return `
@@ -3030,7 +3034,7 @@ function renderCreateInputStep(draft) {
           ? renderStaticModelField("输入类型", inputKindLabel(fixedInputKind))
           : renderSelectModelField("输入类型", "input.kind", selectableInputKinds, draft.input.kind || "", (value) => inputKindLabel(value))
       }
-      ${showUrl ? renderTextModelField("输入 URL", "input.url", draft.input.url, inputKind === "file" ? "/data/media/input.mp4" : "rtsp://camera/live") : ""}
+      ${showUrl ? renderTextModelField("输入 URL", "input.url", draft.input.url, inputKind === "file" ? "/data/media/input.mp4" : inputKind === "http_mp4" ? "http://vod.example.com/archive.mp4" : "rtsp://camera/live") : ""}
       ${showMulticastInput ? renderTextModelField("组播地址", "input.group", draft.input.group, "239.0.0.1") : ""}
       ${(showMulticastInput || showRtpInput) ? renderTextModelField("端口", "input.port", draft.input.port, showRtpInput ? "30000" : "5004", "number") : ""}
       ${showMulticastInput ? renderTextModelField("绑定网卡名", "input.interface_name", draft.input.interface_name, "留空则使用节点默认组播网卡") : ""}
@@ -3059,20 +3063,39 @@ function renderCreateProcessStep(draft) {
   const showPublishUrl = taskType === "file_transcode" || taskType === "file_to_live" || ["file", "zlm_ingest"].includes(publishKind);
   const showPublishNetwork = ["udp_mpegts_multicast", "rtp_multicast"].includes(publishKind);
   const showProtocolFlags = taskType === "live_relay" || taskType === "file_to_live" || taskType === "rtp_receive" || publishKind === "zlm_ingest";
+  const publishTargetLabel = publishKind === "file" ? "输出文件路径" : publishKind === "zlm_ingest" ? "推流目标 URL" : "发布 URL";
+  const publishTargetPlaceholder = publishKind === "file" ? "/data/media/output.mp4" : "rtmp://zlm/live/stream";
+  const publishFormatPlaceholder =
+    showPublishNetwork
+      ? publishKind === "rtp_multicast"
+        ? "rtp_mpegts"
+        : "mpegts"
+      : publishKind === "file"
+        ? "可留空，按文件名推断"
+        : publishKind === "zlm_ingest"
+          ? "可留空，按 URL 协议推断"
+          : "mpegts";
+  const directOutputHint = showPublishUrl
+    ? publishKind === "file"
+      ? `<div class="subtle">当前任务会直接写文件；这里填最终输出文件路径。<code>输出封装格式</code>通常可以留空，系统会按文件名自动推断。</div>`
+      : `<div class="subtle">当前任务会把结果直接推到目标地址；这里填实际推流 URL。<code>输出封装格式</code>通常可以留空，系统会按 URL 协议自动推断。</div>`
+    : showPublishNetwork
+      ? `<div class="subtle">当前任务会直接发组播；填写目标组播地址和端口即可，<code>输出封装格式</code>通常保持默认。</div>`
+      : `<div class="subtle">当前任务默认只维护内部流，不额外指定一个直接输出目标。</div>`;
   return `
     <div class="create-grid">
       ${showProcess ? renderTextModelField("处理模式", "process.mode", draft.process.mode, "copy_or_transcode") : ""}
       ${showProcess ? renderTextModelField("目标码率", "process.bitrate", draft.process.bitrate, "2000", "number") : ""}
       ${showProcess ? renderTextModelField("帧率", "process.fps", draft.process.fps, "25", "number") : ""}
       ${showProcess ? renderTextModelField("GOP", "process.gop", draft.process.gop, "50", "number") : ""}
-      ${showPublishKindSelect ? renderSelectModelField("发布类型", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value ? publishKindLabel(value) : "内部流 / 不显式设置") : renderStaticModelField("发布类型", publishKindLabel(publishKind, "内部流"))}
-      ${showPublishUrl ? renderTextModelField("发布 URL", "publish.url", draft.publish.url, taskType === "file_transcode" ? "/data/media/output.mp4" : "rtmp://zlm/live/stream") : ""}
+      ${showPublishKindSelect ? renderSelectModelField("直接输出目标", "publish.kind", ["", ...PUBLISH_KINDS], draft.publish.kind || "", (value) => value ? publishKindLabel(value) : "仅内部流（不额外输出）") : renderStaticModelField("直接输出目标", publishKindLabel(publishKind, "仅内部流"))}
+      ${showPublishUrl ? renderTextModelField(publishTargetLabel, "publish.url", draft.publish.url, publishTargetPlaceholder) : ""}
       ${showPublishNetwork ? renderTextModelField("发布组播地址", "publish.group", draft.publish.group, "239.1.1.10") : ""}
       ${showPublishNetwork ? renderTextModelField("发布端口", "publish.port", draft.publish.port, "1234", "number") : ""}
       ${showPublishNetwork ? renderTextModelField("发布网卡名", "publish.interface_name", draft.publish.interface_name, "留空则使用节点默认组播网卡") : ""}
       ${showPublishNetwork ? renderTextModelField("发布本地地址", "publish.interface_ip", draft.publish.interface_ip, "可选，本地发送地址") : ""}
       ${showPublishNetwork ? renderTextModelField("发布 TTL", "publish.ttl", draft.publish.ttl, "1", "number") : ""}
-      ${showPublishUrl || showPublishNetwork ? renderTextModelField("发布格式", "publish.format", draft.publish.format, "mpegts") : ""}
+      ${showPublishUrl || showPublishNetwork ? renderTextModelField("输出封装格式（可选）", "publish.format", draft.publish.format, publishFormatPlaceholder) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("enable_rtsp", "publish.enable_rtsp", draft.publish.enable_rtsp) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("enable_rtmp", "publish.enable_rtmp", draft.publish.enable_rtmp) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("enable_http_ts", "publish.enable_http_ts", draft.publish.enable_http_ts) : ""}
@@ -3080,9 +3103,10 @@ function renderCreateProcessStep(draft) {
       ${showProtocolFlags ? renderCheckboxModelField("enable_hls", "publish.enable_hls", draft.publish.enable_hls) : ""}
       ${showProtocolFlags ? renderCheckboxModelField("无人观看自动停止", "publish.stop_on_no_reader", draft.publish.stop_on_no_reader) : ""}
     </div>
+    ${directOutputHint}
     ${
       showProtocolFlags
-        ? `<div class="subtle">这些 <code>publish.enable_*</code> 开关只控制内部流额外暴露哪些播放协议，不会新增一个独立发布目标。例：<code>input.kind=http_ts</code> 是 HTTP-TS 输入源，<code>publish.enable_http_ts=true</code> 是内部流暴露 HTTP-TS 播放地址。</div>`
+        ? `<div class="subtle">这些 <code>publish.enable_*</code> 开关只控制内部流额外暴露哪些播放协议，不会新增一个直接输出目标。例：<code>input.kind=http_ts</code> 是 HTTP-TS 输入源，<code>publish.enable_http_ts=true</code> 是内部流暴露 HTTP-TS 播放地址。</div>`
         : ""
     }
   `;
@@ -3095,21 +3119,18 @@ function renderCreatePolicyStep(draft) {
     <div class="create-grid">
       ${renderCheckboxModelField("启用录制", "record.enabled", draft.record.enabled)}
       ${showRecordFields ? renderSelectModelField("录制格式", "record.format", ["", ...RECORD_FORMATS], draft.record.format || "", (value) => value ? recordFormatLabel(value) : "默认") : ""}
+      ${showRecordFields ? renderTextModelField("录制总时长（秒）", "record.duration_sec", draft.record.duration_sec, "300", "number") : ""}
       ${showRecordFields ? renderTextModelField("录制切片秒数", "record.segment_sec", draft.record.segment_sec, "60", "number") : ""}
       ${showRecordFields ? renderTextModelField("录制路径", "record.save_path", draft.record.save_path, "/data/zlm/record") : ""}
       ${showRecordFields ? renderCheckboxModelField("按播放器口径记账", "record.as_player", draft.record.as_player) : ""}
       ${renderSelectModelField("恢复策略", "recovery.policy", ["", ...RECOVERY_POLICIES], draft.recovery.policy || "", (value) => value ? recoveryPolicyLabel(value) : "默认")}
       ${renderTextModelField("恢复模式", "recovery.resume_mode", draft.recovery.resume_mode, "auto")}
-      ${renderCheckboxModelField("孤儿接管", "recovery.orphan_adopt", draft.recovery.orphan_adopt)}
       ${renderTextModelField("最大连续失败", "recovery.max_consecutive_failures", draft.recovery.max_consecutive_failures, "3", "number")}
       ${renderSelectModelField("启动模式", "schedule.start_mode", START_MODES, draft.schedule.start_mode, (value) => startModeLabel(value))}
       ${startMode === "at" ? renderTextModelField("指定启动时间", "schedule.start_at", draft.schedule.start_at, "2026-03-30T12:00:00Z") : ""}
       ${startMode === "cron" ? renderTextModelField("Cron 表达式", "schedule.cron", draft.schedule.cron, "0 */5 * * * *") : ""}
       ${renderTextareaModelField("必需标签", "resource.required_labels_text", draft.resource.required_labels_text, "逗号分隔")}
       ${renderTextareaModelField("优选标签", "resource.preferred_labels_text", draft.resource.preferred_labels_text, "逗号分隔")}
-      ${renderTextModelField("资源网络接口", "resource.network_interface", draft.resource.network_interface, "eth0")}
-      ${renderTextModelField("资源槽位类型", "resource.slot_class", draft.resource.slot_class, "standard")}
-      ${renderTextModelField("最大 CPU 百分比", "resource.max_cpu_percent", draft.resource.max_cpu_percent, "80", "number")}
     </div>
   `;
 }
@@ -3412,6 +3433,9 @@ async function handleChange(event) {
   try {
     if (target.dataset.model) {
       updateCreateDraftFromElement(target);
+      if (shouldRerenderCreateModalOnModelChange(target)) {
+        renderApp({ chrome: false, page: false, overlays: true, toasts: false });
+      }
       if (target.dataset.model === "template" && target instanceof HTMLSelectElement) {
         await applySelectedTemplate(target.value);
       }
@@ -3467,6 +3491,16 @@ function updateCreateDraftFromElement(target) {
   }
   state.ui.createPreview = null;
   state.ui.createError = null;
+}
+
+function shouldRerenderCreateModalOnModelChange(target) {
+  if (!state.ui.createOpen || !target.dataset.model) {
+    return false;
+  }
+  if (target instanceof HTMLSelectElement) {
+    return true;
+  }
+  return target instanceof HTMLInputElement && target.type === "checkbox";
 }
 
 async function navigate(href) {
@@ -3973,13 +4007,13 @@ function buildDraftPayload(draft) {
 
   setIfBoolean(payload.record, "enabled", draft.record.enabled);
   setIfPresent(payload.record, "format", draft.record.format);
+  setIfNumber(payload.record, "duration_sec", draft.record.duration_sec);
   setIfNumber(payload.record, "segment_sec", draft.record.segment_sec);
   setIfPresent(payload.record, "save_path", draft.record.save_path);
   setIfBoolean(payload.record, "as_player", draft.record.as_player);
 
   setIfPresent(payload.recovery, "policy", draft.recovery.policy);
   setIfPresent(payload.recovery, "resume_mode", draft.recovery.resume_mode);
-  setIfBoolean(payload.recovery, "orphan_adopt", draft.recovery.orphan_adopt);
   setIfNumber(payload.recovery, "max_consecutive_failures", draft.recovery.max_consecutive_failures);
 
   setIfPresent(payload.schedule, "start_mode", draft.schedule.start_mode);
@@ -3988,9 +4022,6 @@ function buildDraftPayload(draft) {
 
   setIfList(payload.resource, "required_labels", draft.resource.required_labels_text);
   setIfList(payload.resource, "preferred_labels", draft.resource.preferred_labels_text);
-  setIfPresent(payload.resource, "network_interface", draft.resource.network_interface);
-  setIfPresent(payload.resource, "slot_class", draft.resource.slot_class);
-  setIfNumber(payload.resource, "max_cpu_percent", draft.resource.max_cpu_percent);
 
   pruneEmptyObjects(payload);
 
@@ -4049,6 +4080,7 @@ function createDefaultDraft() {
     record: {
       enabled: false,
       format: "",
+      duration_sec: "",
       segment_sec: "",
       save_path: "",
       as_player: false,
@@ -4056,7 +4088,6 @@ function createDefaultDraft() {
     recovery: {
       policy: "",
       resume_mode: "",
-      orphan_adopt: true,
       max_consecutive_failures: "",
     },
     schedule: {
@@ -4067,9 +4098,6 @@ function createDefaultDraft() {
     resource: {
       required_labels_text: "",
       preferred_labels_text: "",
-      network_interface: "",
-      slot_class: "",
-      max_cpu_percent: "",
     },
   };
   normalizeDraftForTaskType(draft, draft.task_type);
@@ -4084,7 +4112,7 @@ function normalizeDraftForTaskType(draft, taskType) {
       draft.publish.kind = "file";
       break;
     case "file_to_live":
-      draft.input.kind = "file";
+      draft.input.kind = draft.input.kind || "file";
       draft.publish.kind = "zlm_ingest";
       break;
     case "multicast_bridge":
@@ -5184,6 +5212,7 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
   applyDraftSectionDefaults(draft.record, spec.record, {
     enabled: "boolean",
     format: "string",
+    duration_sec: "number",
     segment_sec: "number",
     save_path: "string",
     as_player: "boolean",
@@ -5191,7 +5220,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
   applyDraftSectionDefaults(draft.recovery, spec.recovery, {
     policy: "string",
     resume_mode: "string",
-    orphan_adopt: "boolean",
     max_consecutive_failures: "number",
   });
   applyDraftSectionDefaults(draft.schedule, spec.schedule, {
@@ -5202,9 +5230,6 @@ function applyTaskSpecDefaultsToDraft(draft, spec) {
   applyDraftSectionDefaults(draft.resource, spec.resource, {
     required_labels: "list:required_labels_text",
     preferred_labels: "list:preferred_labels_text",
-    network_interface: "string",
-    slot_class: "string",
-    max_cpu_percent: "number",
   });
 }
 

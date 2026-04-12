@@ -268,6 +268,7 @@ pub enum InputKind {
     Rtsp,
     Rtmp,
     Hls,
+    HttpMp4,
     HttpFlv,
     HttpTs,
     File,
@@ -280,7 +281,13 @@ impl InputKind {
     pub const fn is_url_based(self) -> bool {
         matches!(
             self,
-            Self::Rtsp | Self::Rtmp | Self::Hls | Self::HttpFlv | Self::HttpTs | Self::File
+            Self::Rtsp
+                | Self::Rtmp
+                | Self::Hls
+                | Self::HttpMp4
+                | Self::HttpFlv
+                | Self::HttpTs
+                | Self::File
         )
     }
 }
@@ -436,6 +443,26 @@ impl TaskSpec {
                 "must be provided",
             ));
         }
+        if let Some(duration_sec) = self.record.duration_sec {
+            if !self.record.enabled.unwrap_or(false) {
+                issues.push(ValidationIssue::new(
+                    "record.duration_sec",
+                    "requires record.enabled=true",
+                ));
+            }
+            if duration_sec == 0 {
+                issues.push(ValidationIssue::new(
+                    "record.duration_sec",
+                    "must be greater than 0",
+                ));
+            }
+            if !matches!(self.task_type, TaskType::LiveRelay | TaskType::FileToLive) {
+                issues.push(ValidationIssue::new(
+                    "record.duration_sec",
+                    "is only supported for live_relay and file_to_live",
+                ));
+            }
+        }
 
         match self.input.kind {
             None => issues.push(ValidationIssue::new("input.kind", "must be provided")),
@@ -541,10 +568,13 @@ impl TaskSpec {
                 None => {}
             },
             TaskType::FileToLive => {
-                if self.input.kind != Some(InputKind::File) {
+                if !matches!(
+                    self.input.kind,
+                    Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs)
+                ) {
                     issues.push(ValidationIssue::new(
                         "input.kind",
-                        "file_to_live requires file input",
+                        "file_to_live requires file, http_mp4, hls, or http_ts input",
                     ));
                 }
                 match self.publish.kind {
@@ -629,15 +659,6 @@ impl TaskSpec {
                     }
                 }
             },
-        }
-
-        if let Some(max_cpu_percent) = self.resource.max_cpu_percent {
-            if max_cpu_percent > 100 {
-                issues.push(ValidationIssue::new(
-                    "resource.max_cpu_percent",
-                    "must be between 0 and 100",
-                ));
-            }
         }
 
         if issues.is_empty() {
@@ -761,6 +782,8 @@ pub struct RecordSpec {
     #[serde(default)]
     pub format: Option<RecordFormat>,
     #[serde(default)]
+    pub duration_sec: Option<u32>,
+    #[serde(default)]
     pub segment_sec: Option<u32>,
     #[serde(default)]
     pub save_path: Option<String>,
@@ -797,8 +820,6 @@ pub struct RecoverySpec {
     #[serde(default)]
     pub resume_mode: Option<String>,
     #[serde(default)]
-    pub orphan_adopt: Option<bool>,
-    #[serde(default)]
     pub backoff: Option<BackoffPolicy>,
     #[serde(default)]
     pub max_consecutive_failures: Option<u32>,
@@ -809,7 +830,6 @@ impl Default for RecoverySpec {
         Self {
             policy: None,
             resume_mode: None,
-            orphan_adopt: None,
             backoff: None,
             max_consecutive_failures: None,
         }
@@ -833,13 +853,7 @@ pub struct ResourceSpec {
     #[serde(default)]
     pub preferred_labels: Vec<String>,
     #[serde(default)]
-    pub network_interface: Option<String>,
-    #[serde(default)]
     pub need_gpu: Option<bool>,
-    #[serde(default)]
-    pub slot_class: Option<String>,
-    #[serde(default)]
-    pub max_cpu_percent: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1184,6 +1198,72 @@ mod tests {
 
         let error = task.validate().expect_err("validation should fail");
         assert!(error.issues.iter().any(|issue| issue.field == "input.kind"));
+    }
+
+    #[test]
+    fn validate_allows_file_to_live_with_http_mp4_input() {
+        let task = TaskSpec {
+            task_type: TaskType::FileToLive,
+            template: None,
+            name: "file-live".to_string(),
+            profile: None,
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::HttpMp4),
+                url: Some("http://vod.example.com/archive.mp4".to_string()),
+                ..InputSpec::default()
+            },
+            process: ProcessSpec::default(),
+            publish: PublishSpec {
+                kind: Some(PublishTargetKind::ZlmIngest),
+                url: Some("rtmp://127.0.0.1/live/out".to_string()),
+                ..PublishSpec::default()
+            },
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        task.validate()
+            .expect("validation should allow http_mp4 file_to_live input");
+    }
+
+    #[test]
+    fn validate_rejects_record_duration_for_unsupported_task_types() {
+        let mut task = sample_task(TaskType::MulticastBridge);
+        task.publish.kind = Some(PublishTargetKind::File);
+        task.publish.url = Some("/tmp/out.ts".to_string());
+        task.record.enabled = Some(true);
+        task.record.duration_sec = Some(300);
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "record.duration_sec")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_positive_record_duration() {
+        let mut task = sample_task(TaskType::LiveRelay);
+        task.record.enabled = Some(true);
+        task.record.duration_sec = Some(0);
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "record.duration_sec")
+        );
     }
 
     #[test]

@@ -5575,6 +5575,10 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
         ("enabled", spec.record.enabled.map(|value| json!(value))),
         ("format", spec.record.format.map(|value| json!(value))),
         (
+            "duration_sec",
+            spec.record.duration_sec.map(|value| json!(value)),
+        ),
+        (
             "segment_sec",
             spec.record.segment_sec.map(|value| json!(value)),
         ),
@@ -5604,10 +5608,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
         (
             "resume_mode",
             spec.recovery.resume_mode.as_ref().map(|value| json!(value)),
-        ),
-        (
-            "orphan_adopt",
-            spec.recovery.orphan_adopt.map(|value| json!(value)),
         ),
         (
             "max_consecutive_failures",
@@ -5651,25 +5651,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
             "preferred_labels".to_string(),
             json!(spec.resource.preferred_labels),
         );
-    }
-    if let Some(network_interface) = spec
-        .resource
-        .network_interface
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        resource.insert("network_interface".to_string(), json!(network_interface));
-    }
-    if let Some(slot_class) = spec
-        .resource
-        .slot_class
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        resource.insert("slot_class".to_string(), json!(slot_class));
-    }
-    if let Some(max_cpu_percent) = spec.resource.max_cpu_percent {
-        resource.insert("max_cpu_percent".to_string(), json!(max_cpu_percent));
     }
     if !resource.is_empty() {
         overlay.insert("resource".to_string(), Value::Object(resource));
@@ -6355,6 +6336,43 @@ mod tests {
         assert_eq!(overlay["template"], json!("tpl_default_rtsp"));
         assert_eq!(overlay["common"]["created_by"], json!("alice"));
         assert!(overlay["publish"].is_null());
+    }
+
+    #[test]
+    fn task_spec_overlay_preserves_record_duration_sec() {
+        let mut spec = TaskSpec {
+            task_type: TaskType::FileToLive,
+            template: None,
+            name: "duration-check".to_string(),
+            profile: None,
+            priority: 50,
+            common: media_domain::CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: media_domain::InputSpec {
+                kind: Some(media_domain::InputKind::HttpMp4),
+                url: Some("http://127.0.0.1/test.mp4".to_string()),
+                ..Default::default()
+            },
+            process: Default::default(),
+            publish: media_domain::PublishSpec {
+                kind: Some(media_domain::PublishTargetKind::ZlmIngest),
+                url: Some("rtmp://127.0.0.1/live/test".to_string()),
+                ..Default::default()
+            },
+            record: Default::default(),
+            recovery: Default::default(),
+            schedule: Default::default(),
+            resource: Default::default(),
+        };
+        spec.record.enabled = Some(true);
+        spec.record.duration_sec = Some(300);
+
+        let overlay = task_spec_overlay(&spec);
+
+        assert_eq!(overlay["record"]["duration_sec"], json!(300));
     }
 
     #[test]

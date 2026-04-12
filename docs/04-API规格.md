@@ -122,13 +122,14 @@
 - `publish.kind` 表示任务直接写出的目标类型；当前只支持 `file`、`zlm_ingest`、`udp_mpegts_multicast`、`rtp_multicast`。
 - `publish.enable_*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
 - 例如 `input.kind=http_ts` 表示“HTTP-TS 作为输入源”，`publish.enable_http_ts=true` 表示“内部流额外暴露 HTTP-TS 播放地址”，两者不是同一件事。
+- `record.duration_sec` 表示总录制时长：`file_to_live` 按媒体时间截取，`live_relay` 按现实时间计时；到点后任务整体成功结束。
 
 当前能力矩阵：
 
 | 任务类型 | 支持的 `input.kind` | 支持的 `publish.kind` | 支持的 `publish.enable_*` 播放协议暴露 |
 | --- | --- | --- | --- |
 | `live_relay` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` | 无显式 `publish.kind`，默认内部流 | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
-| `file_to_live` | `file` | `zlm_ingest` | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
+| `file_to_live` | `file` `http_mp4` `hls` `http_ts` | `zlm_ingest` | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
 | `file_transcode` | `file` | `file` | 不适用 |
 | `multicast_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `zlm_ingest` `udp_mpegts_multicast` `rtp_multicast` | 仅当 `publish.kind=zlm_ingest` 时支持 `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
 | `rtp_receive` | `gb_rtp` | 不允许设置 | `enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |

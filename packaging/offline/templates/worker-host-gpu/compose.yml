@@ -55,5 +55,6 @@ services:
     volumes:
       - ./data/media/work:/data/media/work
       - ./data/media/logs:/data/media/logs
+      - ./data/zlm/record:/data/zlm/record
       - ./data/zlm/www:/data/zlm/www
       - ./certs:/certs:ro

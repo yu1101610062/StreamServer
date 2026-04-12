@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use media_domain::{
     InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy, RuntimeHandle,
     RuntimeState, TaskSpec, TaskType, WorkerKind,
@@ -229,8 +229,15 @@ enum ZlmRecordKind {
 struct LiveRelayRecording {
     formats: Vec<ZlmRecordKind>,
     root_path: String,
+    duration_sec: Option<u32>,
     segment_sec: Option<u32>,
     as_player: bool,
+    #[serde(default)]
+    recording_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    auto_stop_requested: bool,
+    #[serde(default)]
+    completion_reason: Option<String>,
     #[serde(default)]
     started: bool,
     #[serde(default)]
@@ -506,8 +513,11 @@ impl LocalExecutor for ManagedProcessExecutor {
                     );
                 let _ =
                     persist_runtime_state(&persisted.work_dir, &handle, &persisted.success_check);
+                let needs_startup_probe = !stream_online(&handle)
+                    || live_relay_recording_from_handle(&handle)
+                        .is_some_and(|recording| should_start_live_relay_recording(&recording));
                 if let Some(startup_probe) =
-                    startup_probe_from_handle(&handle).filter(|_| !stream_online(&handle))
+                    startup_probe_from_handle(&handle).filter(|_| needs_startup_probe)
                 {
                     spawn_startup_probe_monitor(
                         handle.runtime_id,
@@ -897,7 +907,24 @@ impl ManagedProcessExecutor {
                 }
             }
 
+            let completion_reason = completion_reason_from_handle(&exited_handle);
+            let fatal_recording_error = fatal_recording_error_from_handle(&exited_handle);
             let (event_type, event_level, message, payload) = match status {
+                Ok(status)
+                    if was_stopped
+                        && completion_reason.as_deref() == Some("record_duration_reached") =>
+                {
+                    (
+                        "succeeded",
+                        "info",
+                        "child process completed after recording duration reached".to_string(),
+                        json!({
+                            "exit_code": status.code(),
+                            "output_target": output_target,
+                            "reason": "record_duration_reached",
+                        }),
+                    )
+                }
                 Ok(status) if was_stopped => (
                     "canceled",
                     "info",
@@ -905,6 +932,21 @@ impl ManagedProcessExecutor {
                     json!({
                         "exit_code": status.code(),
                         "output_target": output_target,
+                    }),
+                ),
+                Ok(status) if fatal_recording_error.is_some() => (
+                    "failed",
+                    "error",
+                    format!(
+                        "child process stopped after recording startup failed: {}",
+                        fatal_recording_error
+                            .as_deref()
+                            .unwrap_or("unknown recording error")
+                    ),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": output_target,
+                        "recording_error": fatal_recording_error,
                     }),
                 ),
                 Ok(status)
@@ -961,6 +1003,21 @@ impl ManagedProcessExecutor {
                     json!({
                         "exit_code": status.code(),
                         "output_target": output_target,
+                    }),
+                ),
+                Err(error) if fatal_recording_error.is_some() => (
+                    "failed",
+                    "error",
+                    format!(
+                        "child process stopped after recording startup failed: {}",
+                        fatal_recording_error
+                            .as_deref()
+                            .unwrap_or("unknown recording error")
+                    ),
+                    json!({
+                        "output_target": output_target,
+                        "recording_error": fatal_recording_error,
+                        "wait_error": error.to_string(),
                     }),
                 ),
                 Err(error) => (
@@ -1557,10 +1614,12 @@ fn build_file_to_live_plan(
     spec: &TaskSpec,
 ) -> Result<ProcessPlan, ExecutorError> {
     let input_url = match spec.input.kind {
-        Some(InputKind::File) => required_nonempty("input.url", spec.input.url.as_deref())?,
+        Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs) => {
+            build_input_url(settings, &spec.input)?
+        }
         _ => {
             return Err(ExecutorError::InvalidRequest(
-                "file_to_live requires input.kind=file".to_string(),
+                "file_to_live requires input.kind=file|http_mp4|hls|http_ts".to_string(),
             ));
         }
     };
@@ -1582,6 +1641,9 @@ fn build_file_to_live_plan(
         AudioOutputPolicy::Aac,
     )?;
     args.extend(["-threads".to_string(), "0".to_string()]);
+    if let Some(duration_sec) = spec.record.duration_sec {
+        args.extend(["-t".to_string(), duration_sec.to_string()]);
+    }
 
     if spec.record.enabled.unwrap_or(false) {
         match spec
@@ -1932,6 +1994,7 @@ fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String
             InputKind::Rtsp
             | InputKind::Rtmp
             | InputKind::Hls
+            | InputKind::HttpMp4
             | InputKind::HttpFlv
             | InputKind::HttpTs
             | InputKind::File,
@@ -2431,8 +2494,12 @@ fn build_live_relay_recording(
     Ok(Some(LiveRelayRecording {
         formats,
         root_path,
+        duration_sec: spec.record.duration_sec,
         segment_sec: spec.record.segment_sec,
         as_player: spec.record.as_player.unwrap_or(false),
+        recording_started_at: None,
+        auto_stop_requested: false,
+        completion_reason: None,
         started: false,
         failed: false,
     }))
@@ -2675,6 +2742,26 @@ fn stream_online(handle: &RuntimeHandle) -> bool {
         .unwrap_or(false)
 }
 
+fn completion_reason_from_handle(handle: &RuntimeHandle) -> Option<String> {
+    handle
+        .metadata
+        .get("completion_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            live_relay_recording_from_handle(handle)
+                .and_then(|recording| recording.completion_reason)
+        })
+}
+
+fn fatal_recording_error_from_handle(handle: &RuntimeHandle) -> Option<String> {
+    handle
+        .metadata
+        .get("recording_fatal_error")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn stream_binding_from_handle(handle: &RuntimeHandle) -> Option<StreamBinding> {
     handle
         .metadata
@@ -2711,6 +2798,50 @@ fn should_start_live_relay_recording(recording: &LiveRelayRecording) -> bool {
     !recording.started && !recording.failed
 }
 
+fn should_fail_on_recording_start_error(recording: &LiveRelayRecording) -> bool {
+    recording.duration_sec.is_some()
+}
+
+fn recording_duration_reached(recording: &LiveRelayRecording, now: DateTime<Utc>) -> bool {
+    let Some(duration_sec) = recording.duration_sec else {
+        return false;
+    };
+    let Some(started_at) = recording.recording_started_at else {
+        return false;
+    };
+    now >= started_at + chrono::Duration::seconds(i64::from(duration_sec))
+}
+
+fn mark_recording_started(
+    recording: &LiveRelayRecording,
+    now: DateTime<Utc>,
+) -> LiveRelayRecording {
+    let mut updated = recording.clone();
+    updated.started = true;
+    updated.failed = false;
+    updated.recording_started_at = Some(now);
+    updated.auto_stop_requested = false;
+    updated.completion_reason = None;
+    updated
+}
+
+fn mark_recording_failed(recording: &LiveRelayRecording) -> LiveRelayRecording {
+    let mut updated = recording.clone();
+    updated.started = false;
+    updated.failed = true;
+    updated
+}
+
+fn mark_recording_completion(
+    recording: &LiveRelayRecording,
+    reason: impl Into<String>,
+) -> LiveRelayRecording {
+    let mut updated = recording.clone();
+    updated.auto_stop_requested = true;
+    updated.completion_reason = Some(reason.into());
+    updated
+}
+
 fn live_relay_auto_close_enabled(settings: &AgentSettings, spec: &TaskSpec) -> bool {
     settings.zlm_auto_close_on_no_reader_enabled && spec.publish.stop_on_no_reader.unwrap_or(false)
 }
@@ -2745,6 +2876,7 @@ fn should_auto_restart_process(
     if was_stopped
         || task_type_from_handle(handle) != Some(TaskType::FileToLive)
         || !stream_online(handle)
+        || fatal_recording_error_from_handle(handle).is_some()
     {
         return false;
     }
@@ -3052,9 +3184,139 @@ fn spawn_startup_probe_monitor(
                 .await
                 .unwrap_or(false)
             {
+                let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
+                    schema: startup_probe.schema.clone(),
+                    vhost: startup_probe.vhost.clone(),
+                    app: startup_probe.app.clone(),
+                    stream: startup_probe.stream.clone(),
+                });
+                let mut recording_started = false;
+                if let Some(recording) = live_relay_recording_from_handle(&handle)
+                    .filter(should_start_live_relay_recording)
+                {
+                    match start_stream_recording(
+                        &http_client,
+                        &settings,
+                        &binding,
+                        &recording,
+                        Utc::now(),
+                    )
+                    .await
+                    {
+                        Ok(updated_recording) => {
+                            let updated_handle = registry
+                                .update(runtime_id, |runtime| {
+                                    runtime.metadata["recording"] =
+                                        json!(updated_recording.clone());
+                                })
+                                .unwrap_or_else(|| {
+                                    let mut handle = handle.clone();
+                                    handle.metadata["recording"] = json!(updated_recording);
+                                    handle
+                                });
+                            let _ =
+                                persist_runtime_state(&work_dir, &updated_handle, &success_check);
+                            let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                                task_id: updated_handle.task_id,
+                                attempt_no: updated_handle.attempt_no,
+                                event_type: "recording_started".to_string(),
+                                event_level: "info".to_string(),
+                                message: "stream recording started".to_string(),
+                                payload: json!({
+                                    "formats": recording.formats,
+                                    "root_path": recording.root_path,
+                                    "duration_sec": recording.duration_sec,
+                                    "segment_sec": recording.segment_sec,
+                                    "as_player": recording.as_player,
+                                }),
+                            }));
+                            recording_started = true;
+                        }
+                        Err(error) => {
+                            let failed_recording = mark_recording_failed(&recording);
+                            let fatal = should_fail_on_recording_start_error(&recording);
+                            let updated_handle = registry
+                                .update(runtime_id, |runtime| {
+                                    runtime.last_progress_at = Some(Utc::now());
+                                    runtime.metadata["stream_online"] = json!(true);
+                                    runtime.metadata["stream_binding"] = json!({
+                                        "schema": binding.schema,
+                                        "vhost": binding.vhost,
+                                        "app": binding.app,
+                                        "stream": binding.stream,
+                                    });
+                                    runtime.metadata["recording_error"] = json!(error.to_string());
+                                    runtime.metadata["recording"] = json!(failed_recording.clone());
+                                    if fatal {
+                                        runtime.metadata["recording_fatal_error"] =
+                                            json!(error.to_string());
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    let mut handle = handle.clone();
+                                    handle.last_progress_at = Some(Utc::now());
+                                    handle.metadata["stream_online"] = json!(true);
+                                    handle.metadata["stream_binding"] = json!({
+                                        "schema": binding.schema,
+                                        "vhost": binding.vhost,
+                                        "app": binding.app,
+                                        "stream": binding.stream,
+                                    });
+                                    handle.metadata["recording_error"] = json!(error.to_string());
+                                    handle.metadata["recording"] = json!(failed_recording);
+                                    if fatal {
+                                        handle.metadata["recording_fatal_error"] =
+                                            json!(error.to_string());
+                                    }
+                                    handle
+                                });
+                            let _ =
+                                persist_runtime_state(&work_dir, &updated_handle, &success_check);
+                            let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                                task_id: updated_handle.task_id,
+                                attempt_no: updated_handle.attempt_no,
+                                event_type: "zlm_api_error".to_string(),
+                                event_level: "error".to_string(),
+                                message: format!("failed to start stream recording: {error}"),
+                                payload: json!({
+                                    "schema": binding.schema,
+                                    "vhost": binding.vhost,
+                                    "app": binding.app,
+                                    "stream": binding.stream,
+                                    "record_root": recording.root_path,
+                                    "duration_sec": recording.duration_sec,
+                                }),
+                            }));
+                            if fatal {
+                                let _ =
+                                    events.send(RuntimeNotification::TaskSnapshot(updated_handle));
+                                let _ = signal_pid(pid, libc::SIGTERM);
+                                return;
+                            }
+                            let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                                task_id: updated_handle.task_id,
+                                attempt_no: updated_handle.attempt_no,
+                                event_type: "recording_degraded".to_string(),
+                                event_level: "warn".to_string(),
+                                message:
+                                    "stream recording startup failed; continuing without recording"
+                                        .to_string(),
+                                payload: json!({
+                                    "schema": binding.schema,
+                                    "vhost": binding.vhost,
+                                    "app": binding.app,
+                                    "stream": binding.stream,
+                                    "record_root": recording.root_path,
+                                }),
+                            }));
+                            let _ = events.send(RuntimeNotification::TaskSnapshot(updated_handle));
+                        }
+                    }
+                }
                 let running_handle = registry
                     .update(runtime_id, |runtime| {
                         runtime.state = RuntimeState::Running;
+                        runtime.last_progress_at = Some(Utc::now());
                         runtime.metadata["stream_online"] = json!(true);
                         runtime.metadata["stream_binding"] = json!({
                             "schema": startup_probe.schema,
@@ -3078,6 +3340,7 @@ fn spawn_startup_probe_monitor(
                         "vhost": startup_probe.vhost,
                         "app": startup_probe.app,
                         "stream": startup_probe.stream,
+                        "recording_started": recording_started,
                     }),
                 }));
                 let _ = events.send(RuntimeNotification::TaskSnapshot(running_handle));
@@ -3136,27 +3399,26 @@ fn spawn_live_relay_monitor(
                                 app: startup_probe.app.clone(),
                                 stream: startup_probe.stream.clone(),
                             });
-                        match start_live_relay_recording(
+                        match start_stream_recording(
                             &http_client,
                             &settings,
                             &binding,
                             &recording,
+                            Utc::now(),
                         )
                         .await
                         {
-                            Ok(()) => {
+                            Ok(updated_recording) => {
                                 let updated_handle = registry
                                     .update(runtime_id, |runtime| {
-                                        runtime.metadata["recording"] = json!({
-                                            "formats": recording.formats,
-                                            "root_path": recording.root_path,
-                                            "segment_sec": recording.segment_sec,
-                                            "as_player": recording.as_player,
-                                            "started": true,
-                                            "failed": false,
-                                        });
+                                        runtime.metadata["recording"] =
+                                            json!(updated_recording.clone());
                                     })
-                                    .unwrap_or_else(|| handle.clone());
+                                    .unwrap_or_else(|| {
+                                        let mut handle = handle.clone();
+                                        handle.metadata["recording"] = json!(updated_recording);
+                                        handle
+                                    });
                                 let _ = persist_runtime_state(
                                     &work_dir,
                                     &updated_handle,
@@ -3172,6 +3434,7 @@ fn spawn_live_relay_monitor(
                                         payload: json!({
                                             "formats": recording.formats,
                                             "root_path": recording.root_path,
+                                            "duration_sec": recording.duration_sec,
                                             "segment_sec": recording.segment_sec,
                                             "as_player": recording.as_player,
                                         }),
@@ -3179,20 +3442,20 @@ fn spawn_live_relay_monitor(
                                 recording_started = true;
                             }
                             Err(error) => {
+                                let failed_recording = mark_recording_failed(&recording);
+                                let fatal = should_fail_on_recording_start_error(&recording);
                                 let degraded_handle = registry
                                     .update(runtime_id, |runtime| {
                                         runtime.last_progress_at = Some(Utc::now());
                                         runtime.metadata["stream_online"] = json!(true);
                                         runtime.metadata["recording_error"] =
                                             json!(error.to_string());
-                                        runtime.metadata["recording"] = json!({
-                                            "formats": recording.formats,
-                                            "root_path": recording.root_path,
-                                            "segment_sec": recording.segment_sec,
-                                            "as_player": recording.as_player,
-                                            "started": false,
-                                            "failed": true,
-                                        });
+                                        runtime.metadata["recording"] =
+                                            json!(failed_recording.clone());
+                                        if fatal {
+                                            runtime.metadata["recording_fatal_error"] =
+                                                json!(error.to_string());
+                                        }
                                     })
                                     .unwrap_or_else(|| {
                                         let mut handle = handle.clone();
@@ -3200,14 +3463,11 @@ fn spawn_live_relay_monitor(
                                         handle.metadata["stream_online"] = json!(true);
                                         handle.metadata["recording_error"] =
                                             json!(error.to_string());
-                                        handle.metadata["recording"] = json!({
-                                            "formats": recording.formats,
-                                            "root_path": recording.root_path,
-                                            "segment_sec": recording.segment_sec,
-                                            "as_player": recording.as_player,
-                                            "started": false,
-                                            "failed": true,
-                                        });
+                                        handle.metadata["recording"] = json!(failed_recording);
+                                        if fatal {
+                                            handle.metadata["recording_fatal_error"] =
+                                                json!(error.to_string());
+                                        }
                                         handle
                                     });
                                 let _ =
@@ -3225,6 +3485,7 @@ fn spawn_live_relay_monitor(
                                             "app": binding.app,
                                             "stream": binding.stream,
                                             "record_root": recording.root_path,
+                                            "duration_sec": recording.duration_sec,
                                         }),
                                     }));
                                 let _ = persist_runtime_state(
@@ -3232,6 +3493,63 @@ fn spawn_live_relay_monitor(
                                     &degraded_handle,
                                     &SuccessCheck::ProcessExit,
                                 );
+                                if fatal {
+                                    let _ = events.send(RuntimeNotification::TaskSnapshot(
+                                        degraded_handle.clone(),
+                                    ));
+                                    let _ = stop_live_relay_recording(
+                                        &http_client,
+                                        &settings,
+                                        &binding,
+                                        &recording,
+                                    )
+                                    .await;
+                                    let _ = call_zlm_api(
+                                        &http_client,
+                                        &settings,
+                                        "/index/api/close_streams",
+                                        &build_close_stream_params(&binding, true),
+                                    )
+                                    .await;
+                                    let failed_handle = registry
+                                        .update(runtime_id, |runtime| {
+                                            runtime.state = RuntimeState::Exited;
+                                            runtime.last_progress_at = Some(Utc::now());
+                                        })
+                                        .unwrap_or(degraded_handle.clone());
+                                    let _ = persist_runtime_state(
+                                        &work_dir,
+                                        &failed_handle,
+                                        &SuccessCheck::ProcessExit,
+                                    );
+                                    let _ = events.send(RuntimeNotification::TaskSnapshot(
+                                        failed_handle.clone(),
+                                    ));
+                                    let _ = events.send(RuntimeNotification::TaskEvent(
+                                        RuntimeTaskEvent {
+                                            task_id: failed_handle.task_id,
+                                            attempt_no: failed_handle.attempt_no,
+                                            event_type: "failed".to_string(),
+                                            event_level: "error".to_string(),
+                                            message: "live_relay recording startup failed"
+                                                .to_string(),
+                                            payload: json!({
+                                                "schema": binding.schema,
+                                                "vhost": binding.vhost,
+                                                "app": binding.app,
+                                                "stream": binding.stream,
+                                                "record_root": recording.root_path,
+                                                "reason": "recording_start_failed",
+                                            }),
+                                        },
+                                    ));
+                                    runtimes
+                                        .write()
+                                        .expect("runtime map lock poisoned")
+                                        .remove(&runtime_id);
+                                    let _ = registry.remove(runtime_id);
+                                    return;
+                                }
                                 let _ =
                                     events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                         task_id: degraded_handle.task_id,
@@ -3252,6 +3570,71 @@ fn spawn_live_relay_monitor(
                                     events.send(RuntimeNotification::TaskSnapshot(degraded_handle));
                             }
                         }
+                    }
+                    let handle = registry.get(runtime_id).unwrap_or(handle.clone());
+                    if let Some(recording) = live_relay_recording_from_handle(&handle)
+                        .filter(|recording| recording.started)
+                        .filter(|recording| recording_duration_reached(recording, Utc::now()))
+                    {
+                        let completion_handle = if recording.auto_stop_requested {
+                            handle.clone()
+                        } else {
+                            let completed_recording =
+                                mark_recording_completion(&recording, "record_duration_reached");
+                            registry
+                                .update(runtime_id, |runtime| {
+                                    runtime.last_progress_at = Some(Utc::now());
+                                    runtime.metadata["recording"] =
+                                        json!(completed_recording.clone());
+                                    runtime.metadata["completion_reason"] =
+                                        json!("record_duration_reached");
+                                })
+                                .unwrap_or_else(|| {
+                                    let mut handle = handle.clone();
+                                    handle.last_progress_at = Some(Utc::now());
+                                    handle.metadata["recording"] =
+                                        json!(completed_recording.clone());
+                                    handle.metadata["completion_reason"] =
+                                        json!("record_duration_reached");
+                                    handle
+                                })
+                        };
+                        let _ = persist_runtime_state(
+                            &work_dir,
+                            &completion_handle,
+                            &SuccessCheck::ProcessExit,
+                        );
+                        if let Some(runtime) = runtimes
+                            .read()
+                            .expect("runtime map lock poisoned")
+                            .get(&runtime_id)
+                            .cloned()
+                        {
+                            runtime.stop_requested.store(true, Ordering::Relaxed);
+                        }
+                        let binding = stream_binding_from_handle(&completion_handle).unwrap_or(
+                            StreamBinding {
+                                schema: startup_probe.schema.clone(),
+                                vhost: startup_probe.vhost.clone(),
+                                app: startup_probe.app.clone(),
+                                stream: startup_probe.stream.clone(),
+                            },
+                        );
+                        let _ = stop_live_relay_recording(
+                            &http_client,
+                            &settings,
+                            &binding,
+                            &recording,
+                        )
+                        .await;
+                        let _ = call_zlm_api(
+                            &http_client,
+                            &settings,
+                            "/index/api/close_streams",
+                            &build_close_stream_params(&binding, true),
+                        )
+                        .await;
+                        continue;
                     }
                     let should_emit_running = handle.state != RuntimeState::Running
                         || !stream_online(&handle)
@@ -3368,28 +3751,37 @@ fn spawn_live_relay_monitor(
                         });
                     let auto_close_enabled =
                         live_relay_auto_close_enabled_from_handle(&settings, &handle);
-                    let (event_type, event_level, message, reason) = if stop_requested {
-                        (
-                            "canceled",
-                            "info",
-                            "live_relay stream stopped".to_string(),
-                            "stop_requested",
-                        )
-                    } else if auto_close_enabled {
-                        (
-                            "canceled",
-                            "info",
-                            "live_relay stopped after no-reader auto-close policy".to_string(),
-                            "no_reader_auto_close",
-                        )
-                    } else {
-                        (
-                            "failed",
-                            "error",
-                            "live_relay stream went offline unexpectedly".to_string(),
-                            "unexpected_offline",
-                        )
-                    };
+                    let completion_reason = completion_reason_from_handle(&exited_handle);
+                    let (event_type, event_level, message, reason) =
+                        if completion_reason.as_deref() == Some("record_duration_reached") {
+                            (
+                                "succeeded",
+                                "info",
+                                "live_relay completed after recording duration reached".to_string(),
+                                "record_duration_reached",
+                            )
+                        } else if stop_requested {
+                            (
+                                "canceled",
+                                "info",
+                                "live_relay stream stopped".to_string(),
+                                "stop_requested",
+                            )
+                        } else if auto_close_enabled {
+                            (
+                                "canceled",
+                                "info",
+                                "live_relay stopped after no-reader auto-close policy".to_string(),
+                                "no_reader_auto_close",
+                            )
+                        } else {
+                            (
+                                "failed",
+                                "error",
+                                "live_relay stream went offline unexpectedly".to_string(),
+                                "unexpected_offline",
+                            )
+                        };
                     let _ = persist_runtime_state(
                         &work_dir,
                         &exited_handle,
@@ -3582,6 +3974,17 @@ async fn start_live_relay_recording(
         .await?;
     }
     Ok(())
+}
+
+async fn start_stream_recording(
+    client: &Client,
+    settings: &AgentSettings,
+    binding: &StreamBinding,
+    recording: &LiveRelayRecording,
+    now: DateTime<Utc>,
+) -> Result<LiveRelayRecording, ExecutorError> {
+    start_live_relay_recording(client, settings, binding, recording).await?;
+    Ok(mark_recording_started(recording, now))
 }
 
 async fn stop_live_relay_recording(
@@ -3870,6 +4273,32 @@ fn classify_adopted_exit(
     stop_requested: bool,
 ) -> (&'static str, &'static str, String, Value) {
     let output_target = handle.outputs.first().cloned().unwrap_or_default();
+    if let Some(reason) =
+        completion_reason_from_handle(handle).filter(|reason| reason == "record_duration_reached")
+    {
+        return (
+            "succeeded",
+            "info",
+            "adopted child process completed after recording duration reached".to_string(),
+            json!({
+                "output_target": output_target,
+                "orphaned": true,
+                "reason": reason,
+            }),
+        );
+    }
+    if let Some(error) = fatal_recording_error_from_handle(handle) {
+        return (
+            "failed",
+            "error",
+            format!("adopted child process stopped after recording startup failed: {error}"),
+            json!({
+                "output_target": output_target,
+                "orphaned": true,
+                "recording_error": error,
+            }),
+        );
+    }
     if stop_requested {
         return (
             "canceled",
@@ -4620,6 +5049,50 @@ echo "{codec_name}"
     }
 
     #[test]
+    fn build_file_to_live_plan_accepts_http_mp4_and_duration_limit() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::FileToLive,
+            resolved_spec: json!({
+                "type": "file_to_live",
+                "name": "file-live-http",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "http_mp4", "url": "http://vod.example.com/archive.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "publish": {
+                    "kind": "zlm_ingest",
+                    "url": "rtmp://127.0.0.1/live/stream"
+                },
+                "record": {
+                    "enabled": true,
+                    "format": "mp4",
+                    "duration_sec": 300,
+                    "save_path": "/tmp/archive.mp4"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(plan.args.iter().any(|arg| arg == "-re"));
+        assert!(plan.args.windows(2).any(|window| window == ["-t", "300"]));
+        assert!(
+            plan.args
+                .iter()
+                .any(|arg| arg == "http://vod.example.com/archive.mp4")
+        );
+    }
+
+    #[test]
     fn build_live_relay_plan_allocates_stable_stream_binding() {
         let settings = test_settings("/tmp/work");
         let task_id = Uuid::now_v7();
@@ -4745,12 +5218,64 @@ echo "{codec_name}"
 
         assert_eq!(recording.formats, vec![ZlmRecordKind::Mp4]);
         assert_eq!(recording.root_path, "/var/media/archive");
+        assert_eq!(recording.duration_sec, None);
         assert_eq!(recording.segment_sec, Some(120));
         assert!(
             plan.outputs
                 .iter()
                 .any(|output| output == "/var/media/archive")
         );
+    }
+
+    #[test]
+    fn recording_duration_reached_uses_recording_start_time() {
+        let started_at = Utc::now();
+        let recording = LiveRelayRecording {
+            formats: vec![ZlmRecordKind::Mp4],
+            root_path: "/var/media/archive".to_string(),
+            duration_sec: Some(300),
+            segment_sec: None,
+            as_player: false,
+            recording_started_at: Some(started_at),
+            auto_stop_requested: false,
+            completion_reason: None,
+            started: true,
+            failed: false,
+        };
+
+        assert!(!recording_duration_reached(
+            &recording,
+            started_at + chrono::Duration::seconds(299)
+        ));
+        assert!(recording_duration_reached(
+            &recording,
+            started_at + chrono::Duration::seconds(300)
+        ));
+    }
+
+    #[test]
+    fn classify_adopted_exit_treats_record_duration_reached_as_success() {
+        let handle = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(1234),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Exited,
+            command_line: Some("ffmpeg -re -i input".to_string()),
+            outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+            metadata: json!({
+                "task_type": "file_to_live",
+                "completion_reason": "record_duration_reached",
+            }),
+        };
+
+        let (event_type, _, _, payload) =
+            classify_adopted_exit(&handle, &SuccessCheck::ProcessExit, true);
+        assert_eq!(event_type, "succeeded");
+        assert_eq!(payload["reason"], json!("record_duration_reached"));
     }
 
     #[test]
@@ -4787,8 +5312,12 @@ echo "{codec_name}"
         let recording = LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
             root_path: "/var/media/archive".to_string(),
+            duration_sec: None,
             segment_sec: Some(90),
             as_player: false,
+            recording_started_at: None,
+            auto_stop_requested: false,
+            completion_reason: None,
             started: false,
             failed: false,
         };
@@ -4928,8 +5457,12 @@ echo "{codec_name}"
         assert!(!should_start_live_relay_recording(&LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
             root_path: "/var/media/archive".to_string(),
+            duration_sec: None,
             segment_sec: None,
             as_player: false,
+            recording_started_at: None,
+            auto_stop_requested: false,
+            completion_reason: None,
             started: false,
             failed: true,
         }));
