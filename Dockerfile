@@ -1,6 +1,23 @@
 ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn
 ARG UBUNTU_MIRROR=
 ARG CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
+ARG NPM_REGISTRY_MIRROR=https://registry.npmmirror.com
+
+FROM node:22-bookworm AS frontend-builder
+
+ARG NPM_REGISTRY_MIRROR
+
+WORKDIR /app/crates/media-core/frontend
+
+COPY crates/media-core/frontend/package.json ./
+COPY crates/media-core/frontend/package-lock.json ./
+
+RUN if [ -n "${NPM_REGISTRY_MIRROR:-}" ]; then npm config set registry "${NPM_REGISTRY_MIRROR}"; fi \
+    && npm ci
+
+COPY crates/media-core/frontend ./
+
+RUN npm run build
 
 FROM rust:1.85-bookworm AS builder
 
@@ -57,6 +74,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM debian:bookworm-slim AS media-core-runtime
 
 ARG DEBIAN_MIRROR
+ENV STREAMSERVER_UI_DIR=/app/ui
 
 RUN set -eux; \
     if [ -n "${DEBIAN_MIRROR:-}" ]; then \
@@ -76,6 +94,7 @@ RUN set -eux; \
 WORKDIR /app
 
 COPY --from=builder /app/target/release/media-core /usr/local/bin/media-core
+COPY --from=frontend-builder /app/crates/media-core/ui ./ui
 COPY config ./config
 
 CMD ["media-core"]

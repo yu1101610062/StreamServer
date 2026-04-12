@@ -371,9 +371,7 @@ impl AuthenticatedPrincipal {
             PrincipalKind::Disabled | PrincipalKind::User => true,
             PrincipalKind::Machine => matches!(
                 permission,
-                ApiPermission::TaskRead
-                    | ApiPermission::TaskWrite
-                    | ApiPermission::RecordRead
+                ApiPermission::TaskRead | ApiPermission::TaskWrite | ApiPermission::RecordRead
             ),
         };
 

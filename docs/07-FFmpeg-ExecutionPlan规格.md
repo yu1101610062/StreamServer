@@ -57,8 +57,8 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| `kind` | `file`, `zlm_ingest`, `udp_mpegts_multicast`, `rtp_multicast` |
-| `url` | 输出地址或文件路径 |
+| `kind` | `file`, `udp_mpegts_multicast`, `rtp_multicast`, `rtmp_push` |
+| `url` | 输出地址；`file` 由平台托管生成，`rtmp_push` 为外部 RTMP/RTMPS 地址 |
 | `format` | `mp4`, `flv`, `mpegts`, `matroska` 等 |
 | `muxer_options` | muxer 级参数 |
 | `stream_options` | 码率、GOP、preset 等 |

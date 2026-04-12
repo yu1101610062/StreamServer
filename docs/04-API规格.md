@@ -126,7 +126,7 @@
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；其他输入类型按规则自动推断。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
 - `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
-- `publish.kind` 表示任务直接写出的外部目标类型；当前只支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`。
+- `publish.kind` 表示任务直接写出的外部目标类型；当前支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`、`rtmp_push`。
 - `record.duration_sec` 表示总录制时长：`stream_ingest + source_mode=vod` 按媒体时间截取，`stream_ingest + source_mode=live` 按现实时间计时；到点后任务整体成功结束。
 
 当前能力矩阵：
@@ -134,8 +134,18 @@
 | 任务类型 | 支持的 `input.kind` | 支持的 `publish.kind` | 支持的内部流协议暴露 |
 | --- | --- | --- | --- |
 | `stream_ingest` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` `gb_rtp` | 不允许设置 | `expose.enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
-| `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` | 不适用 |
+| `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` `rtmp_push` | 不适用 |
 | `file_transcode` | `file` `http_mp4` `hls(vod)` `http_ts(vod)` | `file` | 不适用 |
+
+`stream_bridge` 输出约束：
+
+- `publish.kind=file`：
+  - 输出路径由平台托管生成，不能通过 `publish.url` 指定目录或文件名
+  - `stream_bridge(file)` 产物落到 `/data/zlm/www/artifacts/bridge/YYYY/MM/DD/HHMMSS[-NN].ext`
+- `publish.kind=rtmp_push`：
+  - `publish.url` 必填，且必须是完整的 `rtmp://` 或 `rtmps://` 目标地址
+  - `publish.format` 留空或填 `flv`；其他格式不允许
+  - `vod` 输入会自动按实时节奏推送，避免把外部 RTMP 目标瞬间灌满
 
 返回：
 
@@ -250,8 +260,9 @@
       "http_url": "http://192.168.6.10/record/live/camera01/clip.mp4"
     }
   ],
-  "transcode_artifacts": [
+  "file_artifacts": [
     {
+      "artifact_kind": "transcode_output",
       "id": "019d....",
       "file_name": "output.mp4",
       "file_path": "/data/zlm/www/artifacts/transcode/output.mp4",
@@ -393,10 +404,11 @@
 
 - `http_url`：录像文件的 HTTP 访问地址。若 ZLM Hook 未上报 URL，则允许为空。
 
-### 5.3 `GET /transcode-artifacts`
+### 5.3 `GET /file-artifacts`
 
 支持字段：
 
+- `artifact_kind`
 - `task_id`
 - `date_from`
 - `date_to`
@@ -406,6 +418,7 @@
 返回字段：
 
 - `id`
+- `artifact_kind`
 - `task_id`
 - `attempt_id`
 - `node_id`
@@ -417,7 +430,8 @@
 
 说明：
 
-- 只覆盖改造后的 `file_transcode` 成功产物。
+- 同时覆盖 `file_transcode` 与 `stream_bridge(file)` 的成功产物。
+- `artifact_kind` 取值为 `transcode_output` 或 `bridge_output`。
 - `http_url` 基于工作节点 `agent_stream_addr` 和 `/data/zlm/www` 下的相对路径生成。
 
 ### 5.4 `GET /nodes`

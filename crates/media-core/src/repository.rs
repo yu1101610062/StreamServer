@@ -7,8 +7,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, AttemptStatus, CapabilitySnapshot, EventSource, GpuDeviceInfo,
-    GpuRuntimeStats, HeartbeatSnapshot, Page, RecoveryPolicy, StartMode, TaskOperation, TaskSpec,
-    TaskStateError, TaskStatus, TaskType, TaskValidationError, ValidationIssue, WorkerKind,
+    GpuRuntimeStats, HeartbeatSnapshot, Page, PublishTargetKind, RecoveryPolicy, StartMode,
+    TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType, TaskValidationError,
+    ValidationIssue, WorkerKind,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -1068,31 +1069,33 @@ impl TaskRepository {
         .collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub async fn list_transcode_artifacts(
+    pub async fn list_file_artifacts(
         &self,
-        filter: TranscodeArtifactListFilter,
-    ) -> Result<Page<TranscodeArtifactSummary>, RepoError> {
+        filter: FileArtifactListFilter,
+    ) -> Result<Page<FileArtifactSummary>, RepoError> {
         let page = filter.page.unwrap_or(1).max(1);
         let page_size = filter.page_size.unwrap_or(20).clamp(1, 200);
-        let total = self.count_transcode_artifacts(&filter).await?;
+        let total = self.count_file_artifacts(&filter).await?;
 
         let mut builder = QueryBuilder::<Postgres>::new(
             r#"
             select
-              id,
-              task_id,
-              attempt_id,
-              node_id,
-              file_name,
-              file_path,
-              http_url,
-              file_size,
-              created_at
-            from transcode_artifacts
+              ta.id,
+              t.type::text as task_type,
+              ta.task_id,
+              ta.attempt_id,
+              ta.node_id,
+              ta.file_name,
+              ta.file_path,
+              ta.http_url,
+              ta.file_size,
+              ta.created_at
+            from transcode_artifacts ta
+            join tasks t on t.id = ta.task_id
             where 1 = 1
             "#,
         );
-        apply_transcode_artifact_filters(&mut builder, &filter);
+        apply_file_artifact_filters(&mut builder, &filter);
         builder.push(" order by created_at desc limit ");
         builder.push_bind(i64::from(page_size));
         builder.push(" offset ");
@@ -1103,30 +1106,32 @@ impl TaskRepository {
             .fetch_all(&self.pool)
             .await?
             .into_iter()
-            .map(|row| TranscodeArtifactSummary::from_row(&row))
+            .map(|row| FileArtifactSummary::from_row(&row))
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Page::new(rows, page, page_size, total))
     }
 
-    pub async fn list_task_transcode_artifacts(
+    pub async fn list_task_file_artifacts(
         &self,
         task_id: Uuid,
-    ) -> Result<Vec<TranscodeArtifactSummary>, RepoError> {
+    ) -> Result<Vec<FileArtifactSummary>, RepoError> {
         Ok(sqlx::query(
             r#"
             select
-              id,
-              task_id,
-              attempt_id,
-              node_id,
-              file_name,
-              file_path,
-              http_url,
-              file_size,
-              created_at
-            from transcode_artifacts
-            where task_id = $1
+              ta.id,
+              t.type::text as task_type,
+              ta.task_id,
+              ta.attempt_id,
+              ta.node_id,
+              ta.file_name,
+              ta.file_path,
+              ta.http_url,
+              ta.file_size,
+              ta.created_at
+            from transcode_artifacts ta
+            join tasks t on t.id = ta.task_id
+            where ta.task_id = $1
             order by created_at desc, id desc
             "#,
         )
@@ -1134,7 +1139,7 @@ impl TaskRepository {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
-        .map(|row| TranscodeArtifactSummary::from_row(&row))
+        .map(|row| FileArtifactSummary::from_row(&row))
         .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1682,11 +1687,11 @@ impl TaskRepository {
         let merged_spec: TaskSpec = serde_json::from_value(merged_json)?;
         merged_spec.validate()?;
         validate_task_callback_url(&merged_spec)?;
-        validate_transcode_publish_target(&merged_spec)?;
+        validate_managed_file_publish_target(&merged_spec)?;
         let resolved_spec = merged_spec.resolved();
         resolved_spec.validate()?;
         validate_task_callback_url(&resolved_spec)?;
-        validate_transcode_publish_target(&resolved_spec)?;
+        validate_managed_file_publish_target(&resolved_spec)?;
 
         Ok(ResolvedTaskRequest {
             requested_spec: merged_spec,
@@ -2956,7 +2961,7 @@ impl TaskRepository {
 
         self.upsert_stream_binding_from_snapshot(&mut tx, &snapshot)
             .await?;
-        self.upsert_transcode_artifact_from_snapshot(&mut tx, node_id, &snapshot)
+        self.upsert_file_artifacts_from_snapshot(&mut tx, node_id, &snapshot)
             .await?;
 
         tx.commit().await?;
@@ -3033,21 +3038,12 @@ impl TaskRepository {
         Ok(())
     }
 
-    async fn upsert_transcode_artifact_from_snapshot(
+    async fn upsert_file_artifacts_from_snapshot(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
         node_id: Uuid,
         snapshot: &TaskSnapshotRecord,
     ) -> Result<(), RepoError> {
-        let Some(metadata) = snapshot
-            .metadata
-            .get("transcode_artifact")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<TranscodeArtifactMetadata>(value).ok())
-        else {
-            return Ok(());
-        };
-
         let Some(attempt_id) = sqlx::query_scalar::<_, Uuid>(
             r#"
             select id
@@ -3078,8 +3074,65 @@ impl TaskRepository {
             return Ok(());
         };
 
-        let http_url =
-            artifact_http_url_from_path(agent_stream_addr.as_str(), metadata.file_path.as_str())?;
+        if let Some(metadata) = snapshot
+            .metadata
+            .get("transcode_artifact")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<FileArtifactMetadata>(value).ok())
+        {
+            self.upsert_file_artifact_row(
+                tx,
+                snapshot.task_id,
+                attempt_id,
+                node_id,
+                &agent_stream_addr,
+                metadata,
+            )
+            .await?;
+            self.enqueue_artifact_update_callback_if_needed(
+                tx,
+                snapshot.task_id,
+                snapshot.attempt_no,
+            )
+            .await?;
+        }
+
+        if let Some(metadata) = snapshot
+            .metadata
+            .get("bridge_artifact")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<FileArtifactMetadata>(value).ok())
+        {
+            self.upsert_file_artifact_row(
+                tx,
+                snapshot.task_id,
+                attempt_id,
+                node_id,
+                &agent_stream_addr,
+                metadata,
+            )
+            .await?;
+            self.enqueue_artifact_update_callback_if_needed(
+                tx,
+                snapshot.task_id,
+                snapshot.attempt_no,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn upsert_file_artifact_row(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_id: Uuid,
+        node_id: Uuid,
+        agent_stream_addr: &str,
+        metadata: FileArtifactMetadata,
+    ) -> Result<(), RepoError> {
+        let http_url = artifact_http_url_from_path(agent_stream_addr, metadata.file_path.as_str())?;
 
         sqlx::query(
             r#"
@@ -3098,7 +3151,7 @@ impl TaskRepository {
             "#,
         )
         .bind(Uuid::now_v7())
-        .bind(snapshot.task_id)
+        .bind(task_id)
         .bind(attempt_id)
         .bind(node_id)
         .bind(&metadata.file_name)
@@ -3108,9 +3161,6 @@ impl TaskRepository {
         .bind(Utc::now())
         .execute(&mut **tx)
         .await?;
-
-        self.enqueue_artifact_update_callback_if_needed(tx, snapshot.task_id, snapshot.attempt_no)
-            .await?;
 
         Ok(())
     }
@@ -3589,14 +3639,14 @@ impl TaskRepository {
         Ok(total as u64)
     }
 
-    async fn count_transcode_artifacts(
+    async fn count_file_artifacts(
         &self,
-        filter: &TranscodeArtifactListFilter,
+        filter: &FileArtifactListFilter,
     ) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from transcode_artifacts where 1 = 1",
+            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id where 1 = 1",
         );
-        apply_transcode_artifact_filters(&mut builder, filter);
+        apply_file_artifact_filters(&mut builder, filter);
 
         let row = builder.build().fetch_one(&self.pool).await?;
         let total: i64 = row.try_get("total")?;
@@ -4441,10 +4491,34 @@ impl RecordFileSummary {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileArtifactKind {
+    TranscodeOutput,
+    BridgeOutput,
+}
+
+impl FileArtifactKind {
+    fn from_task_type(value: &str) -> Result<Self, RepoError> {
+        match value {
+            "file_transcode" => Ok(Self::TranscodeOutput),
+            "stream_bridge" => Ok(Self::BridgeOutput),
+            other => Err(RepoError::Validation(TaskValidationError {
+                issues: vec![ValidationIssue::new(
+                    "artifact_kind",
+                    format!("unsupported file artifact task type: {other}"),
+                )],
+            })),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
-pub struct TranscodeArtifactListFilter {
+pub struct FileArtifactListFilter {
     #[serde(default)]
     pub task_id: Option<Uuid>,
+    #[serde(default)]
+    pub artifact_kind: Option<FileArtifactKind>,
     #[serde(default)]
     pub date_from: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -4456,8 +4530,9 @@ pub struct TranscodeArtifactListFilter {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TranscodeArtifactSummary {
+pub struct FileArtifactSummary {
     pub id: Uuid,
+    pub artifact_kind: FileArtifactKind,
     pub task_id: Uuid,
     pub attempt_id: Option<Uuid>,
     pub node_id: Uuid,
@@ -4468,10 +4543,11 @@ pub struct TranscodeArtifactSummary {
     pub created_at: DateTime<Utc>,
 }
 
-impl TranscodeArtifactSummary {
+impl FileArtifactSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
         Ok(Self {
             id: row.try_get("id")?,
+            artifact_kind: FileArtifactKind::from_task_type(row.try_get::<&str, _>("task_type")?)?,
             task_id: row.try_get("task_id")?,
             attempt_id: row.try_get("attempt_id")?,
             node_id: row.try_get("node_id")?,
@@ -4752,20 +4828,28 @@ fn apply_record_filters<'a>(
     }
 }
 
-fn apply_transcode_artifact_filters<'a>(
+fn apply_file_artifact_filters<'a>(
     builder: &mut QueryBuilder<'a, Postgres>,
-    filter: &'a TranscodeArtifactListFilter,
+    filter: &'a FileArtifactListFilter,
 ) {
     if let Some(task_id) = filter.task_id {
-        builder.push(" and task_id = ");
+        builder.push(" and ta.task_id = ");
         builder.push_bind(task_id);
     }
+    if let Some(artifact_kind) = filter.artifact_kind {
+        builder.push(" and t.type = ");
+        builder.push_bind(match artifact_kind {
+            FileArtifactKind::TranscodeOutput => "file_transcode",
+            FileArtifactKind::BridgeOutput => "stream_bridge",
+        });
+        builder.push("::task_type");
+    }
     if let Some(date_from) = filter.date_from {
-        builder.push(" and created_at >= ");
+        builder.push(" and ta.created_at >= ");
         builder.push_bind(date_from);
     }
     if let Some(date_to) = filter.date_to {
-        builder.push(" and created_at <= ");
+        builder.push(" and ta.created_at <= ");
         builder.push_bind(date_to);
     }
 }
@@ -4773,7 +4857,6 @@ fn apply_transcode_artifact_filters<'a>(
 const ZLM_HTTP_ROOT: &str = "/data/zlm/www";
 const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
 const LEGACY_ZLM_RECORD_ROOT: &str = "/data/zlm/record";
-const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
 
 fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     if path == root {
@@ -4809,21 +4892,21 @@ fn normalized_absolute_path(path: &str) -> Result<String, RepoError> {
     Ok(format!("/{}", parts.join("/")))
 }
 
-fn validate_transcode_publish_target(spec: &TaskSpec) -> Result<(), RepoError> {
-    if spec.task_type != TaskType::FileTranscode {
+fn validate_managed_file_publish_target(spec: &TaskSpec) -> Result<(), RepoError> {
+    if !matches!(spec.publish.kind, Some(PublishTargetKind::File)) {
         return Ok(());
     }
 
-    let output = spec
+    if spec
         .publish
         .url
         .as_deref()
-        .ok_or_else(|| validation_error("publish.url", "is required for file_transcode"))?;
-    let normalized = normalized_absolute_path(output)?;
-    if relative_path_under_root(&normalized, TRANSCODE_ARTIFACT_ROOT).is_none() {
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
         return Err(validation_error(
             "publish.url",
-            format!("file_transcode output must stay under {TRANSCODE_ARTIFACT_ROOT}"),
+            "must not be provided for file output; output path is managed by the platform",
         ));
     }
     Ok(())
@@ -4961,7 +5044,10 @@ async fn resolve_record_http_url(
         .and_then(|raw_url| resolve_absolute_http_url(agent_stream_addr.as_str(), raw_url)))
 }
 
-fn build_resolved_task_json(task_type: TaskType, request_overrides: &Value) -> Result<Value, RepoError> {
+fn build_resolved_task_json(
+    task_type: TaskType,
+    request_overrides: &Value,
+) -> Result<Value, RepoError> {
     let mut merged = json!({});
     if !request_overrides.is_object() {
         return Err(validation_error(
@@ -5382,7 +5468,7 @@ struct StreamBindingSnapshot {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TranscodeArtifactMetadata {
+struct FileArtifactMetadata {
     file_name: String,
     file_path: String,
     file_size: i64,
@@ -6004,7 +6090,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_transcode_publish_target_rejects_paths_outside_zlm_http_root() {
+    fn validate_managed_file_publish_target_rejects_file_path_override() {
         let spec: TaskSpec = serde_json::from_value(json!({
             "type": "file_transcode",
             "name": "artifact-test",
@@ -6023,7 +6109,7 @@ mod tests {
         .expect("task spec should parse");
 
         let error =
-            validate_transcode_publish_target(&spec).expect_err("invalid output should reject");
+            validate_managed_file_publish_target(&spec).expect_err("invalid output should reject");
         assert!(matches!(error, RepoError::Validation(_)));
     }
 }

@@ -18,8 +18,8 @@ use uuid::Uuid;
 use media_domain::{AttemptStatus, TaskStatus, TaskType, WorkerKind};
 
 use crate::repository::{
-    AttemptSummary, CallbackOutboxJob, NodeSummary, RecordFileSummary, StreamListFilter,
-    StreamSummary, TaskDetail, TaskEventSummary, TaskRepository, TranscodeArtifactSummary,
+    AttemptSummary, CallbackOutboxJob, FileArtifactSummary, NodeSummary, RecordFileSummary,
+    StreamListFilter, StreamSummary, TaskDetail, TaskEventSummary, TaskRepository,
 };
 
 const CALLBACK_TICK: Duration = Duration::from_secs(2);
@@ -361,9 +361,7 @@ async fn build_task_completed_callback_payload(
         })
         .await?;
     let records = repository.list_task_record_files(job.task_id).await?;
-    let transcode_artifacts = repository
-        .list_task_transcode_artifacts(job.task_id)
-        .await?;
+    let file_artifacts = repository.list_task_file_artifacts(job.task_id).await?;
 
     Ok(Some(TaskCompletedCallbackPayload {
         event_id: job.id,
@@ -380,9 +378,9 @@ async fn build_task_completed_callback_payload(
             .into_iter()
             .map(TaskCallbackRecord::from_summary)
             .collect(),
-        transcode_artifacts: transcode_artifacts
+        file_artifacts: file_artifacts
             .into_iter()
-            .map(TaskCallbackTranscodeArtifact::from_summary)
+            .map(TaskCallbackFileArtifact::from_summary)
             .collect(),
         latest_event: select_latest_business_event(&detail.recent_events)
             .map(TaskCallbackLatestEvent::from_summary),
@@ -422,7 +420,7 @@ pub struct TaskCompletedCallbackPayload {
     pub attempt: TaskCallbackAttempt,
     pub streams: Vec<TaskCallbackStream>,
     pub records: Vec<TaskCallbackRecord>,
-    pub transcode_artifacts: Vec<TaskCallbackTranscodeArtifact>,
+    pub file_artifacts: Vec<TaskCallbackFileArtifact>,
     pub latest_event: Option<TaskCallbackLatestEvent>,
 }
 
@@ -601,8 +599,9 @@ impl TaskCallbackRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct TaskCallbackTranscodeArtifact {
+pub struct TaskCallbackFileArtifact {
     pub id: Uuid,
+    pub artifact_kind: String,
     pub file_name: String,
     pub file_path: String,
     pub http_url: String,
@@ -610,10 +609,15 @@ pub struct TaskCallbackTranscodeArtifact {
     pub created_at: DateTime<Utc>,
 }
 
-impl TaskCallbackTranscodeArtifact {
-    fn from_summary(summary: TranscodeArtifactSummary) -> Self {
+impl TaskCallbackFileArtifact {
+    fn from_summary(summary: FileArtifactSummary) -> Self {
         Self {
             id: summary.id,
+            artifact_kind: match summary.artifact_kind {
+                crate::repository::FileArtifactKind::TranscodeOutput => "transcode_output",
+                crate::repository::FileArtifactKind::BridgeOutput => "bridge_output",
+            }
+            .to_string(),
             file_name: summary.file_name,
             file_path: summary.file_path,
             http_url: summary.http_url,

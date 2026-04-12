@@ -4,7 +4,7 @@ use std::{
     fs,
     future::Future,
     net::Ipv4Addr,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Stdio,
     ptr,
     str::FromStr,
@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use media_domain::{
     ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy,
     RuntimeHandle, RuntimeState, SourceMode, TaskSpec, TaskType, WorkerKind,
@@ -884,7 +884,7 @@ impl ManagedProcessExecutor {
                     metadata: wait_handle.metadata.clone(),
                 });
 
-            attach_transcode_artifact_metadata(&mut exited_handle, &success_check);
+            attach_file_artifact_metadata(&mut exited_handle, &success_check);
 
             if should_auto_restart_process(&exited_handle, was_stopped, &status) {
                 let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
@@ -1526,52 +1526,104 @@ fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
 const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
 const LEGACY_ZLM_RECORD_ROOT: &str = "/data/zlm/record";
 const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
+const BRIDGE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/bridge";
 
-fn path_is_under_root(path: &str, root: &str) -> bool {
-    path != root
-        && path
-            .strip_prefix(root)
-            .is_some_and(|suffix| suffix.starts_with('/'))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedFileOutputKind {
+    Transcode,
+    Bridge,
 }
 
-fn normalized_posix_path(path: &str) -> Result<String, ExecutorError> {
-    let path = Path::new(path.trim());
-    if !path.is_absolute() {
-        return Err(ExecutorError::InvalidRequest(
-            "file_transcode publish.url must be an absolute path".to_string(),
-        ));
-    }
-
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(ExecutorError::InvalidRequest(
-                    "file_transcode publish.url must not contain parent segments".to_string(),
-                ));
-            }
-            Component::Prefix(_) => {
-                return Err(ExecutorError::InvalidRequest(
-                    "file_transcode publish.url must be a POSIX path".to_string(),
-                ));
-            }
+impl ManagedFileOutputKind {
+    fn root(self) -> &'static str {
+        match self {
+            Self::Transcode => TRANSCODE_ARTIFACT_ROOT,
+            Self::Bridge => BRIDGE_ARTIFACT_ROOT,
         }
     }
 
-    Ok(format!("/{}", parts.join("/")))
+    fn metadata_key(self) -> &'static str {
+        match self {
+            Self::Transcode => "transcode_artifact",
+            Self::Bridge => "bridge_artifact",
+        }
+    }
 }
 
-fn validate_transcode_output_path(path: &str) -> Result<String, ExecutorError> {
-    let normalized = normalized_posix_path(path)?;
-    if !path_is_under_root(&normalized, TRANSCODE_ARTIFACT_ROOT) {
-        return Err(ExecutorError::InvalidRequest(format!(
-            "file_transcode publish.url must stay under {TRANSCODE_ARTIFACT_ROOT}"
-        )));
+fn managed_file_output_kind_for_task(task_type: TaskType) -> Option<ManagedFileOutputKind> {
+    match task_type {
+        TaskType::FileTranscode => Some(ManagedFileOutputKind::Transcode),
+        TaskType::StreamBridge => Some(ManagedFileOutputKind::Bridge),
+        _ => None,
     }
-    Ok(normalized)
+}
+
+fn normalize_optional_publish_format(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn default_file_extension_for_format(format: &str) -> String {
+    match format {
+        "mp4" => "mp4".to_string(),
+        "flv" => "flv".to_string(),
+        "mpegts" | "rtp_mpegts" => "ts".to_string(),
+        "matroska" => "mkv".to_string(),
+        "mov" => "mov".to_string(),
+        "webm" => "webm".to_string(),
+        other => {
+            let sanitized: String = other
+                .chars()
+                .filter(|value| {
+                    value.is_ascii_alphanumeric() || matches!(value, '.' | '_' | '+' | '-')
+                })
+                .collect();
+            if sanitized.is_empty() {
+                "bin".to_string()
+            } else {
+                sanitized
+            }
+        }
+    }
+}
+
+fn allocate_managed_file_output(
+    kind: ManagedFileOutputKind,
+    publish: &PublishSpec,
+) -> Result<PublishOutput, ExecutorError> {
+    if publish
+        .url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(ExecutorError::InvalidRequest(
+            "publish.url must not be provided for file output; output path is managed by the platform".to_string(),
+        ));
+    }
+
+    let format = normalize_optional_publish_format(publish.format.as_deref())
+        .unwrap_or_else(|| "mp4".to_string());
+    let extension = default_file_extension_for_format(&format);
+    let timestamp = Local::now().naive_local();
+    let relative_dir = timestamp.format("%Y/%m/%d").to_string();
+    let file_stem = timestamp.format("%H%M%S").to_string();
+    let dir = PathBuf::from(kind.root()).join(relative_dir);
+    let mut path = dir.join(format!("{file_stem}.{extension}"));
+    let mut suffix = 1_u32;
+    while path.exists() {
+        path = dir.join(format!("{file_stem}-{suffix:02}.{extension}"));
+        suffix += 1;
+    }
+
+    let target = path.to_string_lossy().to_string();
+    Ok(PublishOutput {
+        success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
+        target,
+        format,
+    })
 }
 
 fn build_file_transcode_plan(
@@ -1582,9 +1634,9 @@ fn build_file_transcode_plan(
     let input_url = build_input_url(settings, &spec.input)?;
 
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let output_path = match spec.publish.kind {
+    let output = match spec.publish.kind {
         Some(PublishTargetKind::File) => {
-            required_nonempty("publish.url", spec.publish.url.as_deref())?
+            allocate_managed_file_output(ManagedFileOutputKind::Transcode, &spec.publish)?
         }
         Some(_) => {
             return Err(ExecutorError::InvalidRequest(
@@ -1597,12 +1649,6 @@ fn build_file_transcode_plan(
             ));
         }
     };
-    let output_path = validate_transcode_output_path(&output_path)?;
-    let output_format = spec
-        .publish
-        .format
-        .clone()
-        .unwrap_or_else(|| infer_file_output_format(&output_path, "mp4"));
     let mut args = ffmpeg_base_args(input_url.clone(), false);
     append_process_args(
         &mut args,
@@ -1618,17 +1664,17 @@ fn build_file_transcode_plan(
         "-threads".to_string(),
         "0".to_string(),
         "-f".to_string(),
-        output_format,
-        output_path.clone(),
+        output.format.clone(),
+        output.target.clone(),
     ]);
 
     Ok(ProcessPlan {
         executable: settings.ffmpeg_bin.clone(),
         args,
         work_dir,
-        output_target: output_path.clone(),
-        outputs: vec![output_path.clone()],
-        success_check: SuccessCheck::FileExists(PathBuf::from(output_path)),
+        output_target: output.target.clone(),
+        outputs: vec![output.target.clone()],
+        success_check: output.success_check,
         startup_probe: None,
         recording: None,
     })
@@ -1724,23 +1770,29 @@ fn build_multicast_bridge_plan(
 ) -> Result<ProcessPlan, ExecutorError> {
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let output = build_publish_output(settings, &spec.publish)?;
+    let output = build_publish_output(settings, spec.task_type, &spec.publish)?;
     let startup_probe = None;
     let realtime = spec.input.source_mode == Some(SourceMode::Vod)
         && matches!(
             spec.publish.kind,
-            Some(PublishTargetKind::UdpMpegtsMulticast | PublishTargetKind::RtpMulticast)
+            Some(
+                PublishTargetKind::UdpMpegtsMulticast
+                    | PublishTargetKind::RtpMulticast
+                    | PublishTargetKind::RtmpPush
+            )
         );
     let mut args = ffmpeg_base_args(input_url.clone(), realtime);
-    insert_ffmpeg_input_args(
-        &mut args,
-        vec![
-            "-use_wallclock_as_timestamps".to_string(),
-            "1".to_string(),
-            "-fflags".to_string(),
-            "+genpts".to_string(),
-        ],
-    );
+    if spec.input.source_mode != Some(SourceMode::Vod) {
+        insert_ffmpeg_input_args(
+            &mut args,
+            vec![
+                "-use_wallclock_as_timestamps".to_string(),
+                "1".to_string(),
+                "-fflags".to_string(),
+                "+genpts".to_string(),
+            ],
+        );
+    }
     if should_stabilize_live_mpegts_multicast_bridge(spec, &output) {
         // ZLM-published live inputs can surface unset/non-monotonic DTS when copied
         // directly into MPEG-TS. Re-encode video to regenerate timestamps while
@@ -2243,7 +2295,9 @@ fn build_internal_stream_output(settings: &AgentSettings, probe: &StartupProbe) 
     PublishOutput {
         success_check: SuccessCheck::ProcessExit,
         target: build_internal_stream_target(settings, probe),
-        format: probe.schema.clone().unwrap_or_else(|| "flv".to_string()),
+        // Internal ingest always pushes into ZLM via RTMP, regardless of which
+        // playback protocols are later exposed for the stream.
+        format: "flv".to_string(),
     }
 }
 
@@ -2257,21 +2311,17 @@ fn build_internal_stream_target(settings: &AgentSettings, probe: &StartupProbe) 
 
 fn build_publish_output(
     settings: &AgentSettings,
+    task_type: TaskType,
     publish: &PublishSpec,
 ) -> Result<PublishOutput, ExecutorError> {
     match publish.kind {
-        Some(PublishTargetKind::File) => {
-            let target = required_nonempty("publish.url", publish.url.as_deref())?;
-            let format = publish
-                .format
-                .clone()
-                .unwrap_or_else(|| infer_file_output_format(&target, "mpegts"));
-            Ok(PublishOutput {
-                success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
-                target,
-                format,
+        Some(PublishTargetKind::File) => managed_file_output_kind_for_task(task_type)
+            .ok_or_else(|| {
+                ExecutorError::InvalidRequest(
+                    "publish.kind=file is only supported for managed file output tasks".to_string(),
+                )
             })
-        }
+            .and_then(|kind| allocate_managed_file_output(kind, publish)),
         Some(PublishTargetKind::UdpMpegtsMulticast | PublishTargetKind::RtpMulticast) => {
             let target = build_multicast_url(
                 match publish.kind.expect("kind checked") {
@@ -2312,6 +2362,11 @@ fn build_publish_output(
                 format,
             })
         }
+        Some(PublishTargetKind::RtmpPush) => Ok(PublishOutput {
+            success_check: SuccessCheck::ProcessExit,
+            target: required_nonempty("publish.url", publish.url.as_deref())?,
+            format: "flv".to_string(),
+        }),
         None => Err(ExecutorError::InvalidRequest(
             "publish.kind must be provided".to_string(),
         )),
@@ -2672,22 +2727,6 @@ fn required_nonempty(field: &str, value: Option<&str>) -> Result<String, Executo
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| ExecutorError::InvalidRequest(format!("{field} must be provided")))
-}
-
-fn infer_file_output_format(path: &str, default_format: &str) -> String {
-    match Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("mp4") => "mp4".to_string(),
-        Some("mkv") => "matroska".to_string(),
-        Some("ts") | Some("mpegts") => "mpegts".to_string(),
-        Some("flv") => "flv".to_string(),
-        Some("mov") => "mov".to_string(),
-        _ => default_format.to_string(),
-    }
 }
 
 fn attempt_work_dir(settings: &AgentSettings, task_id: Uuid, attempt_no: i32) -> PathBuf {
@@ -3082,7 +3121,7 @@ fn spawn_adopted_runtime_monitor(
                     handle.last_progress_at = Some(Utc::now());
                     handle
                 });
-            attach_transcode_artifact_metadata(&mut exited_handle, &success_check);
+            attach_file_artifact_metadata(&mut exited_handle, &success_check);
 
             let (event_type, event_level, message, payload) =
                 classify_adopted_exit(&exited_handle, &success_check, stop_requested);
@@ -4220,11 +4259,12 @@ fn zlm_record_kind_code(kind: &ZlmRecordKind) -> u8 {
     }
 }
 
-fn attach_transcode_artifact_metadata(handle: &mut RuntimeHandle, success_check: &SuccessCheck) {
-    if task_type_from_handle(handle) != Some(TaskType::FileTranscode) {
-        return;
-    }
+fn attach_file_artifact_metadata(handle: &mut RuntimeHandle, success_check: &SuccessCheck) {
     let SuccessCheck::FileExists(path) = success_check else {
+        return;
+    };
+    let Some(kind) = task_type_from_handle(handle).and_then(managed_file_output_kind_for_task)
+    else {
         return;
     };
     let Ok(metadata) = fs::metadata(path) else {
@@ -4245,7 +4285,7 @@ fn attach_transcode_artifact_metadata(handle: &mut RuntimeHandle, success_check:
         return;
     };
     object.insert(
-        "transcode_artifact".to_string(),
+        kind.metadata_key().to_string(),
         json!({
             "file_name": file_name,
             "file_path": file_path,
@@ -4544,7 +4584,7 @@ echo "{codec_name}"
     }
 
     #[test]
-    fn build_file_transcode_plan_uses_publish_file_target() {
+    fn build_file_transcode_plan_allocates_managed_output_path() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
@@ -4558,8 +4598,7 @@ echo "{codec_name}"
                 "process": {"mode": "copy_or_transcode"},
                 "record": {},
                 "publish": {
-                    "kind": "file",
-                    "url": "/data/zlm/www/artifacts/transcode/output.mp4"
+                    "kind": "file"
                 },
                 "recovery": {},
                 "schedule": {"start_mode": "immediate"},
@@ -4575,10 +4614,8 @@ echo "{codec_name}"
             build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
         assert_eq!(plan.executable, "ffmpeg");
         assert!(plan.args.iter().any(|arg| arg == "pipe:1"));
-        assert_eq!(
-            plan.output_target,
-            "/data/zlm/www/artifacts/transcode/output.mp4"
-        );
+        assert!(plan.output_target.starts_with(TRANSCODE_ARTIFACT_ROOT));
+        assert!(plan.output_target.ends_with(".mp4"));
     }
 
     #[test]
@@ -4627,7 +4664,7 @@ echo "{codec_name}"
     }
 
     #[test]
-    fn build_file_transcode_plan_rejects_output_outside_http_root() {
+    fn build_file_transcode_plan_rejects_publish_url_override() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
@@ -4655,12 +4692,46 @@ echo "{codec_name}"
 
         let spec = parse_task_spec(&request).expect("spec should parse");
         let error = build_file_transcode_plan(&settings, &request, &spec)
-            .expect_err("plan should reject output outside web root");
+            .expect_err("plan should reject publish url override");
         assert!(matches!(
             error,
             ExecutorError::InvalidRequest(message)
-                if message.contains(TRANSCODE_ARTIFACT_ROOT)
+                if message.contains("publish.url must not be provided")
         ));
+    }
+
+    #[test]
+    fn build_multicast_bridge_plan_allocates_managed_file_output_path() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamBridge,
+            resolved_spec: json!({
+                "type": "stream_bridge",
+                "name": "bridge-test",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://example.com/live"},
+                "process": {"mode": "passthrough"},
+                "publish": {
+                    "kind": "file"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(plan.output_target.starts_with(BRIDGE_ARTIFACT_ROOT));
+        assert!(plan.output_target.ends_with(".mp4"));
+        assert!(plan.args.iter().any(|arg| arg == "mp4"));
     }
 
     #[test]
@@ -4865,7 +4936,7 @@ echo "{codec_name}"
     }
 
     #[test]
-    fn build_multicast_bridge_plan_waits_for_zlm_stream_when_ingesting() {
+    fn build_multicast_bridge_plan_pushes_live_input_to_external_rtmp_without_realtime_pacing() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
@@ -4873,18 +4944,17 @@ echo "{codec_name}"
             task_type: TaskType::StreamBridge,
             resolved_spec: json!({
                 "type": "stream_bridge",
-                "name": "bridge-to-zlm",
+                "name": "bridge-to-rtmp",
                 "common": {"created_by": "tester"},
                 "input": {
-                    "kind": "udp_mpegts_multicast",
-                    "group": "239.10.10.10",
-                    "port": 5000,
-                    "interface_ip": "192.168.1.10"
+                    "kind": "rtsp",
+                    "source_mode": "live",
+                    "url": "rtsp://camera.example/live"
                 },
                 "process": {"mode": "passthrough"},
                 "publish": {
-                    "kind": "zlm_ingest",
-                    "url": "rtmp://zlmediakit/live/bridge-ingest"
+                    "kind": "rtmp_push",
+                    "url": "rtmp://push.example.com/live/bridge-ingest"
                 },
                 "record": {},
                 "recovery": {},
@@ -4900,46 +4970,51 @@ echo "{codec_name}"
         let plan =
             build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
 
-        assert_eq!(plan.output_target, "rtmp://zlmediakit/live/bridge-ingest");
         assert_eq!(
-            plan.startup_probe
-                .as_ref()
-                .and_then(|probe| probe.schema.as_deref()),
-            Some("rtmp")
+            plan.output_target,
+            "rtmp://push.example.com/live/bridge-ingest"
         );
+        assert!(plan.startup_probe.is_none());
         assert_eq!(
-            plan.startup_probe.as_ref().map(|probe| probe.app.as_str()),
-            Some("live")
+            plan.args
+                .windows(2)
+                .find(|window| *window == ["-f", "flv"])
+                .map(|_| "flv"),
+            Some("flv")
         );
+        assert!(!plan.args.iter().any(|arg| arg == "-re"));
+        let wallclock_index = plan
+            .args
+            .iter()
+            .position(|arg| arg == "-use_wallclock_as_timestamps")
+            .expect("live bridge should stabilize timestamps");
         assert_eq!(
-            plan.startup_probe
-                .as_ref()
-                .map(|probe| probe.stream.as_str()),
-            Some("bridge-ingest")
+            plan.args.get(wallclock_index + 1).map(String::as_str),
+            Some("1")
         );
+        assert!(plan.args.iter().any(|arg| arg == "+genpts"));
     }
 
     #[test]
-    fn build_multicast_bridge_plan_uses_agent_default_multicast_interface_ip() {
-        let mut settings = test_settings("/tmp/work");
-        settings.multicast_interface_ip = "192.168.50.20".to_string();
+    fn build_multicast_bridge_plan_pushes_vod_input_to_external_rtmp_with_realtime_pacing() {
+        let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
             task_type: TaskType::StreamBridge,
             resolved_spec: json!({
                 "type": "stream_bridge",
-                "name": "bridge-default-multicast",
+                "name": "bridge-vod-to-rtmp",
                 "common": {"created_by": "tester"},
                 "input": {
-                    "kind": "udp_mpegts_multicast",
-                    "group": "239.10.10.10",
-                    "port": 5000
+                    "kind": "http_mp4",
+                    "source_mode": "vod",
+                    "url": "http://vod.example.com/archive.mp4"
                 },
                 "process": {"mode": "passthrough"},
                 "publish": {
-                    "kind": "zlm_ingest",
-                    "url": "rtmp://zlmediakit/live/bridge-default"
+                    "kind": "rtmp_push",
+                    "url": "rtmps://push.example.com/live/bridge-default"
                 },
                 "record": {},
                 "recovery": {},
@@ -4955,11 +5030,19 @@ echo "{codec_name}"
         let plan =
             build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
 
-        assert!(
-            plan.args
-                .iter()
-                .any(|arg| arg == "udp://239.10.10.10:5000?localaddr=192.168.50.20")
+        assert_eq!(
+            plan.output_target,
+            "rtmps://push.example.com/live/bridge-default"
         );
+        assert!(plan.args.iter().any(|arg| arg == "-re"));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+        assert!(
+            !plan
+                .args
+                .iter()
+                .any(|arg| arg == "-use_wallclock_as_timestamps")
+        );
+        assert!(!plan.args.iter().any(|arg| arg == "+genpts"));
     }
 
     #[test]
@@ -5094,6 +5177,50 @@ echo "{codec_name}"
                 .iter()
                 .any(|arg| arg == "http://vod.example.com/archive.mp4")
         );
+    }
+
+    #[test]
+    fn build_file_to_live_plan_uses_flv_for_internal_rtmp_publish() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-flv",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "http_mp4",
+                    "source_mode": "vod",
+                    "url": "http://vod.example.com/archive.mp4"
+                },
+                "stream": {
+                    "app": "live",
+                    "name": "internal-flv-check"
+                },
+                "expose": {
+                    "enable_rtmp": true
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert_eq!(
+            plan.output_target,
+            "rtmp://127.0.0.1/live/internal-flv-check"
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+        assert!(!plan.args.windows(2).any(|window| window == ["-f", "rtmp"]));
     }
 
     #[test]

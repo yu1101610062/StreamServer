@@ -318,6 +318,7 @@ pub enum PublishTargetKind {
     File,
     UdpMpegtsMulticast,
     RtpMulticast,
+    RtmpPush,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -415,31 +416,34 @@ impl TaskSpec {
             resolved.input.source_mode =
                 resolved.input.kind.and_then(InputKind::default_source_mode);
         }
-        resolved.stream.app = Some(
-            resolved
-                .stream
-                .app
-                .clone()
-                .unwrap_or_else(|| "live".to_string()),
-        );
-        resolved.stream.vhost = Some(
-            resolved
-                .stream
-                .vhost
-                .clone()
-                .unwrap_or_else(|| "__defaultVhost__".to_string()),
-        );
-        resolved.expose.enable_rtsp = Some(resolved.expose.enable_rtsp.unwrap_or(true));
-        resolved.expose.enable_rtmp = Some(resolved.expose.enable_rtmp.unwrap_or(true));
-        resolved.expose.enable_http_ts = Some(resolved.expose.enable_http_ts.unwrap_or(true));
-        resolved.expose.enable_http_fmp4 = Some(resolved.expose.enable_http_fmp4.unwrap_or(true));
-        resolved.expose.enable_hls = Some(resolved.expose.enable_hls.unwrap_or(false));
-        resolved.expose.stop_on_no_reader =
-            Some(resolved.expose.stop_on_no_reader.unwrap_or(false));
+        if resolved.task_type == TaskType::StreamIngest {
+            resolved.stream.app = Some(
+                resolved
+                    .stream
+                    .app
+                    .clone()
+                    .unwrap_or_else(|| "live".to_string()),
+            );
+            resolved.stream.vhost = Some(
+                resolved
+                    .stream
+                    .vhost
+                    .clone()
+                    .unwrap_or_else(|| "__defaultVhost__".to_string()),
+            );
+            resolved.expose.enable_rtsp = Some(resolved.expose.enable_rtsp.unwrap_or(true));
+            resolved.expose.enable_rtmp = Some(resolved.expose.enable_rtmp.unwrap_or(true));
+            resolved.expose.enable_http_ts = Some(resolved.expose.enable_http_ts.unwrap_or(true));
+            resolved.expose.enable_http_fmp4 =
+                Some(resolved.expose.enable_http_fmp4.unwrap_or(true));
+            resolved.expose.enable_hls = Some(resolved.expose.enable_hls.unwrap_or(false));
+            resolved.expose.stop_on_no_reader =
+                Some(resolved.expose.stop_on_no_reader.unwrap_or(false));
+            resolved.record.enabled = Some(resolved.record.enabled.unwrap_or(false));
+        }
         if matches!(resolved.input.kind, Some(InputKind::GbRtp)) {
             resolved.input.tcp_mode = Some(resolved.input.tcp_mode.unwrap_or(0));
         }
-        resolved.record.enabled = Some(resolved.record.enabled.unwrap_or(false));
         resolved.recovery.policy = Some(
             resolved
                 .recovery
@@ -674,12 +678,11 @@ impl TaskSpec {
                             .url
                             .as_deref()
                             .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .is_none()
+                            .is_some_and(|value| !value.is_empty())
                         {
                             issues.push(ValidationIssue::new(
                                 "publish.url",
-                                "must be provided for file publish",
+                                "must not be provided for file publish; output path is managed by the platform",
                             ));
                         }
                     }
@@ -704,6 +707,71 @@ impl TaskSpec {
                                 "publish.port",
                                 "must be provided for multicast publish",
                             ));
+                        }
+                    }
+                    Some(PublishTargetKind::RtmpPush) => {
+                        let publish_url = self
+                            .publish
+                            .url
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        match publish_url {
+                            Some(url)
+                                if url.starts_with("rtmp://") || url.starts_with("rtmps://") => {}
+                            Some(_) => issues.push(ValidationIssue::new(
+                                "publish.url",
+                                "must start with rtmp:// or rtmps:// for rtmp_push output",
+                            )),
+                            None => issues.push(ValidationIssue::new(
+                                "publish.url",
+                                "must be provided for rtmp_push output",
+                            )),
+                        }
+                        if let Some(format) = self.publish.format.as_deref().map(str::trim) {
+                            if !format.is_empty() && format != "flv" {
+                                issues.push(ValidationIssue::new(
+                                    "publish.format",
+                                    "rtmp_push only supports flv format",
+                                ));
+                            }
+                        }
+                        for field in [
+                            (
+                                "publish.group",
+                                self.publish.group.as_deref().map(str::trim),
+                            ),
+                            (
+                                "publish.interface_name",
+                                self.publish.interface_name.as_deref().map(str::trim),
+                            ),
+                            (
+                                "publish.interface_ip",
+                                self.publish.interface_ip.as_deref().map(str::trim),
+                            ),
+                        ] {
+                            if field.1.is_some_and(|value| !value.is_empty()) {
+                                issues.push(ValidationIssue::new(
+                                    field.0,
+                                    "is not supported for rtmp_push output",
+                                ));
+                            }
+                        }
+                        for field in [
+                            ("publish.port", self.publish.port.is_some()),
+                            ("publish.ttl", self.publish.ttl.is_some()),
+                            ("publish.reuse", self.publish.reuse.is_some()),
+                            ("publish.pkt_size", self.publish.pkt_size.is_some()),
+                            ("publish.dscp", self.publish.dscp.is_some()),
+                            ("publish.buffer_size", self.publish.buffer_size.is_some()),
+                            ("publish.fifo_size", self.publish.fifo_size.is_some()),
+                        ] {
+                            if field.1 {
+                                issues.push(ValidationIssue::new(
+                                    field.0,
+                                    "is not supported for rtmp_push output",
+                                ));
+                            }
                         }
                     }
                     None => issues.push(ValidationIssue::new(
@@ -747,21 +815,7 @@ impl TaskSpec {
                     ));
                 }
                 match self.publish.kind {
-                    Some(PublishTargetKind::File) => {
-                        if self
-                            .publish
-                            .url
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .is_none()
-                        {
-                            issues.push(ValidationIssue::new(
-                                "publish.url",
-                                "must be provided for file_transcode output",
-                            ));
-                        }
-                    }
+                    Some(PublishTargetKind::File) => {}
                     Some(_) => issues.push(ValidationIssue::new(
                         "publish.kind",
                         "file_transcode requires file output",
@@ -787,6 +841,18 @@ impl TaskSpec {
                     issues.push(ValidationIssue::new(
                         "record",
                         "file_transcode does not accept recording settings",
+                    ));
+                }
+                if self
+                    .publish
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty())
+                {
+                    issues.push(ValidationIssue::new(
+                        "publish.url",
+                        "must not be provided for file_transcode output; output path is managed by the platform",
                     ));
                 }
             }
@@ -1212,7 +1278,6 @@ mod tests {
             process: ProcessSpec::default(),
             publish: PublishSpec {
                 kind: Some(PublishTargetKind::File),
-                url: Some("/tmp/out.ts".to_string()),
                 ..PublishSpec::default()
             },
             record: RecordSpec::default(),
@@ -1335,7 +1400,6 @@ mod tests {
             process: ProcessSpec::default(),
             publish: PublishSpec {
                 kind: Some(PublishTargetKind::File),
-                url: Some("/tmp/out.mp4".to_string()),
                 ..PublishSpec::default()
             },
             record: RecordSpec::default(),
@@ -1375,7 +1439,6 @@ mod tests {
             process: ProcessSpec::default(),
             publish: PublishSpec {
                 kind: Some(PublishTargetKind::File),
-                url: Some("/tmp/out.mp4".to_string()),
                 ..PublishSpec::default()
             },
             record: RecordSpec::default(),
@@ -1427,7 +1490,6 @@ mod tests {
     fn validate_rejects_record_duration_for_unsupported_task_types() {
         let mut task = sample_task(TaskType::StreamBridge);
         task.publish.kind = Some(PublishTargetKind::File);
-        task.publish.url = Some("/tmp/out.ts".to_string());
         task.record.enabled = Some(true);
         task.record.duration_sec = Some(300);
 
@@ -1437,6 +1499,126 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.field == "record.duration_sec")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_stream_bridge_file_publish_url_override() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::File);
+        task.publish.url = Some("/data/zlm/www/artifacts/bridge/out.mp4".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.url")
+        );
+    }
+
+    #[test]
+    fn validate_allows_stream_bridge_rtmp_push_output() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+        task.publish.url = Some("rtmp://push.example.com/live/stream01".to_string());
+
+        task.validate()
+            .expect("validation should allow rtmp_push output");
+    }
+
+    #[test]
+    fn validate_allows_stream_bridge_rtmps_push_output() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+        task.publish.url = Some("rtmps://push.example.com/live/stream01".to_string());
+
+        task.validate()
+            .expect("validation should allow rtmps push output");
+    }
+
+    #[test]
+    fn validate_rejects_stream_bridge_rtmp_push_without_url() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.url")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_stream_bridge_rtmp_push_with_non_rtmp_scheme() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+        task.publish.url = Some("http://push.example.com/live/stream01".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.url")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_stream_bridge_rtmp_push_with_non_flv_format() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+        task.publish.url = Some("rtmp://push.example.com/live/stream01".to_string());
+        task.publish.format = Some("mp4".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.format")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_stream_bridge_rtmp_push_with_multicast_fields() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+        task.publish.url = Some("rtmp://push.example.com/live/stream01".to_string());
+        task.publish.group = Some("239.0.0.1".to_string());
+        task.publish.port = Some(1234);
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.group")
+        );
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.port")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_file_transcode_publish_url_override() {
+        let mut task = sample_task(TaskType::FileTranscode);
+        task.input.kind = Some(InputKind::File);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.publish.kind = Some(PublishTargetKind::File);
+        task.publish.url = Some("/data/zlm/www/artifacts/transcode/out.mp4".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "publish.url")
         );
     }
 
@@ -1483,6 +1665,19 @@ mod tests {
 
         let resolved = task.resolved();
         assert_eq!(resolved.input.tcp_mode, Some(0));
+    }
+
+    #[test]
+    fn resolve_does_not_inject_ingest_only_defaults_into_stream_bridge() {
+        let mut task = sample_task(TaskType::StreamBridge);
+        task.publish.kind = Some(PublishTargetKind::RtmpPush);
+        task.publish.url = Some("rtmp://push.example.com/live/stream01".to_string());
+
+        let resolved = task.resolved();
+
+        assert_eq!(resolved.stream, StreamSpec::default());
+        assert_eq!(resolved.expose, ExposeSpec::default());
+        assert_eq!(resolved.record, RecordSpec::default());
     }
 
     #[test]
