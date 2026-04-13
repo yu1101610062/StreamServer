@@ -1694,7 +1694,7 @@ fn build_file_transcode_plan(
         }
     };
     let mut args = ffmpeg_base_args(input_url.clone(), false);
-    append_process_args(
+    let audio_copy_decoration = append_process_args(
         &mut args,
         settings,
         spec,
@@ -1704,6 +1704,11 @@ fn build_file_transcode_plan(
         VideoOutputPolicy::KeepSourceFamily,
         AudioOutputPolicy::Aac,
     )?;
+    if let Some(filter) =
+        audio_copy_decoration.and_then(|value| value.filter_for_output(output.format.as_str()))
+    {
+        append_audio_bitstream_filter_arg(&mut args, filter);
+    }
 
     args.extend([
         "-threads".to_string(),
@@ -1746,7 +1751,7 @@ fn build_file_to_live_plan(
             vec!["-stream_loop".to_string(), "-1".to_string()],
         );
     }
-    append_process_args(
+    let audio_copy_decoration = append_process_args(
         &mut args,
         settings,
         spec,
@@ -1771,17 +1776,30 @@ fn build_file_to_live_plan(
                 let record_format = "mp4".to_string();
                 let record_path = work_dir.join("record.mp4").to_string_lossy().to_string();
                 let tee_target = format!(
-                    "[f={}:onfail=ignore]{}|[f={}:onfail=ignore]{}",
-                    publish_output.format,
-                    escape_tee_target(&publish_output.target),
-                    record_format,
-                    escape_tee_target(&record_path),
+                    "{}|{}",
+                    tee_slave_target(
+                        publish_output.format.as_str(),
+                        &publish_output.target,
+                        true,
+                        audio_copy_decoration,
+                    ),
+                    tee_slave_target(
+                        record_format.as_str(),
+                        &record_path,
+                        true,
+                        audio_copy_decoration,
+                    ),
                 );
                 args.extend(["-f".to_string(), "tee".to_string(), tee_target]);
                 outputs.push(record_path.clone());
                 success_check = SuccessCheck::FileExists(PathBuf::from(record_path));
             }
             media_domain::RecordFormat::Hls | media_domain::RecordFormat::Both => {
+                if let Some(filter) = audio_copy_decoration
+                    .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
+                {
+                    append_audio_bitstream_filter_arg(&mut args, filter);
+                }
                 args.extend([
                     "-f".to_string(),
                     publish_output.format.clone(),
@@ -1794,6 +1812,11 @@ fn build_file_to_live_plan(
             }
         }
     } else {
+        if let Some(filter) = audio_copy_decoration
+            .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
+        {
+            append_audio_bitstream_filter_arg(&mut args, filter);
+        }
         args.extend([
             "-f".to_string(),
             publish_output.format.clone(),
@@ -1836,7 +1859,7 @@ fn build_stream_ingest_fast_record_plan(
             vec!["-stream_loop".to_string(), "-1".to_string()],
         );
     }
-    append_process_args(
+    let audio_copy_decoration = append_process_args(
         &mut args,
         settings,
         spec,
@@ -1861,6 +1884,11 @@ fn build_stream_ingest_fast_record_plan(
             let output =
                 allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("mp4"));
             append_default_output_maps(&mut args);
+            if let Some(filter) = audio_copy_decoration
+                .and_then(|value| value.filter_for_output(output.format.as_str()))
+            {
+                append_audio_bitstream_filter_arg(&mut args, filter);
+            }
             args.extend([
                 "-f".to_string(),
                 output.format.clone(),
@@ -1899,6 +1927,13 @@ fn build_stream_ingest_fast_record_plan(
                 "0:v?".to_string(),
                 "-map".to_string(),
                 "0:a?".to_string(),
+            ]);
+            if let Some(filter) = audio_copy_decoration
+                .and_then(|value| value.filter_for_output(mp4_output.format.as_str()))
+            {
+                append_audio_bitstream_filter_arg(&mut args, filter);
+            }
+            args.extend([
                 "-f".to_string(),
                 "mp4".to_string(),
                 mp4_output.target.clone(),
@@ -1971,7 +2006,7 @@ fn build_multicast_bridge_plan(
         // keeping audio copy so the bridge stays close to passthrough semantics.
         append_live_mpegts_multicast_bridge_args(&mut args, settings, spec, input_url.as_str());
     } else {
-        append_process_args(
+        let audio_copy_decoration = append_process_args(
             &mut args,
             settings,
             spec,
@@ -1981,6 +2016,11 @@ fn build_multicast_bridge_plan(
             VideoOutputPolicy::ForceH264,
             AudioOutputPolicy::Aac,
         )?;
+        if let Some(filter) =
+            audio_copy_decoration.and_then(|value| value.filter_for_output(output.format.as_str()))
+        {
+            append_audio_bitstream_filter_arg(&mut args, filter);
+        }
     }
     args.extend([
         "-threads".to_string(),
@@ -2204,6 +2244,33 @@ enum AudioOutputPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioBitstreamFilter {
+    AacAdtsToAsc,
+}
+
+impl AudioBitstreamFilter {
+    fn as_ffmpeg_name(self) -> &'static str {
+        match self {
+            Self::AacAdtsToAsc => "aac_adtstoasc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioCopyDecoration {
+    NeedsAdtsToAscForFlvAndMp4,
+}
+
+impl AudioCopyDecoration {
+    fn filter_for_output(self, output_format: &str) -> Option<AudioBitstreamFilter> {
+        match output_format.trim().to_ascii_lowercase().as_str() {
+            "flv" | "mp4" | "mov" => Some(AudioBitstreamFilter::AacAdtsToAsc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VideoCodecFamily {
     H264,
     Hevc,
@@ -2225,6 +2292,7 @@ struct TranscodeSelection {
     input_args: Vec<String>,
     video_encoder: String,
     audio_encoder: String,
+    audio_copy_decoration: Option<AudioCopyDecoration>,
 }
 
 fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String, ExecutorError> {
@@ -2328,6 +2396,29 @@ fn append_default_output_maps(args: &mut Vec<String>) {
     ]);
 }
 
+fn append_audio_bitstream_filter_arg(args: &mut Vec<String>, filter: AudioBitstreamFilter) {
+    args.extend(["-bsf:a".to_string(), filter.as_ffmpeg_name().to_string()]);
+}
+
+fn tee_slave_target(
+    output_format: &str,
+    target: &str,
+    onfail_ignore: bool,
+    audio_copy_decoration: Option<AudioCopyDecoration>,
+) -> String {
+    let mut options = vec![format!("f={output_format}")];
+    if onfail_ignore {
+        options.push("onfail=ignore".to_string());
+    }
+    if let Some(filter) =
+        audio_copy_decoration.and_then(|value| value.filter_for_output(output_format))
+    {
+        options.push(format!("bsfs/a={}", filter.as_ffmpeg_name()));
+    }
+
+    format!("[{}]{}", options.join(":"), escape_tee_target(target))
+}
+
 fn normalized_process_mode<'a>(spec: &'a TaskSpec, default_mode: &'a str) -> &'a str {
     match spec.process.mode.as_deref().unwrap_or(default_mode) {
         "transcode" => "force_transcode",
@@ -2344,16 +2435,19 @@ fn append_process_args(
     output_format: &str,
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
-) -> Result<(), ExecutorError> {
+) -> Result<Option<AudioCopyDecoration>, ExecutorError> {
     let mode = normalized_process_mode(spec, default_mode);
     match mode {
         "passthrough" => {
+            let audio_copy_decoration =
+                resolve_passthrough_audio_copy_decoration(settings, spec, input_url, output_format);
             args.extend([
                 "-c:v".to_string(),
                 "copy".to_string(),
                 "-c:a".to_string(),
                 "copy".to_string(),
             ]);
+            Ok(audio_copy_decoration)
         }
         "copy_or_transcode" | "force_transcode" => {
             let selection = resolve_process_selection(
@@ -2383,15 +2477,12 @@ fn append_process_args(
             if let Some(gop) = spec.process.gop {
                 args.extend(["-g".to_string(), gop.to_string()]);
             }
+            Ok(selection.audio_copy_decoration)
         }
-        other => {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "unsupported process.mode: {other}"
-            )));
-        }
+        other => Err(ExecutorError::InvalidRequest(format!(
+            "unsupported process.mode: {other}"
+        ))),
     }
-
-    Ok(())
 }
 
 fn resolve_process_selection(
@@ -2409,12 +2500,13 @@ fn resolve_process_selection(
 
     let profile = probe_input_media_profile(settings, spec, input_url);
     let video_copy = should_copy_video_stream(spec, output_format, &profile, video_policy);
-    let audio_copy = should_copy_audio_stream(spec, output_format, &profile, audio_policy);
-    if video_copy && audio_copy {
+    let audio_copy = resolve_audio_copy_selection(spec, output_format, &profile, audio_policy);
+    if video_copy && audio_copy.copy {
         return TranscodeSelection {
             input_args: Vec::new(),
             video_encoder: "copy".to_string(),
             audio_encoder: "copy".to_string(),
+            audio_copy_decoration: audio_copy.decoration,
         };
     }
 
@@ -2436,10 +2528,15 @@ fn resolve_process_selection(
         } else {
             transcode.video_encoder
         },
-        audio_encoder: if audio_copy {
+        audio_encoder: if audio_copy.copy {
             "copy".to_string()
         } else {
             transcode.audio_encoder
+        },
+        audio_copy_decoration: if audio_copy.copy {
+            audio_copy.decoration
+        } else {
+            None
         },
     }
 }
@@ -2464,42 +2561,82 @@ fn should_copy_video_stream(
         && format_supports_video_family_copy(output_format, profile.video_family)
 }
 
-fn should_copy_audio_stream(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioCopySelection {
+    copy: bool,
+    decoration: Option<AudioCopyDecoration>,
+}
+
+fn resolve_audio_copy_selection(
     spec: &TaskSpec,
     output_format: &str,
     profile: &InputMediaProfile,
     audio_policy: AudioOutputPolicy,
-) -> bool {
+) -> AudioCopySelection {
     if !profile.has_audio {
-        return true;
+        return AudioCopySelection {
+            copy: true,
+            decoration: None,
+        };
     }
     if process_requires_audio_transcode(spec) {
-        return false;
+        return AudioCopySelection {
+            copy: false,
+            decoration: None,
+        };
     }
 
     match audio_policy {
-        AudioOutputPolicy::Copy => {
-            format_supports_audio_codec_copy(output_format, profile.audio_codec_name.as_deref())
-        }
+        AudioOutputPolicy::Copy => AudioCopySelection {
+            copy: format_supports_audio_codec_copy(
+                output_format,
+                profile.audio_codec_name.as_deref(),
+            ),
+            decoration: None,
+        },
         AudioOutputPolicy::Aac => {
-            profile.audio_codec_name.as_deref() == Some("aac")
-                && format_supports_audio_codec_copy(output_format, Some("aac"))
-                && !source_family_requires_aac_transcode(profile.source_family, output_format)
+            let copy = profile.audio_codec_name.as_deref() == Some("aac")
+                && format_supports_audio_codec_copy(output_format, Some("aac"));
+            AudioCopySelection {
+                copy,
+                decoration: if copy {
+                    resolve_audio_copy_decoration(
+                        profile.source_family,
+                        profile.audio_codec_name.as_deref(),
+                    )
+                } else {
+                    None
+                },
+            }
         }
     }
 }
 
-fn source_family_requires_aac_transcode(
-    source_family: InputSourceFamily,
+fn resolve_passthrough_audio_copy_decoration(
+    settings: &AgentSettings,
+    spec: &TaskSpec,
+    input_url: &str,
     output_format: &str,
-) -> bool {
-    matches!(
+) -> Option<AudioCopyDecoration> {
+    let profile = probe_input_media_profile(settings, spec, input_url);
+    if !profile.has_audio
+        || !format_supports_audio_codec_copy(output_format, profile.audio_codec_name.as_deref())
+    {
+        return None;
+    }
+
+    resolve_audio_copy_decoration(profile.source_family, profile.audio_codec_name.as_deref())
+}
+
+fn resolve_audio_copy_decoration(
+    source_family: InputSourceFamily,
+    codec_name: Option<&str>,
+) -> Option<AudioCopyDecoration> {
+    (matches!(
         source_family,
         InputSourceFamily::MpegTs | InputSourceFamily::Hls
-    ) && matches!(
-        output_format.trim().to_ascii_lowercase().as_str(),
-        "flv" | "mp4" | "mov"
-    )
+    ) && codec_name == Some("aac"))
+    .then_some(AudioCopyDecoration::NeedsAdtsToAscForFlvAndMp4)
 }
 
 fn process_requires_video_transcode(spec: &TaskSpec) -> bool {
@@ -2537,7 +2674,7 @@ fn process_requires_audio_transcode(spec: &TaskSpec) -> bool {
 fn format_supports_video_family_copy(output_format: &str, video_family: VideoCodecFamily) -> bool {
     match output_format.trim().to_ascii_lowercase().as_str() {
         "flv" => matches!(video_family, VideoCodecFamily::H264),
-        "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" => {
+        "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" | "hls" => {
             matches!(
                 video_family,
                 VideoCodecFamily::H264 | VideoCodecFamily::Hevc
@@ -2553,7 +2690,9 @@ fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str
     };
 
     match output_format.trim().to_ascii_lowercase().as_str() {
-        "flv" | "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" => codec_name == "aac",
+        "flv" | "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" | "hls" => {
+            codec_name == "aac"
+        }
         _ => false,
     }
 }
@@ -2615,6 +2754,7 @@ fn resolve_transcode_selection_for_input_family(
         input_args,
         video_encoder,
         audio_encoder,
+        audio_copy_decoration: None,
     }
 }
 
@@ -5293,7 +5433,7 @@ fi
     }
 
     #[test]
-    fn build_file_transcode_plan_copy_or_transcode_transcodes_mpegts_aac_for_mp4() {
+    fn build_file_transcode_plan_copy_or_transcode_copies_mpegts_aac_for_mp4_with_bsf() {
         let temp_root = std::env::temp_dir().join(format!(
             "streamserver-copy-transcode-mpegts-aac-{}",
             Uuid::now_v7()
@@ -5337,12 +5477,16 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "copy"])
         );
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
         assert!(
-            !plan
-                .args
+            plan.args
                 .windows(2)
                 .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
         );
 
         let _ = fs::remove_dir_all(temp_root);
@@ -5883,7 +6027,7 @@ fi
     }
 
     #[test]
-    fn build_multicast_bridge_plan_copy_or_transcode_transcodes_hls_aac_to_external_rtmp() {
+    fn build_multicast_bridge_plan_copy_or_transcode_copies_hls_aac_to_external_rtmp_with_bsf() {
         let temp_root =
             std::env::temp_dir().join(format!("streamserver-bridge-hls-aac-{}", Uuid::now_v7()));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -5929,12 +6073,79 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "copy"])
         );
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
         assert!(
-            !plan
-                .args
+            plan.args
                 .windows(2)
                 .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_multicast_bridge_plan_passthrough_copies_hls_aac_to_external_rtmp_with_bsf() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-bridge-passthrough-hls-aac-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "hls", "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamBridge,
+            resolved_spec: json!({
+                "type": "stream_bridge",
+                "name": "bridge-passthrough-hls-to-rtmp",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "hls",
+                    "source_mode": "live",
+                    "url": "http://vod.example.com/archive.m3u8"
+                },
+                "process": {"mode": "passthrough"},
+                "publish": {
+                    "kind": "rtmp_push",
+                    "url": "rtmp://push.example.com/live/bridge-hls-pass"
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
         );
 
         let _ = fs::remove_dir_all(temp_root);
@@ -6225,7 +6436,7 @@ fi
     }
 
     #[test]
-    fn build_stream_ingest_fast_record_plan_transcodes_mpegts_aac_for_mp4_output() {
+    fn build_stream_ingest_fast_record_plan_copies_mpegts_aac_for_mp4_output_with_bsf() {
         let temp_root = std::env::temp_dir().join(format!(
             "streamserver-fast-record-mpegts-aac-{}",
             Uuid::now_v7()
@@ -6279,13 +6490,150 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "copy"])
         );
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
         assert!(
-            !plan
-                .args
+            plan.args
                 .windows(2)
                 .any(|window| window == ["-c:a", "copy"])
         );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_stream_ingest_fast_record_plan_copies_mpegts_h264_aac_for_hls_output() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-fast-record-hls-copy-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "mpegts", "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "vod-fast-record-hls",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "file",
+                    "source_mode": "vod",
+                    "url": "archive.ts"
+                },
+                "stream": {"app": "live", "name": "archive-fast-hls"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {
+                    "enabled": true,
+                    "format": "hls",
+                    "segment_sec": 6
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "hls"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_stream_ingest_fast_record_plan_copies_hls_h264_aac_for_hls_output() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-fast-record-hls-source-copy-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "hls", "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "vod-fast-record-hls-source",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "hls",
+                    "source_mode": "vod",
+                    "url": "http://vod.example.com/archive.m3u8"
+                },
+                "stream": {"app": "live", "name": "archive-fast-hls-source"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {
+                    "enabled": true,
+                    "format": "hls",
+                    "segment_sec": 6
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -6345,7 +6693,84 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_copy_or_transcode_transcodes_mpegts_aac_into_internal_rtmp() {
+    fn build_stream_ingest_fast_record_plan_copies_mpegts_aac_for_both_output_with_mp4_bsf() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-fast-record-both-mpegts-aac-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "mpegts", "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "vod-fast-record-both-mpegts",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "file",
+                    "source_mode": "vod",
+                    "url": "archive.ts"
+                },
+                "stream": {"app": "live", "name": "archive-both-mpegts"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {
+                    "enabled": true,
+                    "format": "both",
+                    "segment_sec": 8
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
+        );
+        assert_eq!(
+            plan.args
+                .windows(2)
+                .filter(|window| *window == ["-bsf:a", "aac_adtstoasc"])
+                .count(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_copy_or_transcode_copies_mpegts_aac_into_internal_rtmp_with_bsf() {
         let temp_root =
             std::env::temp_dir().join(format!("streamserver-file-live-mpegts-{}", Uuid::now_v7()));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -6383,7 +6808,11 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "copy"])
         );
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
         assert!(
             !plan
                 .args
@@ -6391,10 +6820,9 @@ fi
                 .any(|window| window == ["-c:v", "libx264"])
         );
         assert!(
-            !plan
-                .args
+            plan.args
                 .windows(2)
-                .any(|window| window == ["-c:a", "copy"])
+                .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
         );
 
         let _ = fs::remove_dir_all(temp_root);
@@ -6495,7 +6923,7 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_transcodes_mpegts_aac_when_recording_mp4() {
+    fn build_file_to_live_plan_uses_bsf_when_recording_mp4_from_mpegts_aac() {
         let temp_root = std::env::temp_dir().join(format!(
             "streamserver-file-live-recording-mpegts-{}",
             Uuid::now_v7()
@@ -6535,14 +6963,17 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "libx264"])
         );
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
         assert!(plan.args.iter().any(|arg| arg == "-f"));
         assert!(plan.args.iter().any(|arg| arg == "tee"));
         assert!(
-            !plan
-                .args
-                .windows(2)
-                .any(|window| window == ["-c:a", "copy"])
+            plan.args
+                .iter()
+                .any(|arg| arg.contains("bsfs/a=aac_adtstoasc"))
         );
 
         let _ = fs::remove_dir_all(temp_root);
