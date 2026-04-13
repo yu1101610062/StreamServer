@@ -1208,8 +1208,8 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     method: "POST",
     path: "/api/v1/tasks/{id}/start",
     title: "启动任务",
-    summary: "启动处于 CREATED、FAILED 或 CANCELED 的任务。",
-    description: "适合手动审核后启动、失败后人工拉起等场景。",
+    summary: "启动或重新派发处于 CREATED、VALIDATING、QUEUED、FAILED 或 CANCELED 的任务。",
+    description: "适合手动审核后启动、补推进等待中的任务、失败后人工拉起等场景。",
     successStatus: "202 Accepted",
     params: [authHeaderParam(), idempotencyHeaderParam(), taskIdPathParam()],
     requestExample: {

@@ -1470,6 +1470,11 @@ impl TaskRepository {
             select id
               from tasks
              where (
+                    schedule_start_mode = 'immediate'
+                and status = 'VALIDATING'::task_status
+                and resolved_spec is not null
+             )
+                or (
                     schedule_start_mode = 'at'
                 and status = 'VALIDATING'::task_status
                 and resolved_spec is not null

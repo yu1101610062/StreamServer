@@ -746,22 +746,10 @@ async fn create_task(
         .create_task(&idempotency_key, &request_hash, task)
         .await?
     {
-        CreateTaskResult::Fresh(task) => {
-            if task.status == media_domain::TaskStatus::Validating
-                && resolved_task_is_immediate(&state, task.id).await?
-            {
-                match state.control_plane.dispatch_task(task.id).await {
-                    Ok(()) => {}
-                    Err(control_plane::ControlPlaneError::NoConnectedNode)
-                    | Err(control_plane::ControlPlaneError::NodeDisconnected(_)) => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let task = state.repository.get_task_summary(task.id).await?;
-                Ok((StatusCode::CREATED, Json(task)))
-            } else {
-                Ok((StatusCode::CREATED, Json(task)))
-            }
-        }
+        CreateTaskResult::Fresh(task) => Ok((
+            StatusCode::CREATED,
+            Json(maybe_dispatch_immediate_task(&state, task).await?),
+        )),
         CreateTaskResult::Replay(task) => Ok((StatusCode::OK, Json(task))),
     }
 }
@@ -901,7 +889,10 @@ async fn clone_task(
         .repository
         .clone_task(task_id, overrides.map(|Json(value)| value))
         .await?;
-    Ok((StatusCode::CREATED, Json(task)))
+    Ok((
+        StatusCode::CREATED,
+        Json(maybe_dispatch_immediate_task(&state, task).await?),
+    ))
 }
 
 async fn get_task_events(
@@ -1932,6 +1923,25 @@ fn hash_json<T: Serialize>(value: &T) -> Result<String, AppError> {
         .map_err(|error| AppError::Internal(format!("failed to serialize request: {error}")))?;
     let digest = Sha256::digest(bytes);
     Ok(format!("{digest:x}"))
+}
+
+async fn maybe_dispatch_immediate_task(
+    state: &AppState,
+    task: repository::TaskSummary,
+) -> Result<repository::TaskSummary, AppError> {
+    if task.status == media_domain::TaskStatus::Validating
+        && resolved_task_is_immediate(state, task.id).await?
+    {
+        match state.control_plane.dispatch_task(task.id).await {
+            Ok(()) => {}
+            Err(control_plane::ControlPlaneError::NoConnectedNode)
+            | Err(control_plane::ControlPlaneError::NodeDisconnected(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(state.repository.get_task_summary(task.id).await?);
+    }
+
+    Ok(task)
 }
 
 async fn resolved_task_is_immediate(state: &AppState, task_id: Uuid) -> Result<bool, AppError> {
@@ -3411,6 +3421,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_due_at_tasks_includes_validating_immediate_tasks() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let task = match repository
+            .create_task(
+                "validating-immediate-task",
+                "validating-immediate-task-hash",
+                serde_json::from_value::<TaskSpec>(sample_create_task_payload("immediate"))?,
+            )
+            .await?
+        {
+            CreateTaskResult::Fresh(task) | CreateTaskResult::Replay(task) => task,
+        };
+        assert_eq!(task.status, media_domain::TaskStatus::Validating);
+
+        let due_tasks = repository.list_due_at_tasks(Utc::now()).await?;
+        assert!(
+            due_tasks.contains(&task.id),
+            "validating immediate task should be picked up by scheduler sweep"
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn clone_task_applies_supported_request_overrides() -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
             return Ok(());
@@ -3465,6 +3503,58 @@ mod tests {
         assert_eq!(
             source_detail.requested_spec["common"]["created_by"],
             json!("alice")
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clone_task_dispatches_immediate_tasks_like_create_task() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let source_spec = serde_json::from_value::<TaskSpec>(sample_create_task_payload("manual"))?;
+        let source_task = match repository
+            .create_task(
+                "source-task-immediate-clone",
+                "source-hash-immediate-clone",
+                source_spec,
+            )
+            .await?
+        {
+            CreateTaskResult::Fresh(task) | CreateTaskResult::Replay(task) => task,
+        };
+        repository
+            .transition_task(source_task.id, TaskOperation::Cancel)
+            .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/tasks/{}/clone", source_task.id))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({
+                        "name": "relay-camera-01-immediate-copy",
+                        "schedule": { "start_mode": "immediate" }
+                    }))?))?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = json_body(response).await;
+        let cloned_id = Uuid::parse_str(body["id"].as_str().expect("clone id should exist"))?;
+
+        assert_eq!(body["status"], json!("QUEUED"));
+
+        let detail = repository.get_task(cloned_id).await?;
+        assert_eq!(detail.task.status, media_domain::TaskStatus::Queued);
+        assert_eq!(
+            detail.requested_spec["schedule"]["start_mode"],
+            json!("immediate")
         );
 
         db.cleanup().await?;
