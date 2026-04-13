@@ -3251,79 +3251,81 @@ impl TaskRepository {
             .find_stream_binding_for_hook(&mut tx, &record.vhost, &record.app, &record.stream)
             .await?
         {
-            let http_url = resolve_record_http_url(&mut tx, server_id, &record).await?;
-            sqlx::query(
-                r#"
-                insert into record_files (
-                  id, task_id, attempt_id, vhost, app, stream, file_path, http_url, file_size,
-                  time_len, start_time, source, created_at
-                ) values (
-                  $1, $2, $3, $4, $5, $6, $7, $8, $9,
-                  $10, $11, 'hook', $12
+            if should_persist_record_file_hook(hook_name, &binding, &record)? {
+                let http_url = resolve_record_http_url(&mut tx, server_id, &record).await?;
+                sqlx::query(
+                    r#"
+                    insert into record_files (
+                      id, task_id, attempt_id, vhost, app, stream, file_path, http_url, file_size,
+                      time_len, start_time, source, created_at
+                    ) values (
+                      $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                      $10, $11, 'hook', $12
+                    )
+                    on conflict (file_path) do update
+                       set task_id = excluded.task_id,
+                           attempt_id = excluded.attempt_id,
+                           vhost = excluded.vhost,
+                           app = excluded.app,
+                           stream = excluded.stream,
+                           http_url = excluded.http_url,
+                           file_size = excluded.file_size,
+                           time_len = excluded.time_len,
+                           start_time = excluded.start_time,
+                           source = excluded.source
+                    "#,
                 )
-                on conflict (file_path) do update
-                   set task_id = excluded.task_id,
-                       attempt_id = excluded.attempt_id,
-                       vhost = excluded.vhost,
-                       app = excluded.app,
-                       stream = excluded.stream,
-                       http_url = excluded.http_url,
-                       file_size = excluded.file_size,
-                       time_len = excluded.time_len,
-                       start_time = excluded.start_time,
-                       source = excluded.source
-                "#,
-            )
-            .bind(Uuid::now_v7())
-            .bind(binding.task_id)
-            .bind(binding.attempt_id)
-            .bind(&record.vhost)
-            .bind(&record.app)
-            .bind(&record.stream)
-            .bind(&record.file_path)
-            .bind(http_url.as_deref())
-            .bind(record.file_size)
-            .bind(record.time_len_sec)
-            .bind(record.start_time)
-            .bind(Utc::now())
-            .execute(&mut *tx)
-            .await?;
+                .bind(Uuid::now_v7())
+                .bind(binding.task_id)
+                .bind(binding.attempt_id)
+                .bind(&record.vhost)
+                .bind(&record.app)
+                .bind(&record.stream)
+                .bind(&record.file_path)
+                .bind(http_url.as_deref())
+                .bind(record.file_size)
+                .bind(record.time_len_sec)
+                .bind(record.start_time)
+                .bind(Utc::now())
+                .execute(&mut *tx)
+                .await?;
 
-            self.insert_event(
-                &mut tx,
-                binding.task_id,
-                Some(binding.attempt_id),
-                Some(binding.attempt_no),
-                EventSource::ZlmHook,
-                "record_file_created",
-                "info",
-                json!({
-                    "server_id": server_id,
-                    "hook_name": hook_name,
-                    "record_format": record.record_format,
-                    "schema": record.schema,
-                    "vhost": record.vhost,
-                    "app": record.app,
-                    "stream": record.stream,
-                    "file_path": record.file_path,
-                    "file_name": record.file_name,
-                    "folder": record.folder,
-                    "url": http_url.clone().or(record.url.clone()),
-                    "http_url": http_url,
-                    "file_size": record.file_size,
-                    "time_len": record.time_len_sec,
-                    "start_time": record.start_time,
-                    "source": "hook",
-                }),
-            )
-            .await?;
+                self.insert_event(
+                    &mut tx,
+                    binding.task_id,
+                    Some(binding.attempt_id),
+                    Some(binding.attempt_no),
+                    EventSource::ZlmHook,
+                    "record_file_created",
+                    "info",
+                    json!({
+                        "server_id": server_id,
+                        "hook_name": hook_name,
+                        "record_format": record.record_format,
+                        "schema": record.schema,
+                        "vhost": record.vhost,
+                        "app": record.app,
+                        "stream": record.stream,
+                        "file_path": record.file_path,
+                        "file_name": record.file_name,
+                        "folder": record.folder,
+                        "url": http_url.clone().or(record.url.clone()),
+                        "http_url": http_url,
+                        "file_size": record.file_size,
+                        "time_len": record.time_len_sec,
+                        "start_time": record.start_time,
+                        "source": "hook",
+                    }),
+                )
+                .await?;
 
-            self.enqueue_artifact_update_callback_if_needed(
-                &mut tx,
-                binding.task_id,
-                binding.attempt_no,
-            )
-            .await?;
+                self.enqueue_artifact_update_callback_if_needed(
+                    &mut tx,
+                    binding.task_id,
+                    binding.attempt_no,
+                )
+                .await?;
+            }
         }
 
         self.mark_hook_event_processed(&mut tx, dedup_key).await?;
@@ -3819,10 +3821,13 @@ impl TaskRepository {
             select
               sb.task_id,
               sb.attempt_id,
-              ta.attempt_no
+              ta.attempt_no,
+              t.resolved_spec
             from stream_bindings sb
             join task_attempts ta
               on ta.id = sb.attempt_id
+            join tasks t
+              on t.id = sb.task_id
             where sb.vhost = $1
               and sb.app = $2
               and sb.stream = $3
@@ -5036,6 +5041,41 @@ fn resolve_absolute_http_url(agent_stream_addr: &str, value: &str) -> Option<Str
     base.join(trimmed).ok().map(|value| value.to_string())
 }
 
+fn should_persist_record_file_hook(
+    hook_name: &str,
+    binding: &HookStreamBinding,
+    record: &ZlmRecordFileRecord,
+) -> Result<bool, RepoError> {
+    if record.record_format.as_deref() != Some("hls") {
+        return Ok(true);
+    }
+
+    if hook_name != "on_record_hls" {
+        return Ok(false);
+    }
+
+    if !is_hls_playlist_record_path(record.file_path.as_str()) {
+        return Ok(false);
+    }
+
+    Ok(binding
+        .resolved_task_spec()?
+        .is_some_and(|spec| spec.record.wants_hls()))
+}
+
+fn is_hls_playlist_record_path(file_path: &str) -> bool {
+    let Ok(normalized) = normalized_absolute_path(file_path) else {
+        return false;
+    };
+    let in_record_root = relative_path_under_root(&normalized, ZLM_RECORD_HTTP_ROOT).is_some()
+        || relative_path_under_root(&normalized, LEGACY_ZLM_RECORD_ROOT).is_some();
+    in_record_root
+        && Path::new(&normalized)
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("m3u8"))
+}
+
 async fn resolve_record_http_url(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     server_id: &str,
@@ -5516,6 +5556,7 @@ struct HookStreamBinding {
     task_id: Uuid,
     attempt_id: Uuid,
     attempt_no: i32,
+    resolved_spec: Option<Value>,
 }
 
 impl HookStreamBinding {
@@ -5524,7 +5565,16 @@ impl HookStreamBinding {
             task_id: row.try_get("task_id")?,
             attempt_id: row.try_get("attempt_id")?,
             attempt_no: row.try_get("attempt_no")?,
+            resolved_spec: row.try_get("resolved_spec")?,
         })
+    }
+
+    fn resolved_task_spec(&self) -> Result<Option<TaskSpec>, RepoError> {
+        self.resolved_spec
+            .clone()
+            .map(serde_json::from_value::<TaskSpec>)
+            .transpose()
+            .map_err(RepoError::from)
     }
 }
 
@@ -6157,6 +6207,117 @@ mod tests {
         let url = resolve_absolute_http_url("http://worker.example:8081", "/record/live.m3u8")
             .expect("relative hook url should resolve");
         assert_eq!(url, "http://worker.example:8081/record/live.m3u8");
+    }
+
+    #[test]
+    fn is_hls_playlist_record_path_accepts_record_root_m3u8_only() {
+        assert!(is_hls_playlist_record_path(
+            "/data/zlm/www/record/live/camera01/index.m3u8"
+        ));
+        assert!(is_hls_playlist_record_path(
+            "/data/zlm/record/live/camera01/index.m3u8"
+        ));
+        assert!(!is_hls_playlist_record_path(
+            "/data/zlm/www/live/camera01/hls.m3u8"
+        ));
+        assert!(!is_hls_playlist_record_path(
+            "/data/zlm/www/record/live/camera01/index-00001.ts"
+        ));
+    }
+
+    #[test]
+    fn should_persist_record_file_hook_only_keeps_hls_record_playlists() {
+        let binding = HookStreamBinding {
+            task_id: Uuid::now_v7(),
+            attempt_id: Uuid::now_v7(),
+            attempt_no: 1,
+            resolved_spec: Some(json!({
+                "type": "stream_ingest",
+                "name": "record-hls",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+                "stream": {"app": "live", "name": "camera01"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {"enabled": true, "format": "hls"},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            })),
+        };
+        let playlist = ZlmRecordFileRecord {
+            record_format: Some("hls".to_string()),
+            schema: None,
+            vhost: "__defaultVhost__".to_string(),
+            app: "live".to_string(),
+            stream: "camera01".to_string(),
+            file_path: "/data/zlm/www/record/live/camera01/index.m3u8".to_string(),
+            file_size: 1024,
+            time_len_sec: Some(30),
+            start_time: None,
+            file_name: Some("index.m3u8".to_string()),
+            folder: Some("/data/zlm/www/record/live/camera01".to_string()),
+            url: Some("http://stream.example/record/live/camera01/index.m3u8".to_string()),
+        };
+        let segment = ZlmRecordFileRecord {
+            file_path: "/data/zlm/www/record/live/camera01/index-00001.ts".to_string(),
+            file_name: Some("index-00001.ts".to_string()),
+            ..playlist.clone()
+        };
+
+        assert!(
+            should_persist_record_file_hook("on_record_hls", &binding, &playlist)
+                .expect("playlist should evaluate")
+        );
+        assert!(
+            !should_persist_record_file_hook("on_record_ts", &binding, &segment)
+                .expect("segment should evaluate")
+        );
+
+        let exposed_only_binding = HookStreamBinding {
+            resolved_spec: Some(json!({
+                "type": "stream_ingest",
+                "name": "expose-hls",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+                "stream": {"app": "live", "name": "camera01"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": true
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {"enabled": false},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            })),
+            ..binding
+        };
+        let exposed_playlist = ZlmRecordFileRecord {
+            file_path: "/data/zlm/www/live/camera01/hls.m3u8".to_string(),
+            file_name: Some("hls.m3u8".to_string()),
+            folder: Some("/data/zlm/www/live/camera01".to_string()),
+            url: Some("http://stream.example/live/camera01/hls.m3u8".to_string()),
+            ..playlist
+        };
+
+        assert!(
+            !should_persist_record_file_hook(
+                "on_record_hls",
+                &exposed_only_binding,
+                &exposed_playlist
+            )
+            .expect("exposed playlist should evaluate")
+        );
     }
 
     #[test]

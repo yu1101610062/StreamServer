@@ -1803,7 +1803,7 @@ async fn process_zlm_hook(
                                 .clone()
                                 .or_else(|| file_name_from_path(&file_path)),
                             folder: hook.folder.clone().or_else(|| folder_from_path(&file_path)),
-                            url: hook.url.clone().or(hook.m3u8_url.clone()),
+                            url: hook.m3u8_url.clone().or(hook.url.clone()),
                         },
                     )
                     .await?;
@@ -4526,6 +4526,172 @@ mod tests {
         let _ = shutdown_tx.send(true);
         dispatcher.abort();
         callback_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hls_expose_hooks_do_not_create_record_rows() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "live-hls-expose",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": true
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+
+        repository
+            .record_zlm_record_file_hook(
+                &node_id.to_string(),
+                "on_record_hls",
+                "hls-expose-hook-1",
+                json!({}),
+                repository::ZlmRecordFileRecord {
+                    record_format: Some("hls".to_string()),
+                    schema: None,
+                    vhost: "__defaultVhost__".to_string(),
+                    app: "live".to_string(),
+                    stream: "camera01".to_string(),
+                    file_path: "/data/zlm/www/live/camera01/hls.m3u8".to_string(),
+                    file_size: 512,
+                    time_len_sec: Some(6),
+                    start_time: Some(Utc::now()),
+                    file_name: Some("hls.m3u8".to_string()),
+                    folder: Some("/data/zlm/www/live/camera01".to_string()),
+                    url: Some("http://stream.example/live/camera01/hls.m3u8".to_string()),
+                },
+            )
+            .await?;
+
+        let records = repository.list_task_record_files(task_id).await?;
+        assert!(records.is_empty());
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hls_record_hooks_only_persist_playlist_rows() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "live-hls-record",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {"enabled": true, "format": "hls"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+
+        repository
+            .record_zlm_record_file_hook(
+                &node_id.to_string(),
+                "on_record_ts",
+                "hls-record-hook-ts-1",
+                json!({}),
+                repository::ZlmRecordFileRecord {
+                    record_format: Some("hls".to_string()),
+                    schema: None,
+                    vhost: "__defaultVhost__".to_string(),
+                    app: "live".to_string(),
+                    stream: "camera01".to_string(),
+                    file_path: "/data/zlm/www/record/live/camera01/index-00001.ts".to_string(),
+                    file_size: 4096,
+                    time_len_sec: Some(6),
+                    start_time: Some(Utc::now()),
+                    file_name: Some("index-00001.ts".to_string()),
+                    folder: Some("/data/zlm/www/record/live/camera01".to_string()),
+                    url: Some(
+                        "http://stream.example/record/live/camera01/index-00001.ts".to_string(),
+                    ),
+                },
+            )
+            .await?;
+        repository
+            .record_zlm_record_file_hook(
+                &node_id.to_string(),
+                "on_record_hls",
+                "hls-record-hook-m3u8-1",
+                json!({}),
+                repository::ZlmRecordFileRecord {
+                    record_format: Some("hls".to_string()),
+                    schema: None,
+                    vhost: "__defaultVhost__".to_string(),
+                    app: "live".to_string(),
+                    stream: "camera01".to_string(),
+                    file_path: "/data/zlm/www/record/live/camera01/index.m3u8".to_string(),
+                    file_size: 1024,
+                    time_len_sec: Some(30),
+                    start_time: Some(Utc::now()),
+                    file_name: Some("index.m3u8".to_string()),
+                    folder: Some("/data/zlm/www/record/live/camera01".to_string()),
+                    url: Some("http://stream.example/record/live/camera01/index.m3u8".to_string()),
+                },
+            )
+            .await?;
+
+        let records = repository.list_task_record_files(task_id).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].file_path,
+            "/data/zlm/www/record/live/camera01/index.m3u8"
+        );
+        assert_eq!(
+            records[0].http_url.as_deref(),
+            Some("http://stream.example/record/live/camera01/index.m3u8")
+        );
+
         db.cleanup().await?;
         Ok(())
     }

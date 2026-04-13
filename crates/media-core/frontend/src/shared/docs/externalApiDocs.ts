@@ -1463,7 +1463,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     path: "/api/v1/records",
     title: "查询录像记录",
     summary: "返回录像索引、文件大小、时长和 HTTP 地址。",
-    description: "适合检索实时录制产生的录像、做回看和路径回传。VOD 快录输出不会落在这里，而是进入文件产物接口。",
+    description: "适合检索实时录制产生的录像、做回看和路径回传。HLS 录制按 `m3u8` 播放列表展示，不展开底层 `ts` segment；仅用于实时播放的 HLS 文件不会落在这里。VOD 快录输出不会进入该接口，而是进入文件产物接口。",
     successStatus: "200 OK",
     params: [
       authHeaderParam(),

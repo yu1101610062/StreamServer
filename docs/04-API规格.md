@@ -447,6 +447,8 @@
 说明：
 
 - 该接口只覆盖实时录制产生的录像。
+- `record.format=hls` 时，列表按播放列表 `m3u8` 展示逻辑录像条目，不展开底层 `ts` segment。
+- 仅因 `expose.enable_hls=true` 产生的实时播放 HLS 文件不会进入该接口。
 - `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全关闭时，会进入快录分支；这类输出不会进入 `/records`，而是进入 `/file-artifacts`。
 
 ### 5.3 `GET /file-artifacts`
