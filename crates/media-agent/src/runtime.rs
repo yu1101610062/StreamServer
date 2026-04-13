@@ -18,8 +18,8 @@ use std::{
 use chrono::{DateTime, Local, Utc};
 use media_domain::{
     ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy,
-    RuntimeHandle, RuntimeState, SourceMode, TaskSpec, TaskType, WorkerKind,
-    normalize_relative_file_input_path,
+    RuntimeHandle, RuntimeState, SourceMode, StreamIngestRecordMode, TaskSpec, TaskType,
+    WorkerKind, normalize_relative_file_input_path,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -174,6 +174,7 @@ struct ProcessPlan {
     success_check: SuccessCheck,
     startup_probe: Option<StartupProbe>,
     recording: Option<LiveRelayRecording>,
+    managed_file_output_kind: Option<ManagedFileOutputKind>,
 }
 
 #[derive(Debug, Clone)]
@@ -766,6 +767,7 @@ impl ManagedProcessExecutor {
                 "startup_probe": plan.startup_probe,
                 "stream_online": plan.startup_probe.is_none(),
                 "recording": plan.recording,
+                "managed_file_output_kind": plan.managed_file_output_kind,
             }),
         };
         self.registry.track(handle.clone());
@@ -1497,8 +1499,21 @@ fn build_process_plan(
                     "stream_ingest task should not run in the managed process executor".to_string(),
                 ));
             }
-            build_file_to_live_plan(settings, request, &spec)
+            build_stream_ingest_plan(settings, request, &spec)
         }
+    }
+}
+
+fn build_stream_ingest_plan(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+) -> Result<ProcessPlan, ExecutorError> {
+    match spec.stream_ingest_record_mode() {
+        Some(StreamIngestRecordMode::Fast) => {
+            build_stream_ingest_fast_record_plan(settings, request, spec)
+        }
+        _ => build_file_to_live_plan(settings, request, spec),
     }
 }
 
@@ -1527,11 +1542,14 @@ fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
 const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
 const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
 const BRIDGE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/bridge";
+const STREAM_INGEST_RECORD_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/stream-ingest-record";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum ManagedFileOutputKind {
     Transcode,
     Bridge,
+    StreamIngestRecord,
 }
 
 impl ManagedFileOutputKind {
@@ -1539,6 +1557,7 @@ impl ManagedFileOutputKind {
         match self {
             Self::Transcode => TRANSCODE_ARTIFACT_ROOT,
             Self::Bridge => BRIDGE_ARTIFACT_ROOT,
+            Self::StreamIngestRecord => STREAM_INGEST_RECORD_ARTIFACT_ROOT,
         }
     }
 
@@ -1546,6 +1565,7 @@ impl ManagedFileOutputKind {
         match self {
             Self::Transcode => "transcode_artifact",
             Self::Bridge => "bridge_artifact",
+            Self::StreamIngestRecord => "stream_ingest_record_artifacts",
         }
     }
 }
@@ -1567,6 +1587,7 @@ fn normalize_optional_publish_format(value: Option<&str>) -> Option<String> {
 
 fn default_file_extension_for_format(format: &str) -> String {
     match format {
+        "hls" => "m3u8".to_string(),
         "mp4" => "mp4".to_string(),
         "flv" => "flv".to_string(),
         "mpegts" | "rtp_mpegts" => "ts".to_string(),
@@ -1589,6 +1610,48 @@ fn default_file_extension_for_format(format: &str) -> String {
     }
 }
 
+fn allocate_managed_output(
+    kind: ManagedFileOutputKind,
+    requested_format: Option<&str>,
+) -> PublishOutput {
+    let format =
+        normalize_optional_publish_format(requested_format).unwrap_or_else(|| "mp4".to_string());
+    let extension = default_file_extension_for_format(&format);
+    let timestamp = Local::now().naive_local();
+    let relative_dir = timestamp.format("%Y/%m/%d").to_string();
+    let file_stem = timestamp.format("%H%M%S").to_string();
+    let dir = PathBuf::from(kind.root()).join(relative_dir);
+    let mut path = dir.join(format!("{file_stem}.{extension}"));
+    let mut suffix = 1_u32;
+    while path.exists() {
+        path = dir.join(format!("{file_stem}-{suffix:02}.{extension}"));
+        suffix += 1;
+    }
+
+    let target = path.to_string_lossy().to_string();
+    PublishOutput {
+        success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
+        target,
+        format,
+    }
+}
+
+fn hls_segment_template(playlist_path: &str) -> String {
+    let path = Path::new(playlist_path);
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("segment");
+    parent
+        .join(format!("{stem}-%05d.ts"))
+        .to_string_lossy()
+        .to_string()
+}
+
 fn allocate_managed_file_output(
     kind: ManagedFileOutputKind,
     publish: &PublishSpec,
@@ -1604,26 +1667,7 @@ fn allocate_managed_file_output(
         ));
     }
 
-    let format = normalize_optional_publish_format(publish.format.as_deref())
-        .unwrap_or_else(|| "mp4".to_string());
-    let extension = default_file_extension_for_format(&format);
-    let timestamp = Local::now().naive_local();
-    let relative_dir = timestamp.format("%Y/%m/%d").to_string();
-    let file_stem = timestamp.format("%H%M%S").to_string();
-    let dir = PathBuf::from(kind.root()).join(relative_dir);
-    let mut path = dir.join(format!("{file_stem}.{extension}"));
-    let mut suffix = 1_u32;
-    while path.exists() {
-        path = dir.join(format!("{file_stem}-{suffix:02}.{extension}"));
-        suffix += 1;
-    }
-
-    let target = path.to_string_lossy().to_string();
-    Ok(PublishOutput {
-        success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
-        target,
-        format,
-    })
+    Ok(allocate_managed_output(kind, publish.format.as_deref()))
 }
 
 fn build_file_transcode_plan(
@@ -1678,6 +1722,7 @@ fn build_file_transcode_plan(
         success_check: output.success_check,
         startup_probe: None,
         recording: None,
+        managed_file_output_kind: Some(ManagedFileOutputKind::Transcode),
     })
 }
 
@@ -1765,6 +1810,128 @@ fn build_file_to_live_plan(
         success_check,
         startup_probe: Some(startup_probe),
         recording,
+        managed_file_output_kind: None,
+    })
+}
+
+fn build_stream_ingest_fast_record_plan(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+) -> Result<ProcessPlan, ExecutorError> {
+    let input_url = build_input_url(settings, &spec.input)?;
+    let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
+    let mut args = ffmpeg_base_args_without_maps(input_url.clone(), false);
+    let preferred_output_format = match spec
+        .record
+        .format
+        .unwrap_or(media_domain::RecordFormat::Mp4)
+    {
+        media_domain::RecordFormat::Mp4 | media_domain::RecordFormat::Both => "mp4",
+        media_domain::RecordFormat::Hls => "hls",
+    };
+    if should_loop_file_to_live_input(spec) {
+        insert_ffmpeg_input_args(
+            &mut args,
+            vec!["-stream_loop".to_string(), "-1".to_string()],
+        );
+    }
+    append_process_args(
+        &mut args,
+        settings,
+        spec,
+        "copy_or_transcode",
+        input_url.as_str(),
+        preferred_output_format,
+        VideoOutputPolicy::KeepSourceFamily,
+        AudioOutputPolicy::Aac,
+    )?;
+    args.extend(["-threads".to_string(), "0".to_string()]);
+    if let Some(duration_sec) = spec.record.duration_sec {
+        args.extend(["-t".to_string(), duration_sec.to_string()]);
+    }
+
+    let mut outputs = Vec::new();
+    let primary_output = match spec
+        .record
+        .format
+        .unwrap_or(media_domain::RecordFormat::Mp4)
+    {
+        media_domain::RecordFormat::Mp4 => {
+            let output =
+                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("mp4"));
+            append_default_output_maps(&mut args);
+            args.extend([
+                "-f".to_string(),
+                output.format.clone(),
+                output.target.clone(),
+            ]);
+            outputs.push(output.target.clone());
+            output
+        }
+        media_domain::RecordFormat::Hls => {
+            let output =
+                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("hls"));
+            let segment_template = hls_segment_template(output.target.as_str());
+            append_default_output_maps(&mut args);
+            args.extend([
+                "-f".to_string(),
+                "hls".to_string(),
+                "-hls_time".to_string(),
+                spec.record.segment_sec.unwrap_or(6).to_string(),
+                "-hls_list_size".to_string(),
+                "0".to_string(),
+                "-hls_segment_filename".to_string(),
+                segment_template,
+                output.target.clone(),
+            ]);
+            outputs.push(output.target.clone());
+            output
+        }
+        media_domain::RecordFormat::Both => {
+            let mp4_output =
+                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("mp4"));
+            let hls_output =
+                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("hls"));
+            let segment_template = hls_segment_template(hls_output.target.as_str());
+            args.extend([
+                "-map".to_string(),
+                "0:v?".to_string(),
+                "-map".to_string(),
+                "0:a?".to_string(),
+                "-f".to_string(),
+                "mp4".to_string(),
+                mp4_output.target.clone(),
+                "-map".to_string(),
+                "0:v?".to_string(),
+                "-map".to_string(),
+                "0:a?".to_string(),
+                "-f".to_string(),
+                "hls".to_string(),
+                "-hls_time".to_string(),
+                spec.record.segment_sec.unwrap_or(6).to_string(),
+                "-hls_list_size".to_string(),
+                "0".to_string(),
+                "-hls_segment_filename".to_string(),
+                segment_template,
+                hls_output.target.clone(),
+            ]);
+            outputs.push(mp4_output.target.clone());
+            outputs.push(hls_output.target.clone());
+            mp4_output
+        }
+    };
+
+    Ok(ProcessPlan {
+        executable: settings.ffmpeg_bin.clone(),
+        args,
+        work_dir,
+        output_target: primary_output.target.clone(),
+        outputs,
+        success_check: primary_output.success_check,
+        startup_probe: None,
+        recording: None,
+        managed_file_output_kind: Some(ManagedFileOutputKind::StreamIngestRecord),
     })
 }
 
@@ -1832,6 +1999,7 @@ fn build_multicast_bridge_plan(
         success_check: output.success_check,
         startup_probe,
         recording: None,
+        managed_file_output_kind: Some(ManagedFileOutputKind::Bridge),
     })
 }
 
@@ -2111,7 +2279,7 @@ fn should_loop_file_to_live_input(spec: &TaskSpec) -> bool {
         )
 }
 
-fn ffmpeg_base_args(input_url: String, realtime: bool) -> Vec<String> {
+fn ffmpeg_base_args_without_maps(input_url: String, realtime: bool) -> Vec<String> {
     let mut args = vec![
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
@@ -2126,15 +2294,28 @@ fn ffmpeg_base_args(input_url: String, realtime: bool) -> Vec<String> {
     if realtime {
         args.push("-re".to_string());
     }
+    args.extend(["-i".to_string(), input_url]);
+    args
+}
+
+fn ffmpeg_base_args(input_url: String, realtime: bool) -> Vec<String> {
+    let mut args = ffmpeg_base_args_without_maps(input_url, realtime);
     args.extend([
-        "-i".to_string(),
-        input_url,
         "-map".to_string(),
         "0:v?".to_string(),
         "-map".to_string(),
         "0:a?".to_string(),
     ]);
     args
+}
+
+fn append_default_output_maps(args: &mut Vec<String>) {
+    args.extend([
+        "-map".to_string(),
+        "0:v?".to_string(),
+        "-map".to_string(),
+        "0:a?".to_string(),
+    ]);
 }
 
 fn normalized_process_mode<'a>(spec: &'a TaskSpec, default_mode: &'a str) -> &'a str {
@@ -4522,35 +4703,37 @@ fn attach_file_artifact_metadata(handle: &mut RuntimeHandle, success_check: &Suc
     let SuccessCheck::FileExists(path) = success_check else {
         return;
     };
-    let Some(kind) = task_type_from_handle(handle).and_then(managed_file_output_kind_for_task)
-    else {
+    let Some(kind) = managed_file_output_kind_from_handle(handle) else {
         return;
     };
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    if !metadata.is_file() {
+
+    if kind == ManagedFileOutputKind::StreamIngestRecord {
+        let mut artifacts = handle
+            .outputs
+            .iter()
+            .filter_map(|output| file_artifact_metadata_from_path(Path::new(output)))
+            .collect::<Vec<_>>();
+        if artifacts.is_empty() {
+            if let Some(metadata) = file_artifact_metadata_from_path(path) {
+                artifacts.push(metadata);
+            }
+        }
+        let Some(object) = handle.metadata.as_object_mut() else {
+            return;
+        };
+        if !artifacts.is_empty() {
+            object.insert(kind.metadata_key().to_string(), Value::Array(artifacts));
+        }
         return;
     }
 
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_string();
-    let file_path = path.to_string_lossy().to_string();
-
+    let Some(metadata) = file_artifact_metadata_from_path(path) else {
+        return;
+    };
     let Some(object) = handle.metadata.as_object_mut() else {
         return;
     };
-    object.insert(
-        kind.metadata_key().to_string(),
-        json!({
-            "file_name": file_name,
-            "file_path": file_path,
-            "file_size": i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-        }),
-    );
+    object.insert(kind.metadata_key().to_string(), metadata);
 }
 
 fn classify_adopted_exit(
@@ -4662,6 +4845,31 @@ fn task_type_from_handle(handle: &RuntimeHandle) -> Option<TaskType> {
         .get("task_type")
         .and_then(Value::as_str)
         .and_then(|value| TaskType::from_str(value).ok())
+}
+
+fn managed_file_output_kind_from_handle(handle: &RuntimeHandle) -> Option<ManagedFileOutputKind> {
+    handle
+        .metadata
+        .get("managed_file_output_kind")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ManagedFileOutputKind>(value).ok())
+}
+
+fn file_artifact_metadata_from_path(path: &Path) -> Option<Value> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+
+    Some(json!({
+        "file_name": path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string(),
+        "file_path": path.to_string_lossy().to_string(),
+        "file_size": i64::try_from(metadata.len()).unwrap_or(i64::MAX),
+    }))
 }
 
 fn resolved_spec_from_handle(handle: &RuntimeHandle) -> Option<TaskSpec> {
@@ -5709,6 +5917,117 @@ fi
         );
         assert!(plan.args.iter().any(|arg| arg == "-re"));
         assert!(plan.args.windows(2).any(|window| window == ["-t", "300"]));
+    }
+
+    #[test]
+    fn build_stream_ingest_fast_record_plan_disables_realtime_pacing_and_stream_probe() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "vod-fast-record",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "http_mp4",
+                    "source_mode": "vod",
+                    "url": "http://vod.example.com/archive.mp4"
+                },
+                "stream": {"app": "live", "name": "archive-fast"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {
+                    "enabled": true,
+                    "format": "mp4",
+                    "duration_sec": 300
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(!plan.args.iter().any(|arg| arg == "-re"));
+        assert!(plan.startup_probe.is_none());
+        assert_eq!(plan.recording, None);
+        assert_eq!(
+            plan.managed_file_output_kind,
+            Some(ManagedFileOutputKind::StreamIngestRecord)
+        );
+        assert!(
+            plan.output_target
+                .starts_with(STREAM_INGEST_RECORD_ARTIFACT_ROOT)
+        );
+        assert!(plan.output_target.ends_with(".mp4"));
+        assert!(plan.args.windows(2).any(|window| window == ["-t", "300"]));
+    }
+
+    #[test]
+    fn build_stream_ingest_fast_record_plan_generates_mp4_and_hls_outputs_for_both_format() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "vod-fast-record-both",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "file",
+                    "source_mode": "vod",
+                    "url": "archive.mp4"
+                },
+                "stream": {"app": "live", "name": "archive-both"},
+                "expose": {
+                    "enable_rtsp": false,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "record": {
+                    "enabled": true,
+                    "format": "both",
+                    "segment_sec": 8
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert_eq!(plan.outputs.len(), 2);
+        assert!(plan.outputs.iter().any(|output| output.ends_with(".mp4")));
+        assert!(plan.outputs.iter().any(|output| output.ends_with(".m3u8")));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "mp4"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "hls"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-hls_time", "8"])
+        );
     }
 
     #[test]

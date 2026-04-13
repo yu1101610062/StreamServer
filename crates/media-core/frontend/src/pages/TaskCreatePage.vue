@@ -12,6 +12,7 @@ import {
   buildDraftPayload,
   createDefaultDraft,
   defaultSourceModeForInputKind,
+  deriveStreamIngestRecordMode,
   guidedScenarios,
   humanSummary,
   inputKindSupportsLoop,
@@ -84,6 +85,7 @@ const showPublishFormatSelect = computed(
 );
 const showStreamSection = computed(() => draft.task_type === "stream_ingest");
 const showRecordSection = computed(() => draft.task_type === "stream_ingest");
+const derivedRecordMode = computed(() => deriveStreamIngestRecordMode(draft));
 const previewPayload = computed(() => buildDraftPayload(draft));
 const summaryText = computed(() => humanSummary(draft));
 const managedFileInputHint = computed(
@@ -94,6 +96,24 @@ const inputLoopHint = computed(
   () =>
     "开启后，系统会在离线输入读到 EOF 后从头继续读取，适合让内部流长期保持有内容。如果同时设置录制时长，到时任务仍会整体成功结束。",
 );
+const recordModeHintTitle = computed(() => {
+  if (derivedRecordMode.value === "realtime") {
+    return "当前会按实时模式录制";
+  }
+  if (derivedRecordMode.value === "fast") {
+    return "当前会按快录模式录制";
+  }
+  return "";
+});
+const recordModeHint = computed(() => {
+  if (derivedRecordMode.value === "realtime") {
+    return "因为你仍启用了至少一种播放协议，系统会继续生成内部流并按实时节奏录制，旧行为保持不变。";
+  }
+  if (derivedRecordMode.value === "fast") {
+    return "因为你关闭了全部播放协议，系统会跳过内部流播放链路并尽快完成录制。此时不会提供实时流播放地址；如果还开启了循环读取，建议同时填写录制时长。";
+  }
+  return "";
+});
 const publishFormatGroups = computed(() => {
   const commonOptions = optionSets.publishFormats;
   const knownValues = new Set(commonOptions.map((item) => item.value));
@@ -501,6 +521,14 @@ function previewTask() {
             <el-checkbox v-model="draft.expose.stop_on_no_reader">无人观看时自动停流</el-checkbox>
           </div>
         </el-form-item>
+
+        <el-alert
+          v-if="derivedRecordMode === 'fast'"
+          type="warning"
+          :closable="false"
+          title="当前配置不会启用实时流播放"
+          description="你已经关闭了全部播放协议。若同时开启录制，系统会直接进入快录分支，不再保留可播放的内部流。app / stream / vhost 仅保留为任务规格字段，不会形成实时播放地址。"
+        />
       </el-form>
     </div>
 
@@ -589,10 +617,18 @@ function previewTask() {
           type="warning"
           :closable="false"
           title="只在你确实需要回看文件时开启录制"
-          description="MP4 适合回看和下载；HLS 适合分段输出；MP4 + HLS 适合同时兼顾两种需求。录制目录由系统托管生成，duration_sec 可以限制录制时长。"
+          description="MP4 适合回看和下载；HLS 适合分段输出；MP4 + HLS 适合同时兼顾两种需求。录制目录由系统托管生成。VOD 输入是否快录会由播放协议自动判定。"
         />
       </div>
       <el-form label-position="top">
+        <el-alert
+          v-if="derivedRecordMode"
+          :type="derivedRecordMode === 'fast' ? 'warning' : 'info'"
+          :closable="false"
+          :title="recordModeHintTitle"
+          :description="recordModeHint"
+          style="margin-bottom: 16px"
+        />
         <el-row :gutter="16">
           <el-col :md="6" :span="24">
             <el-form-item label="启用录制">

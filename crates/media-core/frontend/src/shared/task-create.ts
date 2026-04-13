@@ -162,6 +162,27 @@ export function inputKindSupportsLoop(kind: string, sourceMode: string) {
   return sourceMode === "vod" && ["file", "http_mp4", "hls", "http_ts"].includes(kind);
 }
 
+export function streamIngestPlaybackExposed(draft: TaskCreateDraft) {
+  return [
+    draft.expose.enable_rtsp,
+    draft.expose.enable_rtmp,
+    draft.expose.enable_http_ts,
+    draft.expose.enable_http_fmp4,
+    draft.expose.enable_hls,
+  ].some(Boolean);
+}
+
+export function deriveStreamIngestRecordMode(draft: TaskCreateDraft) {
+  if (
+    draft.task_type !== "stream_ingest" ||
+    draft.input.source_mode !== "vod" ||
+    !draft.record.enabled
+  ) {
+    return null;
+  }
+  return streamIngestPlaybackExposed(draft) ? "realtime" : "fast";
+}
+
 export function createDefaultDraft(): TaskCreateDraft {
   const draft: TaskCreateDraft = {
     task_type: "stream_ingest",
@@ -465,6 +486,7 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
 }
 
 export function humanSummary(draft: TaskCreateDraft) {
+  const recordMode = deriveStreamIngestRecordMode(draft);
   const parts = [
     `目标是${taskTypeLabel(draft.task_type)}`,
     draft.input.kind ? `输入源为${inputKindLabel(draft.input.kind)}` : "",
@@ -479,6 +501,8 @@ export function humanSummary(draft: TaskCreateDraft) {
       ? `推送到 ${draft.publish.url.trim()}`
       : "",
     draft.record.enabled ? `并开启系统托管录制` : "",
+    recordMode === "realtime" ? "录制会按实时节奏进行并保留实时流播放能力" : "",
+    recordMode === "fast" ? "录制会按快录模式尽快完成且不提供实时流播放地址" : "",
   ].filter(Boolean);
   return `${parts.join("，")}。`;
 }

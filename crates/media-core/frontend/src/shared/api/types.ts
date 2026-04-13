@@ -138,7 +138,7 @@ export interface RecordFileSummary {
 
 export interface FileArtifactSummary {
   id: string;
-  artifact_kind: "transcode_output" | "bridge_output";
+  artifact_kind: "transcode_output" | "bridge_output" | "stream_ingest_record";
   task_id: string;
   attempt_id?: string | null;
   node_id: string;

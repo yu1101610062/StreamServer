@@ -3171,6 +3171,58 @@ mod tests {
         Ok(task_id)
     }
 
+    async fn insert_running_ingest_task(
+        pool: &sqlx::PgPool,
+        node_id: Uuid,
+        resolved_spec: Value,
+    ) -> anyhow::Result<Uuid> {
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'ingest-job-01', 'stream_ingest'::task_type, 'RUNNING'::task_status, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5, null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("ingest-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, $3, 'ffmpeg'::worker_kind, 'RUNNING'::attempt_status,
+              null, null, null, null, null, null,
+              null, null, null, null,
+              null, $4, null, $4
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        Ok(task_id)
+    }
+
     fn short_id(value: Uuid) -> String {
         value.simple().to_string()[..8].to_string()
     }
@@ -4787,6 +4839,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_payload_includes_file_artifact_http_url_for_stream_ingest_fast_record()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+            db.pool.clone(),
+            chrono::Duration::zero(),
+        ));
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "ingest-fast-record-01",
+            "common": {"created_by": "tester", "callback_url": callback_url},
+            "input": {"kind": "http_mp4", "source_mode": "vod", "url": "http://vod.example.com/archive.mp4"},
+            "stream": {"app": "live", "name": "archive-fast"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {"enabled": true, "format": "mp4", "duration_sec": 300},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id = insert_running_ingest_task(&db.pool, node_id, resolved_spec).await?;
+        repository
+            .record_agent_snapshot(
+                node_id,
+                repository::TaskSnapshotRecord {
+                    runtime_id: Uuid::now_v7(),
+                    task_id,
+                    attempt_no: 1,
+                    worker_kind: "ffmpeg".to_string(),
+                    pid: Some(3234),
+                    state: "RUNNING".to_string(),
+                    command_line: Some("ffmpeg ...".to_string()),
+                    outputs: vec![
+                        "/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4"
+                            .to_string(),
+                    ],
+                    metadata: json!({
+                        "stream_ingest_record_artifacts": [
+                            {
+                                "file_name": "output.mp4",
+                                "file_path": "/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4",
+                                "file_size": 16384
+                            }
+                        ]
+                    }),
+                },
+            )
+            .await?;
+        repository
+            .record_agent_task_event(
+                node_id,
+                repository::AgentTaskEventRecord {
+                    task_id,
+                    attempt_no: 1,
+                    event_type: "succeeded".to_string(),
+                    event_level: "info".to_string(),
+                    message: "finished".to_string(),
+                    payload: json!({}),
+                },
+            )
+            .await?;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let dispatcher = callback::spawn(
+            repository.clone(),
+            Client::new(),
+            callback::CallbackConfig {
+                timeout: std::time::Duration::from_secs(2),
+                max_attempts: 3,
+                initial_backoff: std::time::Duration::from_millis(50),
+                max_backoff: std::time::Duration::from_millis(200),
+                shared_secret: None,
+            },
+            shutdown_rx,
+        );
+
+        let delivered = wait_for_callback_count(&calls, 1).await?;
+        assert_eq!(
+            delivered[0].1["file_artifacts"][0]["http_url"],
+            json!("http://stream.example/artifacts/stream-ingest-record/verify/output.mp4")
+        );
+        assert_eq!(
+            delivered[0].1["file_artifacts"][0]["artifact_kind"],
+            json!("stream_ingest_record")
+        );
+
+        let _ = shutdown_tx.send(true);
+        dispatcher.abort();
+        callback_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn callback_dispatcher_delivers_bridge_artifact_update_callback() -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
             return Ok(());
@@ -4957,6 +5120,98 @@ mod tests {
         assert_eq!(
             body["items"][0]["file_path"],
             json!("/data/zlm/www/artifacts/bridge/verify/output.mp4")
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_file_artifacts_returns_stream_ingest_fast_record_outputs() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "ingest-fast-record-01",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "http_mp4", "source_mode": "vod", "url": "http://vod.example.com/archive.mp4"},
+            "stream": {"app": "live", "name": "archive-fast"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {"enabled": true, "format": "mp4", "duration_sec": 300},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id = insert_running_ingest_task(&db.pool, node_id, resolved_spec).await?;
+        repository
+            .record_agent_snapshot(
+                node_id,
+                repository::TaskSnapshotRecord {
+                    runtime_id: Uuid::now_v7(),
+                    task_id,
+                    attempt_no: 1,
+                    worker_kind: "ffmpeg".to_string(),
+                    pid: Some(3234),
+                    state: "RUNNING".to_string(),
+                    command_line: Some("ffmpeg ...".to_string()),
+                    outputs: vec![
+                        "/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4"
+                            .to_string(),
+                    ],
+                    metadata: json!({
+                        "stream_ingest_record_artifacts": [
+                            {
+                                "file_name": "output.mp4",
+                                "file_path": "/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4",
+                                "file_size": 16384
+                            }
+                        ]
+                    }),
+                },
+            )
+            .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/file-artifacts?artifact_kind=stream_ingest_record&page=1&page_size=10")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["total"], json!(1));
+        assert_eq!(body["items"][0]["task_id"], json!(task_id.to_string()));
+        assert_eq!(
+            body["items"][0]["artifact_kind"],
+            json!("stream_ingest_record")
+        );
+        assert_eq!(
+            body["items"][0]["http_url"],
+            json!("http://stream.example/artifacts/stream-ingest-record/verify/output.mp4")
+        );
+        assert_eq!(
+            body["items"][0]["file_path"],
+            json!("/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4")
         );
 
         db.cleanup().await?;

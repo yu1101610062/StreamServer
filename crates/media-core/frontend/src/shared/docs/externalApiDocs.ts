@@ -161,7 +161,7 @@ const PROCESS_MODE_ENUM = ["passthrough", "copy_or_transcode", "force_transcode"
 const PUBLISH_KIND_ENUM = ["file", "udp_mpegts_multicast", "rtp_multicast", "rtmp_push"];
 const RECORD_FORMAT_ENUM = ["mp4", "hls", "both"];
 const RECOVERY_POLICY_ENUM = ["auto", "never"];
-const FILE_ARTIFACT_KIND_ENUM = ["transcode_output", "bridge_output"];
+const FILE_ARTIFACT_KIND_ENUM = ["transcode_output", "bridge_output", "stream_ingest_record"];
 const START_MODE_ENUM = ["immediate", "manual", "at", "cron"];
 const LOG_STREAM_ENUM = ["stdout", "stderr", "merged"];
 const SORT_ORDER_ENUM = ["asc", "desc"];
@@ -276,7 +276,7 @@ function fieldMeta(path: string): FieldMeta | null {
       test: (value) => value === "input.loop_enabled",
       meta: {
         description:
-          "是否在离线输入读到 EOF 后从头循环读取。仅 `stream_ingest + source_mode=vod` 支持，对 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)` 生效；若同时设置 `record.duration_sec`，到时任务仍会整体成功结束。",
+          "是否在离线输入读到 EOF 后从头循环读取。仅 `stream_ingest + source_mode=vod` 支持，对 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)` 生效；若同时关闭全部播放协议并启用录制，会进入快录模式，此时 `loop_enabled=true` 需要配合 `record.duration_sec`。",
       },
     },
     {
@@ -307,7 +307,7 @@ function fieldMeta(path: string): FieldMeta | null {
     { test: (value) => value === "stream.app", meta: { description: "内部应用名。", required: "stream_ingest 时建议填写" } },
     { test: (value) => value === "stream.name", meta: { description: "内部流名。", required: "stream_ingest 时建议填写" } },
     { test: (value) => value === "stream.vhost", meta: { description: "内部流所属 vhost。" } },
-    { test: (value) => value === "expose", meta: { description: "内部流对外播放协议开关。" } },
+    { test: (value) => value === "expose", meta: { description: "内部流对外播放协议开关。对 `stream_ingest + source_mode=vod + record.enabled=true`，任一协议开启都会保持实时录制；全部关闭则切到快录且不再提供实时流播放地址。" } },
     { test: (value) => /^expose\./.test(value), meta: { description: "布尔开关，控制是否暴露对应协议。" } },
     { test: (value) => value === "publish", meta: { description: "显式输出目标定义。" } },
     {
@@ -328,12 +328,12 @@ function fieldMeta(path: string): FieldMeta | null {
       meta: { description: "输出封装格式；文件输出留空时默认 MP4，组播输出按目标自动选择合适封装格式，`rtmp_push` 固定使用 FLV。", enumValues: COMMON_PUBLISH_FORMAT_ENUM },
     },
     { test: (value) => value === "record", meta: { description: "录制设置。" } },
-    { test: (value) => value === "record.enabled", meta: { description: "是否启用录制。" } },
+    { test: (value) => value === "record.enabled", meta: { description: "是否启用录制。对 `stream_ingest` 的 VOD 输入，录制模式会由 expose 自动判定。" } },
     {
       test: (value) => value === "record.format",
       meta: { description: "录制输出格式。", enumValues: RECORD_FORMAT_ENUM },
     },
-    { test: (value) => value === "record.duration_sec", meta: { description: "录制时长上限，单位秒。" } },
+    { test: (value) => value === "record.duration_sec", meta: { description: "录制时长上限，单位秒。VOD 快录分支下如果同时开启 `input.loop_enabled=true`，这里必须填写。" } },
     { test: (value) => value === "record.segment_sec", meta: { description: "录制分段时长，单位秒。" } },
     {
       test: (value) => value === "record.save_path",
@@ -406,7 +406,7 @@ function fieldMeta(path: string): FieldMeta | null {
     { test: (value) => value === "artifact_kind" || value.endsWith(".artifact_kind"), meta: { description: "文件产物来源类型。", enumValues: FILE_ARTIFACT_KIND_ENUM } },
     { test: (value) => value === "streams[]", meta: { description: "本次任务关联的内部流列表。" } },
     { test: (value) => value === "records[]", meta: { description: "本次任务关联的录像文件列表。" } },
-    { test: (value) => value === "file_artifacts[]", meta: { description: "本次任务产生的文件产物列表，包含转码输出和桥接输出。" } },
+    { test: (value) => value === "file_artifacts[]", meta: { description: "本次任务产生的文件产物列表，包含转码输出、桥接输出和流接入快录输出。" } },
     { test: (value) => value === "latest_event", meta: { description: "最近一条与业务相关的事件摘要。" } },
     { test: (value) => value === "latest_event.message", meta: { description: "最近事件的人类可读说明。" } },
     { test: (value) => value === "source" || value.endsWith(".source"), meta: { description: "来源类型或来源标识。" } },
@@ -778,6 +778,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     notes: [
       "这个接口不会创建任务，也不会占用节点资源。",
       "如果要让离线输入持续供流，可在 `stream_ingest + source_mode=vod` 时设置 `input.loop_enabled=true`。",
+      "当 `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全部关闭时，resolved_spec 会走快录语义；只要 expose 任一协议开启，就保持实时录制。",
     ],
   },
   {
@@ -810,6 +811,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     },
     notes: [
       "`input.loop_enabled=true` 仅支持 `stream_ingest` 的离线输入；若同时配置 `record.duration_sec`，到时任务仍会自动成功结束。",
+      "`stream_ingest` 的 VOD 录制不会手动指定实时/快录，而是由 expose 自动判定：有播放协议就实时，没有播放协议就快录。",
     ],
   },
   {
@@ -1461,7 +1463,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     path: "/api/v1/records",
     title: "查询录像记录",
     summary: "返回录像索引、文件大小、时长和 HTTP 地址。",
-    description: "适合检索录像、做回看和路径回传。",
+    description: "适合检索实时录制产生的录像、做回看和路径回传。VOD 快录输出不会落在这里，而是进入文件产物接口。",
     successStatus: "200 OK",
     params: [
       authHeaderParam(),
@@ -1511,8 +1513,8 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     method: "GET",
     path: "/api/v1/file-artifacts",
     title: "查询文件产物",
-    summary: "返回桥接输出和转码输出的托管文件产物。",
-    description: "适合统一查看平台托管的文件输出、HTTP 地址和节点落盘路径。",
+    summary: "返回桥接输出、转码输出和流接入快录的托管文件产物。",
+    description: "适合统一查看平台托管的文件输出、HTTP 地址和节点落盘路径。VOD 快录不会进入录像中心，而是落在这里。",
     successStatus: "200 OK",
     params: [
       authHeaderParam(),

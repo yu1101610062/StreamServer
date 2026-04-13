@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { buildDraftPayload, createDefaultDraft, normalizeDraftForTaskType } from "@/shared/task-create";
+import {
+  buildDraftPayload,
+  createDefaultDraft,
+  deriveStreamIngestRecordMode,
+  normalizeDraftForTaskType,
+} from "@/shared/task-create";
 
 describe("buildDraftPayload", () => {
   it("omits ingest-only sections for stream_bridge tasks", () => {
@@ -107,5 +112,30 @@ describe("buildDraftPayload", () => {
     expect(draft.input.loop_enabled).toBe(false);
     const payload = buildDraftPayload(draft) as Record<string, unknown>;
     expect(payload.input).not.toHaveProperty("loop_enabled");
+  });
+
+  it("derives realtime record mode when vod recording keeps playback exposed", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.url = "http://vod.example.com/archive.mp4";
+    draft.record.enabled = true;
+
+    expect(deriveStreamIngestRecordMode(draft)).toBe("realtime");
+  });
+
+  it("derives fast record mode when vod recording disables all playback exposes", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.url = "http://vod.example.com/archive.mp4";
+    draft.record.enabled = true;
+    draft.expose.enable_rtsp = false;
+    draft.expose.enable_rtmp = false;
+    draft.expose.enable_http_ts = false;
+    draft.expose.enable_http_fmp4 = false;
+    draft.expose.enable_hls = false;
+
+    expect(deriveStreamIngestRecordMode(draft)).toBe("fast");
   });
 });

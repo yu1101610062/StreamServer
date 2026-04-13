@@ -616,6 +616,7 @@ impl TaskCallbackFileArtifact {
             artifact_kind: match summary.artifact_kind {
                 crate::repository::FileArtifactKind::TranscodeOutput => "transcode_output",
                 crate::repository::FileArtifactKind::BridgeOutput => "bridge_output",
+                crate::repository::FileArtifactKind::StreamIngestRecord => "stream_ingest_record",
             }
             .to_string(),
             file_name: summary.file_name,

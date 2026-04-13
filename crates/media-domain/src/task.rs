@@ -418,6 +418,21 @@ pub enum RecordFormat {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamIngestRecordMode {
+    Realtime,
+    Fast,
+}
+
+impl StreamIngestRecordMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Realtime => "realtime",
+            Self::Fast => "fast",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskSpec {
     #[serde(rename = "type")]
@@ -522,8 +537,24 @@ impl TaskSpec {
         self.common.created_by.as_deref()
     }
 
+    pub fn stream_ingest_record_mode(&self) -> Option<StreamIngestRecordMode> {
+        if self.task_type != TaskType::StreamIngest
+            || self.input.source_mode != Some(SourceMode::Vod)
+            || !self.record.enabled.unwrap_or(false)
+        {
+            return None;
+        }
+
+        if self.expose.any_playback_enabled() {
+            Some(StreamIngestRecordMode::Realtime)
+        } else {
+            Some(StreamIngestRecordMode::Fast)
+        }
+    }
+
     pub fn validate(&self) -> Result<(), TaskValidationError> {
         let mut issues = Vec::new();
+        let resolved = self.resolved();
 
         if self.name.trim().is_empty() {
             issues.push(ValidationIssue::new("name", "must not be empty"));
@@ -679,6 +710,16 @@ impl TaskSpec {
                     "requires file, http_mp4, hls(vod), or http_ts(vod) input",
                 ));
             }
+        }
+
+        if resolved.stream_ingest_record_mode() == Some(StreamIngestRecordMode::Fast)
+            && resolved.input.loop_enabled.unwrap_or(false)
+            && resolved.record.duration_sec.is_none()
+        {
+            issues.push(ValidationIssue::new(
+                "record.duration_sec",
+                "is required for fast recording when input.loop_enabled=true",
+            ));
         }
 
         match self.task_type {
@@ -1040,6 +1081,14 @@ impl ExposeSpec {
             || self.enable_hls.is_some()
             || self.stop_on_no_reader.is_some()
     }
+
+    pub fn any_playback_enabled(&self) -> bool {
+        self.enable_rtsp.unwrap_or(false)
+            || self.enable_rtmp.unwrap_or(false)
+            || self.enable_http_ts.unwrap_or(false)
+            || self.enable_http_fmp4.unwrap_or(false)
+            || self.enable_hls.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1314,6 +1363,43 @@ mod tests {
     }
 
     #[test]
+    fn resolved_stream_ingest_vod_record_mode_defaults_to_realtime_when_playback_is_exposed() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::HttpMp4);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
+        task.record.enabled = Some(true);
+
+        let resolved = task.resolved();
+
+        assert_eq!(
+            resolved.stream_ingest_record_mode(),
+            Some(StreamIngestRecordMode::Realtime)
+        );
+    }
+
+    #[test]
+    fn resolved_stream_ingest_vod_record_mode_becomes_fast_when_all_playback_is_disabled() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::HttpMp4);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
+        task.record.enabled = Some(true);
+        task.expose.enable_rtsp = Some(false);
+        task.expose.enable_rtmp = Some(false);
+        task.expose.enable_http_ts = Some(false);
+        task.expose.enable_http_fmp4 = Some(false);
+        task.expose.enable_hls = Some(false);
+
+        let resolved = task.resolved();
+
+        assert_eq!(
+            resolved.stream_ingest_record_mode(),
+            Some(StreamIngestRecordMode::Fast)
+        );
+    }
+
+    #[test]
     fn resolve_normalizes_file_input_relative_path() {
         let mut task = sample_task(TaskType::FileTranscode);
         task.input.kind = Some(InputKind::File);
@@ -1462,6 +1548,29 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.field == "input.loop_enabled")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_fast_record_loop_without_duration() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::HttpMp4);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.loop_enabled = Some(true);
+        task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
+        task.record.enabled = Some(true);
+        task.expose.enable_rtsp = Some(false);
+        task.expose.enable_rtmp = Some(false);
+        task.expose.enable_http_ts = Some(false);
+        task.expose.enable_http_fmp4 = Some(false);
+        task.expose.enable_hls = Some(false);
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "record.duration_sec")
         );
     }
 

@@ -45,11 +45,13 @@ const artifactKindOptions: OptionItem[] = [
   { value: "", label: "全部文件产物" },
   { value: "transcode_output", label: "转码输出" },
   { value: "bridge_output", label: "桥接输出" },
+  { value: "stream_ingest_record", label: "流接入快录" },
 ];
 
 function artifactKindLabel(value: string) {
   if (value === "bridge_output") return "桥接输出";
   if (value === "transcode_output") return "转码输出";
+  if (value === "stream_ingest_record") return "流接入快录";
   return "—";
 }
 
@@ -80,7 +82,7 @@ async function resetFilters() {
 
 <template>
   <section class="page-grid">
-    <PageHeader title="文件产物" description="查看桥接输出和转码输出的文件、路径和节点 HTTP 地址。" />
+    <PageHeader title="文件产物" description="查看桥接输出、转码输出和流接入快录文件的路径与节点 HTTP 地址。" />
 
     <div class="surface-card">
       <el-form label-position="top" inline>

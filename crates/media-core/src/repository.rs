@@ -3125,6 +3125,31 @@ impl TaskRepository {
             .await?;
         }
 
+        if let Some(records) = snapshot
+            .metadata
+            .get("stream_ingest_record_artifacts")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Vec<FileArtifactMetadata>>(value).ok())
+        {
+            for metadata in records {
+                self.upsert_file_artifact_row(
+                    tx,
+                    snapshot.task_id,
+                    attempt_id,
+                    node_id,
+                    &agent_stream_addr,
+                    metadata,
+                )
+                .await?;
+            }
+            self.enqueue_artifact_update_callback_if_needed(
+                tx,
+                snapshot.task_id,
+                snapshot.attempt_no,
+            )
+            .await?;
+        }
+
         Ok(())
     }
 
@@ -4501,6 +4526,7 @@ impl RecordFileSummary {
 pub enum FileArtifactKind {
     TranscodeOutput,
     BridgeOutput,
+    StreamIngestRecord,
 }
 
 impl FileArtifactKind {
@@ -4508,6 +4534,7 @@ impl FileArtifactKind {
         match value {
             "file_transcode" => Ok(Self::TranscodeOutput),
             "stream_bridge" => Ok(Self::BridgeOutput),
+            "stream_ingest" => Ok(Self::StreamIngestRecord),
             other => Err(RepoError::Validation(TaskValidationError {
                 issues: vec![ValidationIssue::new(
                     "artifact_kind",
@@ -4846,6 +4873,7 @@ fn apply_file_artifact_filters<'a>(
         builder.push_bind(match artifact_kind {
             FileArtifactKind::TranscodeOutput => "file_transcode",
             FileArtifactKind::BridgeOutput => "stream_bridge",
+            FileArtifactKind::StreamIngestRecord => "stream_ingest",
         });
         builder.push("::task_type");
     }

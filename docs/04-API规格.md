@@ -126,11 +126,11 @@
 - `input.kind` 表示任务直接接收的输入源类型。
 - `input.kind=file` 时，`input.url` 必须填写相对 `/data/media/work` 的文件路径；如果误写成 `/demo.mp4`，系统会自动按 `demo.mp4` 处理。
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；其他输入类型按规则自动推断。
-- `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时配置 `record.duration_sec`，到点后任务仍整体成功结束。
+- `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时关闭全部播放协议并启用录制，任务会进入快录分支，此时必须填写 `record.duration_sec` 作为快录终点。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
-- `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
+- `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。对 `stream_ingest + source_mode=vod + record.enabled=true`，只要任一播放协议开启，任务就保持实时录制；全部关闭则切到快录且不再提供实时播放地址。
 - `publish.kind` 表示任务直接写出的外部目标类型；当前支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`、`rtmp_push`。
-- `record.duration_sec` 表示总录制时长：`stream_ingest + source_mode=vod` 按媒体时间截取，`stream_ingest + source_mode=live` 按现实时间计时；到点后任务整体成功结束。
+- `record.duration_sec` 表示总录制时长：`stream_ingest + source_mode=vod` 在实时分支按媒体时间截取、在快录分支作为离线处理的终点；`stream_ingest + source_mode=live` 按现实时间计时；到点后任务整体成功结束。
 
 当前能力矩阵：
 
@@ -158,6 +158,13 @@
   "stream": {
     "app": "live",
     "name": "promo-loop-01"
+  },
+  "expose": {
+    "enable_rtsp": false,
+    "enable_rtmp": false,
+    "enable_http_ts": false,
+    "enable_http_fmp4": false,
+    "enable_hls": false
   },
   "record": {
     "enabled": true,
@@ -437,6 +444,11 @@
 
 - `http_url`：录像文件的 HTTP 访问地址。若 ZLM Hook 未上报 URL，则允许为空。
 
+说明：
+
+- 该接口只覆盖实时录制产生的录像。
+- `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全关闭时，会进入快录分支；这类输出不会进入 `/records`，而是进入 `/file-artifacts`。
+
 ### 5.3 `GET /file-artifacts`
 
 支持字段：
@@ -463,8 +475,8 @@
 
 说明：
 
-- 同时覆盖 `file_transcode` 与 `stream_bridge(file)` 的成功产物。
-- `artifact_kind` 取值为 `transcode_output` 或 `bridge_output`。
+- 同时覆盖 `file_transcode`、`stream_bridge(file)` 与 `stream_ingest(vod 快录)` 的成功产物。
+- `artifact_kind` 取值为 `transcode_output`、`bridge_output` 或 `stream_ingest_record`。
 - `http_url` 基于工作节点 `agent_stream_addr` 和 `/data/zlm/www` 下的相对路径生成。
 
 ### 5.4 `GET /nodes`
