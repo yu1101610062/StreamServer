@@ -340,7 +340,7 @@ fn default_network_mode() -> String {
 }
 
 fn default_max_runtime_slots() -> u32 {
-    4
+    0
 }
 
 fn default_work_root() -> String {

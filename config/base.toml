@@ -43,5 +43,5 @@ zlm_auto_close_on_no_reader_enabled = false
 agent_stream_addr = "http://127.0.0.1:8081"
 network_mode = "bridge"
 labels = []
-max_runtime_slots = 4
+max_runtime_slots = 0
 work_root = "/data/media/work"
