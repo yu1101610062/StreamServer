@@ -1656,6 +1656,7 @@ fn build_file_transcode_plan(
         spec,
         "copy_or_transcode",
         input_url.as_str(),
+        output.format.as_str(),
         VideoOutputPolicy::KeepSourceFamily,
         AudioOutputPolicy::Aac,
     )?;
@@ -1700,6 +1701,7 @@ fn build_file_to_live_plan(
         spec,
         "copy_or_transcode",
         input_url.as_str(),
+        publish_output.format.as_str(),
         VideoOutputPolicy::ForceH264,
         AudioOutputPolicy::Aac,
     )?;
@@ -1802,6 +1804,7 @@ fn build_multicast_bridge_plan(
             spec,
             "passthrough",
             input_url.as_str(),
+            output.format.as_str(),
             VideoOutputPolicy::ForceH264,
             AudioOutputPolicy::Aac,
         )?;
@@ -1827,8 +1830,15 @@ fn build_multicast_bridge_plan(
 }
 
 fn should_stabilize_live_mpegts_multicast_bridge(spec: &TaskSpec, output: &PublishOutput) -> bool {
-    output.format == "mpegts"
-        && spec.process.mode.as_deref().unwrap_or("passthrough") == "passthrough"
+    spec.process.mode.as_deref().unwrap_or("passthrough") == "passthrough"
+        && requires_live_mpegts_multicast_video_stabilization(spec, output.format.as_str())
+}
+
+fn requires_live_mpegts_multicast_video_stabilization(
+    spec: &TaskSpec,
+    output_format: &str,
+) -> bool {
+    output_format.eq_ignore_ascii_case("mpegts")
         && matches!(
             spec.input.kind,
             Some(
@@ -2124,6 +2134,7 @@ fn append_process_args(
     spec: &TaskSpec,
     default_mode: &str,
     input_url: &str,
+    output_format: &str,
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
 ) -> Result<(), ExecutorError> {
@@ -2138,8 +2149,15 @@ fn append_process_args(
             ]);
         }
         "copy_or_transcode" | "force_transcode" => {
-            let selection =
-                resolve_transcode_selection(settings, input_url, video_policy, audio_policy);
+            let selection = resolve_process_selection(
+                settings,
+                spec,
+                mode,
+                input_url,
+                output_format,
+                video_policy,
+                audio_policy,
+            );
             if !selection.input_args.is_empty() {
                 insert_ffmpeg_input_args(args, selection.input_args);
             }
@@ -2169,13 +2187,173 @@ fn append_process_args(
     Ok(())
 }
 
+fn resolve_process_selection(
+    settings: &AgentSettings,
+    spec: &TaskSpec,
+    mode: &str,
+    input_url: &str,
+    output_format: &str,
+    video_policy: VideoOutputPolicy,
+    audio_policy: AudioOutputPolicy,
+) -> TranscodeSelection {
+    if mode == "force_transcode" {
+        return resolve_transcode_selection(settings, input_url, video_policy, audio_policy);
+    }
+
+    let profile = probe_input_media_profile(settings, input_url);
+    let video_copy = should_copy_video_stream(spec, output_format, &profile, video_policy);
+    let audio_copy = should_copy_audio_stream(spec, output_format, &profile, audio_policy);
+    if video_copy && audio_copy {
+        return TranscodeSelection {
+            input_args: Vec::new(),
+            video_encoder: "copy".to_string(),
+            audio_encoder: "copy".to_string(),
+        };
+    }
+
+    let transcode = resolve_transcode_selection_for_input_family(
+        settings,
+        profile.video_family,
+        video_policy,
+        audio_policy,
+    );
+
+    TranscodeSelection {
+        input_args: if video_copy {
+            Vec::new()
+        } else {
+            transcode.input_args
+        },
+        video_encoder: if video_copy {
+            "copy".to_string()
+        } else {
+            transcode.video_encoder
+        },
+        audio_encoder: if audio_copy {
+            "copy".to_string()
+        } else {
+            transcode.audio_encoder
+        },
+    }
+}
+
+fn should_copy_video_stream(
+    spec: &TaskSpec,
+    output_format: &str,
+    profile: &InputMediaProfile,
+    video_policy: VideoOutputPolicy,
+) -> bool {
+    if !profile.has_video {
+        return true;
+    }
+    if process_requires_video_transcode(spec)
+        || requires_live_mpegts_multicast_video_stabilization(spec, output_format)
+    {
+        return false;
+    }
+
+    let required_family = output_video_family(profile.video_family, video_policy);
+    profile.video_family == required_family
+        && format_supports_video_family_copy(output_format, profile.video_family)
+}
+
+fn should_copy_audio_stream(
+    spec: &TaskSpec,
+    output_format: &str,
+    profile: &InputMediaProfile,
+    audio_policy: AudioOutputPolicy,
+) -> bool {
+    if !profile.has_audio {
+        return true;
+    }
+    if process_requires_audio_transcode(spec) {
+        return false;
+    }
+
+    match audio_policy {
+        AudioOutputPolicy::Copy => {
+            format_supports_audio_codec_copy(output_format, profile.audio_codec_name.as_deref())
+        }
+        AudioOutputPolicy::Aac => {
+            profile.audio_codec_name.as_deref() == Some("aac")
+                && format_supports_audio_codec_copy(output_format, Some("aac"))
+        }
+    }
+}
+
+fn process_requires_video_transcode(spec: &TaskSpec) -> bool {
+    spec.process.bitrate.is_some()
+        || spec.process.fps.is_some()
+        || spec.process.gop.is_some()
+        || spec
+            .process
+            .video_codec
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || spec
+            .process
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+        || spec
+            .process
+            .preset
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+}
+
+fn process_requires_audio_transcode(spec: &TaskSpec) -> bool {
+    spec.process
+        .audio_codec
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn format_supports_video_family_copy(output_format: &str, video_family: VideoCodecFamily) -> bool {
+    match output_format.trim().to_ascii_lowercase().as_str() {
+        "flv" => matches!(video_family, VideoCodecFamily::H264),
+        "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" => {
+            matches!(
+                video_family,
+                VideoCodecFamily::H264 | VideoCodecFamily::Hevc
+            )
+        }
+        _ => false,
+    }
+}
+
+fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str>) -> bool {
+    let Some(codec_name) = codec_name.map(str::trim).map(str::to_ascii_lowercase) else {
+        return false;
+    };
+
+    match output_format.trim().to_ascii_lowercase().as_str() {
+        "flv" | "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" => codec_name == "aac",
+        _ => false,
+    }
+}
+
 fn resolve_transcode_selection(
     settings: &AgentSettings,
     input_url: &str,
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
 ) -> TranscodeSelection {
-    let (input_family, output_family) = resolve_video_families(settings, input_url, video_policy);
+    let (input_family, _) = resolve_video_families(settings, input_url, video_policy);
+    resolve_transcode_selection_for_input_family(settings, input_family, video_policy, audio_policy)
+}
+
+fn resolve_transcode_selection_for_input_family(
+    settings: &AgentSettings,
+    input_family: VideoCodecFamily,
+    video_policy: VideoOutputPolicy,
+    audio_policy: AudioOutputPolicy,
+) -> TranscodeSelection {
+    let output_family = output_video_family(input_family, video_policy);
     let use_gpu = gpu_acceleration_enabled(settings)
         && !probe_gpu_devices(settings).is_empty()
         && ffmpeg_supports_hwaccel(&settings.ffmpeg_bin, "cuda")
@@ -2219,20 +2397,115 @@ fn resolve_transcode_selection(
     }
 }
 
+fn output_video_family(
+    input_family: VideoCodecFamily,
+    video_policy: VideoOutputPolicy,
+) -> VideoCodecFamily {
+    match video_policy {
+        VideoOutputPolicy::KeepSourceFamily => match input_family {
+            VideoCodecFamily::Hevc => VideoCodecFamily::Hevc,
+            _ => VideoCodecFamily::H264,
+        },
+        VideoOutputPolicy::ForceH264 => VideoCodecFamily::H264,
+    }
+}
+
 fn resolve_video_families(
     settings: &AgentSettings,
     input_url: &str,
     video_policy: VideoOutputPolicy,
 ) -> (VideoCodecFamily, VideoCodecFamily) {
     let input_family = probe_primary_video_codec_family(settings, input_url);
-    let output_family = match video_policy {
-        VideoOutputPolicy::KeepSourceFamily => match input_family {
-            VideoCodecFamily::Hevc => VideoCodecFamily::Hevc,
-            _ => VideoCodecFamily::H264,
-        },
-        VideoOutputPolicy::ForceH264 => VideoCodecFamily::H264,
-    };
+    let output_family = output_video_family(input_family, video_policy);
     (input_family, output_family)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputMediaProfile {
+    has_video: bool,
+    video_family: VideoCodecFamily,
+    has_audio: bool,
+    audio_codec_name: Option<String>,
+}
+
+impl Default for InputMediaProfile {
+    fn default() -> Self {
+        Self {
+            has_video: false,
+            video_family: VideoCodecFamily::Unknown,
+            has_audio: false,
+            audio_codec_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeStreamsResponse {
+    #[serde(default)]
+    streams: Vec<FfprobeStream>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FfprobeStream {
+    codec_type: Option<String>,
+    codec_name: Option<String>,
+}
+
+fn probe_input_media_profile(settings: &AgentSettings, input_url: &str) -> InputMediaProfile {
+    let output = std::process::Command::new(&settings.ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "json",
+            input_url,
+        ])
+        .output();
+
+    let Ok(output) = output else {
+        return InputMediaProfile::default();
+    };
+    if !output.status.success() {
+        return InputMediaProfile::default();
+    }
+
+    let Ok(parsed) = serde_json::from_slice::<FfprobeStreamsResponse>(&output.stdout) else {
+        return InputMediaProfile::default();
+    };
+
+    let mut profile = InputMediaProfile::default();
+    for stream in parsed.streams {
+        match stream.codec_type.as_deref() {
+            Some("video") if !profile.has_video => {
+                profile.has_video = true;
+                profile.video_family = match stream
+                    .codec_name
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                {
+                    Some("h264") => VideoCodecFamily::H264,
+                    Some("hevc") | Some("h265") => VideoCodecFamily::Hevc,
+                    _ => VideoCodecFamily::Unknown,
+                };
+            }
+            Some("audio") if !profile.has_audio => {
+                profile.has_audio = true;
+                profile.audio_codec_name = stream
+                    .codec_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_ascii_lowercase);
+            }
+            _ => {}
+        }
+    }
+
+    profile
 }
 
 fn maybe_add_cuda_decoder(
@@ -4515,12 +4788,39 @@ esac
         path.to_string_lossy().to_string()
     }
 
-    fn create_mock_ffprobe_binary(root: &Path, codec_name: &str) -> String {
+    fn create_mock_ffprobe_binary(
+        root: &Path,
+        video_codec_name: &str,
+        audio_codec_name: Option<&str>,
+    ) -> String {
         let path = root.join("mock-ffprobe.sh");
+        let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
+            format!(
+                r#",
+    {{"codec_type":"audio","codec_name":"{codec}"}}"#
+            )
+        });
         let body = format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
-echo "{codec_name}"
+want_json=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
+    want_json=1
+    break
+  fi
+  prev="$arg"
+done
+if [ "$want_json" = "1" ]; then
+  cat <<'EOF'
+{{"streams":[
+    {{"codec_type":"video","codec_name":"{video_codec_name}"}}{audio_stream}
+]}}
+EOF
+else
+  echo "{video_codec_name}"
+fi
 "#
         );
         write_executable(&path, &body);
@@ -4589,19 +4889,98 @@ echo "{codec_name}"
     }
 
     #[test]
+    fn build_file_transcode_plan_copy_or_transcode_copies_hevc_aac_when_mp4_allows_it() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-copy-transcode-hevc-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test-copy-hevc",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "format": "mp4"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn resolve_video_families_keeps_hevc_input_probe_for_force_h264() {
         let temp_root =
             std::env::temp_dir().join(format!("streamserver-gpu-probe-{}", Uuid::now_v7()));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
 
         let mut settings = test_settings("/tmp/work");
-        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc", None);
 
         let (input_family, output_family) =
             resolve_video_families(&settings, "/tmp/input.mp4", VideoOutputPolicy::ForceH264);
 
         assert_eq!(input_family, VideoCodecFamily::Hevc);
         assert_eq!(output_family, VideoCodecFamily::H264);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn probe_input_media_profile_reads_video_and_audio_codecs() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-media-profile-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
+
+        let profile = probe_input_media_profile(&settings, "/tmp/input.ts");
+
+        assert!(profile.has_video);
+        assert_eq!(profile.video_family, VideoCodecFamily::H264);
+        assert!(profile.has_audio);
+        assert_eq!(profile.audio_codec_name.as_deref(), Some("aac"));
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -4906,6 +5285,69 @@ echo "{codec_name}"
     }
 
     #[test]
+    fn build_multicast_bridge_plan_copy_or_transcode_keeps_video_transcode_for_live_mpegts_multicast()
+     {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-bridge-mpegts-stable-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamBridge,
+            resolved_spec: json!({
+                "type": "stream_bridge",
+                "name": "bridge-live-to-mcast-copy-or-transcode",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "rtsp",
+                    "source_mode": "live",
+                    "url": "rtsp://camera.example/live"
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "publish": {
+                    "kind": "udp_mpegts_multicast",
+                    "group": "239.20.20.20",
+                    "port": 6000,
+                    "interface_ip": "192.168.1.20",
+                    "ttl": 4,
+                    "reuse": true,
+                    "pkt_size": 1316
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn build_multicast_bridge_plan_pushes_live_input_to_external_rtmp_without_realtime_pacing() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
@@ -4963,6 +5405,67 @@ echo "{codec_name}"
             Some("1")
         );
         assert!(plan.args.iter().any(|arg| arg == "+genpts"));
+    }
+
+    #[test]
+    fn build_multicast_bridge_plan_copy_or_transcode_copies_h264_aac_to_external_rtmp() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-bridge-copy-rtmp-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamBridge,
+            resolved_spec: json!({
+                "type": "stream_bridge",
+                "name": "bridge-copy-to-rtmp",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "rtsp",
+                    "source_mode": "live",
+                    "url": "rtsp://camera.example/live"
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "publish": {
+                    "kind": "rtmp_push",
+                    "url": "rtmp://push.example.com/live/bridge-copy"
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
@@ -5148,6 +5651,105 @@ echo "{codec_name}"
     }
 
     #[test]
+    fn build_file_to_live_plan_copy_or_transcode_copies_h264_aac_into_internal_rtmp() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-file-live-copy-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-copy",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.ts"},
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_copy_or_transcode_only_transcodes_non_aac_audio() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-audio-transcode-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("mp3"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-audio-transcode",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.ts"},
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn build_file_to_live_plan_accepts_http_mp4_and_duration_limit() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
@@ -5244,7 +5846,7 @@ echo "{codec_name}"
                 "name": "relay",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "rtsp", "url": "rtsp://camera.example/live"},
-                "publish": {
+                "expose": {
                     "enable_rtsp": true,
                     "enable_rtmp": false,
                     "enable_http_ts": false,
@@ -5266,7 +5868,7 @@ echo "{codec_name}"
 
         assert_eq!(plan.startup_probe.schema.as_deref(), Some("rtsp"));
         assert_eq!(plan.startup_probe.vhost, "__defaultVhost__");
-        assert_eq!(plan.startup_probe.app, "relay");
+        assert_eq!(plan.startup_probe.app, "live");
         assert_eq!(plan.startup_probe.stream, task_id.to_string());
         assert!(
             plan.command_line
@@ -5283,7 +5885,7 @@ echo "{codec_name}"
             "name": "relay",
             "common": {"created_by": "tester"},
             "input": {"kind": "rtsp", "url": "rtsp://camera.example/live", "probe_timeout_ms": 7000},
-            "publish": {
+            "expose": {
                 "enable_rtsp": false,
                 "enable_rtmp": true,
                 "enable_http_ts": false,
