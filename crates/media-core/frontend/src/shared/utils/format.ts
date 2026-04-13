@@ -57,6 +57,23 @@ export function errorMessage(error: unknown) {
   return String(error);
 }
 
+export function taskValidationMessage(error: unknown) {
+  if (error instanceof Error) {
+    const payload = (error as Error & { payload?: Record<string, unknown> }).payload;
+    const details = isPlainObject(payload?.details) ? payload.details : null;
+    const issues = Array.isArray(details?.issues) ? details.issues : [];
+    const firstIssue = issues.find((issue) => isPlainObject(issue)) as
+      | { field?: unknown; message?: unknown }
+      | undefined;
+    const field = typeof firstIssue?.field === "string" ? firstIssue.field.trim() : "";
+    const message = typeof firstIssue?.message === "string" ? firstIssue.message.trim() : "";
+    if (message) {
+      return field ? `${field}: ${message}` : message;
+    }
+  }
+  return errorMessage(error);
+}
+
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }

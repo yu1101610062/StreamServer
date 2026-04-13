@@ -272,7 +272,13 @@ function fieldMeta(path: string): FieldMeta | null {
       test: (value) => value === "input.source_mode",
       meta: { description: "输入源语义，显式区分实时源和离线源。", enumValues: SOURCE_MODE_ENUM, required: "hls/http_ts 时必填" },
     },
-    { test: (value) => value === "input.url", meta: { description: "输入 URL 或输入文件路径。", required: "URL/文件输入时必填" } },
+    {
+      test: (value) => value === "input.url",
+      meta: {
+        description: "输入 URL；当 input.kind=file 时，这里填写相对 /data/media/work 的文件路径，前导 / 会被自动忽略。",
+        required: "URL/文件输入时必填",
+      },
+    },
     { test: (value) => value === "input.group", meta: { description: "组播地址。", required: "组播输入时必填" } },
     { test: (value) => value === "input.port", meta: { description: "输入端口。", required: "组播/GB RTP 输入时必填" } },
     { test: (value) => value === "input.interface_name", meta: { description: "绑定网卡名称。" } },
@@ -322,7 +328,10 @@ function fieldMeta(path: string): FieldMeta | null {
     },
     { test: (value) => value === "record.duration_sec", meta: { description: "录制时长上限，单位秒。" } },
     { test: (value) => value === "record.segment_sec", meta: { description: "录制分段时长，单位秒。" } },
-    { test: (value) => value === "record.save_path", meta: { description: "录制文件保存路径。" } },
+    {
+      test: (value) => value === "record.save_path",
+      meta: { description: "已忽略。stream_ingest 录制目录由系统托管生成，仅为兼容旧请求保留。" },
+    },
     { test: (value) => value === "record.as_player", meta: { description: "是否按播放器视角维持录制保活。" } },
     { test: (value) => value === "recovery", meta: { description: "失败恢复策略。" } },
     {
@@ -576,7 +585,6 @@ const streamIngestExample = {
     enabled: true,
     format: "mp4",
     duration_sec: 300,
-    save_path: "/data/zlm/www/record/project-a",
   },
   recovery: {
     policy: "auto",

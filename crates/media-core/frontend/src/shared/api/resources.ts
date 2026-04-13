@@ -34,6 +34,25 @@ export function toQuery(params: Record<string, unknown>) {
   return stringified ? `?${stringified}` : "";
 }
 
+function randomHex(bytes: number) {
+  const cryptoApi = globalThis.crypto;
+  if (cryptoApi?.getRandomValues) {
+    const buffer = new Uint8Array(bytes);
+    cryptoApi.getRandomValues(buffer);
+    return Array.from(buffer, (value) => value.toString(16).padStart(2, "0")).join("");
+  }
+
+  return Array.from({ length: bytes * 2 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+}
+
+function createIdempotencyKey() {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    return cryptoApi.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${randomHex(12)}`;
+}
+
 export const authApi = {
   currentSession: () => apiRequest<CurrentSession>("/api/v1/me"),
   login: (payload: { username: string; password: string }) =>
@@ -70,7 +89,7 @@ export const taskApi = {
   create: (payload: UnknownJson) =>
     apiRequest<TaskSummary>("/api/v1/tasks", {
       method: "POST",
-      headers: { "Idempotency-Key": crypto.randomUUID() },
+      headers: { "Idempotency-Key": createIdempotencyKey() },
       body: payload,
     }),
   list: (params: Record<string, unknown>) =>

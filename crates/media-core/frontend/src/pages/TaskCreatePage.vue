@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { useMutation, useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
+import { activeSession } from "@/shared/api/client";
 import { nodeApi, taskApi } from "@/shared/api/resources";
 import type { TaskPreview } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
@@ -17,13 +18,16 @@ import {
   normalizeDraftForTaskType,
   optionSets,
 } from "@/shared/task-create";
-import { errorMessage, formatJson } from "@/shared/utils/format";
+import { formatJson, taskValidationMessage } from "@/shared/utils/format";
 
 const router = useRouter();
 const draft = reactive(createDefaultDraft());
 const createMode = ref<"guided" | "expert">("guided");
 const selectedScenario = ref(guidedScenarios[0].id);
 const previewData = ref<TaskPreview | null>(null);
+const managedFileInputRoot = "/data/media/work";
+const managedFileHostPath = "/home/streamserver/data/media/work";
+const currentCreator = computed(() => activeSession.value?.subject?.trim() ?? "");
 
 const nodeFormatsQuery = useQuery({
   queryKey: ["task-create-publish-formats"],
@@ -38,7 +42,7 @@ const previewMutation = useMutation({
     previewData.value = result;
     ElMessage.success("规格检查通过，已生成解析结果");
   },
-  onError: (error) => ElMessage.error(errorMessage(error)),
+  onError: (error) => ElMessage.error(taskValidationMessage(error)),
 });
 
 const createMutation = useMutation({
@@ -47,7 +51,7 @@ const createMutation = useMutation({
     ElMessage.success("任务已创建");
     await router.push(`/tasks/${task.id}`);
   },
-  onError: (error) => ElMessage.error(errorMessage(error)),
+  onError: (error) => ElMessage.error(taskValidationMessage(error)),
 });
 
 const showExplicitSourceMode = computed(() => inputKindSupportsExplicitSourceMode(draft.input.kind));
@@ -58,6 +62,7 @@ const showInputMulticast = computed(() =>
   ["udp_mpegts_multicast", "rtp_multicast"].includes(draft.input.kind),
 );
 const showGbRtp = computed(() => draft.input.kind === "gb_rtp");
+const showManagedFileInputHint = computed(() => draft.input.kind === "file");
 const showPublishSection = computed(() => draft.task_type !== "stream_ingest");
 const showManagedFileOutputHint = computed(
   () => showPublishSection.value && draft.publish.kind === "file",
@@ -75,6 +80,10 @@ const showStreamSection = computed(() => draft.task_type === "stream_ingest");
 const showRecordSection = computed(() => draft.task_type === "stream_ingest");
 const previewPayload = computed(() => buildDraftPayload(draft));
 const summaryText = computed(() => humanSummary(draft));
+const managedFileInputHint = computed(
+  () =>
+    `任务里只填相对 ${managedFileInputRoot} 的路径，例如 demo.mp4 或 vod/demo.ts。文件实际应放到宿主机安装目录下的 data/media/work；当前标准实例路径是 ${managedFileHostPath}。如果误写成 /demo.mp4，系统会自动按 demo.mp4 处理。`,
+);
 const publishFormatGroups = computed(() => {
   const commonOptions = optionSets.publishFormats;
   const knownValues = new Set(commonOptions.map((item) => item.value));
@@ -149,6 +158,16 @@ watch(
       draft.publish.url = "";
     }
   },
+);
+
+watch(
+  [currentCreator, () => draft.common.created_by],
+  ([subject, createdBy]) => {
+    if (!createdBy.trim() && subject) {
+      draft.common.created_by = subject;
+    }
+  },
+  { immediate: true },
 );
 
 watch(
@@ -315,14 +334,22 @@ function previewTask() {
 
         <el-row v-if="showInputUrl" :gutter="16">
           <el-col :span="24">
-            <el-form-item :label="draft.input.kind === 'file' ? '输入文件路径' : '输入 URL'">
+            <el-form-item :label="draft.input.kind === 'file' ? '输入文件相对路径' : '输入 URL'">
               <el-input
                 v-model="draft.input.url"
-                :placeholder="draft.input.kind === 'file' ? '/data/media/input.mp4' : 'rtsp:// / rtmp:// / http://...'"
+                :placeholder="draft.input.kind === 'file' ? 'demo.mp4 或 vod/demo.ts' : 'rtsp:// / rtmp:// / http://...'"
               />
             </el-form-item>
           </el-col>
         </el-row>
+
+        <el-alert
+          v-if="showManagedFileInputHint"
+          type="info"
+          :closable="false"
+          title="本地文件输入只填相对路径"
+          :description="managedFileInputHint"
+        />
 
         <el-row v-if="showInputMulticast" :gutter="16">
           <el-col :md="8" :span="24">
@@ -526,7 +553,7 @@ function previewTask() {
           type="warning"
           :closable="false"
           title="只在你确实需要回看文件时开启录制"
-          description="MP4 适合回看和下载；HLS 适合分段输出；MP4 + HLS 适合同时兼顾两种需求。duration_sec 可以限制录制时长。"
+          description="MP4 适合回看和下载；HLS 适合分段输出；MP4 + HLS 适合同时兼顾两种需求。录制目录由系统托管生成，duration_sec 可以限制录制时长。"
         />
       </div>
       <el-form label-position="top">
@@ -553,14 +580,7 @@ function previewTask() {
               <el-input v-model="draft.record.segment_sec" placeholder="例如 60" />
             </el-form-item>
           </el-col>
-        </el-row>
-        <el-row v-if="draft.record.enabled" :gutter="16">
-          <el-col :md="18" :span="24">
-            <el-form-item label="录制路径（可选）">
-              <el-input v-model="draft.record.save_path" placeholder="/data/zlm/www/record/project-x" />
-            </el-form-item>
-          </el-col>
-          <el-col :md="6" :span="24">
+          <el-col v-if="draft.record.enabled" :md="6" :span="24">
             <el-form-item label="按播放器视角录制">
               <el-switch v-model="draft.record.as_player" />
             </el-form-item>
@@ -639,10 +659,17 @@ function previewTask() {
       <el-form label-position="top">
         <el-row :gutter="16">
           <el-col :md="12" :span="24">
+            <el-form-item label="创建人（自动）">
+              <el-input :model-value="draft.common.created_by || currentCreator || '—'" readonly />
+            </el-form-item>
+          </el-col>
+          <el-col :md="12" :span="24">
             <el-form-item label="任务回调地址（可选）">
               <el-input v-model="draft.common.callback_url" placeholder="https://biz.example.com/callback" />
             </el-form-item>
           </el-col>
+        </el-row>
+        <el-row :gutter="16">
           <el-col :md="12" :span="24">
             <el-form-item label="标签（逗号分隔，可选）">
               <el-input v-model="draft.common.labels_text" placeholder="project-a, night-shift" />

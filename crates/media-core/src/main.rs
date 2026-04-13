@@ -3807,13 +3807,11 @@ mod tests {
     #[test]
     fn build_publish_hook_response_maps_task_publish_policy() {
         let spec = serde_json::from_value::<TaskSpec>(json!({
-            "type": "file_to_live",
+            "type": "stream_ingest",
             "name": "push",
             "common": {"created_by": "tester"},
-            "input": {"kind": "file", "url": "/tmp/input.mp4"},
-            "publish": {
-                "kind": "zlm_ingest",
-                "url": "rtmp://127.0.0.1/live/stream-a",
+            "input": {"kind": "file", "url": "input.mp4"},
+            "expose": {
                 "enable_rtsp": false,
                 "enable_rtmp": true,
                 "enable_http_ts": false,
@@ -4521,7 +4519,7 @@ mod tests {
             "type": "file_transcode",
             "name": "transcode-job-01",
             "common": {"created_by": "tester", "callback_url": callback_url},
-            "input": {"kind": "file", "url": "/tmp/input-hevc.mp4"},
+            "input": {"kind": "file", "url": "input-hevc.mp4"},
             "process": {"mode": "copy_or_transcode"},
             "publish": {"kind": "file"},
             "record": {},

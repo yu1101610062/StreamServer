@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    path::{Component, Path},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -312,6 +316,41 @@ impl InputKind {
     }
 }
 
+pub const MANAGED_FILE_INPUT_ROOT: &str = "/data/media/work";
+
+pub fn normalize_relative_file_input_path(value: &str) -> Result<String, &'static str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("must be provided for file input");
+    }
+
+    let stripped = trimmed.trim_start_matches('/');
+    if stripped.is_empty() {
+        return Err("must be a relative path under /data/media/work");
+    }
+    if stripped.contains("://") {
+        return Err("must be a relative path under /data/media/work, not a URL");
+    }
+
+    let mut segments = Vec::new();
+    for component in Path::new(stripped).components() {
+        match component {
+            Component::Normal(segment) => segments.push(segment.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => return Err("must not contain '..' segments"),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("must be a relative path under /data/media/work");
+            }
+        }
+    }
+
+    if segments.is_empty() {
+        return Err("must be a relative path under /data/media/work");
+    }
+
+    Ok(segments.join("/"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PublishTargetKind {
@@ -440,6 +479,16 @@ impl TaskSpec {
             resolved.expose.stop_on_no_reader =
                 Some(resolved.expose.stop_on_no_reader.unwrap_or(false));
             resolved.record.enabled = Some(resolved.record.enabled.unwrap_or(false));
+            // Recording output paths are now fully managed by the system for
+            // stream_ingest tasks, so any client-provided override is ignored.
+            resolved.record.save_path = None;
+        }
+        if matches!(resolved.input.kind, Some(InputKind::File)) {
+            if let Some(url) = resolved.input.url.as_deref() {
+                if let Ok(normalized) = normalize_relative_file_input_path(url) {
+                    resolved.input.url = Some(normalized);
+                }
+            }
         }
         if matches!(resolved.input.kind, Some(InputKind::GbRtp)) {
             resolved.input.tcp_mode = Some(resolved.input.tcp_mode.unwrap_or(0));
@@ -521,6 +570,17 @@ impl TaskSpec {
 
         match self.input.kind {
             None => issues.push(ValidationIssue::new("input.kind", "must be provided")),
+            Some(InputKind::File) => match self.input.url.as_deref() {
+                Some(value) => {
+                    if let Err(message) = normalize_relative_file_input_path(value) {
+                        issues.push(ValidationIssue::new("input.url", message));
+                    }
+                }
+                None => issues.push(ValidationIssue::new(
+                    "input.url",
+                    "must be provided for file input",
+                )),
+            },
             Some(kind) if kind.is_url_based() => {
                 if self
                     .input
@@ -1208,8 +1268,34 @@ mod tests {
         assert_eq!(resolved.expose.enable_hls, Some(false));
         assert_eq!(resolved.expose.stop_on_no_reader, Some(false));
         assert_eq!(resolved.record.enabled, Some(false));
+        assert_eq!(resolved.record.save_path, None);
         assert_eq!(resolved.recovery.policy, Some(RecoveryPolicy::Auto));
         assert_eq!(resolved.schedule.start_mode, Some(StartMode::Immediate));
+    }
+
+    #[test]
+    fn resolve_ignores_stream_ingest_record_save_path_override() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.record.enabled = Some(true);
+        task.record.save_path = Some("/data/zlm/www/record/custom".to_string());
+
+        let resolved = task.resolved();
+
+        assert_eq!(resolved.record.enabled, Some(true));
+        assert_eq!(resolved.record.save_path, None);
+    }
+
+    #[test]
+    fn resolve_normalizes_file_input_relative_path() {
+        let mut task = sample_task(TaskType::FileTranscode);
+        task.input.kind = Some(InputKind::File);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("///vod/./demo.ts".to_string());
+        task.publish.kind = Some(PublishTargetKind::File);
+
+        let resolved = task.resolved();
+
+        assert_eq!(resolved.input.url.as_deref(), Some("vod/demo.ts"));
     }
 
     #[test]
@@ -1694,7 +1780,7 @@ mod tests {
             input: InputSpec {
                 kind: Some(InputKind::File),
                 source_mode: Some(SourceMode::Vod),
-                url: Some("/tmp/input.mp4".to_string()),
+                url: Some("input.mp4".to_string()),
                 ..InputSpec::default()
             },
             stream: StreamSpec {
@@ -1716,5 +1802,45 @@ mod tests {
 
         let error = task.validate().expect_err("validation should fail");
         assert!(error.issues.iter().any(|issue| issue.field == "stream"));
+    }
+
+    #[test]
+    fn validate_allows_file_input_with_leading_slash() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::File);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("/demo.mp4".to_string());
+
+        task.validate()
+            .expect("validation should accept a file input path with a leading slash");
+    }
+
+    #[test]
+    fn validate_rejects_file_input_with_parent_dir() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::File);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("../demo.mp4".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(error.issues.iter().any(|issue| {
+            issue.field == "input.url" && issue.message.contains("must not contain '..' segments")
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_file_input_with_url_value() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::File);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("http://example.com/demo.mp4".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| { issue.field == "input.url" && issue.message.contains("not a URL") })
+        );
     }
 }

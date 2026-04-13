@@ -123,6 +123,7 @@
 能力边界说明：
 
 - `input.kind` 表示任务直接接收的输入源类型。
+- `input.kind=file` 时，`input.url` 必须填写相对 `/data/media/work` 的文件路径；如果误写成 `/demo.mp4`，系统会自动按 `demo.mp4` 处理。
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；其他输入类型按规则自动推断。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
 - `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。

@@ -11,7 +11,8 @@ pub use paging::Page;
 pub use state_machine::{TaskOperation, TaskStateError};
 pub use task::{
     AttemptStatus, BackoffPolicy, CommonSpec, EventSource, ExposeSpec, InputKind, InputSpec,
-    ProcessSpec, PublishSpec, PublishTargetKind, RecordFormat, RecordSpec, RecoveryPolicy,
-    RecoverySpec, ResourceSpec, ScheduleSpec, SourceMode, StartMode, StreamSpec, TaskSpec,
-    TaskStatus, TaskType, TaskValidationError, ValidationIssue, WorkerKind,
+    MANAGED_FILE_INPUT_ROOT, ProcessSpec, PublishSpec, PublishTargetKind, RecordFormat, RecordSpec,
+    RecoveryPolicy, RecoverySpec, ResourceSpec, ScheduleSpec, SourceMode, StartMode, StreamSpec,
+    TaskSpec, TaskStatus, TaskType, TaskValidationError, ValidationIssue, WorkerKind,
+    normalize_relative_file_input_path,
 };

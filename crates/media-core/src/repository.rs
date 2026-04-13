@@ -6095,7 +6095,7 @@ mod tests {
             "type": "file_transcode",
             "name": "artifact-test",
             "common": {"created_by": "tester"},
-            "input": {"kind": "file", "url": "/tmp/input.mp4"},
+            "input": {"kind": "file", "url": "input.mp4"},
             "process": {"mode": "copy_or_transcode"},
             "record": {},
             "publish": {

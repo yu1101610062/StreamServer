@@ -19,6 +19,7 @@ use chrono::{DateTime, Local, Utc};
 use media_domain::{
     ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy,
     RuntimeHandle, RuntimeState, SourceMode, TaskSpec, TaskType, WorkerKind,
+    normalize_relative_file_input_path,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -1524,7 +1525,6 @@ fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
 }
 
 const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
-const LEGACY_ZLM_RECORD_ROOT: &str = "/data/zlm/record";
 const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
 const BRIDGE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/bridge";
 
@@ -1716,10 +1716,7 @@ fn build_file_to_live_plan(
         {
             media_domain::RecordFormat::Mp4 => {
                 let record_format = "mp4".to_string();
-                let record_path =
-                    spec.record.save_path.clone().unwrap_or_else(|| {
-                        work_dir.join("record.mp4").to_string_lossy().to_string()
-                    });
+                let record_path = work_dir.join("record.mp4").to_string_lossy().to_string();
                 let tee_target = format!(
                     "[f={}:onfail=ignore]{}|[f={}:onfail=ignore]{}",
                     publish_output.format,
@@ -2038,14 +2035,24 @@ struct TranscodeSelection {
 
 fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String, ExecutorError> {
     match input.kind {
+        Some(InputKind::File) => {
+            let raw_value = input.url.as_deref().ok_or_else(|| {
+                ExecutorError::InvalidRequest("input.url must be provided".to_string())
+            })?;
+            let normalized = normalize_relative_file_input_path(raw_value)
+                .map_err(|message| ExecutorError::InvalidRequest(format!("input.url {message}")))?;
+            Ok(PathBuf::from(&settings.work_root)
+                .join(normalized)
+                .to_string_lossy()
+                .to_string())
+        }
         Some(
             InputKind::Rtsp
             | InputKind::Rtmp
             | InputKind::Hls
             | InputKind::HttpMp4
             | InputKind::HttpFlv
-            | InputKind::HttpTs
-            | InputKind::File,
+            | InputKind::HttpTs,
         ) => input
             .url
             .clone()
@@ -2529,7 +2536,7 @@ fn build_open_rtp_server_params(plan: &RtpReceivePlan) -> Vec<(String, String)> 
 
 fn build_live_relay_recording(
     spec: &TaskSpec,
-    work_dir: &Path,
+    _work_dir: &Path,
 ) -> Result<Option<LiveRelayRecording>, ExecutorError> {
     if !spec.record.enabled.unwrap_or(false) {
         return Ok(None);
@@ -2544,7 +2551,7 @@ fn build_live_relay_recording(
         media_domain::RecordFormat::Hls => vec![ZlmRecordKind::Hls],
         media_domain::RecordFormat::Both => vec![ZlmRecordKind::Mp4, ZlmRecordKind::Hls],
     };
-    let root_path = normalize_record_root(spec.record.save_path.as_deref(), work_dir);
+    let root_path = ZLM_RECORD_HTTP_ROOT.to_string();
 
     Ok(Some(LiveRelayRecording {
         formats,
@@ -2558,43 +2565,6 @@ fn build_live_relay_recording(
         started: false,
         failed: false,
     }))
-}
-
-fn normalize_record_root(save_path: Option<&str>, work_dir: &Path) -> String {
-    let Some(save_path) = save_path.map(str::trim).filter(|value| !value.is_empty()) else {
-        return ZLM_RECORD_HTTP_ROOT.to_string();
-    };
-    let path = PathBuf::from(save_path);
-    let root = if path.extension().is_some() {
-        path.parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or(work_dir)
-            .to_path_buf()
-    } else {
-        path
-    };
-    normalize_record_root_path(&root)
-}
-
-fn normalize_record_root_path(root: &Path) -> String {
-    if root.as_os_str().is_empty() {
-        return ZLM_RECORD_HTTP_ROOT.to_string();
-    }
-
-    if root.is_relative() {
-        return Path::new(ZLM_RECORD_HTTP_ROOT)
-            .join(root)
-            .to_string_lossy()
-            .to_string();
-    }
-
-    match root.strip_prefix(LEGACY_ZLM_RECORD_ROOT) {
-        Ok(suffix) => Path::new(ZLM_RECORD_HTTP_ROOT)
-            .join(suffix)
-            .to_string_lossy()
-            .to_string(),
-        Err(_) => root.to_string_lossy().to_string(),
-    }
 }
 
 fn build_startup_probe(task_id: Uuid, spec: &TaskSpec) -> Result<StartupProbe, ExecutorError> {
@@ -4594,7 +4564,7 @@ echo "{codec_name}"
                 "type": "file_transcode",
                 "name": "test",
                 "common": {"created_by": "tester"},
-                "input": {"kind": "file", "url": "/tmp/input.mp4"},
+                "input": {"kind": "file", "url": "input.mp4"},
                 "process": {"mode": "copy_or_transcode"},
                 "record": {},
                 "publish": {
@@ -4674,7 +4644,7 @@ echo "{codec_name}"
                 "type": "file_transcode",
                 "name": "test",
                 "common": {"created_by": "tester"},
-                "input": {"kind": "file", "url": "/tmp/input.mp4"},
+                "input": {"kind": "file", "url": "input.mp4"},
                 "process": {"mode": "copy_or_transcode"},
                 "record": {},
                 "publish": {
@@ -4766,7 +4736,7 @@ echo "{codec_name}"
                 "type": "file_transcode",
                 "name": "test",
                 "common": {"created_by": "tester"},
-                "input": {"kind": "file", "url": "/tmp/input.mp4"},
+                "input": {"kind": "file", "url": "input.mp4"},
                 "process": {"mode": "copy_or_transcode"},
                 "record": {},
                 "publish": {
@@ -5090,6 +5060,52 @@ echo "{codec_name}"
     }
 
     #[test]
+    fn build_input_url_resolves_relative_file_input_under_work_root() {
+        let settings = test_settings("/tmp/work");
+        let input = InputSpec {
+            kind: Some(InputKind::File),
+            url: Some("vod/demo.ts".to_string()),
+            ..InputSpec::default()
+        };
+
+        let input_url = build_input_url(&settings, &input).expect("input url should resolve");
+
+        assert_eq!(input_url, "/tmp/work/vod/demo.ts");
+    }
+
+    #[test]
+    fn build_input_url_strips_leading_slash_for_file_input() {
+        let settings = test_settings("/tmp/work");
+        let input = InputSpec {
+            kind: Some(InputKind::File),
+            url: Some("/demo.mp4".to_string()),
+            ..InputSpec::default()
+        };
+
+        let input_url = build_input_url(&settings, &input).expect("input url should resolve");
+
+        assert_eq!(input_url, "/tmp/work/demo.mp4");
+    }
+
+    #[test]
+    fn build_input_url_rejects_parent_dir_in_file_input() {
+        let settings = test_settings("/tmp/work");
+        let input = InputSpec {
+            kind: Some(InputKind::File),
+            url: Some("../demo.mp4".to_string()),
+            ..InputSpec::default()
+        };
+
+        let error = build_input_url(&settings, &input).expect_err("input url should fail");
+
+        assert!(matches!(
+            error,
+            ExecutorError::InvalidRequest(message)
+                if message.contains("must not contain '..' segments")
+        ));
+    }
+
+    #[test]
     fn build_file_to_live_plan_uses_realtime_tee_output() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
@@ -5100,16 +5116,12 @@ echo "{codec_name}"
                 "type": "stream_ingest",
                 "name": "file-live",
                 "common": {"created_by": "tester"},
-                "input": {"kind": "file", "url": "/tmp/input.mp4"},
+                "input": {"kind": "file", "url": "input.mp4"},
+                "stream": {"app": "live", "name": "stream"},
                 "process": {"mode": "copy_or_transcode"},
-                "publish": {
-                    "kind": "zlm_ingest",
-                    "url": "rtmp://127.0.0.1/live/stream"
-                },
                 "record": {
                     "enabled": true,
-                    "format": "mp4",
-                    "save_path": "/tmp/archive.mp4"
+                    "format": "mp4"
                 },
                 "recovery": {},
                 "schedule": {"start_mode": "immediate"},
@@ -5130,7 +5142,7 @@ echo "{codec_name}"
             plan.outputs,
             vec![
                 "rtmp://127.0.0.1/live/stream".to_string(),
-                "/tmp/archive.mp4".to_string()
+                "/tmp/work/00000000-0000-0000-0000-000000000000/attempt-1/record.mp4".to_string()
             ]
         );
     }
@@ -5147,16 +5159,12 @@ echo "{codec_name}"
                 "name": "file-live-http",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "http_mp4", "url": "http://vod.example.com/archive.mp4"},
+                "stream": {"app": "live", "name": "stream"},
                 "process": {"mode": "copy_or_transcode"},
-                "publish": {
-                    "kind": "zlm_ingest",
-                    "url": "rtmp://127.0.0.1/live/stream"
-                },
                 "record": {
                     "enabled": true,
                     "format": "mp4",
-                    "duration_sec": 300,
-                    "save_path": "/tmp/archive.mp4"
+                    "duration_sec": 300
                 },
                 "recovery": {},
                 "schedule": {"start_mode": "immediate"},
@@ -5316,7 +5324,7 @@ echo "{codec_name}"
     }
 
     #[test]
-    fn build_live_relay_plan_includes_recording_root_when_enabled() {
+    fn build_live_relay_plan_uses_managed_recording_root_when_enabled() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::now_v7(),
@@ -5331,7 +5339,6 @@ echo "{codec_name}"
                 "record": {
                     "enabled": true,
                     "format": "mp4",
-                    "save_path": "/var/media/archive/session.mp4",
                     "segment_sec": 120
                 },
                 "recovery": {},
@@ -5348,13 +5355,13 @@ echo "{codec_name}"
         let recording = plan.recording.expect("recording should be present");
 
         assert_eq!(recording.formats, vec![ZlmRecordKind::Mp4]);
-        assert_eq!(recording.root_path, "/var/media/archive");
+        assert_eq!(recording.root_path, "/data/zlm/www/record");
         assert_eq!(recording.duration_sec, None);
         assert_eq!(recording.segment_sec, Some(120));
         assert!(
             plan.outputs
                 .iter()
-                .any(|output| output == "/var/media/archive")
+                .any(|output| output == "/data/zlm/www/record")
         );
     }
 
@@ -5410,26 +5417,37 @@ echo "{codec_name}"
     }
 
     #[test]
-    fn normalize_record_root_defaults_to_http_record_root() {
-        assert_eq!(
-            normalize_record_root(None, Path::new("/tmp/work")),
-            "/data/zlm/www/record"
-        );
-    }
+    fn build_live_relay_plan_ignores_record_save_path_override() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "relay-record-custom-path",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "rtsp", "url": "rtsp://camera.example/live"},
+                "publish": {},
+                "record": {
+                    "enabled": true,
+                    "format": "hls",
+                    "save_path": "/var/media/archive/custom"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
 
-    #[test]
-    fn normalize_record_root_maps_legacy_record_root_into_http_root() {
-        assert_eq!(
-            normalize_record_root(
-                Some("/data/zlm/record/live/archive.mp4"),
-                Path::new("/tmp/work")
-            ),
-            "/data/zlm/www/record/live"
-        );
-        assert_eq!(
-            normalize_record_root(Some("/data/zlm/record/live"), Path::new("/tmp/work")),
-            "/data/zlm/www/record/live"
-        );
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_live_relay_plan(&settings, &request, &spec).expect("plan should build");
+        let recording = plan.recording.expect("recording should be present");
+
+        assert_eq!(recording.root_path, "/data/zlm/www/record");
     }
 
     #[test]

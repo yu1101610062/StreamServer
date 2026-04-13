@@ -14,6 +14,7 @@ import {
   sourceModeLabel,
   taskTypeLabel,
 } from "@/shared/labels";
+import { activeSession } from "@/shared/api/client";
 import { isPlainObject } from "@/shared/utils/format";
 
 export interface TaskCreateDraft {
@@ -73,7 +74,6 @@ export interface TaskCreateDraft {
     format: string;
     duration_sec: string;
     segment_sec: string;
-    save_path: string;
     as_player: boolean;
   };
   recovery: {
@@ -215,7 +215,6 @@ export function createDefaultDraft(): TaskCreateDraft {
       format: "",
       duration_sec: "",
       segment_sec: "",
-      save_path: "",
       as_player: false,
     },
     recovery: {
@@ -261,7 +260,11 @@ export function normalizeDraftForTaskType(draft: TaskCreateDraft, taskType: stri
 }
 
 function toOptionalNumber(value: string) {
-  const numeric = Number(String(value ?? "").trim());
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const numeric = Number(trimmed);
   return Number.isFinite(numeric) ? numeric : undefined;
 }
 
@@ -283,6 +286,18 @@ function setIfPresent(target: Record<string, unknown>, key: string, value: strin
   if (trimmed) {
     target[key] = trimmed;
   }
+}
+
+function normalizeLocalFileInputPath(value: string) {
+  return value.trim().replace(/^\/+/, "");
+}
+
+function resolveCreatedBy(value: string) {
+  const trimmed = value.trim();
+  if (trimmed) {
+    return trimmed;
+  }
+  return activeSession.value?.subject?.trim() ?? "";
 }
 
 function setIfNumber(target: Record<string, unknown>, key: string, value: string) {
@@ -330,6 +345,7 @@ function mergeInto(target: Record<string, unknown>, overlay: Record<string, unkn
 }
 
 export function buildDraftPayload(draft: TaskCreateDraft) {
+  const isStreamIngest = draft.task_type === "stream_ingest";
   const payload: Record<string, unknown> = {
     type: draft.task_type,
     name: draft.name.trim(),
@@ -346,13 +362,17 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
     resource: {},
   };
 
-  setIfPresent(payload.common as Record<string, unknown>, "created_by", draft.common.created_by);
+  setIfPresent(payload.common as Record<string, unknown>, "created_by", resolveCreatedBy(draft.common.created_by));
   setIfPresent(payload.common as Record<string, unknown>, "callback_url", draft.common.callback_url);
   setIfList(payload.common as Record<string, unknown>, "labels", draft.common.labels_text);
 
   setIfPresent(payload.input as Record<string, unknown>, "kind", draft.input.kind);
   setIfPresent(payload.input as Record<string, unknown>, "source_mode", draft.input.source_mode);
-  setIfPresent(payload.input as Record<string, unknown>, "url", draft.input.url);
+  setIfPresent(
+    payload.input as Record<string, unknown>,
+    "url",
+    draft.input.kind === "file" ? normalizeLocalFileInputPath(draft.input.url) : draft.input.url,
+  );
   setIfPresent(payload.input as Record<string, unknown>, "group", draft.input.group);
   setIfNumber(payload.input as Record<string, unknown>, "port", draft.input.port);
   setIfPresent(payload.input as Record<string, unknown>, "interface_name", draft.input.interface_name);
@@ -368,20 +388,26 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
   setIfNumber(payload.process as Record<string, unknown>, "fps", draft.process.fps);
   setIfNumber(payload.process as Record<string, unknown>, "gop", draft.process.gop);
 
-  setIfPresent(payload.stream as Record<string, unknown>, "app", draft.stream.app);
-  setIfPresent(payload.stream as Record<string, unknown>, "name", draft.stream.name);
-  setIfPresent(payload.stream as Record<string, unknown>, "vhost", draft.stream.vhost);
+  if (isStreamIngest) {
+    setIfPresent(payload.stream as Record<string, unknown>, "app", draft.stream.app);
+    setIfPresent(payload.stream as Record<string, unknown>, "name", draft.stream.name);
+    setIfPresent(payload.stream as Record<string, unknown>, "vhost", draft.stream.vhost);
 
-  [
-    "enable_rtsp",
-    "enable_rtmp",
-    "enable_http_ts",
-    "enable_http_fmp4",
-    "enable_hls",
-    "stop_on_no_reader",
-  ].forEach((key) => {
-    setIfBoolean(payload.expose as Record<string, unknown>, key, draft.expose[key as keyof typeof draft.expose] as boolean);
-  });
+    [
+      "enable_rtsp",
+      "enable_rtmp",
+      "enable_http_ts",
+      "enable_http_fmp4",
+      "enable_hls",
+      "stop_on_no_reader",
+    ].forEach((key) => {
+      setIfBoolean(
+        payload.expose as Record<string, unknown>,
+        key,
+        draft.expose[key as keyof typeof draft.expose] as boolean,
+      );
+    });
+  }
 
   setIfPresent(payload.publish as Record<string, unknown>, "kind", draft.publish.kind);
   if (draft.publish.kind === "rtmp_push") {
@@ -394,12 +420,15 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
   setIfNumber(payload.publish as Record<string, unknown>, "ttl", draft.publish.ttl);
   setIfPresent(payload.publish as Record<string, unknown>, "format", draft.publish.format);
 
-  setIfBoolean(payload.record as Record<string, unknown>, "enabled", draft.record.enabled);
-  setIfPresent(payload.record as Record<string, unknown>, "format", draft.record.format);
-  setIfNumber(payload.record as Record<string, unknown>, "duration_sec", draft.record.duration_sec);
-  setIfNumber(payload.record as Record<string, unknown>, "segment_sec", draft.record.segment_sec);
-  setIfPresent(payload.record as Record<string, unknown>, "save_path", draft.record.save_path);
-  setIfBoolean(payload.record as Record<string, unknown>, "as_player", draft.record.as_player);
+  if (isStreamIngest) {
+    setIfBoolean(payload.record as Record<string, unknown>, "enabled", draft.record.enabled);
+    if (draft.record.enabled) {
+      setIfPresent(payload.record as Record<string, unknown>, "format", draft.record.format);
+      setIfNumber(payload.record as Record<string, unknown>, "duration_sec", draft.record.duration_sec);
+      setIfNumber(payload.record as Record<string, unknown>, "segment_sec", draft.record.segment_sec);
+      setIfBoolean(payload.record as Record<string, unknown>, "as_player", draft.record.as_player);
+    }
+  }
 
   setIfPresent(payload.recovery as Record<string, unknown>, "policy", draft.recovery.policy);
   setIfPresent(payload.recovery as Record<string, unknown>, "resume_mode", draft.recovery.resume_mode);
@@ -430,7 +459,7 @@ export function humanSummary(draft: TaskCreateDraft) {
     draft.publish.kind === "rtmp_push" && draft.publish.url.trim()
       ? `推送到 ${draft.publish.url.trim()}`
       : "",
-    draft.record.enabled ? `并开启录制` : "",
+    draft.record.enabled ? `并开启系统托管录制` : "",
   ].filter(Boolean);
   return `${parts.join("，")}。`;
 }
