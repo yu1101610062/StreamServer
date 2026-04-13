@@ -72,6 +72,24 @@ describe("buildDraftPayload", () => {
     });
   });
 
+  it("keeps required_labels and strips preferred_labels from advanced json overrides", () => {
+    const draft = createDefaultDraft();
+    draft.name = "labels";
+    draft.common.created_by = "alice";
+    draft.resource.required_labels_text = "gpu, beijing-idc";
+    draft.advanced_json = JSON.stringify({
+      resource: {
+        preferred_labels: ["archive"],
+      },
+    });
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.resource).toEqual({
+      required_labels: ["gpu", "beijing-idc"],
+    });
+  });
+
   it("does not turn empty numeric fields into zero-valued publish settings", () => {
     const draft = createDefaultDraft();
     draft.name = "ingest-http-ts";

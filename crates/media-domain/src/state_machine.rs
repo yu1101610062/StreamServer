@@ -20,6 +20,7 @@ impl TaskStatus {
             (Created, Validating)
                 | (Validating, Queued)
                 | (Queued, Dispatching)
+                | (Queued, Failed)
                 | (Dispatching, Queued)
                 | (Dispatching, Starting)
                 | (Starting, Running)

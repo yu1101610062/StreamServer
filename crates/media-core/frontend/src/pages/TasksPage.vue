@@ -122,6 +122,32 @@ function rowActions(task: TaskSummary) {
     canClone: ["SUCCEEDED", "FAILED", "CANCELED", "LOST"].includes(task.status),
   };
 }
+
+function transcodeLabel(task: TaskSummary) {
+  switch (task.transcode_mode) {
+    case "none":
+      return "不转码";
+    case "adaptive":
+      return "自适应";
+    case "forced":
+      return "转码";
+    default:
+      return "—";
+  }
+}
+
+function transcodeTagType(task: TaskSummary) {
+  switch (task.transcode_mode) {
+    case "none":
+      return "success";
+    case "adaptive":
+      return "warning";
+    case "forced":
+      return "danger";
+    default:
+      return "info";
+  }
+}
 </script>
 
 <template>
@@ -189,6 +215,11 @@ function rowActions(task: TaskSummary) {
         <el-table-column label="状态" min-width="120">
           <template #default="{ row }">
             <StatusTag :status="row.status" />
+          </template>
+        </el-table-column>
+        <el-table-column label="转码" min-width="120">
+          <template #default="{ row }">
+            <el-tag :type="transcodeTagType(row)" effect="light" round>{{ transcodeLabel(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column prop="priority" label="优先级" min-width="100" />

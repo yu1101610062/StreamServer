@@ -7,9 +7,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, AttemptStatus, CapabilitySnapshot, EventSource, GpuDeviceInfo,
-    GpuRuntimeStats, HeartbeatSnapshot, Page, PublishTargetKind, RecoveryPolicy, StartMode,
-    TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType, TaskValidationError,
-    ValidationIssue, WorkerKind,
+    GpuRuntimeStats, HeartbeatSnapshot, InputKind, Page, PublishTargetKind, RecoveryPolicy,
+    SourceMode, StartMode, TaskOperation, TaskSpec, TaskStateError, TaskStatus, TaskType,
+    TaskValidationError, ValidationIssue, WorkerKind,
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -440,6 +440,7 @@ impl TaskRepository {
             updated_at,
             started_at: None,
             finished_at: None,
+            transcode_mode: task_summary_transcode_mode(&resolved_spec).map(str::to_string),
         };
 
         let mut tx = self.pool.begin().await?;
@@ -588,7 +589,8 @@ impl TaskRepository {
               created_at,
               updated_at,
               started_at,
-              finished_at
+              finished_at,
+              resolved_spec
             from tasks
             where 1 = 1
             "#,
@@ -1619,6 +1621,7 @@ impl TaskRepository {
             updated_at: now,
             started_at: None,
             finished_at: None,
+            transcode_mode: task_summary_transcode_mode(&resolved_spec).map(str::to_string),
         };
 
         sqlx::query(
@@ -2074,6 +2077,7 @@ impl TaskRepository {
             updated_at: now,
             started_at: None,
             finished_at: None,
+            transcode_mode: task_summary_transcode_mode(&resolved_spec).map(str::to_string),
         };
 
         let mut tx = self.pool.begin().await?;
@@ -2197,6 +2201,155 @@ impl TaskRepository {
 
         tx.commit().await?;
         Ok(summary)
+    }
+
+    pub async fn fail_queued_task(
+        &self,
+        task_id: Uuid,
+        failure_code: &str,
+        failure_reason: &str,
+    ) -> Result<TaskSummary, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              status::text as status,
+              priority,
+              created_by,
+              assigned_node_id,
+              current_attempt_no,
+              created_at,
+              updated_at,
+              started_at,
+              finished_at
+            from tasks
+            where id = $1
+            for update
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepoError::TaskNotFound(task_id))?;
+
+        let current = TaskSummary::from_row(&row)?;
+        if current.status != TaskStatus::Queued {
+            return Err(RepoError::TaskNotDispatchable(current.status));
+        }
+
+        current.status.ensure_transition(TaskStatus::Failed)?;
+
+        let now = Utc::now();
+        let attempt_no = if current.current_attempt_no > 0 {
+            current.current_attempt_no
+        } else {
+            1
+        };
+
+        if current.current_attempt_no > 0 {
+            sqlx::query(
+                r#"
+                update task_attempts
+                   set status = 'FAILED'::attempt_status,
+                       node_id = null,
+                       failure_code = $1,
+                       failure_reason = $2,
+                       ended_at = $3
+                 where task_id = $4
+                   and attempt_no = $5
+                   and status = 'PENDING'::attempt_status
+                "#,
+            )
+            .bind(failure_code)
+            .bind(failure_reason)
+            .bind(now)
+            .bind(task_id)
+            .bind(attempt_no)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                insert into task_attempts (
+                  id, task_id, attempt_no, node_id, worker_kind, status,
+                  pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+                  rtp_port, exit_code, failure_code, failure_reason,
+                  checkpoint_json, started_at, ended_at, created_at
+                ) values (
+                  $1, $2, $3, null, $4::worker_kind, 'FAILED'::attempt_status,
+                  null, null, null, null, null, null,
+                  null, null, $5, $6,
+                  null, null, $7, $7
+                )
+                "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(task_id)
+            .bind(attempt_no)
+            .bind(current.task_type.default_worker_kind().as_str())
+            .bind(failure_code)
+            .bind(failure_reason)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query(
+            r#"
+            update tasks
+               set status = 'FAILED'::task_status,
+                   assigned_node_id = null,
+                   current_attempt_no = $1,
+                   updated_at = $2,
+                   finished_at = $2
+             where id = $3
+            "#,
+        )
+        .bind(attempt_no)
+        .bind(now)
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
+        self.insert_event(
+            &mut tx,
+            task_id,
+            None,
+            Some(attempt_no),
+            EventSource::Core,
+            "task_failed",
+            "error",
+            json!({
+                "from": current.status,
+                "to": TaskStatus::Failed,
+                "attempt_no": attempt_no,
+                "failure_code": failure_code,
+                "failure_reason": failure_reason,
+            }),
+        )
+        .await?;
+
+        self.enqueue_task_completed_callback(
+            &mut tx,
+            task_id,
+            attempt_no,
+            "terminal_state",
+            now + self.callback_settle_delay,
+        )
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(TaskSummary {
+            status: TaskStatus::Failed,
+            current_attempt_no: attempt_no,
+            updated_at: now,
+            finished_at: Some(now),
+            ..current
+        })
     }
 
     pub async fn prepare_task_dispatch(
@@ -3621,7 +3774,8 @@ impl TaskRepository {
               created_at,
               updated_at,
               started_at,
-              finished_at
+              finished_at,
+              resolved_spec
             from tasks
             where id = $1
             "#,
@@ -5381,12 +5535,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
             json!(spec.resource.required_labels),
         );
     }
-    if !spec.resource.preferred_labels.is_empty() {
-        resource.insert(
-            "preferred_labels".to_string(),
-            json!(spec.resource.preferred_labels),
-        );
-    }
     if !resource.is_empty() {
         overlay.insert("resource".to_string(), Value::Object(resource));
     }
@@ -5602,6 +5750,10 @@ pub struct TaskListFilter {
     pub sort_order: Option<String>,
 }
 
+const TASK_TRANSCODE_NONE: &str = "none";
+const TASK_TRANSCODE_ADAPTIVE: &str = "adaptive";
+const TASK_TRANSCODE_FORCED: &str = "forced";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub id: Uuid,
@@ -5617,6 +5769,8 @@ pub struct TaskSummary {
     pub updated_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcode_mode: Option<String>,
 }
 
 impl TaskSummary {
@@ -5630,6 +5784,10 @@ impl TaskSummary {
         let status = TaskStatus::from_str(row.try_get::<&str, _>("status")?)
             .map_err(RepoError::ParseEnum)?;
         let priority = row.try_get::<i32, _>("priority")?;
+        let resolved_spec = optional_json_column(row, "resolved_spec")?;
+        let transcode_mode = resolved_spec
+            .as_ref()
+            .and_then(task_summary_transcode_mode_from_value);
 
         Ok(Self {
             id: row.try_get("id")?,
@@ -5644,7 +5802,124 @@ impl TaskSummary {
             updated_at: row.try_get("updated_at")?,
             started_at: row.try_get("started_at")?,
             finished_at: row.try_get("finished_at")?,
+            transcode_mode,
         })
+    }
+}
+
+fn optional_json_column(row: &PgRow, column: &str) -> Result<Option<Value>, RepoError> {
+    match row.try_get::<Option<Value>, _>(column) {
+        Ok(value) => Ok(value),
+        Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn task_summary_transcode_mode_from_value(value: &Value) -> Option<String> {
+    serde_json::from_value::<TaskSpec>(value.clone())
+        .ok()
+        .and_then(|spec| task_summary_transcode_mode(&spec).map(str::to_string))
+}
+
+fn task_summary_transcode_mode(spec: &TaskSpec) -> Option<&'static str> {
+    match task_runtime_mode(spec) {
+        TaskRuntimeMode::ZlmProxy | TaskRuntimeMode::ZlmRtpServer => Some(TASK_TRANSCODE_NONE),
+        TaskRuntimeMode::ManagedProcess => {
+            if should_force_bridge_stabilization_transcode(spec) {
+                Some(TASK_TRANSCODE_FORCED)
+            } else {
+                let default_mode = match spec.task_type {
+                    TaskType::StreamBridge => "passthrough",
+                    TaskType::StreamIngest | TaskType::FileTranscode => "copy_or_transcode",
+                };
+                effective_transcode_mode(spec.process.mode.as_deref(), default_mode)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskRuntimeMode {
+    ZlmProxy,
+    ZlmRtpServer,
+    ManagedProcess,
+}
+
+fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
+    match spec.task_type {
+        TaskType::FileTranscode | TaskType::StreamBridge => TaskRuntimeMode::ManagedProcess,
+        TaskType::StreamIngest => match (spec.input.kind, spec.input.source_mode) {
+            (Some(InputKind::GbRtp), _) => TaskRuntimeMode::ZlmRtpServer,
+            (Some(InputKind::Rtsp | InputKind::Rtmp | InputKind::HttpFlv), _) => {
+                TaskRuntimeMode::ZlmProxy
+            }
+            (Some(InputKind::Hls | InputKind::HttpTs), Some(SourceMode::Live)) => {
+                TaskRuntimeMode::ZlmProxy
+            }
+            _ => TaskRuntimeMode::ManagedProcess,
+        },
+    }
+}
+
+fn effective_transcode_mode(mode: Option<&str>, default_mode: &str) -> Option<&'static str> {
+    match mode.unwrap_or(default_mode) {
+        "passthrough" => Some(TASK_TRANSCODE_NONE),
+        "copy_or_transcode" => Some(TASK_TRANSCODE_ADAPTIVE),
+        "force_transcode" => Some(TASK_TRANSCODE_FORCED),
+        _ => None,
+    }
+}
+
+fn should_force_bridge_stabilization_transcode(spec: &TaskSpec) -> bool {
+    if spec.task_type != TaskType::StreamBridge
+        || spec.process.mode.as_deref().unwrap_or("passthrough") != "passthrough"
+    {
+        return false;
+    }
+
+    bridge_output_format(spec).is_some_and(|format| format.eq_ignore_ascii_case("mpegts"))
+        && matches!(
+            spec.input.kind,
+            Some(
+                InputKind::Rtsp
+                    | InputKind::Rtmp
+                    | InputKind::Hls
+                    | InputKind::HttpFlv
+                    | InputKind::HttpTs
+            )
+        )
+}
+
+fn bridge_output_format(spec: &TaskSpec) -> Option<String> {
+    match spec.publish.kind? {
+        PublishTargetKind::File => Some(
+            spec.publish
+                .format
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("mp4")
+                .to_ascii_lowercase(),
+        ),
+        PublishTargetKind::UdpMpegtsMulticast => Some(
+            spec.publish
+                .format
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("mpegts")
+                .to_ascii_lowercase(),
+        ),
+        PublishTargetKind::RtpMulticast => Some(
+            spec.publish
+                .format
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("rtp_mpegts")
+                .to_ascii_lowercase(),
+        ),
+        PublishTargetKind::RtmpPush => Some("flv".to_string()),
     }
 }
 
@@ -6058,6 +6333,74 @@ mod tests {
         assert_eq!(resolved.expose.enable_rtsp, Some(true));
         assert_eq!(resolved.expose.enable_hls, Some(false));
         assert_eq!(resolved.record.enabled, Some(false));
+    }
+
+    #[test]
+    fn task_summary_transcode_mode_marks_live_rtsp_ingest_as_non_transcode() {
+        let spec: TaskSpec = serde_json::from_value(json!({
+            "type": "stream_ingest",
+            "name": "relay-camera-01",
+            "input": {
+                "kind": "rtsp",
+                "source_mode": "live",
+                "url": "rtsp://camera.example/live"
+            }
+        }))
+        .expect("spec should parse");
+
+        assert_eq!(
+            task_summary_transcode_mode(&spec),
+            Some(TASK_TRANSCODE_NONE)
+        );
+    }
+
+    #[test]
+    fn task_summary_transcode_mode_defaults_file_transcode_to_adaptive() {
+        let spec: TaskSpec = serde_json::from_value(json!({
+            "type": "file_transcode",
+            "name": "transcode-archive",
+            "input": {
+                "kind": "file",
+                "source_mode": "vod",
+                "url": "archive/demo.mp4"
+            },
+            "publish": {
+                "kind": "file"
+            }
+        }))
+        .expect("spec should parse");
+
+        assert_eq!(
+            task_summary_transcode_mode(&spec),
+            Some(TASK_TRANSCODE_ADAPTIVE)
+        );
+    }
+
+    #[test]
+    fn task_summary_transcode_mode_marks_mpegts_bridge_stabilization_as_forced() {
+        let spec: TaskSpec = serde_json::from_value(json!({
+            "type": "stream_bridge",
+            "name": "bridge-live-to-mcast",
+            "input": {
+                "kind": "rtsp",
+                "source_mode": "live",
+                "url": "rtsp://camera.example/live"
+            },
+            "publish": {
+                "kind": "udp_mpegts_multicast",
+                "group": "239.0.0.10",
+                "port": 1234
+            },
+            "process": {
+                "mode": "passthrough"
+            }
+        }))
+        .expect("spec should parse");
+
+        assert_eq!(
+            task_summary_transcode_mode(&spec),
+            Some(TASK_TRANSCODE_FORCED)
+        );
     }
 
     #[test]

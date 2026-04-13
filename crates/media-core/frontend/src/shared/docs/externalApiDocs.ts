@@ -158,6 +158,7 @@ const INPUT_KIND_ENUM = [
 ];
 const SOURCE_MODE_ENUM = ["live", "vod"];
 const PROCESS_MODE_ENUM = ["passthrough", "copy_or_transcode", "force_transcode"];
+const TASK_TRANSCODE_MODE_ENUM = ["none", "adaptive", "forced"];
 const PUBLISH_KIND_ENUM = ["file", "udp_mpegts_multicast", "rtp_multicast", "rtmp_push"];
 const RECORD_FORMAT_ENUM = ["mp4", "hls", "both"];
 const RECOVERY_POLICY_ENUM = ["auto", "never"];
@@ -354,9 +355,15 @@ function fieldMeta(path: string): FieldMeta | null {
     },
     { test: (value) => value === "schedule.start_at", meta: { description: "定时启动时间，RFC3339 格式。" } },
     { test: (value) => value === "schedule.cron", meta: { description: "Cron 表达式。" } },
-    { test: (value) => value === "resource", meta: { description: "调度资源偏好。" } },
-    { test: (value) => value === "resource.required_labels[]", meta: { description: "节点必需标签。" } },
-    { test: (value) => value === "resource.preferred_labels[]", meta: { description: "节点优选标签。" } },
+    { test: (value) => value === "resource", meta: { description: "调度资源约束。" } },
+    {
+      test: (value) => value === "resource.required_labels[]",
+      meta: { description: "节点必需标签。只有同时具备全部这些标签的在线节点才会进入调度候选集；如果当前没有任何匹配标签的在线节点，任务会直接失败。" },
+    },
+    {
+      test: (value) => value === "transcode_mode",
+      meta: { description: "基于 resolved_spec 推导出的转码摘要。`none` 表示不转码，`adaptive` 表示拷贝优先且必要时转码，`forced` 表示按配置会走转码路径。", enumValues: TASK_TRANSCODE_MODE_ENUM, required: false },
+    },
     { test: (value) => value === "items[]", meta: { description: "列表结果项。" } },
     { test: (value) => value === "page", meta: { description: "当前页码，从 1 开始。" } },
     { test: (value) => value === "page_size", meta: { description: "每页条数。" } },
@@ -600,6 +607,9 @@ const streamIngestExample = {
   schedule: {
     start_mode: "immediate",
   },
+  resource: {
+    required_labels: ["beijing-idc"],
+  },
 };
 
 const streamIngestLoopExample = {
@@ -802,6 +812,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       name: "relay-camera-01",
       type: "stream_ingest",
       status: "RUNNING",
+      transcode_mode: "none",
       priority: 50,
       created_by: "alice",
       assigned_node_id: "f8996fe7-6a7e-4aa0-8b13-2e8a5f9fdc31",
@@ -812,6 +823,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     notes: [
       "`input.loop_enabled=true` 仅支持 `stream_ingest` 的离线输入；若同时配置 `record.duration_sec`，到时任务仍会自动成功结束。",
       "`stream_ingest` 的 VOD 录制不会手动指定实时/快录，而是由 expose 自动判定：有播放协议就实时，没有播放协议就快录。",
+      "`resource.required_labels[]` 会做节点硬过滤；如果当前没有任何匹配标签的在线节点，任务会直接失败。",
     ],
   },
   {
@@ -882,6 +894,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
           name: "relay-camera-01",
           type: "stream_ingest",
           status: "RUNNING",
+          transcode_mode: "none",
           priority: 50,
           created_by: "alice",
           assigned_node_id: "f8996fe7-6a7e-4aa0-8b13-2e8a5f9fdc31",
@@ -918,6 +931,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         name: "relay-camera-01",
         type: "stream_ingest",
         status: "RUNNING",
+        transcode_mode: "none",
         priority: 50,
         created_by: "alice",
         assigned_node_id: "f8996fe7-6a7e-4aa0-8b13-2e8a5f9fdc31",
@@ -1390,6 +1404,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       name: "relay-camera-01-copy",
       type: "stream_ingest",
       status: "CREATED",
+      transcode_mode: "none",
       priority: 15,
       created_by: "bob",
       current_attempt_no: 0,

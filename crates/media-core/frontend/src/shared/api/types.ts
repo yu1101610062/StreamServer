@@ -34,6 +34,7 @@ export interface TaskSummary {
   updated_at: string;
   started_at?: string | null;
   finished_at?: string | null;
+  transcode_mode?: "none" | "adaptive" | "forced" | null;
 }
 
 export interface AttemptSummary {

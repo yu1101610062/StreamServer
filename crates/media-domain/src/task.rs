@@ -1246,8 +1246,6 @@ pub struct ResourceSpec {
     #[serde(default)]
     pub required_labels: Vec<String>,
     #[serde(default)]
-    pub preferred_labels: Vec<String>,
-    #[serde(default)]
     pub need_gpu: Option<bool>,
 }
 

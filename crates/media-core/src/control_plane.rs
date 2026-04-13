@@ -121,6 +121,13 @@ struct DispatchScore {
     node_id: Uuid,
 }
 
+#[derive(Debug)]
+enum ClaimResult {
+    Selected(SessionTarget),
+    NoConnectedNode,
+    MissingRequiredLabels,
+}
+
 impl ControlPlaneService {
     pub fn new(repository: Arc<TaskRepository>) -> Self {
         Self {
@@ -140,7 +147,7 @@ impl ControlPlaneService {
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
         let source_affinity_ip = task_source_affinity_ip(&resolved_spec);
         let execution_preference = task_execution_preference(&resolved_spec);
-        let target = self
+        let target = match self
             .claim_best_session(
                 source_affinity_ip,
                 task_id,
@@ -148,7 +155,33 @@ impl ControlPlaneService {
                 execution_preference,
             )
             .await
-            .ok_or(ControlPlaneError::NoConnectedNode)?;
+        {
+            ClaimResult::Selected(target) => target,
+            ClaimResult::NoConnectedNode => return Err(ControlPlaneError::NoConnectedNode),
+            ClaimResult::MissingRequiredLabels => {
+                let required_labels: Vec<String> = resolved_spec
+                    .resource
+                    .required_labels
+                    .iter()
+                    .map(|label| label.trim())
+                    .filter(|label| !label.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let failure_reason = format!(
+                    "no online node satisfies required_labels: {}",
+                    required_labels.join(", ")
+                );
+                self.repository
+                    .fail_queued_task(task_id, "required_labels_unmatched", &failure_reason)
+                    .await?;
+                warn!(
+                    task_id = %task_id,
+                    required_labels = ?required_labels,
+                    "task failed because no online node satisfies required_labels"
+                );
+                return Ok(());
+            }
+        };
         let command = match self
             .repository
             .prepare_task_dispatch(task_id, target.node_id, &format!("node:{}", target.node_id))
@@ -615,10 +648,24 @@ impl ControlPlaneService {
         task_id: Uuid,
         spec: &TaskSpec,
         preference: ExecutionPreference,
-    ) -> Option<SessionTarget> {
+    ) -> ClaimResult {
         let mut sessions = self.sessions.lock().await;
-        let target = pick_best_session_target(&sessions, source_affinity_ip, spec, preference)?;
-        let handle = sessions.get_mut(&target.node_id)?;
+        let has_required_label_match = task_has_required_labels(spec)
+            && sessions
+                .values()
+                .any(|handle| node_matches_required_labels(spec, &handle.registration));
+        let Some(target) =
+            pick_best_session_target(&sessions, source_affinity_ip, spec, preference)
+        else {
+            return if task_has_required_labels(spec) && !has_required_label_match {
+                ClaimResult::MissingRequiredLabels
+            } else {
+                ClaimResult::NoConnectedNode
+            };
+        };
+        let Some(handle) = sessions.get_mut(&target.node_id) else {
+            return ClaimResult::NoConnectedNode;
+        };
         handle
             .reservations
             .push_back(DispatchReservation { task_id });
@@ -631,7 +678,7 @@ impl ControlPlaneService {
             reservation_count(handle),
             target.using_gpu_path,
         );
-        Some(SessionTarget {
+        ClaimResult::Selected(SessionTarget {
             node_id: target.node_id,
             session_id: handle.session_id,
             sender: handle.sender.clone(),
@@ -1110,6 +1157,22 @@ fn gpu_execution_eligible(
         && best_gpu_headroom(&load.gpu_runtime).is_some()
 }
 
+fn node_matches_required_labels(spec: &TaskSpec, registration: &AgentRegistration) -> bool {
+    spec.resource
+        .required_labels
+        .iter()
+        .map(|label| label.trim())
+        .filter(|label| !label.is_empty())
+        .all(|required| registration.labels.iter().any(|label| label == required))
+}
+
+fn task_has_required_labels(spec: &TaskSpec) -> bool {
+    spec.resource
+        .required_labels
+        .iter()
+        .any(|label| !label.trim().is_empty())
+}
+
 fn best_gpu_headroom(runtime: &[GpuRuntimeStats]) -> Option<f64> {
     runtime
         .iter()
@@ -1148,6 +1211,9 @@ fn pick_best_session_target(
         sessions
             .iter()
             .filter(|(_, handle)| {
+                if !node_matches_required_labels(spec, &handle.registration) {
+                    return false;
+                }
                 let reservations = reservation_count(handle);
                 if gpu_only {
                     gpu_execution_eligible(spec, &handle.capabilities, &handle.load, reservations)
@@ -1727,7 +1793,7 @@ mod tests {
             }
         }
 
-        let first = service
+        let ClaimResult::Selected(first) = service
             .claim_best_session(
                 None,
                 Uuid::parse_str("00000000-0000-0000-0000-000000000101").unwrap(),
@@ -1735,8 +1801,10 @@ mod tests {
                 ExecutionPreference::CpuOnly,
             )
             .await
-            .expect("first dispatch should find a node");
-        let second = service
+        else {
+            panic!("first dispatch should find a node");
+        };
+        let ClaimResult::Selected(second) = service
             .claim_best_session(
                 None,
                 Uuid::parse_str("00000000-0000-0000-0000-000000000102").unwrap(),
@@ -1744,10 +1812,158 @@ mod tests {
                 ExecutionPreference::CpuOnly,
             )
             .await
-            .expect("second dispatch should find a node");
+        else {
+            panic!("second dispatch should find a node");
+        };
 
         assert_eq!(first.node_id, first_node);
         assert_eq!(second.node_id, second_node);
+    }
+
+    #[tokio::test]
+    async fn required_labels_filter_candidates_before_scoring() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let matching_node = Uuid::parse_str("00000000-0000-0000-0000-000000000025").unwrap();
+        let other_node = Uuid::parse_str("00000000-0000-0000-0000-000000000026").unwrap();
+        let (matching_sender, _matching_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let (other_sender, _other_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        let mut matching_registration = sample_registration(matching_node);
+        matching_registration.labels = vec!["archive".to_string(), "beijing-idc".to_string()];
+        let mut other_registration = sample_registration(other_node);
+        other_registration.labels = vec!["archive".to_string(), "shanghai".to_string()];
+
+        let mut spec = sample_immediate_task_spec();
+        spec.resource.required_labels = vec!["archive".to_string(), "beijing-idc".to_string()];
+
+        let mut sessions = service.sessions.lock().await;
+        sessions.insert(
+            matching_node,
+            SessionHandle {
+                session_id: 1,
+                sender: matching_sender,
+                registration: matching_registration,
+                capabilities: SessionCapabilities::default(),
+                load: SessionLoad {
+                    slot_usage: 0.9,
+                    running_tasks: 9,
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                    ..SessionLoad::default()
+                },
+                reservations: VecDeque::new(),
+            },
+        );
+        sessions.insert(
+            other_node,
+            SessionHandle {
+                session_id: 2,
+                sender: other_sender,
+                registration: other_registration,
+                capabilities: SessionCapabilities::default(),
+                load: SessionLoad {
+                    slot_usage: 0.1,
+                    running_tasks: 1,
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                    ..SessionLoad::default()
+                },
+                reservations: VecDeque::new(),
+            },
+        );
+        drop(sessions);
+
+        let target = service
+            .pick_best_session(None, &spec, ExecutionPreference::CpuOnly)
+            .await
+            .expect("required label match should still find a node");
+
+        assert_eq!(target.node_id, matching_node);
+    }
+
+    #[tokio::test]
+    async fn required_labels_return_none_when_no_online_node_matches() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000027").unwrap();
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        let mut registration = sample_registration(node_id);
+        registration.labels = vec!["archive".to_string()];
+
+        let mut spec = sample_immediate_task_spec();
+        spec.resource.required_labels = vec!["gpu".to_string()];
+
+        let mut sessions = service.sessions.lock().await;
+        sessions.insert(
+            node_id,
+            SessionHandle {
+                session_id: 1,
+                sender,
+                registration,
+                capabilities: SessionCapabilities::default(),
+                load: SessionLoad {
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                    ..SessionLoad::default()
+                },
+                reservations: VecDeque::new(),
+            },
+        );
+        drop(sessions);
+
+        let target = service
+            .pick_best_session(None, &spec, ExecutionPreference::CpuOnly)
+            .await;
+
+        assert!(target.is_none());
+    }
+
+    #[tokio::test]
+    async fn required_labels_still_queue_when_matching_node_is_saturated() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+            .expect("lazy test pool should parse");
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000029").unwrap();
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+        let mut registration = sample_registration(node_id);
+        registration.labels = vec!["archive".to_string()];
+
+        let mut spec = sample_immediate_task_spec();
+        spec.resource.required_labels = vec!["archive".to_string()];
+
+        let mut sessions = service.sessions.lock().await;
+        sessions.insert(
+            node_id,
+            SessionHandle {
+                session_id: 1,
+                sender,
+                registration,
+                capabilities: SessionCapabilities::default(),
+                load: SessionLoad {
+                    slot_usage: 1.0,
+                    running_tasks: 1,
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                    ..SessionLoad::default()
+                },
+                reservations: VecDeque::new(),
+            },
+        );
+        drop(sessions);
+
+        let target = service
+            .pick_best_session(None, &spec, ExecutionPreference::CpuOnly)
+            .await;
+
+        assert!(target.is_none());
     }
 
     #[tokio::test]
@@ -1970,12 +2186,10 @@ mod tests {
         };
         let repository = Arc::new(TaskRepository::new(db.pool.clone()));
         let service = ControlPlaneService::new(repository.clone());
+        let mut spec = sample_immediate_task_spec();
+        spec.resource.required_labels = vec!["edge".to_string()];
         let task = match repository
-            .create_task(
-                "full-node-dispatch",
-                "full-node-dispatch-hash",
-                sample_immediate_task_spec(),
-            )
+            .create_task("full-node-dispatch", "full-node-dispatch-hash", spec)
             .await?
         {
             crate::repository::CreateTaskResult::Fresh(task)
@@ -2001,6 +2215,65 @@ mod tests {
         let summary = repository.get_task_summary(task.id).await?;
         assert_eq!(summary.status, TaskStatus::Queued);
         assert_eq!(summary.assigned_node_id, None);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_task_fails_when_no_online_node_matches_required_labels() -> anyhow::Result<()>
+    {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let mut spec = sample_immediate_task_spec();
+        spec.resource.required_labels = vec!["archive".to_string()];
+        let task = match repository
+            .create_task("required-labels-miss", "required-labels-miss-hash", spec)
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000028")?;
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _session_id = service
+            .bootstrap_session(&sample_registration(node_id), sender)
+            .await?;
+
+        service.dispatch_task(task.id).await?;
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Failed);
+        assert_eq!(summary.assigned_node_id, None);
+        assert_eq!(summary.current_attempt_no, 1);
+
+        let attempt = sqlx::query(
+            r#"
+            select status::text as status, failure_code, failure_reason
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 1
+            "#,
+        )
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(attempt.try_get::<String, _>("status")?, "FAILED");
+        assert_eq!(
+            attempt.try_get::<Option<String>, _>("failure_code")?,
+            Some("required_labels_unmatched".to_string())
+        );
+        assert!(
+            attempt
+                .try_get::<Option<String>, _>("failure_reason")?
+                .unwrap_or_default()
+                .contains("archive")
+        );
 
         db.cleanup().await?;
         Ok(())

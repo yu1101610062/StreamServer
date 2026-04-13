@@ -89,7 +89,6 @@ export interface TaskCreateDraft {
   };
   resource: {
     required_labels_text: string;
-    preferred_labels_text: string;
   };
   advanced_json: string;
 }
@@ -256,7 +255,6 @@ export function createDefaultDraft(): TaskCreateDraft {
     },
     resource: {
       required_labels_text: "",
-      preferred_labels_text: "",
     },
     advanced_json: "{}",
   };
@@ -478,10 +476,10 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
   setIfPresent(payload.schedule as Record<string, unknown>, "cron", draft.schedule.cron);
 
   setIfList(payload.resource as Record<string, unknown>, "required_labels", draft.resource.required_labels_text);
-  setIfList(payload.resource as Record<string, unknown>, "preferred_labels", draft.resource.preferred_labels_text);
 
   pruneEmptyObjects(payload);
   mergeInto(payload, parseAdvancedJson(draft.advanced_json));
+  stripUnsupportedWebTaskFields(payload);
   return payload;
 }
 
@@ -518,3 +516,15 @@ export const optionSets = {
   recoveryPolicies: RECOVERY_POLICIES,
   startModes: START_MODES,
 };
+
+function stripUnsupportedWebTaskFields(payload: Record<string, unknown>) {
+  const resource = payload.resource;
+  if (!isPlainObject(resource)) {
+    return;
+  }
+
+  delete resource.preferred_labels;
+  if (Object.keys(resource).length === 0) {
+    delete payload.resource;
+  }
+}

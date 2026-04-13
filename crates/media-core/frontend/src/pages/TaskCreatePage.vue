@@ -754,12 +754,13 @@ function previewTask() {
               <el-input v-model="draft.resource.required_labels_text" placeholder="gpu, beijing-idc" />
             </el-form-item>
           </el-col>
-          <el-col :md="12" :span="24">
-            <el-form-item label="节点优选标签（逗号分隔，可选）">
-              <el-input v-model="draft.resource.preferred_labels_text" placeholder="shanghai, archive" />
-            </el-form-item>
-          </el-col>
         </el-row>
+        <el-alert
+          type="info"
+          :closable="false"
+          title="节点必需标签会做硬过滤"
+          description="任务只会派发到同时具备这些标签的节点；如果当前没有任何匹配标签的在线节点，任务会直接失败。"
+        />
 
         <el-form-item v-if="createMode === 'expert'" label="高级 JSON 覆盖">
           <el-input
