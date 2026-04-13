@@ -1695,6 +1695,12 @@ fn build_file_to_live_plan(
     let mut recording = None;
 
     let mut args = ffmpeg_base_args(input_url.clone(), true);
+    if should_loop_file_to_live_input(spec) {
+        insert_ffmpeg_input_args(
+            &mut args,
+            vec!["-stream_loop".to_string(), "-1".to_string()],
+        );
+    }
     append_process_args(
         &mut args,
         settings,
@@ -2093,6 +2099,16 @@ fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String
             "managed executor requires a supported input kind".to_string(),
         )),
     }
+}
+
+fn should_loop_file_to_live_input(spec: &TaskSpec) -> bool {
+    spec.task_type == TaskType::StreamIngest
+        && spec.input.loop_enabled.unwrap_or(false)
+        && spec.input.source_mode == Some(SourceMode::Vod)
+        && matches!(
+            spec.input.kind,
+            Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs)
+        )
 }
 
 fn ffmpeg_base_args(input_url: String, realtime: bool) -> Vec<String> {
@@ -5648,6 +5664,51 @@ fi
                 "/tmp/work/00000000-0000-0000-0000-000000000000/attempt-1/record.mp4".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn build_file_to_live_plan_loops_vod_input_when_enabled() {
+        let settings = test_settings("/tmp/work");
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-loop",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "file",
+                    "source_mode": "vod",
+                    "loop_enabled": true,
+                    "url": "input.mp4"
+                },
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {
+                    "enabled": true,
+                    "format": "mp4",
+                    "duration_sec": 300
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-stream_loop", "-1"])
+        );
+        assert!(plan.args.iter().any(|arg| arg == "-re"));
+        assert!(plan.args.windows(2).any(|window| window == ["-t", "300"]));
     }
 
     #[test]

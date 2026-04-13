@@ -5111,6 +5111,10 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
             "source_mode",
             spec.input.source_mode.map(|value| json!(value)),
         ),
+        (
+            "loop_enabled",
+            spec.input.loop_enabled.map(|value| json!(value)),
+        ),
         ("url", spec.input.url.as_ref().map(|value| json!(value))),
         ("group", spec.input.group.as_ref().map(|value| json!(value))),
         ("port", spec.input.port.map(|value| json!(value))),
@@ -6043,6 +6047,39 @@ mod tests {
         let overlay = task_spec_overlay(&spec);
 
         assert_eq!(overlay["record"]["duration_sec"], json!(300));
+    }
+
+    #[test]
+    fn task_spec_overlay_preserves_input_loop_enabled() {
+        let spec = TaskSpec {
+            task_type: TaskType::StreamIngest,
+            name: "loop-check".to_string(),
+            priority: 50,
+            common: media_domain::CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: media_domain::InputSpec {
+                kind: Some(media_domain::InputKind::HttpMp4),
+                source_mode: Some(media_domain::SourceMode::Vod),
+                loop_enabled: Some(true),
+                url: Some("http://127.0.0.1/test.mp4".to_string()),
+                ..Default::default()
+            },
+            stream: Default::default(),
+            expose: Default::default(),
+            process: Default::default(),
+            publish: Default::default(),
+            record: Default::default(),
+            recovery: Default::default(),
+            schedule: Default::default(),
+            resource: Default::default(),
+        };
+
+        let overlay = task_spec_overlay(&spec);
+
+        assert_eq!(overlay["input"]["loop_enabled"], json!(true));
     }
 
     #[test]

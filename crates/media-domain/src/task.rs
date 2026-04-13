@@ -455,6 +455,7 @@ impl TaskSpec {
             resolved.input.source_mode =
                 resolved.input.kind.and_then(InputKind::default_source_mode);
         }
+        resolved.input.loop_enabled = Some(resolved.input.loop_enabled.unwrap_or(false));
         if resolved.task_type == TaskType::StreamIngest {
             resolved.stream.app = Some(
                 resolved
@@ -654,6 +655,30 @@ impl TaskSpec {
                 }
             }
             _ => {}
+        }
+
+        if self.input.loop_enabled.unwrap_or(false) {
+            if self.task_type != TaskType::StreamIngest {
+                issues.push(ValidationIssue::new(
+                    "input.loop_enabled",
+                    "is only supported for stream_ingest",
+                ));
+            }
+            if self.input.source_mode != Some(SourceMode::Vod) {
+                issues.push(ValidationIssue::new(
+                    "input.loop_enabled",
+                    "requires source_mode=vod",
+                ));
+            }
+            if !matches!(
+                self.input.kind,
+                Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs)
+            ) {
+                issues.push(ValidationIssue::new(
+                    "input.loop_enabled",
+                    "requires file, http_mp4, hls(vod), or http_ts(vod) input",
+                ));
+            }
         }
 
         match self.task_type {
@@ -942,6 +967,8 @@ pub struct InputSpec {
     pub kind: Option<InputKind>,
     #[serde(default)]
     pub source_mode: Option<SourceMode>,
+    #[serde(default)]
+    pub loop_enabled: Option<bool>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]
@@ -1269,6 +1296,7 @@ mod tests {
         assert_eq!(resolved.expose.stop_on_no_reader, Some(false));
         assert_eq!(resolved.record.enabled, Some(false));
         assert_eq!(resolved.record.save_path, None);
+        assert_eq!(resolved.input.loop_enabled, Some(false));
         assert_eq!(resolved.recovery.policy, Some(RecoveryPolicy::Auto));
         assert_eq!(resolved.schedule.start_mode, Some(StartMode::Immediate));
     }
@@ -1392,6 +1420,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_allows_stream_ingest_vod_input_looping() {
+        let task = TaskSpec {
+            task_type: TaskType::StreamIngest,
+            name: "vod-loop".to_string(),
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::HttpTs),
+                source_mode: Some(SourceMode::Vod),
+                loop_enabled: Some(true),
+                url: Some("http://vod.example.com/archive.ts".to_string()),
+                ..InputSpec::default()
+            },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
+            process: ProcessSpec::default(),
+            publish: PublishSpec::default(),
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        task.validate()
+            .expect("validation should allow looping vod ingest input");
+    }
+
+    #[test]
+    fn validate_rejects_loop_enabled_for_live_input() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.loop_enabled = Some(true);
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "input.loop_enabled")
+        );
+    }
+
+    #[test]
     fn validate_rejects_stream_bridge_without_publish_target() {
         let task = TaskSpec {
             task_type: TaskType::StreamBridge,
@@ -1500,6 +1574,47 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.field == "publish.kind")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_loop_enabled_for_non_ingest_tasks() {
+        let task = TaskSpec {
+            task_type: TaskType::StreamBridge,
+            name: "bridge-loop".to_string(),
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::HttpMp4),
+                source_mode: Some(SourceMode::Vod),
+                loop_enabled: Some(true),
+                url: Some("http://vod.example.com/archive.mp4".to_string()),
+                ..InputSpec::default()
+            },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
+            process: ProcessSpec::default(),
+            publish: PublishSpec {
+                kind: Some(PublishTargetKind::RtmpPush),
+                url: Some("rtmp://push.example.com/live/stream01".to_string()),
+                ..PublishSpec::default()
+            },
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        let error = task.validate().expect_err("validation should fail");
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.field == "input.loop_enabled")
         );
     }
 

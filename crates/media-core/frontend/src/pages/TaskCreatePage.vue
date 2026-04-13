@@ -14,6 +14,7 @@ import {
   defaultSourceModeForInputKind,
   guidedScenarios,
   humanSummary,
+  inputKindSupportsLoop,
   inputKindSupportsExplicitSourceMode,
   normalizeDraftForTaskType,
   optionSets,
@@ -63,6 +64,11 @@ const showInputMulticast = computed(() =>
 );
 const showGbRtp = computed(() => draft.input.kind === "gb_rtp");
 const showManagedFileInputHint = computed(() => draft.input.kind === "file");
+const showInputLoop = computed(
+  () =>
+    draft.task_type === "stream_ingest" &&
+    inputKindSupportsLoop(draft.input.kind, draft.input.source_mode),
+);
 const showPublishSection = computed(() => draft.task_type !== "stream_ingest");
 const showManagedFileOutputHint = computed(
   () => showPublishSection.value && draft.publish.kind === "file",
@@ -83,6 +89,10 @@ const summaryText = computed(() => humanSummary(draft));
 const managedFileInputHint = computed(
   () =>
     `任务里只填相对 ${managedFileInputRoot} 的路径，例如 demo.mp4 或 vod/demo.ts。文件实际应放到宿主机安装目录下的 data/media/work；当前标准实例路径是 ${managedFileHostPath}。如果误写成 /demo.mp4，系统会自动按 demo.mp4 处理。`,
+);
+const inputLoopHint = computed(
+  () =>
+    "开启后，系统会在离线输入读到 EOF 后从头继续读取，适合让内部流长期保持有内容。如果同时设置录制时长，到时任务仍会整体成功结束。",
 );
 const publishFormatGroups = computed(() => {
   const commonOptions = optionSets.publishFormats;
@@ -139,6 +149,16 @@ watch(
       draft.publish.kind = "file";
     }
   },
+);
+
+watch(
+  showInputLoop,
+  (enabled) => {
+    if (!enabled) {
+      draft.input.loop_enabled = false;
+    }
+  },
+  { immediate: true },
 );
 
 watch(
@@ -350,6 +370,22 @@ function previewTask() {
           title="本地文件输入只填相对路径"
           :description="managedFileInputHint"
         />
+
+        <el-row v-if="showInputLoop" :gutter="16">
+          <el-col :md="8" :span="24">
+            <el-form-item label="循环读取离线输入">
+              <el-switch v-model="draft.input.loop_enabled" />
+            </el-form-item>
+          </el-col>
+          <el-col :md="16" :span="24">
+            <el-alert
+              type="info"
+              :closable="false"
+              title="适合让内部流长期保持可播"
+              :description="inputLoopHint"
+            />
+          </el-col>
+        </el-row>
 
         <el-row v-if="showInputMulticast" :gutter="16">
           <el-col :md="8" :span="24">

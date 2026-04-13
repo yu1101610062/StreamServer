@@ -48,6 +48,25 @@ describe("buildDraftPayload", () => {
     expect(payload.record).toEqual({ enabled: false });
   });
 
+  it("includes loop_enabled for stream_ingest vod inputs", () => {
+    const draft = createDefaultDraft();
+    draft.name = "vod-loop";
+    draft.common.created_by = "alice";
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.loop_enabled = true;
+    draft.input.url = "http://vod.example.com/archive.mp4";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.input).toMatchObject({
+      kind: "http_mp4",
+      source_mode: "vod",
+      loop_enabled: true,
+      url: "http://vod.example.com/archive.mp4",
+    });
+  });
+
   it("does not turn empty numeric fields into zero-valued publish settings", () => {
     const draft = createDefaultDraft();
     draft.name = "ingest-http-ts";
@@ -75,5 +94,18 @@ describe("buildDraftPayload", () => {
     });
     expect(payload.process).toEqual({ mode: "copy_or_transcode" });
     expect(payload.recovery).toEqual({ policy: "auto" });
+  });
+
+  it("clears loop_enabled when draft switches away from stream_ingest", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "file";
+    draft.input.source_mode = "vod";
+    draft.input.loop_enabled = true;
+
+    normalizeDraftForTaskType(draft, "stream_bridge");
+
+    expect(draft.input.loop_enabled).toBe(false);
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+    expect(payload.input).not.toHaveProperty("loop_enabled");
   });
 });

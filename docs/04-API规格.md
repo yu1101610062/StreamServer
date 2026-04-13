@@ -101,6 +101,7 @@
   "input": {
     "kind": "rtsp",
     "source_mode": "live",
+    "loop_enabled": false,
     "url": "rtsp://camera.example/live"
   },
   "stream": {
@@ -125,6 +126,7 @@
 - `input.kind` 表示任务直接接收的输入源类型。
 - `input.kind=file` 时，`input.url` 必须填写相对 `/data/media/work` 的文件路径；如果误写成 `/demo.mp4`，系统会自动按 `demo.mp4` 处理。
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；其他输入类型按规则自动推断。
+- `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时配置 `record.duration_sec`，到点后任务仍整体成功结束。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
 - `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。
 - `publish.kind` 表示任务直接写出的外部目标类型；当前支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`、`rtmp_push`。
@@ -137,6 +139,36 @@
 | `stream_ingest` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` `gb_rtp` | 不允许设置 | `expose.enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
 | `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` `rtmp_push` | 不适用 |
 | `file_transcode` | `file` `http_mp4` `hls(vod)` `http_ts(vod)` | `file` | 不适用 |
+
+循环 VOD 输入示例：
+
+```json
+{
+  "name": "promo-loop-01",
+  "type": "stream_ingest",
+  "common": {
+    "created_by": "alice"
+  },
+  "input": {
+    "kind": "http_mp4",
+    "source_mode": "vod",
+    "loop_enabled": true,
+    "url": "http://vod.example.com/promo.mp4"
+  },
+  "stream": {
+    "app": "live",
+    "name": "promo-loop-01"
+  },
+  "record": {
+    "enabled": true,
+    "format": "mp4",
+    "duration_sec": 180
+  },
+  "schedule": {
+    "start_mode": "immediate"
+  }
+}
+```
 
 `stream_bridge` 输出约束：
 

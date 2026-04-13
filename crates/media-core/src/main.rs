@@ -3724,7 +3724,8 @@ mod tests {
             body["resolved_spec"]["schedule"]["start_mode"],
             json!("manual")
         );
-        assert_eq!(body["resolved_spec"]["publish"]["enable_rtsp"], json!(true));
+        assert_eq!(body["resolved_spec"]["expose"]["enable_rtsp"], json!(true));
+        assert_eq!(body["resolved_spec"]["input"]["loop_enabled"], json!(false));
         Ok(())
     }
 

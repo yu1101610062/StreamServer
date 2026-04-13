@@ -29,6 +29,7 @@ export interface TaskCreateDraft {
   input: {
     kind: string;
     source_mode: string;
+    loop_enabled: boolean;
     url: string;
     group: string;
     port: string;
@@ -157,6 +158,10 @@ export function inputKindSupportsExplicitSourceMode(kind: string) {
   return kind === "hls" || kind === "http_ts";
 }
 
+export function inputKindSupportsLoop(kind: string, sourceMode: string) {
+  return sourceMode === "vod" && ["file", "http_mp4", "hls", "http_ts"].includes(kind);
+}
+
 export function createDefaultDraft(): TaskCreateDraft {
   const draft: TaskCreateDraft = {
     task_type: "stream_ingest",
@@ -170,6 +175,7 @@ export function createDefaultDraft(): TaskCreateDraft {
     input: {
       kind: "rtsp",
       source_mode: "live",
+      loop_enabled: false,
       url: "",
       group: "",
       port: "",
@@ -246,6 +252,7 @@ export function normalizeDraftForTaskType(draft: TaskCreateDraft, taskType: stri
     draft.publish.kind = "file";
     draft.input.source_mode = draft.input.source_mode || defaultSourceModeForInputKind(draft.input.kind) || "vod";
     draft.record.enabled = false;
+    draft.input.loop_enabled = false;
   } else if (taskType === "stream_bridge") {
     if (draft.input.kind === "gb_rtp" || !draft.input.kind) {
       draft.input.kind = "rtsp";
@@ -253,9 +260,13 @@ export function normalizeDraftForTaskType(draft: TaskCreateDraft, taskType: stri
     draft.publish.kind = draft.publish.kind || "file";
     draft.input.source_mode = draft.input.source_mode || defaultSourceModeForInputKind(draft.input.kind) || "live";
     draft.record.enabled = false;
+    draft.input.loop_enabled = false;
   } else {
     draft.publish.kind = "";
     draft.input.source_mode = draft.input.source_mode || defaultSourceModeForInputKind(draft.input.kind) || "live";
+    if (!inputKindSupportsLoop(draft.input.kind, draft.input.source_mode)) {
+      draft.input.loop_enabled = false;
+    }
   }
 }
 
@@ -368,6 +379,13 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
 
   setIfPresent(payload.input as Record<string, unknown>, "kind", draft.input.kind);
   setIfPresent(payload.input as Record<string, unknown>, "source_mode", draft.input.source_mode);
+  if (isStreamIngest) {
+    setIfBoolean(
+      payload.input as Record<string, unknown>,
+      "loop_enabled",
+      draft.input.loop_enabled,
+    );
+  }
   setIfPresent(
     payload.input as Record<string, unknown>,
     "url",
@@ -455,6 +473,7 @@ export function humanSummary(draft: TaskCreateDraft) {
     draft.task_type === "stream_bridge" && draft.publish.kind
       ? `直接输出到${publishKindLabel(draft.publish.kind)}`
       : "",
+    draft.input.loop_enabled ? "并循环读取离线输入" : "",
     draft.publish.kind === "file" ? "文件路径由平台自动生成" : "",
     draft.publish.kind === "rtmp_push" && draft.publish.url.trim()
       ? `推送到 ${draft.publish.url.trim()}`

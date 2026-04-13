@@ -273,6 +273,13 @@ function fieldMeta(path: string): FieldMeta | null {
       meta: { description: "输入源语义，显式区分实时源和离线源。", enumValues: SOURCE_MODE_ENUM, required: "hls/http_ts 时必填" },
     },
     {
+      test: (value) => value === "input.loop_enabled",
+      meta: {
+        description:
+          "是否在离线输入读到 EOF 后从头循环读取。仅 `stream_ingest + source_mode=vod` 支持，对 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)` 生效；若同时设置 `record.duration_sec`，到时任务仍会整体成功结束。",
+      },
+    },
+    {
       test: (value) => value === "input.url",
       meta: {
         description: "输入 URL；当 input.kind=file 时，这里填写相对 /data/media/work 的文件路径，前导 / 会被自动忽略。",
@@ -562,6 +569,7 @@ const streamIngestExample = {
   input: {
     kind: "rtsp",
     source_mode: "live",
+    loop_enabled: false,
     url: "rtsp://camera.example/live/camera01",
     probe_timeout_ms: 7000,
   },
@@ -585,6 +593,49 @@ const streamIngestExample = {
     enabled: true,
     format: "mp4",
     duration_sec: 300,
+  },
+  recovery: {
+    policy: "auto",
+  },
+  schedule: {
+    start_mode: "immediate",
+  },
+};
+
+const streamIngestLoopExample = {
+  name: "promo-loop-01",
+  type: "stream_ingest",
+  priority: 50,
+  common: {
+    created_by: "alice",
+  },
+  input: {
+    kind: "http_mp4",
+    source_mode: "vod",
+    loop_enabled: true,
+    url: "http://vod.example.com/promo.mp4",
+    probe_timeout_ms: 7000,
+  },
+  process: {
+    mode: "copy_or_transcode",
+  },
+  stream: {
+    app: "live",
+    name: "promo-loop-01",
+    vhost: "__defaultVhost__",
+  },
+  expose: {
+    enable_rtsp: true,
+    enable_rtmp: true,
+    enable_http_ts: true,
+    enable_http_fmp4: true,
+    enable_hls: false,
+    stop_on_no_reader: false,
+  },
+  record: {
+    enabled: true,
+    format: "mp4",
+    duration_sec: 180,
   },
   recovery: {
     policy: "auto",
@@ -713,20 +764,21 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         Authorization: authHeaderParam().example,
         "Idempotency-Key": "preview-relay-camera-01-20260412",
       },
-      body: streamIngestExample,
+      body: streamIngestLoopExample,
     },
     responseExample: {
-      requested_spec: streamIngestExample,
+      requested_spec: streamIngestLoopExample,
       resolved_spec: {
-        ...streamIngestExample,
+        ...streamIngestLoopExample,
         common: {
           created_by: "alice",
-          callback_url: "https://biz.example.com/callback",
-          labels: ["project-a", "night-shift"],
         },
       },
     },
-    notes: ["这个接口不会创建任务，也不会占用节点资源。"],
+    notes: [
+      "这个接口不会创建任务，也不会占用节点资源。",
+      "如果要让离线输入持续供流，可在 `stream_ingest + source_mode=vod` 时设置 `input.loop_enabled=true`。",
+    ],
   },
   {
     category: "任务管理",
@@ -756,6 +808,9 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       created_at: "2026-04-12T10:30:00+08:00",
       updated_at: "2026-04-12T10:30:08+08:00",
     },
+    notes: [
+      "`input.loop_enabled=true` 仅支持 `stream_ingest` 的离线输入；若同时配置 `record.duration_sec`，到时任务仍会自动成功结束。",
+    ],
   },
   {
     category: "任务管理",
