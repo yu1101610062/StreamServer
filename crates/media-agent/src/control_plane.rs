@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ffi::CStr,
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -31,15 +32,18 @@ use crate::{
     config::Settings,
     heartbeat::HeartbeatSampler,
     runtime::{
-        AdoptFilter, LocalExecutor, LocalRuntimeRegistry, ManagedProcessExecutor,
+        AdoptFilter, LocalExecutor, LocalRuntimeRegistry, ManagedProcessExecutor, RuntimeEventSink,
         RuntimeNotification, RuntimeTaskEvent, RuntimeTaskLogBatch, RuntimeTaskProgress,
-        StartTaskRequest, StopTaskRequest, dedup_worker_kinds, rejected_runtime_handle,
+        StartTaskRequest, StopTaskRequest, TerminalRuntimeReplay, cleanup_persisted_runtime_state,
+        collect_terminal_runtime_replays, dedup_worker_kinds, is_terminal_runtime_event,
+        rejected_runtime_handle,
     },
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_BACKOFF: [u64; 5] = [1, 2, 5, 10, 30];
 const CONTROL_BUFFER: usize = 32;
+const LOG_NOTIFICATION_BUFFER: usize = 128;
 
 #[derive(Clone)]
 pub struct AgentController {
@@ -48,7 +52,8 @@ pub struct AgentController {
     capability_probe: CapabilityProbe,
     runtime_registry: LocalRuntimeRegistry,
     executor: Arc<dyn LocalExecutor>,
-    runtime_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
+    runtime_priority_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
+    runtime_log_batches: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
 }
 
 impl AgentController {
@@ -59,11 +64,12 @@ impl AgentController {
             Uuid::parse_str(settings.agent.node_id.trim())?
         };
         let runtime_registry = LocalRuntimeRegistry::new();
-        let (runtime_tx, runtime_rx) = mpsc::unbounded_channel();
+        let (runtime_priority_tx, runtime_priority_rx) = mpsc::unbounded_channel();
+        let (runtime_log_tx, runtime_log_rx) = mpsc::channel(LOG_NOTIFICATION_BUFFER);
         let executor = Arc::new(ManagedProcessExecutor::new(
             settings.agent.clone(),
             runtime_registry.clone(),
-            runtime_tx,
+            RuntimeEventSink::new(runtime_priority_tx, runtime_log_tx),
         ));
 
         Ok(Self {
@@ -72,7 +78,8 @@ impl AgentController {
             capability_probe: CapabilityProbe::new()?,
             runtime_registry,
             executor,
-            runtime_events: Arc::new(Mutex::new(runtime_rx)),
+            runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
+            runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
         })
     }
 
@@ -117,6 +124,7 @@ impl AgentController {
 
         let snapshot = self.capability_probe.snapshot(&self.settings.agent).await;
         send_capability_snapshot(&sender, &snapshot).await?;
+        self.replay_terminal_runtimes(&sender).await?;
 
         let mut heartbeat_sampler = HeartbeatSampler::new(
             self.settings.agent.work_root.clone(),
@@ -124,6 +132,7 @@ impl AgentController {
         );
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut dropped_log_lines = HashMap::new();
 
         info!(
             node_id = %registration.node_id,
@@ -134,18 +143,24 @@ impl AgentController {
 
         loop {
             tokio::select! {
-                _ = heartbeat.tick() => {
-                    self.send_heartbeat(&sender, &mut heartbeat_sampler).await?;
-                }
-                runtime_notification = recv_runtime_notification(self.runtime_events.clone()) => {
-                    if let Some(runtime_notification) = runtime_notification {
-                        self.forward_runtime_notification(&sender, runtime_notification).await?;
-                    }
-                }
+                biased;
                 message = inbound.message() => {
                     match message? {
                         Some(message) => self.handle_core_envelope(&sender, message).await?,
                         None => return Ok(()),
+                    }
+                }
+                runtime_notification = recv_runtime_notification(self.runtime_priority_events.clone()) => {
+                    if let Some(runtime_notification) = runtime_notification {
+                        self.forward_runtime_notification(&sender, runtime_notification).await?;
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    self.send_heartbeat(&sender, &mut heartbeat_sampler).await?;
+                }
+                log_batch = recv_runtime_log_batch(self.runtime_log_batches.clone()) => {
+                    if let Some(log_batch) = log_batch {
+                        try_send_runtime_log_batch(&sender, log_batch, &mut dropped_log_lines)?;
                     }
                 }
             }
@@ -238,6 +253,18 @@ impl AgentController {
         Ok(())
     }
 
+    async fn replay_terminal_runtimes(
+        &self,
+        sender: &mpsc::Sender<AgentEnvelope>,
+    ) -> anyhow::Result<()> {
+        for replay in
+            collect_terminal_runtime_replays(&self.settings.agent.work_root, &self.runtime_registry)
+        {
+            self.forward_terminal_runtime_replay(sender, replay).await?;
+        }
+        Ok(())
+    }
+
     async fn forward_runtime_notification(
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
@@ -245,7 +272,17 @@ impl AgentController {
     ) -> anyhow::Result<()> {
         match notification {
             RuntimeNotification::TaskEvent(event) => {
+                let is_terminal = is_terminal_runtime_event(&event.event_type);
+                let task_id = event.task_id;
+                let attempt_no = event.attempt_no;
                 send_runtime_task_event(sender, event).await?;
+                if is_terminal {
+                    cleanup_persisted_runtime_state(
+                        &self.settings.agent.work_root,
+                        task_id,
+                        attempt_no,
+                    );
+                }
             }
             RuntimeNotification::TaskLogBatch(batch) => {
                 send_runtime_log_batch(sender, batch).await?;
@@ -258,6 +295,21 @@ impl AgentController {
             }
         }
 
+        Ok(())
+    }
+
+    async fn forward_terminal_runtime_replay(
+        &self,
+        sender: &mpsc::Sender<AgentEnvelope>,
+        replay: TerminalRuntimeReplay,
+    ) -> anyhow::Result<()> {
+        send_task_snapshot(sender, &replay.handle).await?;
+        send_runtime_task_event(sender, replay.event.clone()).await?;
+        cleanup_persisted_runtime_state(
+            &self.settings.agent.work_root,
+            replay.handle.task_id,
+            replay.handle.attempt_no,
+        );
         Ok(())
     }
 
@@ -517,6 +569,46 @@ async fn send_runtime_log_batch(
     .await
 }
 
+fn try_send_runtime_log_batch(
+    sender: &mpsc::Sender<AgentEnvelope>,
+    mut batch: RuntimeTaskLogBatch,
+    dropped_log_lines: &mut HashMap<(Uuid, i32, String), usize>,
+) -> anyhow::Result<()> {
+    let key = (batch.task_id, batch.attempt_no, batch.stream.clone());
+    let source_line_count = batch.source_line_count;
+    let suppressed = dropped_log_lines.remove(&key).unwrap_or(0);
+    if suppressed > 0 {
+        batch.lines.insert(
+            0,
+            format!("suppressed {suppressed} {} log lines", batch.stream),
+        );
+    }
+
+    let envelope = AgentEnvelope {
+        payload: Some(
+            media_rpc::control_plane::agent_envelope::Payload::TaskLogBatch(
+                media_rpc::control_plane::TaskLogBatch {
+                    task_id: batch.task_id.to_string(),
+                    attempt_no: batch.attempt_no,
+                    stream: batch.stream.clone(),
+                    lines: batch.lines,
+                },
+            ),
+        ),
+    };
+
+    match sender.try_send(envelope) {
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            *dropped_log_lines.entry(key).or_insert(0) += suppressed + source_line_count;
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(anyhow::anyhow!("control-plane sender closed"))
+        }
+    }
+}
+
 async fn send_runtime_progress(
     sender: &mpsc::Sender<AgentEnvelope>,
     progress: RuntimeTaskProgress,
@@ -736,6 +828,13 @@ fn discover_interface_cidrs() -> Vec<String> {
 async fn recv_runtime_notification(
     receiver: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
 ) -> Option<RuntimeNotification> {
+    let mut receiver = receiver.lock().await;
+    receiver.recv().await
+}
+
+async fn recv_runtime_log_batch(
+    receiver: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
+) -> Option<RuntimeTaskLogBatch> {
     let mut receiver = receiver.lock().await;
     receiver.recv().await
 }

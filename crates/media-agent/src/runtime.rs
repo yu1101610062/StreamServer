@@ -29,7 +29,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::mpsc,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use uuid::Uuid;
 
@@ -153,7 +153,7 @@ pub trait LocalExecutor: Send + Sync {
 pub struct ManagedProcessExecutor {
     settings: AgentSettings,
     registry: LocalRuntimeRegistry,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     http_client: Client,
 }
@@ -270,6 +270,8 @@ const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_PROBE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_LOG_BATCH_LINES: usize = 64;
 const ZLM_RUNTIME_VHOST: &str = "__defaultVhost__";
 
 #[derive(Debug, Clone)]
@@ -296,6 +298,7 @@ pub struct RuntimeTaskLogBatch {
     pub attempt_no: i32,
     pub stream: String,
     pub lines: Vec<String>,
+    pub source_line_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -311,11 +314,90 @@ pub struct RuntimeTaskProgress {
     pub drop_frames: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuntimeLogKey {
+    task_id: Uuid,
+    attempt_no: i32,
+    stream: String,
+}
+
+impl RuntimeLogKey {
+    fn from_batch(batch: &RuntimeTaskLogBatch) -> Self {
+        Self {
+            task_id: batch.task_id,
+            attempt_no: batch.attempt_no,
+            stream: batch.stream.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeEventSink {
+    priority_tx: mpsc::UnboundedSender<RuntimeNotification>,
+    log_tx: mpsc::Sender<RuntimeTaskLogBatch>,
+    suppressed_logs: Arc<RwLock<HashMap<RuntimeLogKey, usize>>>,
+}
+
+impl RuntimeEventSink {
+    pub fn new(
+        priority_tx: mpsc::UnboundedSender<RuntimeNotification>,
+        log_tx: mpsc::Sender<RuntimeTaskLogBatch>,
+    ) -> Self {
+        Self {
+            priority_tx,
+            log_tx,
+            suppressed_logs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn send(&self, notification: RuntimeNotification) -> Result<(), ()> {
+        match notification {
+            RuntimeNotification::TaskLogBatch(batch) => self.send_log_batch(batch),
+            notification => self.priority_tx.send(notification).map_err(|_| ()),
+        }
+    }
+
+    fn send_log_batch(&self, mut batch: RuntimeTaskLogBatch) -> Result<(), ()> {
+        let key = RuntimeLogKey::from_batch(&batch);
+        let suppressed = self
+            .suppressed_logs
+            .write()
+            .expect("suppressed logs lock poisoned")
+            .remove(&key)
+            .unwrap_or(0);
+        if suppressed > 0 {
+            batch.lines.insert(
+                0,
+                format!("suppressed {suppressed} {} log lines", batch.stream),
+            );
+        }
+
+        match self.log_tx.try_send(batch) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+                let mut suppressed_logs = self
+                    .suppressed_logs
+                    .write()
+                    .expect("suppressed logs lock poisoned");
+                *suppressed_logs.entry(key).or_insert(0) += suppressed + batch.source_line_count;
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalRuntimeReplay {
+    pub handle: RuntimeHandle,
+    pub event: RuntimeTaskEvent,
+}
+
 impl ManagedProcessExecutor {
     pub fn new(
         settings: AgentSettings,
         registry: LocalRuntimeRegistry,
-        events: mpsc::UnboundedSender<RuntimeNotification>,
+        events: RuntimeEventSink,
     ) -> Self {
         Self {
             settings,
@@ -1411,7 +1493,7 @@ async fn read_progress_stream(
     task_id: Uuid,
     attempt_no: i32,
     registry: LocalRuntimeRegistry,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
     require_stream_online: bool,
 ) {
     let mut reader = BufReader::new(stdout).lines();
@@ -1462,26 +1544,111 @@ async fn read_progress_stream(
     }
 }
 
+fn flush_log_batch(
+    task_id: Uuid,
+    attempt_no: i32,
+    stream: &str,
+    batch: &mut Vec<(String, usize)>,
+    source_line_count: &mut usize,
+    events: &RuntimeEventSink,
+) {
+    if batch.is_empty() {
+        return;
+    }
+
+    let lines = batch
+        .drain(..)
+        .map(|(line, count)| match count {
+            0 | 1 => line,
+            count => format!("{line} (repeated {count} times)"),
+        })
+        .collect::<Vec<_>>();
+    let emitted_line_count = *source_line_count;
+    *source_line_count = 0;
+
+    let _ = events.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
+        task_id,
+        attempt_no,
+        stream: stream.to_string(),
+        lines,
+        source_line_count: emitted_line_count,
+    }));
+}
+
 async fn read_log_stream(
     stderr: tokio::process::ChildStderr,
     task_id: Uuid,
     attempt_no: i32,
     stream: String,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
 ) {
     let mut reader = BufReader::new(stderr).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
+    let mut batch = Vec::new();
+    let mut source_line_count = 0usize;
+
+    'outer: loop {
+        let next_line = if batch.is_empty() {
+            reader.next_line().await
+        } else {
+            match timeout(LOG_BATCH_FLUSH_INTERVAL, reader.next_line()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    flush_log_batch(
+                        task_id,
+                        attempt_no,
+                        &stream,
+                        &mut batch,
+                        &mut source_line_count,
+                        &events,
+                    );
+                    continue;
+                }
+            }
+        };
+
+        let Ok(line) = next_line else {
+            break;
+        };
+        let Some(line) = line else {
+            break;
+        };
         let line = line.trim_end().to_string();
         if line.is_empty() {
             continue;
         }
-        let _ = events.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
-            task_id,
-            attempt_no,
-            stream: stream.clone(),
-            lines: vec![line],
-        }));
+
+        source_line_count += 1;
+        if let Some((last_line, count)) = batch.last_mut() {
+            if *last_line == line {
+                *count += 1;
+            } else {
+                batch.push((line, 1));
+            }
+        } else {
+            batch.push((line, 1));
+        }
+
+        if batch.len() >= MAX_LOG_BATCH_LINES || source_line_count >= MAX_LOG_BATCH_LINES {
+            flush_log_batch(
+                task_id,
+                attempt_no,
+                &stream,
+                &mut batch,
+                &mut source_line_count,
+                &events,
+            );
+            continue 'outer;
+        }
     }
+
+    flush_log_batch(
+        task_id,
+        attempt_no,
+        &stream,
+        &mut batch,
+        &mut source_line_count,
+        &events,
+    );
 }
 
 fn build_process_plan(
@@ -3749,6 +3916,109 @@ fn scan_persisted_runtimes(work_root: &str) -> Vec<PersistedRuntimeState> {
     states
 }
 
+fn scan_exited_persisted_runtimes(work_root: &str) -> Vec<PersistedRuntimeState> {
+    let root = Path::new(work_root);
+    if !root.exists() {
+        return Vec::new();
+    }
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut states = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) != Some(RUNTIME_STATE_FILE) {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(state) = serde_json::from_slice::<PersistedRuntimeState>(&bytes) else {
+                continue;
+            };
+            if state.handle.state != RuntimeState::Exited {
+                continue;
+            }
+            states.push(state);
+        }
+    }
+    states
+}
+
+fn stop_requested_from_persisted_handle(handle: &RuntimeHandle) -> bool {
+    handle
+        .metadata
+        .get("stop")
+        .map(|value| !value.is_null())
+        .unwrap_or(false)
+}
+
+fn classify_replayed_exit(
+    handle: &RuntimeHandle,
+    success_check: &SuccessCheck,
+) -> (&'static str, &'static str, String, Value) {
+    let (event_type, event_level, message, mut payload) = classify_adopted_exit(
+        handle,
+        success_check,
+        stop_requested_from_persisted_handle(handle),
+    );
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("orphaned");
+        object.insert("replayed".to_string(), json!(true));
+    }
+    (event_type, event_level, message, payload)
+}
+
+pub fn collect_terminal_runtime_replays(
+    work_root: &str,
+    registry: &LocalRuntimeRegistry,
+) -> Vec<TerminalRuntimeReplay> {
+    scan_exited_persisted_runtimes(work_root)
+        .into_iter()
+        .filter(|state| stop_requested_from_persisted_handle(&state.handle))
+        .filter(|state| {
+            registry
+                .find_by_task_attempt(state.handle.task_id, state.handle.attempt_no)
+                .is_none()
+        })
+        .map(|state| {
+            let (event_type, event_level, message, payload) =
+                classify_replayed_exit(&state.handle, &state.success_check);
+            TerminalRuntimeReplay {
+                handle: state.handle.clone(),
+                event: RuntimeTaskEvent {
+                    task_id: state.handle.task_id,
+                    attempt_no: state.handle.attempt_no,
+                    event_type: event_type.to_string(),
+                    event_level: event_level.to_string(),
+                    message,
+                    payload,
+                },
+            }
+        })
+        .collect()
+}
+
+pub fn cleanup_persisted_runtime_state(work_root: &str, task_id: Uuid, attempt_no: i32) {
+    let work_dir = Path::new(work_root)
+        .join(task_id.to_string())
+        .join(format!("attempt-{attempt_no}"));
+    let _ = fs::remove_file(work_dir.join(RUNTIME_STATE_FILE));
+    let _ = fs::remove_file(work_dir.join(RUNTIME_PID_FILE));
+    let _ = fs::remove_file(work_dir.join(RUNTIME_COMMAND_FILE));
+}
+
+pub fn is_terminal_runtime_event(event_type: &str) -> bool {
+    matches!(event_type, "canceled" | "failed" | "succeeded")
+}
+
 fn is_pid_running(pid: i32) -> bool {
     let rc = unsafe { libc::kill(pid, 0) };
     if rc == 0 {
@@ -3767,7 +4037,7 @@ fn spawn_adopted_runtime_monitor(
     success_check: SuccessCheck,
     registry: LocalRuntimeRegistry,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
 ) {
     let runtime_id = handle.runtime_id;
     tokio::spawn(async move {
@@ -3837,7 +4107,7 @@ fn spawn_startup_probe_monitor(
     http_client: Client,
     registry: LocalRuntimeRegistry,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
 ) {
     tokio::spawn(async move {
         let started_at = tokio::time::Instant::now();
@@ -4073,7 +4343,7 @@ fn spawn_live_relay_monitor(
     http_client: Client,
     registry: LocalRuntimeRegistry,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
 ) {
     tokio::spawn(async move {
         let started_at = tokio::time::Instant::now();
@@ -4539,7 +4809,7 @@ fn spawn_rtp_receive_monitor(
     http_client: Client,
     registry: LocalRuntimeRegistry,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    events: mpsc::UnboundedSender<RuntimeNotification>,
+    events: RuntimeEventSink,
 ) {
     tokio::spawn(async move {
         loop {
@@ -5661,11 +5931,16 @@ fi
             metadata: json!({"task_type": "file_transcode"}),
         });
 
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+        let (log_tx, _log_rx) = mpsc::channel(8);
         let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
         settings.max_runtime_slots = 1;
         settings.ffmpeg_bin = "/definitely/missing-ffmpeg".to_string();
-        let executor = ManagedProcessExecutor::new(settings, registry, events_tx);
+        let executor = ManagedProcessExecutor::new(
+            settings,
+            registry,
+            RuntimeEventSink::new(priority_tx, log_tx),
+        );
         let request = StartTaskRequest {
             task_id: Uuid::now_v7(),
             attempt_no: 1,
@@ -7517,11 +7792,12 @@ fi
             .expect("runtime state should persist");
 
         let registry = LocalRuntimeRegistry::new();
-        let (events_tx, _events_rx) = mpsc::unbounded_channel();
+        let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+        let (log_tx, _log_rx) = mpsc::channel(8);
         let executor = ManagedProcessExecutor::new(
             test_settings(temp_root.to_string_lossy().as_ref()),
             registry.clone(),
-            events_tx,
+            RuntimeEventSink::new(priority_tx, log_tx),
         );
 
         let adopted = executor.adopt_orphans(&AdoptFilter {
@@ -7536,6 +7812,155 @@ fi
                 .find_by_task_attempt(handle.task_id, handle.attempt_no)
                 .is_some()
         );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn runtime_event_sink_summarizes_dropped_log_lines() {
+        let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+        let (log_tx, mut log_rx) = mpsc::channel(1);
+        let sink = RuntimeEventSink::new(priority_tx, log_tx);
+        let task_id = Uuid::now_v7();
+
+        assert!(
+            sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
+                task_id,
+                attempt_no: 1,
+                stream: "stderr".to_string(),
+                lines: vec!["first".to_string()],
+                source_line_count: 1,
+            }))
+            .is_ok()
+        );
+        assert!(
+            sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
+                task_id,
+                attempt_no: 1,
+                stream: "stderr".to_string(),
+                lines: vec!["dropped".to_string()],
+                source_line_count: 3,
+            }))
+            .is_ok()
+        );
+
+        let first = log_rx.recv().await.expect("first batch should be queued");
+        assert_eq!(first.lines, vec!["first".to_string()]);
+
+        assert!(
+            sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
+                task_id,
+                attempt_no: 1,
+                stream: "stderr".to_string(),
+                lines: vec!["after".to_string()],
+                source_line_count: 1,
+            }))
+            .is_ok()
+        );
+
+        let second = log_rx.recv().await.expect("second batch should be queued");
+        assert_eq!(
+            second.lines,
+            vec![
+                "suppressed 3 stderr log lines".to_string(),
+                "after".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_terminal_runtime_replays_only_replays_stopped_exited_runtimes() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-terminal-replay-{}", Uuid::now_v7()));
+        let stopped_dir = temp_root.join("stopped").join("attempt-1");
+        let completed_dir = temp_root.join("completed").join("attempt-1");
+
+        let stopped_handle = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::ZlmProxy,
+            pid: Some(1234),
+            started_at: Utc::now(),
+            last_progress_at: Some(Utc::now()),
+            state: RuntimeState::Exited,
+            command_line: Some("ffmpeg -i input".to_string()),
+            outputs: vec!["rtmp://127.0.0.1/live/test".to_string()],
+            metadata: json!({
+                "task_type": "stream_ingest",
+                "stop": {
+                    "reason": "user_requested"
+                }
+            }),
+        };
+        let completed_handle = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::ZlmProxy,
+            pid: Some(5678),
+            started_at: Utc::now(),
+            last_progress_at: Some(Utc::now()),
+            state: RuntimeState::Exited,
+            command_line: Some("ffmpeg -i input".to_string()),
+            outputs: vec!["rtmp://127.0.0.1/live/test".to_string()],
+            metadata: json!({
+                "task_type": "stream_ingest"
+            }),
+        };
+
+        persist_runtime_state(&stopped_dir, &stopped_handle, &SuccessCheck::ProcessExit)
+            .expect("stopped runtime should persist");
+        persist_runtime_state(
+            &completed_dir,
+            &completed_handle,
+            &SuccessCheck::ProcessExit,
+        )
+        .expect("completed runtime should persist");
+
+        let replays = collect_terminal_runtime_replays(
+            temp_root.to_string_lossy().as_ref(),
+            &LocalRuntimeRegistry::new(),
+        );
+
+        assert_eq!(replays.len(), 1);
+        assert_eq!(replays[0].handle.task_id, stopped_handle.task_id);
+        assert_eq!(replays[0].event.event_type, "canceled");
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn cleanup_persisted_runtime_state_removes_runtime_files() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-runtime-cleanup-{}", Uuid::now_v7()));
+        let task_id = Uuid::parse_str("019d8631-7061-71b3-a9ca-95874bddeb55").unwrap();
+        let work_dir = temp_root.join(task_id.to_string()).join("attempt-2");
+        let handle = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id,
+            attempt_no: 2,
+            worker_kind: WorkerKind::ZlmProxy,
+            pid: Some(4321),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Exited,
+            command_line: Some("ffmpeg -i input".to_string()),
+            outputs: vec!["rtmp://127.0.0.1/live/test".to_string()],
+            metadata: json!({"task_type": "stream_ingest"}),
+        };
+
+        persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
+            .expect("runtime should persist");
+        cleanup_persisted_runtime_state(
+            temp_root.to_string_lossy().as_ref(),
+            handle.task_id,
+            handle.attempt_no,
+        );
+
+        assert!(!work_dir.join(RUNTIME_STATE_FILE).exists());
+        assert!(!work_dir.join(RUNTIME_PID_FILE).exists());
+        assert!(!work_dir.join(RUNTIME_COMMAND_FILE).exists());
 
         let _ = fs::remove_dir_all(temp_root);
     }
