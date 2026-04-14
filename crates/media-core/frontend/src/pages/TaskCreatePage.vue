@@ -639,7 +639,7 @@ function previewTask() {
           type="warning"
           :closable="false"
           title="只在你确实需要回看文件时开启录制"
-          description="MP4 适合回看和下载；HLS 适合分段输出；MP4 + HLS 适合同时兼顾两种需求。录制目录由系统托管生成。VOD 输入是否快录会由播放协议自动判定。"
+          description="MP4 适合回看和下载，默认输出单个文件；HLS 适合分段输出；MP4 + HLS 适合同时兼顾两种需求。只有显式填写分段时长时，MP4 才会切片。录制目录由系统托管生成。VOD 输入是否快录会由播放协议自动判定。"
         />
       </div>
       <el-form label-position="top">
@@ -670,7 +670,7 @@ function previewTask() {
             </el-form-item>
           </el-col>
           <el-col v-if="draft.record.enabled" :md="6" :span="24">
-            <el-form-item label="分段时长（秒，可选）">
+            <el-form-item label="分段时长（秒，可选，仅 HLS 或需要切片 MP4 时填写）">
               <el-input v-model="draft.record.segment_sec" placeholder="例如 60" />
             </el-form-item>
           </el-col>

@@ -336,7 +336,7 @@ function fieldMeta(path: string): FieldMeta | null {
       meta: { description: "录制输出格式。", enumValues: RECORD_FORMAT_ENUM },
     },
     { test: (value) => value === "record.duration_sec", meta: { description: "录制时长上限，单位秒。VOD 快录分支下如果同时开启 `input.loop_enabled=true`，这里必须填写。" } },
-    { test: (value) => value === "record.segment_sec", meta: { description: "录制分段时长，单位秒。" } },
+    { test: (value) => value === "record.segment_sec", meta: { description: "录制分段时长，单位秒。HLS 会按此切片；MP4 只有在显式填写时才会分段，不填时默认输出单个文件。" } },
     {
       test: (value) => value === "record.save_path",
       meta: { description: "已忽略。stream_ingest 录制目录由系统托管生成，仅为兼容旧请求保留。" },

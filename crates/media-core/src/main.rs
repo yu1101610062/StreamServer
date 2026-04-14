@@ -2135,9 +2135,9 @@ fn build_publish_hook_response(
         "enable_rtmp": expose.enable_rtmp.unwrap_or(true),
         "enable_ts": expose.enable_http_ts.unwrap_or(true),
         "enable_fmp4": expose.enable_http_fmp4.unwrap_or(true),
-        "enable_hls": expose.enable_hls.unwrap_or(false) || record.wants_hls(),
+        "enable_hls": expose.enable_hls.unwrap_or(false),
         "enable_hls_fmp4": false,
-        "enable_mp4": record.wants_mp4(),
+        "enable_mp4": false,
         "modify_stamp": 2,
         "continue_push_ms": 15_000,
         "mp4_as_player": record.as_player.unwrap_or(false),
@@ -3948,7 +3948,7 @@ mod tests {
     }
 
     #[test]
-    fn build_publish_hook_response_maps_task_publish_policy() {
+    fn build_publish_hook_response_uses_expose_policy_without_auto_recording() {
         let spec = serde_json::from_value::<TaskSpec>(json!({
             "type": "stream_ingest",
             "name": "push",
@@ -3973,7 +3973,7 @@ mod tests {
 
         assert_eq!(response["enable_rtsp"], json!(false));
         assert_eq!(response["enable_hls"], json!(true));
-        assert_eq!(response["enable_mp4"], json!(true));
+        assert_eq!(response["enable_mp4"], json!(false));
         assert_eq!(response["auto_close"], json!(true));
         assert_eq!(response["mp4_as_player"], json!(true));
     }

@@ -3,6 +3,7 @@ use std::{
     ffi::CStr,
     fs,
     future::Future,
+    io::Read,
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::Stdio,
@@ -12,7 +13,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Local, Utc};
@@ -272,6 +273,8 @@ const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_BATCH_LINES: usize = 64;
+const DEFAULT_INPUT_PROBE_TIMEOUT_MS: u64 = 7000;
+const FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ZLM_RUNTIME_VHOST: &str = "__defaultVhost__";
 
 #[derive(Debug, Clone)]
@@ -1710,6 +1713,9 @@ const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
 const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
 const BRIDGE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/bridge";
 const STREAM_INGEST_RECORD_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/stream-ingest-record";
+// ZLMediaKit falls back to a time-sliced mp4 recorder and does not expose a true
+// unlimited mode, so use a long horizon to approximate "single file" recording.
+const ZLM_SINGLE_FILE_MP4_MAX_SECOND: u32 = 31_536_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2244,6 +2250,7 @@ fn append_live_mpegts_multicast_bridge_args(
 ) {
     let selection = resolve_transcode_selection(
         settings,
+        spec,
         input_url,
         VideoOutputPolicy::ForceH264,
         AudioOutputPolicy::Copy,
@@ -2663,7 +2670,7 @@ fn resolve_process_selection(
     audio_policy: AudioOutputPolicy,
 ) -> TranscodeSelection {
     if mode == "force_transcode" {
-        return resolve_transcode_selection(settings, input_url, video_policy, audio_policy);
+        return resolve_transcode_selection(settings, spec, input_url, video_policy, audio_policy);
     }
 
     let profile = probe_input_media_profile(settings, spec, input_url);
@@ -2713,7 +2720,7 @@ fn should_copy_video_stream(
     spec: &TaskSpec,
     output_format: &str,
     profile: &InputMediaProfile,
-    video_policy: VideoOutputPolicy,
+    _video_policy: VideoOutputPolicy,
 ) -> bool {
     if !profile.has_video {
         return true;
@@ -2724,9 +2731,7 @@ fn should_copy_video_stream(
         return false;
     }
 
-    let required_family = output_video_family(profile.video_family, video_policy);
-    profile.video_family == required_family
-        && format_supports_video_family_copy(output_format, profile.video_family)
+    format_supports_video_codec_copy(output_format, profile.video_codec_name.as_deref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2763,8 +2768,10 @@ fn resolve_audio_copy_selection(
             decoration: None,
         },
         AudioOutputPolicy::Aac => {
-            let copy = profile.audio_codec_name.as_deref() == Some("aac")
-                && format_supports_audio_codec_copy(output_format, Some("aac"));
+            let copy = format_supports_audio_codec_copy(
+                output_format,
+                profile.audio_codec_name.as_deref(),
+            );
             AudioCopySelection {
                 copy,
                 decoration: if copy {
@@ -2839,15 +2846,39 @@ fn process_requires_audio_transcode(spec: &TaskSpec) -> bool {
         .is_some_and(|value| !value.is_empty())
 }
 
-fn format_supports_video_family_copy(output_format: &str, video_family: VideoCodecFamily) -> bool {
+fn format_supports_video_codec_copy(output_format: &str, codec_name: Option<&str>) -> bool {
+    let Some(codec_name) = codec_name.map(str::trim).map(str::to_ascii_lowercase) else {
+        return false;
+    };
+
     match output_format.trim().to_ascii_lowercase().as_str() {
-        "flv" => matches!(video_family, VideoCodecFamily::H264),
-        "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" | "hls" => {
-            matches!(
-                video_family,
-                VideoCodecFamily::H264 | VideoCodecFamily::Hevc
-            )
-        }
+        "flv" => matches!(codec_name.as_str(), "h264" | "hevc" | "h265"),
+        "mp4" => matches!(
+            codec_name.as_str(),
+            "h264" | "hevc" | "h265" | "av1" | "vp9" | "mpeg4" | "mjpeg"
+        ),
+        "mov" => matches!(
+            codec_name.as_str(),
+            "h264" | "hevc" | "h265" | "av1" | "vp9" | "mpeg4" | "mjpeg" | "prores" | "dnxhd"
+        ),
+        "matroska" | "mkv" => matches!(
+            codec_name.as_str(),
+            "h264"
+                | "hevc"
+                | "h265"
+                | "av1"
+                | "vp8"
+                | "vp9"
+                | "mpeg4"
+                | "mpeg2video"
+                | "mjpeg"
+                | "prores"
+                | "dnxhd"
+        ),
+        "mpegts" | "rtp_mpegts" | "hls" => matches!(
+            codec_name.as_str(),
+            "h264" | "hevc" | "h265" | "mpeg2video" | "mpeg4"
+        ),
         _ => false,
     }
 }
@@ -2858,8 +2889,42 @@ fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str
     };
 
     match output_format.trim().to_ascii_lowercase().as_str() {
-        "flv" | "mp4" | "mov" | "matroska" | "mkv" | "mpegts" | "rtp_mpegts" | "hls" => {
-            codec_name == "aac"
+        "flv" => matches!(codec_name.as_str(), "aac" | "mp3"),
+        "mp4" => matches!(codec_name.as_str(), "aac" | "mp3" | "ac3" | "eac3" | "alac"),
+        "mov" => matches!(
+            codec_name.as_str(),
+            "aac"
+                | "mp3"
+                | "ac3"
+                | "eac3"
+                | "alac"
+                | "pcm_s16le"
+                | "pcm_s24le"
+                | "pcm_s32le"
+                | "pcm_f32le"
+                | "pcm_f64le"
+        ),
+        "matroska" | "mkv" => matches!(
+            codec_name.as_str(),
+            "aac"
+                | "mp2"
+                | "mp3"
+                | "ac3"
+                | "eac3"
+                | "opus"
+                | "vorbis"
+                | "flac"
+                | "alac"
+                | "pcm_s16le"
+                | "pcm_s24le"
+                | "pcm_s32le"
+                | "pcm_f32le"
+                | "pcm_f64le"
+                | "pcm_alaw"
+                | "pcm_mulaw"
+        ),
+        "mpegts" | "rtp_mpegts" | "hls" => {
+            matches!(codec_name.as_str(), "aac" | "mp2" | "mp3" | "ac3" | "eac3")
         }
         _ => false,
     }
@@ -2867,11 +2932,17 @@ fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str
 
 fn resolve_transcode_selection(
     settings: &AgentSettings,
+    spec: &TaskSpec,
     input_url: &str,
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
 ) -> TranscodeSelection {
-    let (input_family, _) = resolve_video_families(settings, input_url, video_policy);
+    let (input_family, _) = resolve_video_families(
+        settings,
+        input_url,
+        spec.input.probe_timeout_ms,
+        video_policy,
+    );
     resolve_transcode_selection_for_input_family(settings, input_family, video_policy, audio_policy)
 }
 
@@ -2942,9 +3013,10 @@ fn output_video_family(
 fn resolve_video_families(
     settings: &AgentSettings,
     input_url: &str,
+    probe_timeout_ms: Option<u64>,
     video_policy: VideoOutputPolicy,
 ) -> (VideoCodecFamily, VideoCodecFamily) {
-    let input_family = probe_primary_video_codec_family(settings, input_url);
+    let input_family = probe_primary_video_codec_family(settings, input_url, probe_timeout_ms);
     let output_family = output_video_family(input_family, video_policy);
     (input_family, output_family)
 }
@@ -2953,6 +3025,7 @@ fn resolve_video_families(
 struct InputMediaProfile {
     has_video: bool,
     video_family: VideoCodecFamily,
+    video_codec_name: Option<String>,
     has_audio: bool,
     audio_codec_name: Option<String>,
     source_family: InputSourceFamily,
@@ -2963,6 +3036,7 @@ impl Default for InputMediaProfile {
         Self {
             has_video: false,
             video_family: VideoCodecFamily::Unknown,
+            video_codec_name: None,
             has_audio: false,
             audio_codec_name: None,
             source_family: InputSourceFamily::Unknown,
@@ -2997,19 +3071,22 @@ fn probe_input_media_profile(
         source_family: infer_input_source_family(spec, input_url, None),
         ..InputMediaProfile::default()
     };
-    let output = std::process::Command::new(&settings.ffprobe_bin)
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "stream=codec_type,codec_name:format=format_name",
-            "-of",
-            "json",
-            input_url,
-        ])
-        .output();
+    let args = [
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name:format=format_name",
+        "-of",
+        "json",
+        input_url,
+    ];
+    let output = run_ffprobe_with_timeout(
+        &settings.ffprobe_bin,
+        &args,
+        input_probe_timeout_duration(spec.input.probe_timeout_ms),
+    );
 
-    let Ok(output) = output else {
+    let Some(output) = output else {
         return default_profile;
     };
     if !output.status.success() {
@@ -3035,13 +3112,13 @@ fn probe_input_media_profile(
         match stream.codec_type.as_deref() {
             Some("video") if !profile.has_video => {
                 profile.has_video = true;
-                profile.video_family = match stream
+                profile.video_codec_name = stream
                     .codec_name
                     .as_deref()
                     .map(str::trim)
-                    .map(str::to_ascii_lowercase)
-                    .as_deref()
-                {
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_ascii_lowercase);
+                profile.video_family = match profile.video_codec_name.as_deref() {
                     Some("h264") => VideoCodecFamily::H264,
                     Some("hevc") | Some("h265") => VideoCodecFamily::Hevc,
                     _ => VideoCodecFamily::Unknown,
@@ -3061,6 +3138,52 @@ fn probe_input_media_profile(
     }
 
     profile
+}
+
+#[derive(Debug)]
+struct TimedProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn input_probe_timeout_duration(timeout_ms: Option<u64>) -> Duration {
+    Duration::from_millis(
+        timeout_ms
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_INPUT_PROBE_TIMEOUT_MS),
+    )
+}
+
+fn run_ffprobe_with_timeout(
+    ffprobe_bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<TimedProcessOutput> {
+    let mut child = std::process::Command::new(ffprobe_bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_end(&mut stdout);
+                }
+                return Some(TimedProcessOutput { status, stdout });
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(FFPROBE_POLL_INTERVAL),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 fn infer_input_source_family(
@@ -3146,22 +3269,29 @@ fn maybe_add_cuda_decoder(
     }
 }
 
-fn probe_primary_video_codec_family(settings: &AgentSettings, input_url: &str) -> VideoCodecFamily {
-    let output = std::process::Command::new(&settings.ffprobe_bin)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            input_url,
-        ])
-        .output();
+fn probe_primary_video_codec_family(
+    settings: &AgentSettings,
+    input_url: &str,
+    probe_timeout_ms: Option<u64>,
+) -> VideoCodecFamily {
+    let args = [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        input_url,
+    ];
+    let output = run_ffprobe_with_timeout(
+        &settings.ffprobe_bin,
+        &args,
+        input_probe_timeout_duration(probe_timeout_ms),
+    );
 
-    let Ok(output) = output else {
+    let Some(output) = output else {
         return VideoCodecFamily::Unknown;
     };
     if !output.status.success() {
@@ -3373,7 +3503,7 @@ fn build_live_relay_api_params(
         ),
         (
             "enable_hls".to_string(),
-            bool_as_flag(spec.expose.enable_hls.unwrap_or(false) || spec.record.wants_hls()),
+            bool_as_flag(spec.expose.enable_hls.unwrap_or(false)),
         ),
         (
             "enable_ts".to_string(),
@@ -3383,10 +3513,7 @@ fn build_live_relay_api_params(
             "enable_fmp4".to_string(),
             bool_as_flag(spec.expose.enable_http_fmp4.unwrap_or(true)),
         ),
-        (
-            "enable_mp4".to_string(),
-            bool_as_flag(spec.record.wants_mp4()),
-        ),
+        ("enable_mp4".to_string(), bool_as_flag(false)),
         (
             "auto_close".to_string(),
             bool_as_flag(live_relay_auto_close_enabled(settings, spec)),
@@ -5187,10 +5314,18 @@ fn build_record_api_params(
     if matches!(kind, ZlmRecordKind::Mp4) {
         params.push((
             "max_second".to_string(),
-            recording.segment_sec.unwrap_or(3600).to_string(),
+            mp4_record_max_second(recording).to_string(),
         ));
     }
     params
+}
+
+fn mp4_record_max_second(recording: &LiveRelayRecording) -> u32 {
+    recording
+        .segment_sec
+        .filter(|value| *value > 0)
+        .or(recording.duration_sec.filter(|value| *value > 0))
+        .unwrap_or(ZLM_SINGLE_FILE_MP4_MAX_SECOND)
 }
 
 fn build_close_stream_params(binding: &StreamBinding, force: bool) -> Vec<(String, String)> {
@@ -5582,6 +5717,51 @@ fi
         path.to_string_lossy().to_string()
     }
 
+    fn create_slow_mock_ffprobe_binary(
+        root: &Path,
+        sleep_ms: u64,
+        video_codec_name: &str,
+        audio_codec_name: Option<&str>,
+    ) -> String {
+        let path = root.join("mock-ffprobe-slow.sh");
+        let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
+            format!(
+                r#",
+    {{"codec_type":"audio","codec_name":"{codec}"}}"#
+            )
+        });
+        let body = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+sleep_sec=$(python3 - <<'PY'
+print({sleep_ms} / 1000)
+PY
+)
+sleep "${{sleep_sec}}"
+want_json=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
+    want_json=1
+    break
+  fi
+  prev="$arg"
+done
+if [ "$want_json" = "1" ]; then
+  cat <<'EOF'
+{{"streams":[
+    {{"codec_type":"video","codec_name":"{video_codec_name}"}}{audio_stream}
+],"format":{{"format_name":"mpegts"}}}}
+EOF
+else
+  echo "{video_codec_name}"
+fi
+"#
+        );
+        write_executable(&path, &body);
+        path.to_string_lossy().to_string()
+    }
+
     #[test]
     fn registry_tracks_and_filters_snapshots() {
         let registry = LocalRuntimeRegistry::new();
@@ -5772,8 +5952,12 @@ fi
         let mut settings = test_settings("/tmp/work");
         settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc", None);
 
-        let (input_family, output_family) =
-            resolve_video_families(&settings, "/tmp/input.mp4", VideoOutputPolicy::ForceH264);
+        let (input_family, output_family) = resolve_video_families(
+            &settings,
+            "/tmp/input.mp4",
+            Some(DEFAULT_INPUT_PROBE_TIMEOUT_MS),
+            VideoOutputPolicy::ForceH264,
+        );
 
         assert_eq!(input_family, VideoCodecFamily::Hevc);
         assert_eq!(output_family, VideoCodecFamily::H264);
@@ -5807,9 +5991,79 @@ fi
 
         assert!(profile.has_video);
         assert_eq!(profile.video_family, VideoCodecFamily::H264);
+        assert_eq!(profile.video_codec_name.as_deref(), Some("h264"));
         assert!(profile.has_audio);
         assert_eq!(profile.audio_codec_name.as_deref(), Some("aac"));
         assert_eq!(profile.source_family, InputSourceFamily::Mp4Mov);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn probe_input_media_profile_times_out_and_returns_default_profile() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-media-profile-timeout-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_slow_mock_ffprobe_binary(&temp_root, 500, "h264", Some("aac"));
+        let spec: TaskSpec = serde_json::from_value(json!({
+            "type": "stream_ingest",
+            "name": "probe-timeout",
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "udp_mpegts_multicast",
+                "url": "udp://@231.40.1.101:5001",
+                "probe_timeout_ms": 100
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "stream": {"app": "live", "name": "probe-timeout", "vhost": "__defaultVhost__"},
+            "publish": {},
+            "record": {},
+            "expose": {},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }))
+        .expect("spec should parse");
+
+        let started = Instant::now();
+        let profile = probe_input_media_profile(&settings, &spec, "udp://@231.40.1.101:5001");
+
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(profile.source_family, InputSourceFamily::MpegTs);
+        assert!(!profile.has_video);
+        assert!(!profile.has_audio);
+        assert_eq!(profile.video_family, VideoCodecFamily::Unknown);
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn resolve_video_families_times_out_to_unknown_input_family() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-video-family-timeout-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_slow_mock_ffprobe_binary(&temp_root, 500, "hevc", None);
+
+        let started = Instant::now();
+        let (input_family, output_family) = resolve_video_families(
+            &settings,
+            "udp://@231.40.1.101:5001",
+            Some(100),
+            VideoOutputPolicy::ForceH264,
+        );
+
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(input_family, VideoCodecFamily::Unknown);
+        assert_eq!(output_family, VideoCodecFamily::H264);
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -6267,6 +6521,69 @@ fi
                 "publish": {
                     "kind": "rtmp_push",
                     "url": "rtmp://push.example.com/live/bridge-copy"
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_multicast_bridge_plan_copy_or_transcode_copies_hevc_aac_to_external_rtmp() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-bridge-copy-hevc-rtmp-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamBridge,
+            resolved_spec: json!({
+                "type": "stream_bridge",
+                "name": "bridge-copy-hevc-to-rtmp",
+                "common": {"created_by": "tester"},
+                "input": {
+                    "kind": "rtsp",
+                    "source_mode": "live",
+                    "url": "rtsp://camera.example/live"
+                },
+                "process": {"mode": "copy_or_transcode"},
+                "publish": {
+                    "kind": "rtmp_push",
+                    "url": "rtmp://push.example.com/live/bridge-copy-hevc"
                 },
                 "record": {},
                 "recovery": {},
@@ -7167,9 +7484,63 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_copy_or_transcode_only_transcodes_non_aac_audio() {
+    fn build_file_to_live_plan_copy_or_transcode_copies_hevc_aac_into_internal_rtmp() {
+        let temp_root =
+            std::env::temp_dir().join(format!("streamserver-file-live-hevc-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "hevc", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-copy-hevc",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mp4"},
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-c:v", "libx264"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_copy_or_transcode_copies_mp3_audio_when_flv_allows_it() {
         let temp_root = std::env::temp_dir().join(format!(
-            "streamserver-file-live-audio-transcode-{}",
+            "streamserver-file-live-mp3-copy-{}",
             Uuid::now_v7()
         ));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -7184,7 +7555,7 @@ fi
             task_type: TaskType::StreamIngest,
             resolved_spec: json!({
                 "type": "stream_ingest",
-                "name": "file-live-audio-transcode",
+                "name": "file-live-mp3-copy",
                 "common": {"created_by": "tester"},
                 "input": {"kind": "file", "url": "input.ts"},
                 "stream": {"app": "live", "name": "stream"},
@@ -7207,7 +7578,222 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "copy"])
         );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_copy_or_transcode_transcodes_opus_audio_for_flv() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-opus-transcode-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "matroska", "h264", Some("opus"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-opus-transcode",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mkv"},
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
         assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_transcode_plan_copy_or_transcode_copies_mp2_when_mpegts_allows_it() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-copy-transcode-mpegts-mp2-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "mpegts", "h264", Some("mp2"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test-mpegts-mp2-to-mpegts",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.ts"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "format": "mpegts"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_transcode_plan_copy_or_transcode_copies_mp3_when_mp4_allows_it() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-copy-transcode-mp4-mp3-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("mp3"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test-mp4-mp3-copy",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "format": "mp4"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_transcode_plan_copy_or_transcode_copies_opus_when_mkv_allows_it() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-copy-transcode-mkv-opus-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "matroska", "h264", Some("opus"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test-mkv-opus-copy",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mkv"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "format": "mkv"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan =
+            build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -7397,7 +7983,7 @@ fi
     }
 
     #[test]
-    fn build_live_relay_api_params_map_publish_flags() {
+    fn build_live_relay_api_params_uses_expose_protocols_without_auto_recording() {
         let mut settings = test_settings("/tmp/work");
         settings.zlm_auto_close_on_no_reader_enabled = true;
         let spec = serde_json::from_value::<TaskSpec>(json!({
@@ -7439,8 +8025,8 @@ fi
         assert_eq!(params.get("enable_rtmp").map(String::as_str), Some("1"));
         assert_eq!(params.get("enable_ts").map(String::as_str), Some("0"));
         assert_eq!(params.get("enable_fmp4").map(String::as_str), Some("1"));
-        assert_eq!(params.get("enable_hls").map(String::as_str), Some("1"));
-        assert_eq!(params.get("enable_mp4").map(String::as_str), Some("1"));
+        assert_eq!(params.get("enable_hls").map(String::as_str), Some("0"));
+        assert_eq!(params.get("enable_mp4").map(String::as_str), Some("0"));
         assert_eq!(params.get("auto_close").map(String::as_str), Some("1"));
         assert_eq!(params.get("timeout_sec").map(String::as_str), Some("7"));
     }
@@ -7604,6 +8190,65 @@ fi
         );
         assert_eq!(params.get("max_second").map(String::as_str), Some("90"));
         assert_eq!(params.get("schema").map(String::as_str), Some("rtmp"));
+    }
+
+    #[test]
+    fn build_record_api_params_defaults_mp4_to_task_duration() {
+        let binding = StreamBinding {
+            schema: Some("rtmp".to_string()),
+            vhost: "__defaultVhost__".to_string(),
+            app: "relay".to_string(),
+            stream: "stream-1".to_string(),
+        };
+        let recording = LiveRelayRecording {
+            formats: vec![ZlmRecordKind::Mp4],
+            root_path: "/var/media/archive".to_string(),
+            duration_sec: Some(300),
+            segment_sec: None,
+            as_player: false,
+            recording_started_at: None,
+            auto_stop_requested: false,
+            completion_reason: None,
+            started: false,
+            failed: false,
+        };
+
+        let params = build_record_api_params(&binding, &recording, &ZlmRecordKind::Mp4)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(params.get("max_second").map(String::as_str), Some("300"));
+    }
+
+    #[test]
+    fn build_record_api_params_uses_long_default_for_unbounded_mp4() {
+        let binding = StreamBinding {
+            schema: None,
+            vhost: "__defaultVhost__".to_string(),
+            app: "relay".to_string(),
+            stream: "stream-1".to_string(),
+        };
+        let recording = LiveRelayRecording {
+            formats: vec![ZlmRecordKind::Mp4],
+            root_path: "/var/media/archive".to_string(),
+            duration_sec: None,
+            segment_sec: None,
+            as_player: false,
+            recording_started_at: None,
+            auto_stop_requested: false,
+            completion_reason: None,
+            started: false,
+            failed: false,
+        };
+
+        let params = build_record_api_params(&binding, &recording, &ZlmRecordKind::Mp4)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            params.get("max_second").map(String::as_str),
+            Some("31536000")
+        );
     }
 
     #[test]

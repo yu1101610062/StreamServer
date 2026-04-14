@@ -19,7 +19,7 @@ use media_rpc::control_plane::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Semaphore, mpsc},
     time::{MissedTickBehavior, interval, sleep},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -44,6 +44,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_BACKOFF: [u64; 5] = [1, 2, 5, 10, 30];
 const CONTROL_BUFFER: usize = 32;
 const LOG_NOTIFICATION_BUFFER: usize = 128;
+const START_TASK_CONCURRENCY_LIMIT: usize = 4;
 
 #[derive(Clone)]
 pub struct AgentController {
@@ -54,6 +55,7 @@ pub struct AgentController {
     executor: Arc<dyn LocalExecutor>,
     runtime_priority_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
     runtime_log_batches: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
+    start_task_permits: Arc<Semaphore>,
 }
 
 impl AgentController {
@@ -80,6 +82,7 @@ impl AgentController {
             executor,
             runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
             runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
+            start_task_permits: Arc::new(Semaphore::new(START_TASK_CONCURRENCY_LIMIT)),
         })
     }
 
@@ -349,54 +352,64 @@ impl AgentController {
         command: StartTask,
     ) -> anyhow::Result<()> {
         let request = parse_start_task(command)?;
-        match self.executor.start_task(&request) {
-            Ok(handle) => {
-                send_task_event(
-                    sender,
-                    request.task_id,
-                    request.attempt_no,
-                    "accepted",
-                    "info",
-                    "task accepted by local executor",
-                    json!({
-                        "runtime_id": handle.runtime_id,
-                        "worker_kind": handle.worker_kind,
-                    }),
-                )
-                .await?;
-                send_task_event(
-                    sender,
-                    request.task_id,
-                    request.attempt_no,
-                    "starting",
-                    "info",
-                    "runtime handle created",
-                    json!({
-                        "runtime_id": handle.runtime_id,
-                        "worker_kind": handle.worker_kind,
-                    }),
-                )
-                .await?;
-                send_task_snapshot(sender, &handle).await?;
+        let sender = sender.clone();
+        let executor = self.executor.clone();
+        let start_task_permits = self.start_task_permits.clone();
+
+        tokio::spawn(async move {
+            let Ok(_permit) = start_task_permits.acquire_owned().await else {
+                return;
+            };
+
+            match executor.start_task(&request) {
+                Ok(handle) => {
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        "accepted",
+                        "info",
+                        "task accepted by local executor",
+                        json!({
+                            "runtime_id": handle.runtime_id,
+                            "worker_kind": handle.worker_kind,
+                        }),
+                    )
+                    .await;
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        "starting",
+                        "info",
+                        "runtime handle created",
+                        json!({
+                            "runtime_id": handle.runtime_id,
+                            "worker_kind": handle.worker_kind,
+                        }),
+                    )
+                    .await;
+                    let _ = send_task_snapshot(&sender, &handle).await;
+                }
+                Err(error) => {
+                    let handle = rejected_runtime_handle(&request);
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        "rejected",
+                        "error",
+                        error.to_string(),
+                        json!({
+                            "runtime_id": handle.runtime_id,
+                            "worker_kind": handle.worker_kind,
+                            "resolved_spec": request.resolved_spec,
+                        }),
+                    )
+                    .await;
+                }
             }
-            Err(error) => {
-                let handle = rejected_runtime_handle(&request);
-                send_task_event(
-                    sender,
-                    request.task_id,
-                    request.attempt_no,
-                    "rejected",
-                    "error",
-                    error.to_string(),
-                    json!({
-                        "runtime_id": handle.runtime_id,
-                        "worker_kind": handle.worker_kind,
-                        "resolved_spec": request.resolved_spec,
-                    }),
-                )
-                .await?;
-            }
-        }
+        });
 
         Ok(())
     }

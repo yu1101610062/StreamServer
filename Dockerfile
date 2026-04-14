@@ -99,47 +99,21 @@ COPY config ./config
 
 CMD ["media-core"]
 
-FROM debian:bookworm-slim AS media-agent-runtime
-
-ARG DEBIAN_MIRROR
-
-RUN set -eux; \
-    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
-      find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) -print0 \
-        | xargs -0 -r sed -i \
-          -e "s|http://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
-          -e "s|https://deb.debian.org/debian|${DEBIAN_MIRROR}/debian|g" \
-          -e "s|http://deb.debian.org/debian-security|${DEBIAN_MIRROR}/debian-security|g" \
-          -e "s|https://deb.debian.org/debian-security|${DEBIAN_MIRROR}/debian-security|g" \
-          -e "s|http://security.debian.org/debian-security|${DEBIAN_MIRROR}/debian-security|g" \
-          -e "s|https://security.debian.org/debian-security|${DEBIAN_MIRROR}/debian-security|g"; \
-    fi; \
-    apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg iproute2 procps \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
-COPY config ./config
-
-RUN mkdir -p /data/media/work /data/media/logs
-
-CMD ["media-agent"]
-
-FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04 AS media-agent-gpu-runtime
+FROM jrottenberg/ffmpeg:7.1-ubuntu2404 AS media-agent-runtime
 
 ARG UBUNTU_MIRROR
 
 RUN set -eux; \
     if [ -n "${UBUNTU_MIRROR:-}" ]; then \
-      sed -i \
-        -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
-        -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
-        /etc/apt/sources.list; \
+      find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) -print0 \
+        | xargs -0 -r sed -i \
+          -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|https://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g"; \
     fi; \
     apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg iproute2 procps \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -149,4 +123,32 @@ COPY config ./config
 
 RUN mkdir -p /data/media/work /data/media/logs
 
-CMD ["media-agent"]
+ENTRYPOINT ["/usr/local/bin/media-agent"]
+CMD []
+
+FROM jrottenberg/ffmpeg:7.1-nvidia2204 AS media-agent-gpu-runtime
+
+ARG UBUNTU_MIRROR
+
+RUN set -eux; \
+    if [ -n "${UBUNTU_MIRROR:-}" ]; then \
+      find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) -print0 \
+        | xargs -0 -r sed -i \
+          -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|https://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g"; \
+    fi; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
+COPY config ./config
+
+RUN mkdir -p /data/media/work /data/media/logs
+
+ENTRYPOINT ["/usr/local/bin/media-agent"]
+CMD []

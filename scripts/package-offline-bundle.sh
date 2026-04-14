@@ -35,8 +35,8 @@ usage() {
   默认输出到 ./dist。
 
 环境变量:
-  APT_MIRROR             默认 http://mirrors.tuna.tsinghua.edu.cn；设为空则保留 Debian 官方源。
-  UBUNTU_APT_MIRROR      默认留空；仅用于 GPU 镜像的 Ubuntu 源覆盖。
+  APT_MIRROR             默认 http://mirrors.tuna.tsinghua.edu.cn；用于 Debian 构建阶段，也会作为 media-agent Ubuntu 运行时的默认镜像源。
+  UBUNTU_APT_MIRROR      默认留空；如设置则覆盖 media-agent CPU/GPU 运行时的 Ubuntu 源。
   CARGO_REGISTRY_MIRROR  默认 sparse+https://rsproxy.cn/index/；设为空则使用 crates.io 官方源。
   POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
   ZLM_SOURCE_IMAGE       可覆盖 ZLMediaKit 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
@@ -165,6 +165,66 @@ verify_loaded_image_arch() {
   [ "${platform}" = "linux/amd64" ] || fail "镜像 ${image_ref} 平台不是 linux/amd64，而是 ${platform:-unknown}"
 }
 
+resolve_media_agent_ubuntu_mirror() {
+  if [ -n "${UBUNTU_APT_MIRROR}" ]; then
+    printf '%s\n' "${UBUNTU_APT_MIRROR}"
+  else
+    printf '%s\n' "${APT_MIRROR}"
+  fi
+}
+
+smoke_test_media_agent_image() {
+  local image_ref="$1"
+  local require_nvenc="${2:-false}"
+  local container_name="streamserver-media-agent-smoke-$RANDOM-$$"
+
+  log "校验 ${image_ref} 的 FFmpeg 运行时"
+  docker run --rm --platform linux/amd64 --entrypoint sh "${image_ref}" -lc '
+    set -eu
+    command -v curl >/dev/null
+    ffmpeg -version | grep -q "^ffmpeg version 7\.1"
+    ffprobe -version >/dev/null
+    ffmpeg -hide_banner -f lavfi -i testsrc=size=128x72:rate=1 -t 1 -c:v libx265 -an -f flv -y /tmp/hevc-test.flv >/tmp/hevc-flv-smoke.log 2>&1
+    test -s /tmp/hevc-test.flv
+  ' >/dev/null || fail "镜像 ${image_ref} 未通过 FFmpeg 7.1 / HEVC->FLV 校验"
+
+  if [ "${require_nvenc}" = "true" ]; then
+    docker run --rm --platform linux/amd64 --entrypoint sh "${image_ref}" -lc '
+      set -eu
+      ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " h264_nvenc"
+      ffmpeg -hide_banner -encoders 2>/dev/null | grep -q " hevc_nvenc"
+    ' >/dev/null || fail "镜像 ${image_ref} 未检测到 NVENC 编码器"
+  fi
+
+  docker rm -f "${container_name}" >/dev/null 2>&1 || true
+  docker run -d --rm \
+    --platform linux/amd64 \
+    --name "${container_name}" \
+    -e STREAMSERVER_ENV=production \
+    -e WORK_ROOT=/data/media/work \
+    "${image_ref}" >/dev/null
+
+  local ready=0
+  local response=""
+  local i
+  for i in 1 2 3 4 5; do
+    response="$(docker exec "${container_name}" sh -lc 'curl -fsS http://127.0.0.1:8081/health/ready' 2>/dev/null || true)"
+    if printf '%s' "${response}" | grep -q '"status":"ready"'; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+
+  if [ "${ready}" -ne 1 ]; then
+    docker logs "${container_name}" >&2 || true
+    docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    fail "镜像 ${image_ref} 未通过 media-agent 健康检查"
+  fi
+
+  docker rm -f "${container_name}" >/dev/null 2>&1 || true
+}
+
 local_source_candidate() {
   local image_ref="$1"
   if docker image inspect "${image_ref}" >/dev/null 2>&1; then
@@ -213,6 +273,7 @@ build_or_pull_images() {
   local postgres_image="$4"
   local zlm_image="$5"
   local gpu_support="$6"
+  local media_agent_ubuntu_mirror="$7"
 
   log "构建 media-core linux/amd64 镜像"
   docker buildx build \
@@ -230,11 +291,13 @@ build_or_pull_images() {
     --platform linux/amd64 \
     --target media-agent-runtime \
     --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+    --build-arg UBUNTU_MIRROR="${media_agent_ubuntu_mirror}" \
     --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
     --load \
     -t "${media_agent_image}" \
     "${ROOT_DIR}"
   verify_loaded_image_arch "${media_agent_image}"
+  smoke_test_media_agent_image "${media_agent_image}" "false"
 
   if [ "${gpu_support}" = "true" ]; then
     log "构建 media-agent-gpu linux/amd64 镜像"
@@ -242,12 +305,13 @@ build_or_pull_images() {
       --platform linux/amd64 \
       --target media-agent-gpu-runtime \
       --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
-      --build-arg UBUNTU_MIRROR="${UBUNTU_APT_MIRROR}" \
+      --build-arg UBUNTU_MIRROR="${media_agent_ubuntu_mirror}" \
       --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
       --load \
       -t "${media_agent_gpu_image}" \
       "${ROOT_DIR}"
     verify_loaded_image_arch "${media_agent_gpu_image}"
+    smoke_test_media_agent_image "${media_agent_gpu_image}" "true"
   fi
 
   prepare_source_image "${POSTGRES_SOURCE_IMAGE}" "${postgres_image}" "postgres"
@@ -510,6 +574,7 @@ main() {
   local media_core_image
   local media_agent_image
   local media_agent_gpu_image
+  local media_agent_ubuntu_mirror
   local postgres_image
   local zlm_image
   local stage_dir
@@ -520,16 +585,17 @@ main() {
   ensure_supported_packaging_host
   ensure_tools
   resolve_gpu_support
+  media_agent_ubuntu_mirror="$(resolve_media_agent_ubuntu_mirror)"
 
   if [ -n "${APT_MIRROR}" ]; then
     log "使用 APT 镜像: ${APT_MIRROR}"
   else
     log "APT 使用 Debian 官方源"
   fi
-  if [ -n "${UBUNTU_APT_MIRROR}" ]; then
-    log "GPU 镜像使用 Ubuntu APT 镜像: ${UBUNTU_APT_MIRROR}"
+  if [ -n "${media_agent_ubuntu_mirror}" ]; then
+    log "media-agent 运行时使用 Ubuntu APT 镜像: ${media_agent_ubuntu_mirror}"
   else
-    log "GPU 镜像使用 Ubuntu 官方源"
+    log "media-agent 运行时使用 Ubuntu 官方源"
   fi
 
   if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then
@@ -560,7 +626,7 @@ main() {
   mkdir -p "${bundle_root}"
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
-    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}"
+    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}" "${media_agent_ubuntu_mirror}"
   else
     log "跳过镜像构建与导出，仅生成骨架包"
     mkdir -p "${bundle_root}/images"
