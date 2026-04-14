@@ -64,7 +64,6 @@ services:
       retries: 20
     volumes:
       - ./data/media/work:/data/media/work
-      - ./data/zlm/record:/data/zlm/record
       - ./data/zlm/www:/data/zlm/www
       - ./zlm/config.ini:/opt/media/conf/config.ini:ro
 
@@ -106,7 +105,6 @@ services:
     volumes:
       - ./data/media/work:/data/media/work
       - ./data/media/logs:/data/media/logs
-      - ./data/zlm/record:/data/zlm/record
       - ./data/zlm/www:/data/zlm/www
       - ./certs:/certs:ro
 

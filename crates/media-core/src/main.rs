@@ -3934,7 +3934,7 @@ mod tests {
             file_path: None,
             file_name: Some("index.m3u8".to_string()),
             file_size: None,
-            folder: Some("/data/zlm/record/live/camera01".to_string()),
+            folder: Some("/data/zlm/www/record/live/camera01".to_string()),
             start_time: None,
             time_len: None,
             url: None,
@@ -3943,7 +3943,7 @@ mod tests {
 
         assert_eq!(
             resolve_record_hls_file_path(&hook).as_deref(),
-            Some("/data/zlm/record/live/camera01/index.m3u8")
+            Some("/data/zlm/www/record/live/camera01/index.m3u8")
         );
     }
 
@@ -4406,6 +4406,10 @@ mod tests {
             second_calls[1].1["records"][0]["http_url"],
             json!("http://stream.example/record/live/camera01/clip.mp4")
         );
+        assert_eq!(
+            second_calls[1].1["records"][0]["file_path"],
+            json!("/record/live/camera01/clip.mp4")
+        );
 
         let detail = repository.get_task(task_id).await?;
         assert_eq!(
@@ -4683,13 +4687,89 @@ mod tests {
 
         let records = repository.list_task_record_files(task_id).await?;
         assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0].file_path,
-            "/data/zlm/www/record/live/camera01/index.m3u8"
-        );
+        assert_eq!(records[0].file_path, "/record/live/camera01/index.m3u8");
         assert_eq!(
             records[0].http_url.as_deref(),
             Some("http://stream.example/record/live/camera01/index.m3u8")
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_events_endpoint_externalizes_record_file_paths() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "record-mp4",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {"enabled": true, "format": "mp4"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+
+        repository
+            .record_zlm_record_file_hook(
+                &node_id.to_string(),
+                "on_record_mp4",
+                "record-event-paths",
+                json!({}),
+                repository::ZlmRecordFileRecord {
+                    record_format: Some("mp4".to_string()),
+                    schema: Some("rtsp".to_string()),
+                    vhost: "__defaultVhost__".to_string(),
+                    app: "live".to_string(),
+                    stream: "camera01".to_string(),
+                    file_path: "/data/zlm/www/record/live/camera01/clip.mp4".to_string(),
+                    file_size: 4096,
+                    time_len_sec: Some(12),
+                    start_time: Some(Utc::now()),
+                    file_name: Some("clip.mp4".to_string()),
+                    folder: Some("/data/zlm/www/record/live/camera01".to_string()),
+                    url: None,
+                },
+            )
+            .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/tasks/{task_id}/events?page=1&page_size=10"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(
+            body["items"][0]["payload"]["file_path"],
+            json!("/record/live/camera01/clip.mp4")
+        );
+        assert_eq!(
+            body["items"][0]["payload"]["folder"],
+            json!("/record/live/camera01")
         );
 
         db.cleanup().await?;
@@ -4895,6 +4975,10 @@ mod tests {
             json!("http://stream.example/artifacts/transcode/verify/output.mp4")
         );
         assert_eq!(
+            delivered[0].1["file_artifacts"][0]["file_path"],
+            json!("/artifacts/transcode/verify/output.mp4")
+        );
+        assert_eq!(
             delivered[0].1["file_artifacts"][0]["artifact_kind"],
             json!("transcode_output")
         );
@@ -4991,6 +5075,10 @@ mod tests {
         assert_eq!(
             delivered[0].1["file_artifacts"][0]["http_url"],
             json!("http://stream.example/artifacts/bridge/verify/output.mp4")
+        );
+        assert_eq!(
+            delivered[0].1["file_artifacts"][0]["file_path"],
+            json!("/artifacts/bridge/verify/output.mp4")
         );
         assert_eq!(
             delivered[0].1["file_artifacts"][0]["artifact_kind"],
@@ -5104,6 +5192,10 @@ mod tests {
             json!("http://stream.example/artifacts/stream-ingest-record/verify/output.mp4")
         );
         assert_eq!(
+            delivered[0].1["file_artifacts"][0]["file_path"],
+            json!("/artifacts/stream-ingest-record/verify/output.mp4")
+        );
+        assert_eq!(
             delivered[0].1["file_artifacts"][0]["artifact_kind"],
             json!("stream_ingest_record")
         );
@@ -5206,6 +5298,10 @@ mod tests {
             json!("http://stream.example/artifacts/bridge/late/output.mp4")
         );
         assert_eq!(
+            second_calls[1].1["file_artifacts"][0]["file_path"],
+            json!("/artifacts/bridge/late/output.mp4")
+        );
+        assert_eq!(
             second_calls[1].1["file_artifacts"][0]["artifact_kind"],
             json!("bridge_output")
         );
@@ -5285,7 +5381,7 @@ mod tests {
         );
         assert_eq!(
             body["items"][0]["file_path"],
-            json!("/data/zlm/www/artifacts/bridge/verify/output.mp4")
+            json!("/artifacts/bridge/verify/output.mp4")
         );
 
         db.cleanup().await?;
@@ -5377,7 +5473,7 @@ mod tests {
         );
         assert_eq!(
             body["items"][0]["file_path"],
-            json!("/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4")
+            json!("/artifacts/stream-ingest-record/verify/output.mp4")
         );
 
         db.cleanup().await?;
@@ -5455,7 +5551,7 @@ mod tests {
             insert into hook_events (
               id, server_id, hook_name, dedup_key, payload, received_at, processed_at
             ) values
-              ($1, $2, 'on_publish', 'hook-node-a', '{"app":"live"}'::jsonb, $3, $3),
+              ($1, $2, 'on_publish', 'hook-node-a', '{"app":"live","file_path":"/data/zlm/www/live/camera01/hls.m3u8","folder":"/data/zlm/www/live/camera01"}'::jsonb, $3, $3),
               ($4, $5, 'on_record_mp4', 'hook-node-b', '{"app":"archive"}'::jsonb, $3, $3)
             "#,
         )
@@ -5482,6 +5578,11 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["server_id"], json!(node_id.to_string()));
         assert_eq!(items[0]["hook_name"], json!("on_publish"));
+        assert_eq!(
+            items[0]["payload"]["file_path"],
+            json!("/live/camera01/hls.m3u8")
+        );
+        assert_eq!(items[0]["payload"]["folder"], json!("/live/camera01"));
 
         db.cleanup().await?;
         Ok(())

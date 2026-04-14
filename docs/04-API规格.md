@@ -296,7 +296,7 @@
   "records": [
     {
       "id": "019d....",
-      "file_path": "/data/zlm/www/record/live/camera01/clip.mp4",
+      "file_path": "/record/live/camera01/clip.mp4",
       "http_url": "http://192.168.6.10/record/live/camera01/clip.mp4"
     }
   ],
@@ -305,7 +305,7 @@
       "artifact_kind": "transcode_output",
       "id": "019d....",
       "file_name": "output.mp4",
-      "file_path": "/data/zlm/www/artifacts/transcode/output.mp4",
+      "file_path": "/artifacts/transcode/output.mp4",
       "http_url": "http://192.168.6.10/artifacts/transcode/output.mp4"
     }
   ],
@@ -445,6 +445,9 @@
 - `http_url`：录像文件的 HTTP 访问地址。若 ZLM Hook 未上报 URL，则允许为空。
 
 说明：
+
+- `file_path` 返回平台受管挂载根下的相对路径，而不是容器内绝对路径。
+- 录像中心中的 `file_path` 通常表现为 `/record/...`，文件产物中的 `file_path` 通常表现为 `/artifacts/...`。
 
 - 该接口只覆盖实时录制产生的录像。
 - `record.format=hls` 时，列表按播放列表 `m3u8` 展示逻辑录像条目，不展开底层 `ts` segment。

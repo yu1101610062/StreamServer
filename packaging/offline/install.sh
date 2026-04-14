@@ -605,7 +605,7 @@ AGENT_MULTICAST_INTERFACE_IP=${MULTICAST_INTERFACE_IP}
 AGENT_ACCELERATION_MODE=${acceleration_mode}
 AGENT_LABELS=${agent_labels}
 AGENT_MAX_RUNTIME_SLOTS=0
-STORAGE_ALLOWLIST=/data/media/work,/data/zlm/record,/data/zlm/www
+STORAGE_ALLOWLIST=/data/media/work,/data/zlm/www
 AUTH_MODE=${AUTH_MODE}
 AUTH_ENABLED=${AUTH_ENABLED}
 JWT_PUBLIC_KEY=${JWT_PUBLIC_KEY}
@@ -704,8 +704,7 @@ prepare_worker_layout() {
   mkdir -p \
     "${install_dir}/data/media/work" \
     "${install_dir}/data/media/logs" \
-    "${install_dir}/data/zlm/www" \
-    "${install_dir}/data/zlm/record"
+    "${install_dir}/data/zlm/www"
 }
 
 emit_manual_start_hint() {
@@ -858,7 +857,7 @@ configure_control_plane() {
   STACK_SUBNET="172.29.0.0/24"
   POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "")"
-  STORAGE_ALLOWLIST="/data/media/work,/data/zlm/record,/data/zlm/www"
+  STORAGE_ALLOWLIST="/data/media/work,/data/zlm/www"
   prompt_local_auth_configuration
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"

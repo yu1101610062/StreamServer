@@ -24,7 +24,7 @@ callback_initial_backoff_ms = 5000
 callback_max_backoff_ms = 300000
 callback_settle_delay_ms = 8000
 callback_shared_secret = ""
-storage_allowlist = ["/data/media/work", "/data/zlm/record", "/data/zlm/www"]
+storage_allowlist = ["/data/media/work", "/data/zlm/www"]
 
 [agent]
 http_addr = "0.0.0.0:8081"

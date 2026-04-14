@@ -367,11 +367,7 @@ fn default_auth_refresh_token_ttl() -> String {
 }
 
 fn default_storage_allowlist() -> Vec<String> {
-    vec![
-        "/data/media/work".to_string(),
-        "/data/zlm/record".to_string(),
-        "/data/zlm/www".to_string(),
-    ]
+    vec!["/data/media/work".to_string(), "/data/zlm/www".to_string()]
 }
 
 fn default_callback_timeout_ms() -> u64 {

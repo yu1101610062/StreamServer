@@ -4669,7 +4669,7 @@ impl RecordFileSummary {
             vhost: row.try_get("vhost")?,
             app: row.try_get("app")?,
             stream: row.try_get("stream")?,
-            file_path: row.try_get("file_path")?,
+            file_path: externalize_managed_path(row.try_get::<&str, _>("file_path")?, "file_path")?,
             http_url: row.try_get("http_url")?,
             file_size: row.try_get("file_size")?,
             time_len: row.try_get("time_len")?,
@@ -4743,7 +4743,7 @@ impl FileArtifactSummary {
             attempt_id: row.try_get("attempt_id")?,
             node_id: row.try_get("node_id")?,
             file_name: row.try_get("file_name")?,
-            file_path: row.try_get("file_path")?,
+            file_path: externalize_managed_path(row.try_get::<&str, _>("file_path")?, "file_path")?,
             http_url: row.try_get("http_url")?,
             file_size: row.try_get("file_size")?,
             created_at: row.try_get("created_at")?,
@@ -4931,7 +4931,7 @@ impl HookEventSummary {
             server_id: row.try_get("server_id")?,
             hook_name: row.try_get("hook_name")?,
             dedup_key: row.try_get("dedup_key")?,
-            payload: row.try_get("payload")?,
+            payload: externalize_path_fields_in_payload(row.try_get("payload")?)?,
             received_at: row.try_get("received_at")?,
             processed_at: row.try_get("processed_at")?,
         })
@@ -5048,7 +5048,7 @@ fn apply_file_artifact_filters<'a>(
 
 const ZLM_HTTP_ROOT: &str = "/data/zlm/www";
 const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
-const LEGACY_ZLM_RECORD_ROOT: &str = "/data/zlm/record";
+const MEDIA_WORK_ROOT: &str = "/data/media/work";
 
 fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     if path == root {
@@ -5152,6 +5152,73 @@ fn artifact_http_url_from_path(
     })
 }
 
+fn external_relative_path_from_normalized(path: &str) -> Option<String> {
+    for root in [ZLM_HTTP_ROOT, MEDIA_WORK_ROOT] {
+        if path == root {
+            return Some("/".to_string());
+        }
+        if let Some(relative) = relative_path_under_root(path, root) {
+            return Some(format!("/{}", relative.trim_start_matches('/')));
+        }
+    }
+    None
+}
+
+fn externalize_managed_path(path: &str, field: &'static str) -> Result<String, RepoError> {
+    let normalized = normalized_absolute_path(path)?;
+    if let Some(relative) = external_relative_path_from_normalized(&normalized) {
+        return Ok(relative);
+    }
+
+    tracing::warn!(
+        field,
+        path = %normalized,
+        "managed path is outside outward-facing storage roots"
+    );
+    Err(validation_error(
+        field,
+        format!("must be under {ZLM_HTTP_ROOT} or {MEDIA_WORK_ROOT}"),
+    ))
+}
+
+fn externalize_path_fields_in_payload(value: Value) -> Result<Value, RepoError> {
+    match value {
+        Value::Array(items) => items
+            .into_iter()
+            .map(externalize_path_fields_in_payload)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(entries) => {
+            let mut normalized = serde_json::Map::with_capacity(entries.len());
+            for (key, value) in entries {
+                let rewritten = match key.as_str() {
+                    "file_path" => externalize_path_field_value(value, "file_path")?,
+                    "folder" => externalize_path_field_value(value, "folder")?,
+                    _ => externalize_path_fields_in_payload(value)?,
+                };
+                normalized.insert(key, rewritten);
+            }
+            Ok(Value::Object(normalized))
+        }
+        other => Ok(other),
+    }
+}
+
+fn externalize_path_field_value(value: Value, field: &'static str) -> Result<Value, RepoError> {
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::String(path) if path.trim().is_empty() => Ok(Value::String(path)),
+        Value::String(path) => externalize_managed_path(&path, field).map(Value::String),
+        Value::Array(items) => items
+            .into_iter()
+            .map(|item| externalize_path_field_value(item, field))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(entries) => externalize_path_fields_in_payload(Value::Object(entries)),
+        other => Ok(other),
+    }
+}
+
 fn absolute_http_url_from_relative(agent_stream_addr: &str, relative: &str) -> Option<String> {
     let base = Url::parse(agent_stream_addr)
         .map_err(|error| {
@@ -5167,18 +5234,8 @@ fn absolute_http_url_from_relative(agent_stream_addr: &str, relative: &str) -> O
 
 fn record_http_url_from_path(agent_stream_addr: &str, file_path: &str) -> Option<String> {
     let normalized = normalized_absolute_path(file_path).ok()?;
-    if let Some(relative) = relative_path_under_root(&normalized, ZLM_HTTP_ROOT) {
-        return absolute_http_url_from_relative(agent_stream_addr, relative);
-    }
-    let relative = relative_path_under_root(&normalized, LEGACY_ZLM_RECORD_ROOT)?;
-    let record_relative_root =
-        relative_path_under_root(ZLM_RECORD_HTTP_ROOT, ZLM_HTTP_ROOT).unwrap_or("record");
-    let translated = format!(
-        "{}/{}",
-        record_relative_root,
-        relative.trim_start_matches('/')
-    );
-    absolute_http_url_from_relative(agent_stream_addr, &translated)
+    let relative = relative_path_under_root(&normalized, ZLM_HTTP_ROOT)?;
+    absolute_http_url_from_relative(agent_stream_addr, relative)
 }
 
 fn resolve_absolute_http_url(agent_stream_addr: &str, value: &str) -> Option<String> {
@@ -5221,8 +5278,8 @@ fn is_hls_playlist_record_path(file_path: &str) -> bool {
     let Ok(normalized) = normalized_absolute_path(file_path) else {
         return false;
     };
-    let in_record_root = relative_path_under_root(&normalized, ZLM_RECORD_HTTP_ROOT).is_some()
-        || relative_path_under_root(&normalized, LEGACY_ZLM_RECORD_ROOT).is_some();
+    let in_record_root = normalized == ZLM_RECORD_HTTP_ROOT
+        || relative_path_under_root(&normalized, ZLM_RECORD_HTTP_ROOT).is_some();
     in_record_root
         && Path::new(&normalized)
             .extension()
@@ -6051,7 +6108,7 @@ impl TaskEventSummary {
             source,
             event_type: row.try_get("event_type")?,
             event_level: row.try_get("event_level")?,
-            payload: row.try_get("payload")?,
+            payload: externalize_path_fields_in_payload(row.try_get("payload")?)?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -6532,16 +6589,21 @@ mod tests {
     }
 
     #[test]
-    fn record_http_url_from_path_translates_legacy_record_root() {
-        let url = record_http_url_from_path(
-            "http://192.168.1.10:8081",
-            "/data/zlm/record/live/camera01/clip.mp4",
-        )
-        .expect("legacy record url should translate");
-
+    fn externalize_managed_path_strips_mount_roots() {
         assert_eq!(
-            url,
-            "http://192.168.1.10:8081/record/live/camera01/clip.mp4"
+            externalize_managed_path("/data/zlm/www/record/live/camera01/clip.mp4", "file_path")
+                .expect("record path should externalize"),
+            "/record/live/camera01/clip.mp4"
+        );
+        assert_eq!(
+            externalize_managed_path("/data/zlm/www/artifacts/transcode/output.mp4", "file_path",)
+                .expect("artifact path should externalize"),
+            "/artifacts/transcode/output.mp4"
+        );
+        assert_eq!(
+            externalize_managed_path("/data/media/work/mp4/test.mp4", "file_path")
+                .expect("work path should externalize"),
+            "/mp4/test.mp4"
         );
     }
 
@@ -6557,15 +6619,38 @@ mod tests {
         assert!(is_hls_playlist_record_path(
             "/data/zlm/www/record/live/camera01/index.m3u8"
         ));
-        assert!(is_hls_playlist_record_path(
-            "/data/zlm/record/live/camera01/index.m3u8"
-        ));
         assert!(!is_hls_playlist_record_path(
             "/data/zlm/www/live/camera01/hls.m3u8"
         ));
         assert!(!is_hls_playlist_record_path(
             "/data/zlm/www/record/live/camera01/index-00001.ts"
         ));
+    }
+
+    #[test]
+    fn externalize_path_fields_in_payload_rewrites_file_path_and_folder() {
+        let payload = externalize_path_fields_in_payload(json!({
+            "file_path": "/data/zlm/www/record/live/camera01/index.m3u8",
+            "folder": "/data/zlm/www/record/live/camera01",
+            "records": [
+                {
+                    "file_path": "/data/zlm/www/artifacts/transcode/out.mp4",
+                    "folder": "/data/media/work/mp4"
+                }
+            ]
+        }))
+        .expect("payload should externalize");
+
+        assert_eq!(
+            payload["file_path"],
+            json!("/record/live/camera01/index.m3u8")
+        );
+        assert_eq!(payload["folder"], json!("/record/live/camera01"));
+        assert_eq!(
+            payload["records"][0]["file_path"],
+            json!("/artifacts/transcode/out.mp4")
+        );
+        assert_eq!(payload["records"][0]["folder"], json!("/mp4"));
     }
 
     #[test]
