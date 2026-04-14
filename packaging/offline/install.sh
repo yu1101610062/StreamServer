@@ -149,6 +149,51 @@ prompt_password_with_confirmation() {
   done
 }
 
+normalize_csv_labels() {
+  local raw="${1:-}"
+  local part
+  local trimmed
+  local existing
+  local joined=""
+  local duplicate=0
+  local normalized_parts=()
+
+  IFS=',' read -r -a parts <<< "${raw}"
+  for part in "${parts[@]}"; do
+    trimmed="$(printf '%s' "${part}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "${trimmed}" ] || continue
+
+    duplicate=0
+    for existing in "${normalized_parts[@]}"; do
+      if [ "${existing}" = "${trimmed}" ]; then
+        duplicate=1
+        break
+      fi
+    done
+    [ "${duplicate}" -eq 1 ] && continue
+    normalized_parts+=("${trimmed}")
+  done
+
+  for part in "${normalized_parts[@]}"; do
+    if [ -n "${joined}" ]; then
+      joined="${joined},${part}"
+    else
+      joined="${part}"
+    fi
+  done
+
+  printf '%s' "${joined}"
+}
+
+collect_agent_labels() {
+  local default_label="$1"
+  local extra_labels
+
+  printf '当前节点默认会写入算力标签: %s\n' "${default_label}" >&2
+  extra_labels="$(prompt "额外节点标签（逗号分隔，可留空）" "")"
+  printf '%s' "$(normalize_csv_labels "${default_label},${extra_labels}")"
+}
+
 generate_uuid() {
   if command -v uuidgen >/dev/null 2>&1; then
     uuidgen | tr '[:upper:]' '[:lower:]'
@@ -878,6 +923,7 @@ configure_control_plane() {
 configure_worker_host() {
   local default_dir="/opt/streamserver/worker-host-cpu"
   local default_ip
+  local agent_labels
 
   PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "streamserver-worker-cpu")"
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
@@ -896,6 +942,7 @@ configure_worker_host() {
   ZLM_HTTP_PORT="80"
   ZLM_RTMP_PORT="1935"
   ZLM_RTSP_PORT="554"
+  agent_labels="$(collect_agent_labels "cpu")"
 
   [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
 
@@ -907,7 +954,7 @@ configure_worker_host() {
     "${INSTALL_DIR}" \
     "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
-  write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "offline,worker,host"
+  write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "${agent_labels}"
   ensure_images_loaded media-agent zlmediakit
   show_tls_notice "${INSTALL_DIR}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
@@ -916,6 +963,7 @@ configure_worker_host() {
 configure_worker_host_gpu() {
   local default_dir="/opt/streamserver/worker-host-gpu"
   local default_ip
+  local agent_labels
 
   [ "${BUNDLE_GPU_SUPPORT}" = "true" ] || fail "当前离线包为 CPU-only，不支持 GPU 工作节点模板"
   ensure_nvidia_runtime_ready
@@ -937,6 +985,7 @@ configure_worker_host_gpu() {
   ZLM_HTTP_PORT="80"
   ZLM_RTMP_PORT="1935"
   ZLM_RTSP_PORT="554"
+  agent_labels="$(collect_agent_labels "gpu")"
 
   [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
 
@@ -948,7 +997,7 @@ configure_worker_host_gpu() {
     "${INSTALL_DIR}" \
     "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
-  write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "offline,worker,host,gpu"
+  write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "${agent_labels}"
   ensure_images_loaded media-agent-gpu zlmediakit
   show_tls_notice "${INSTALL_DIR}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
@@ -959,6 +1008,7 @@ configure_all_in_one_host() {
   local default_secret
   local default_password
   local default_ip
+  local agent_labels
 
   default_secret="$(generate_secret)"
   default_password="$(generate_secret)"
@@ -986,6 +1036,7 @@ configure_all_in_one_host() {
   POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST=""
   prompt_local_auth_configuration
+  agent_labels="$(collect_agent_labels "cpu")"
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${default_secret}"
@@ -1000,7 +1051,7 @@ configure_all_in_one_host() {
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
-  write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "offline,all-in-one,host"
+  write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "${agent_labels}"
   ensure_images_loaded postgres media-core media-agent zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
   log "all-in-one-host-cpu 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
@@ -1014,6 +1065,7 @@ configure_all_in_one_host_gpu() {
   local default_secret
   local default_password
   local default_ip
+  local agent_labels
 
   [ "${BUNDLE_GPU_SUPPORT}" = "true" ] || fail "当前离线包为 CPU-only，不支持 GPU 一体机模板"
   ensure_nvidia_runtime_ready
@@ -1044,6 +1096,7 @@ configure_all_in_one_host_gpu() {
   POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST=""
   prompt_local_auth_configuration
+  agent_labels="$(collect_agent_labels "gpu")"
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${default_secret}"
@@ -1058,7 +1111,7 @@ configure_all_in_one_host_gpu() {
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
     "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
-  write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "offline,all-in-one,host,gpu"
+  write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "${agent_labels}"
   ensure_images_loaded postgres media-core media-agent-gpu zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
   log "all-in-one-host-gpu 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
