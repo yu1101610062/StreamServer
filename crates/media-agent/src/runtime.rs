@@ -162,7 +162,9 @@ pub struct ManagedProcessExecutor {
 #[derive(Debug, Clone)]
 struct ManagedRuntime {
     pid: Option<i32>,
+    companion_pids: Vec<i32>,
     stop_requested: Arc<AtomicBool>,
+    suppress_companion_events: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +178,18 @@ struct ProcessPlan {
     startup_probe: Option<StartupProbe>,
     recording: Option<LiveRelayRecording>,
     managed_file_output_kind: Option<ManagedFileOutputKind>,
+    companion_recording: Option<CompanionProcessPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct CompanionProcessPlan {
+    executable: String,
+    args: Vec<String>,
+    work_dir: PathBuf,
+    output_target: String,
+    outputs: Vec<String>,
+    success_check: SuccessCheck,
+    kind: CompanionProcessKind,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +266,37 @@ struct LiveRelayRecording {
     started: bool,
     #[serde(default)]
     failed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CompanionProcessKind {
+    StreamIngestMp4Record,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum CompanionProcessState {
+    #[default]
+    Starting,
+    Running,
+    Succeeded,
+    Failed,
+    Exited,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CompanionProcessMetadata {
+    kind: CompanionProcessKind,
+    pid: Option<i32>,
+    output_target: String,
+    outputs: Vec<String>,
+    #[serde(default)]
+    command_line: Option<String>,
+    #[serde(default)]
+    state: CompanionProcessState,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,9 +530,8 @@ impl LocalExecutor for ManagedProcessExecutor {
             }
         });
 
-        if let Some(pid) = runtime.pid {
-            signal_pid(pid, libc::SIGTERM)
-                .map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
+        if runtime.pid.is_some() {
+            signal_runtime_pids(&runtime, libc::SIGTERM)?;
         } else if matches!(
             task_runtime_mode_from_handle(&handle),
             Some(TaskRuntimeMode::ZlmProxy)
@@ -557,7 +601,8 @@ impl LocalExecutor for ManagedProcessExecutor {
             let _ = persist_runtime_state(&work_dir, &handle, &success_check_from_handle(&handle));
         }
 
-        if let Some(pid) = runtime.pid {
+        if runtime.pid.is_some() {
+            let pids = runtime_pids(&runtime);
             let runtimes = self.runtimes.clone();
             tokio::spawn(async move {
                 if force_after_sec == 0 {
@@ -569,7 +614,9 @@ impl LocalExecutor for ManagedProcessExecutor {
                     .expect("runtime map lock poisoned")
                     .contains_key(&runtime_id);
                 if still_running {
-                    let _ = signal_pid(pid, libc::SIGKILL);
+                    for pid in pids {
+                        let _ = signal_pid(pid, libc::SIGKILL);
+                    }
                 }
             });
         }
@@ -598,6 +645,11 @@ impl LocalExecutor for ManagedProcessExecutor {
                 let mut handle = persisted.handle.clone();
                 handle.state = RuntimeState::Orphaned;
                 handle.metadata["orphaned"] = json!(true);
+                let companion_pids = companion_recording_from_handle(&handle)
+                    .and_then(|companion| companion.pid)
+                    .filter(|companion_pid| is_pid_running(*companion_pid))
+                    .into_iter()
+                    .collect::<Vec<_>>();
 
                 self.registry.track(handle.clone());
                 self.runtimes
@@ -607,7 +659,9 @@ impl LocalExecutor for ManagedProcessExecutor {
                         handle.runtime_id,
                         ManagedRuntime {
                             pid: Some(pid),
+                            companion_pids: companion_pids.clone(),
                             stop_requested: Arc::new(AtomicBool::new(false)),
+                            suppress_companion_events: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 let _ =
@@ -630,6 +684,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                         self.events.clone(),
                     );
                 }
+                let adopted_work_dir = persisted.work_dir.clone();
+                let adopted_success_check = persisted.success_check.clone();
                 spawn_adopted_runtime_monitor(
                     handle.clone(),
                     persisted.work_dir,
@@ -638,6 +694,24 @@ impl LocalExecutor for ManagedProcessExecutor {
                     self.runtimes.clone(),
                     self.events.clone(),
                 );
+                if let Some(companion) = companion_recording_from_handle(&handle)
+                    .filter(|companion| companion.pid.is_some())
+                {
+                    if let Some(companion_pid) =
+                        companion.pid.filter(|value| is_pid_running(*value))
+                    {
+                        spawn_adopted_companion_process_monitor(
+                            handle.runtime_id,
+                            companion_pid,
+                            companion,
+                            adopted_work_dir,
+                            adopted_success_check,
+                            self.registry.clone(),
+                            self.runtimes.clone(),
+                            self.events.clone(),
+                        );
+                    }
+                }
                 snapshots.push(handle);
                 seen.insert(key);
                 continue;
@@ -668,7 +742,9 @@ impl LocalExecutor for ManagedProcessExecutor {
                                 handle.runtime_id,
                                 ManagedRuntime {
                                     pid: None,
+                                    companion_pids: Vec::new(),
                                     stop_requested: Arc::new(AtomicBool::new(false)),
+                                    suppress_companion_events: Arc::new(AtomicBool::new(false)),
                                 },
                             );
                         let _ = persist_runtime_state(
@@ -750,7 +826,9 @@ impl LocalExecutor for ManagedProcessExecutor {
                         handle.runtime_id,
                         ManagedRuntime {
                             pid: None,
+                            companion_pids: Vec::new(),
                             stop_requested: Arc::new(AtomicBool::new(false)),
+                            suppress_companion_events: Arc::new(AtomicBool::new(false)),
                         },
                     );
                 let _ =
@@ -828,6 +906,17 @@ impl ManagedProcessExecutor {
         let runtime_id = Uuid::now_v7();
         let stop_requested = Arc::new(AtomicBool::new(false));
         let require_stream_online = plan.startup_probe.is_some();
+        let companion_recording_metadata = plan.companion_recording.as_ref().map(|companion| {
+            json!(CompanionProcessMetadata {
+                kind: companion.kind,
+                pid: None,
+                output_target: companion.output_target.clone(),
+                outputs: companion.outputs.clone(),
+                command_line: Some(render_command_line(&companion.executable, &companion.args,)),
+                state: CompanionProcessState::Starting,
+                error: None,
+            })
+        });
 
         let handle = RuntimeHandle {
             runtime_id,
@@ -853,6 +942,7 @@ impl ManagedProcessExecutor {
                 "stream_online": plan.startup_probe.is_none(),
                 "recording": plan.recording,
                 "managed_file_output_kind": plan.managed_file_output_kind,
+                "companion_recording": companion_recording_metadata,
             }),
         };
         self.registry.track(handle.clone());
@@ -865,7 +955,9 @@ impl ManagedProcessExecutor {
                 runtime_id,
                 ManagedRuntime {
                     pid: Some(pid),
+                    companion_pids: Vec::new(),
                     stop_requested: stop_requested.clone(),
+                    suppress_companion_events: Arc::new(AtomicBool::new(false)),
                 },
             );
 
@@ -897,6 +989,111 @@ impl ManagedProcessExecutor {
                 )
                 .await;
             });
+        }
+
+        if let Some(companion_plan) = plan.companion_recording.clone() {
+            let companion_command_line =
+                render_command_line(&companion_plan.executable, &companion_plan.args);
+            let mut companion_child = Command::new(&companion_plan.executable);
+            companion_child
+                .args(&companion_plan.args)
+                .current_dir(&companion_plan.work_dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+
+            match companion_child.spawn() {
+                Ok(mut companion_child) => {
+                    let companion_pid =
+                        companion_child
+                            .id()
+                            .map(|value| value as i32)
+                            .ok_or_else(|| {
+                                ExecutorError::ProcessSpawn(
+                                    "spawned companion child has no pid".to_string(),
+                                )
+                            })?;
+                    let updated_handle = self
+                        .registry
+                        .update(runtime_id, |runtime| {
+                            update_companion_recording_metadata(runtime, |companion| {
+                                companion.pid = Some(companion_pid);
+                                companion.command_line = Some(companion_command_line.clone());
+                                companion.state = CompanionProcessState::Running;
+                                companion.error = None;
+                            });
+                        })
+                        .unwrap_or_else(|| handle.clone());
+                    persist_runtime_state(&plan.work_dir, &updated_handle, &plan.success_check)?;
+                    self.runtimes
+                        .write()
+                        .expect("runtime map lock poisoned")
+                        .entry(runtime_id)
+                        .and_modify(|runtime| runtime.companion_pids.push(companion_pid));
+
+                    if let Some(stderr) = companion_child.stderr.take() {
+                        let events = self.events.clone();
+                        tokio::spawn(async move {
+                            read_log_stream(
+                                stderr,
+                                handle.task_id,
+                                handle.attempt_no,
+                                "recording_stderr".to_string(),
+                                events,
+                            )
+                            .await;
+                        });
+                    }
+
+                    spawn_companion_process_monitor(
+                        runtime_id,
+                        handle.task_id,
+                        handle.attempt_no,
+                        companion_pid,
+                        companion_plan,
+                        plan.work_dir.clone(),
+                        plan.success_check.clone(),
+                        self.registry.clone(),
+                        self.runtimes.clone(),
+                        self.events.clone(),
+                        companion_child,
+                    );
+                }
+                Err(error) => {
+                    let message =
+                        format!("failed to start stream_ingest mp4 recording sidecar: {error}");
+                    let updated_handle = self
+                        .registry
+                        .update(runtime_id, |runtime| {
+                            update_companion_recording_metadata(runtime, |companion| {
+                                companion.pid = None;
+                                companion.state = CompanionProcessState::Failed;
+                                companion.error = Some(message.clone());
+                            });
+                        })
+                        .unwrap_or_else(|| handle.clone());
+                    let _ =
+                        persist_runtime_state(&plan.work_dir, &updated_handle, &plan.success_check);
+                    let _ = self
+                        .events
+                        .send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
+                    let _ = self
+                        .events
+                        .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                        task_id: updated_handle.task_id,
+                        attempt_no: updated_handle.attempt_no,
+                        event_type: "recording_degraded".to_string(),
+                        event_level: "warn".to_string(),
+                        message:
+                            "mp4 recording sidecar failed to start; continuing without recording"
+                                .to_string(),
+                        payload: json!({
+                            "output_target": companion_plan.output_target,
+                            "reason": "recording_sidecar_start_failed",
+                            "error": error.to_string(),
+                        }),
+                    }));
+                }
+            }
         }
 
         if let Some(startup_probe) = plan.startup_probe.clone() {
@@ -947,7 +1144,32 @@ impl ManagedProcessExecutor {
         let restart_executor = self.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
-            let was_stopped = stop_requested.load(Ordering::Relaxed);
+            let (was_stopped, companion_pids) = {
+                let mut runtimes_guard = runtimes.write().expect("runtime map lock poisoned");
+                if let Some(runtime) = runtimes_guard.get_mut(&runtime_id) {
+                    runtime
+                        .suppress_companion_events
+                        .store(true, Ordering::Relaxed);
+                    let was_stopped = runtime.stop_requested.load(Ordering::Relaxed);
+                    let companion_pids = runtime.companion_pids.clone();
+                    (was_stopped, companion_pids)
+                } else {
+                    (stop_requested.load(Ordering::Relaxed), Vec::new())
+                }
+            };
+            if !companion_pids.is_empty() {
+                for companion_pid in &companion_pids {
+                    if is_pid_running(*companion_pid) {
+                        let _ = signal_pid(*companion_pid, libc::SIGTERM);
+                    }
+                }
+                wait_for_companion_pids_exit(&companion_pids, Duration::from_secs(3)).await;
+                for companion_pid in &companion_pids {
+                    if is_pid_running(*companion_pid) {
+                        let _ = signal_pid(*companion_pid, libc::SIGKILL);
+                    }
+                }
+            }
             runtimes
                 .write()
                 .expect("runtime map lock poisoned")
@@ -1236,7 +1458,9 @@ impl ManagedProcessExecutor {
                 runtime_id,
                 ManagedRuntime {
                     pid: None,
+                    companion_pids: Vec::new(),
                     stop_requested,
+                    suppress_companion_events: Arc::new(AtomicBool::new(false)),
                 },
             );
         let _ = self
@@ -1325,7 +1549,9 @@ impl ManagedProcessExecutor {
                 runtime_id,
                 ManagedRuntime {
                     pid: None,
+                    companion_pids: Vec::new(),
                     stop_requested,
+                    suppress_companion_events: Arc::new(AtomicBool::new(false)),
                 },
             );
         let _ = self
@@ -1901,6 +2127,7 @@ fn build_file_transcode_plan(
         startup_probe: None,
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::Transcode),
+        companion_recording: None,
     })
 }
 
@@ -1914,8 +2141,10 @@ fn build_file_to_live_plan(
     let startup_probe = build_startup_probe(request.task_id, spec)?;
     let publish_output = build_internal_stream_output(settings, &startup_probe);
     let mut outputs = vec![publish_output.target.clone()];
-    let mut success_check = publish_output.success_check.clone();
+    let success_check = publish_output.success_check.clone();
     let mut recording = None;
+    let mut managed_file_output_kind = None;
+    let mut companion_recording = None;
 
     let mut args = ffmpeg_base_args(input_url.clone(), true);
     if should_loop_file_to_live_input(spec) {
@@ -1946,26 +2175,23 @@ fn build_file_to_live_plan(
             .unwrap_or(media_domain::RecordFormat::Mp4)
         {
             media_domain::RecordFormat::Mp4 => {
-                let record_format = "mp4".to_string();
-                let record_path = work_dir.join("record.mp4").to_string_lossy().to_string();
-                let tee_target = format!(
-                    "{}|{}",
-                    tee_slave_target(
-                        publish_output.format.as_str(),
-                        &publish_output.target,
-                        true,
-                        audio_copy_decoration,
-                    ),
-                    tee_slave_target(
-                        record_format.as_str(),
-                        &record_path,
-                        true,
-                        audio_copy_decoration,
-                    ),
-                );
-                args.extend(["-f".to_string(), "tee".to_string(), tee_target]);
-                outputs.push(record_path.clone());
-                success_check = SuccessCheck::FileExists(PathBuf::from(record_path));
+                if let Some(filter) = audio_copy_decoration
+                    .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
+                {
+                    append_audio_bitstream_filter_arg(&mut args, filter);
+                }
+                args.extend([
+                    "-f".to_string(),
+                    publish_output.format.clone(),
+                    publish_output.target.clone(),
+                ]);
+                companion_recording = Some(build_stream_ingest_mp4_recording_plan(
+                    settings,
+                    spec,
+                    input_url.as_str(),
+                    &work_dir,
+                )?);
+                managed_file_output_kind = Some(ManagedFileOutputKind::StreamIngestRecord);
             }
             media_domain::RecordFormat::Hls | media_domain::RecordFormat::Both => {
                 if let Some(filter) = audio_copy_decoration
@@ -2006,7 +2232,52 @@ fn build_file_to_live_plan(
         success_check,
         startup_probe: Some(startup_probe),
         recording,
-        managed_file_output_kind: None,
+        managed_file_output_kind,
+        companion_recording,
+    })
+}
+
+fn build_stream_ingest_mp4_recording_plan(
+    settings: &AgentSettings,
+    spec: &TaskSpec,
+    input_url: &str,
+    work_dir: &Path,
+) -> Result<CompanionProcessPlan, ExecutorError> {
+    let mut args = ffmpeg_base_args(input_url.to_string(), true);
+    if should_loop_file_to_live_input(spec) {
+        insert_ffmpeg_input_args(
+            &mut args,
+            vec!["-stream_loop".to_string(), "-1".to_string()],
+        );
+    }
+    let audio_copy_decoration = append_process_args(
+        &mut args,
+        settings,
+        spec,
+        "copy_or_transcode",
+        input_url,
+        "mp4",
+        VideoOutputPolicy::ForceH264,
+        AudioOutputPolicy::Aac,
+    )?;
+    args.extend(["-threads".to_string(), "0".to_string()]);
+    if let Some(duration_sec) = spec.record.duration_sec {
+        args.extend(["-t".to_string(), duration_sec.to_string()]);
+    }
+    if let Some(filter) = audio_copy_decoration.and_then(|value| value.filter_for_output("mp4")) {
+        append_audio_bitstream_filter_arg(&mut args, filter);
+    }
+    let record_path = work_dir.join("record.mp4").to_string_lossy().to_string();
+    args.extend(["-f".to_string(), "mp4".to_string(), record_path.clone()]);
+
+    Ok(CompanionProcessPlan {
+        executable: settings.ffmpeg_bin.clone(),
+        args,
+        work_dir: work_dir.to_path_buf(),
+        output_target: record_path.clone(),
+        outputs: vec![record_path.clone()],
+        success_check: SuccessCheck::FileExists(PathBuf::from(record_path)),
+        kind: CompanionProcessKind::StreamIngestMp4Record,
     })
 }
 
@@ -2140,6 +2411,7 @@ fn build_stream_ingest_fast_record_plan(
         startup_probe: None,
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::StreamIngestRecord),
+        companion_recording: None,
     })
 }
 
@@ -2213,6 +2485,7 @@ fn build_multicast_bridge_plan(
         startup_probe,
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::Bridge),
+        companion_recording: None,
     })
 }
 
@@ -2391,6 +2664,22 @@ fn prepare_plan_paths(plan: &ProcessPlan) -> Result<(), ExecutorError> {
                     parent.display()
                 ))
             })?;
+        }
+    }
+
+    if let Some(companion) = &plan.companion_recording {
+        if let SuccessCheck::FileExists(path) = &companion.success_check {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|error| {
+                    ExecutorError::ProcessSpawn(format!(
+                        "failed to prepare output dir {}: {error}",
+                        parent.display()
+                    ))
+                })?;
+            }
         }
     }
 
@@ -2573,25 +2862,6 @@ fn append_default_output_maps(args: &mut Vec<String>) {
 
 fn append_audio_bitstream_filter_arg(args: &mut Vec<String>, filter: AudioBitstreamFilter) {
     args.extend(["-bsf:a".to_string(), filter.as_ffmpeg_name().to_string()]);
-}
-
-fn tee_slave_target(
-    output_format: &str,
-    target: &str,
-    onfail_ignore: bool,
-    audio_copy_decoration: Option<AudioCopyDecoration>,
-) -> String {
-    let mut options = vec![format!("f={output_format}")];
-    if onfail_ignore {
-        options.push("onfail=ignore".to_string());
-    }
-    if let Some(filter) =
-        audio_copy_decoration.and_then(|value| value.filter_for_output(output_format))
-    {
-        options.push(format!("bsfs/a={}", filter.as_ffmpeg_name()));
-    }
-
-    format!("[{}]{}", options.join(":"), escape_tee_target(target))
 }
 
 fn normalized_process_mode<'a>(spec: &'a TaskSpec, default_mode: &'a str) -> &'a str {
@@ -3720,10 +3990,6 @@ fn build_rtp_stream_id(task_id: Uuid, attempt_no: i32) -> String {
     format!("{task_id}-{attempt_no}")
 }
 
-fn escape_tee_target(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('|', "\\|")
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StreamBinding {
     schema: Option<String>,
@@ -4158,6 +4424,198 @@ fn is_pid_running(pid: i32) -> bool {
     }
 }
 
+fn runtime_pids(runtime: &ManagedRuntime) -> Vec<i32> {
+    let mut pids = Vec::new();
+    if let Some(pid) = runtime.pid {
+        pids.push(pid);
+    }
+    pids.extend(runtime.companion_pids.iter().copied());
+    pids
+}
+
+fn signal_runtime_pids(runtime: &ManagedRuntime, signal: i32) -> Result<(), ExecutorError> {
+    for pid in runtime_pids(runtime) {
+        signal_pid(pid, signal).map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn wait_for_companion_pids_exit(pids: &[i32], timeout_after_signal: Duration) {
+    let started_at = Instant::now();
+    loop {
+        if pids.iter().all(|pid| !is_pid_running(*pid)) {
+            return;
+        }
+        if started_at.elapsed() >= timeout_after_signal {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn spawn_companion_process_monitor(
+    runtime_id: Uuid,
+    task_id: Uuid,
+    attempt_no: i32,
+    companion_pid: i32,
+    companion_plan: CompanionProcessPlan,
+    work_dir: PathBuf,
+    success_check: SuccessCheck,
+    registry: LocalRuntimeRegistry,
+    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    events: RuntimeEventSink,
+    mut child: tokio::process::Child,
+) {
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        let (stop_requested, suppress_events) = {
+            let mut runtimes_guard = runtimes.write().expect("runtime map lock poisoned");
+            let Some(runtime) = runtimes_guard.get_mut(&runtime_id) else {
+                return;
+            };
+            runtime.companion_pids.retain(|pid| *pid != companion_pid);
+            (
+                runtime.stop_requested.load(Ordering::Relaxed),
+                runtime.suppress_companion_events.load(Ordering::Relaxed),
+            )
+        };
+
+        let succeeded = match (&status, &companion_plan.success_check) {
+            (Ok(status), SuccessCheck::FileExists(path)) => status.success() && path.exists(),
+            (Ok(status), SuccessCheck::ProcessExit) => status.success(),
+            (Err(_), _) => false,
+        };
+
+        let updated_handle = registry.update(runtime_id, |runtime| {
+            update_companion_recording_metadata(runtime, |companion| {
+                companion.pid = None;
+                companion.state = if succeeded {
+                    CompanionProcessState::Succeeded
+                } else {
+                    CompanionProcessState::Failed
+                };
+                companion.error = if succeeded {
+                    None
+                } else {
+                    Some(match &status {
+                        Ok(status) => format!(
+                            "mp4 recording sidecar exited unsuccessfully: {:?}",
+                            status.code()
+                        ),
+                        Err(error) => format!("failed to wait mp4 recording sidecar: {error}"),
+                    })
+                };
+            });
+        });
+
+        if let Some(handle) = updated_handle.as_ref() {
+            let _ = persist_runtime_state(&work_dir, handle, &success_check);
+        }
+
+        if succeeded || stop_requested || suppress_events {
+            return;
+        }
+
+        let Some(updated_handle) = updated_handle else {
+            return;
+        };
+        let _ = events.send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
+        let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+            task_id,
+            attempt_no,
+            event_type: "recording_degraded".to_string(),
+            event_level: "warn".to_string(),
+            message: "mp4 recording sidecar stopped; continuing without recording".to_string(),
+            payload: json!({
+                "output_target": companion_plan.output_target,
+                "exit_code": status.ok().and_then(|value| value.code()),
+                "reason": "recording_sidecar_exit_failed",
+            }),
+        }));
+    });
+}
+
+fn spawn_adopted_companion_process_monitor(
+    runtime_id: Uuid,
+    companion_pid: i32,
+    companion_plan: CompanionProcessMetadata,
+    work_dir: PathBuf,
+    success_check: SuccessCheck,
+    registry: LocalRuntimeRegistry,
+    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    events: RuntimeEventSink,
+) {
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(2)).await;
+
+            let (stop_requested, suppress_events) = {
+                let mut runtimes_guard = runtimes.write().expect("runtime map lock poisoned");
+                let Some(runtime) = runtimes_guard.get_mut(&runtime_id) else {
+                    return;
+                };
+                if is_pid_running(companion_pid) {
+                    continue;
+                }
+                runtime.companion_pids.retain(|pid| *pid != companion_pid);
+                (
+                    runtime.stop_requested.load(Ordering::Relaxed),
+                    runtime.suppress_companion_events.load(Ordering::Relaxed),
+                )
+            };
+
+            let succeeded = companion_plan
+                .outputs
+                .iter()
+                .any(|output| Path::new(output).exists());
+            let updated_handle = registry.update(runtime_id, |runtime| {
+                update_companion_recording_metadata(runtime, |companion| {
+                    companion.pid = None;
+                    companion.state = if succeeded {
+                        CompanionProcessState::Succeeded
+                    } else {
+                        CompanionProcessState::Failed
+                    };
+                    companion.error = if succeeded {
+                        None
+                    } else {
+                        Some(
+                            "mp4 recording sidecar exited before artifact was finalized"
+                                .to_string(),
+                        )
+                    };
+                });
+            });
+
+            if let Some(handle) = updated_handle.as_ref() {
+                let _ = persist_runtime_state(&work_dir, handle, &success_check);
+            }
+
+            if succeeded || stop_requested || suppress_events {
+                return;
+            }
+
+            let Some(updated_handle) = updated_handle else {
+                return;
+            };
+            let _ = events.send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
+            let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                task_id: updated_handle.task_id,
+                attempt_no: updated_handle.attempt_no,
+                event_type: "recording_degraded".to_string(),
+                event_level: "warn".to_string(),
+                message: "mp4 recording sidecar stopped; continuing without recording".to_string(),
+                payload: json!({
+                    "output_target": companion_plan.output_target,
+                    "reason": "recording_sidecar_exit_failed",
+                    "orphaned": true,
+                }),
+            }));
+            return;
+        }
+    });
+}
+
 fn spawn_adopted_runtime_monitor(
     handle: RuntimeHandle,
     work_dir: PathBuf,
@@ -4272,9 +4730,7 @@ fn spawn_startup_probe_monitor(
                     .get(&runtime_id)
                     .cloned()
                 {
-                    if let Some(pid) = runtime.pid {
-                        let _ = signal_pid(pid, libc::SIGTERM);
-                    }
+                    let _ = signal_runtime_pids(&runtime, libc::SIGTERM);
                 }
                 return;
             }
@@ -4788,6 +5244,19 @@ fn spawn_live_relay_monitor(
                 Ok(false)
                     if !stream_online(&handle) && started_at.elapsed() >= STARTUP_PROBE_TIMEOUT =>
                 {
+                    let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
+                        schema: startup_probe.schema.clone(),
+                        vhost: startup_probe.vhost.clone(),
+                        app: startup_probe.app.clone(),
+                        stream: startup_probe.stream.clone(),
+                    });
+                    let _ = call_zlm_api(
+                        &http_client,
+                        &settings,
+                        "/index/api/close_streams",
+                        &build_close_stream_params(&binding, true),
+                    )
+                    .await;
                     let failed_handle = registry
                         .update(runtime_id, |runtime| {
                             runtime.state = RuntimeState::Exited;
@@ -5352,9 +5821,6 @@ fn zlm_record_kind_code(kind: &ZlmRecordKind) -> u8 {
 }
 
 fn attach_file_artifact_metadata(handle: &mut RuntimeHandle, success_check: &SuccessCheck) {
-    let SuccessCheck::FileExists(path) = success_check else {
-        return;
-    };
     let Some(kind) = managed_file_output_kind_from_handle(handle) else {
         return;
     };
@@ -5366,8 +5832,20 @@ fn attach_file_artifact_metadata(handle: &mut RuntimeHandle, success_check: &Suc
             .filter_map(|output| file_artifact_metadata_from_path(Path::new(output)))
             .collect::<Vec<_>>();
         if artifacts.is_empty() {
-            if let Some(metadata) = file_artifact_metadata_from_path(path) {
-                artifacts.push(metadata);
+            if let Some(companion) = companion_recording_from_handle(handle) {
+                artifacts.extend(
+                    companion
+                        .outputs
+                        .iter()
+                        .filter_map(|output| file_artifact_metadata_from_path(Path::new(output))),
+                );
+            }
+        }
+        if artifacts.is_empty() {
+            if let SuccessCheck::FileExists(path) = success_check {
+                if let Some(metadata) = file_artifact_metadata_from_path(path) {
+                    artifacts.push(metadata);
+                }
             }
         }
         let Some(object) = handle.metadata.as_object_mut() else {
@@ -5379,6 +5857,9 @@ fn attach_file_artifact_metadata(handle: &mut RuntimeHandle, success_check: &Suc
         return;
     }
 
+    let SuccessCheck::FileExists(path) = success_check else {
+        return;
+    };
     let Some(metadata) = file_artifact_metadata_from_path(path) else {
         return;
     };
@@ -5505,6 +5986,28 @@ fn managed_file_output_kind_from_handle(handle: &RuntimeHandle) -> Option<Manage
         .get("managed_file_output_kind")
         .cloned()
         .and_then(|value| serde_json::from_value::<ManagedFileOutputKind>(value).ok())
+}
+
+fn companion_recording_from_handle(handle: &RuntimeHandle) -> Option<CompanionProcessMetadata> {
+    handle
+        .metadata
+        .get("companion_recording")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<CompanionProcessMetadata>(value).ok())
+}
+
+fn update_companion_recording_metadata(
+    runtime: &mut RuntimeHandle,
+    update: impl FnOnce(&mut CompanionProcessMetadata),
+) {
+    let Some(value) = runtime.metadata.get("companion_recording").cloned() else {
+        return;
+    };
+    let Ok(mut companion) = serde_json::from_value::<CompanionProcessMetadata>(value) else {
+        return;
+    };
+    update(&mut companion);
+    runtime.metadata["companion_recording"] = json!(companion);
 }
 
 fn file_artifact_metadata_from_path(path: &Path) -> Option<Value> {
@@ -6899,7 +7402,7 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_uses_realtime_tee_output() {
+    fn build_file_to_live_plan_uses_companion_mp4_recording_process() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
@@ -6927,17 +7430,23 @@ fi
 
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+        let companion = plan
+            .companion_recording
+            .clone()
+            .expect("mp4 recording should use a companion process");
 
         assert!(plan.args.iter().any(|arg| arg == "-re"));
-        assert!(plan.args.iter().any(|arg| arg == "tee"));
+        assert!(!plan.args.iter().any(|arg| arg == "tee"));
         assert_eq!(plan.output_target, "rtmp://127.0.0.1/live/stream");
         assert_eq!(
             plan.outputs,
-            vec![
-                "rtmp://127.0.0.1/live/stream".to_string(),
-                "/tmp/work/00000000-0000-0000-0000-000000000000/attempt-1/record.mp4".to_string()
-            ]
+            vec!["rtmp://127.0.0.1/live/stream".to_string()]
         );
+        assert_eq!(
+            companion.output_target,
+            "/tmp/work/00000000-0000-0000-0000-000000000000/attempt-1/record.mp4".to_string()
+        );
+        assert!(companion.args.iter().any(|arg| arg == "mp4"));
     }
 
     #[test]
@@ -7833,6 +8342,10 @@ fi
 
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+        let companion = plan
+            .companion_recording
+            .clone()
+            .expect("mp4 recording should use a companion process");
 
         assert!(
             plan.args
@@ -7844,13 +8357,55 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:a", "copy"])
         );
-        assert!(plan.args.iter().any(|arg| arg == "-f"));
-        assert!(plan.args.iter().any(|arg| arg == "tee"));
-        assert!(
-            plan.args
-                .iter()
-                .any(|arg| arg.contains("bsfs/a=aac_adtstoasc"))
-        );
+        assert!(!plan.args.iter().any(|arg| arg == "tee"));
+        assert!(plan.args.iter().any(|arg| arg == "aac_adtstoasc"));
+        assert!(companion.args.iter().any(|arg| arg == "aac_adtstoasc"));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn attach_file_artifact_metadata_uses_companion_recording_outputs() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-stream-ingest-sidecar-artifact-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+        let artifact_path = temp_root.join("record.mp4");
+        fs::write(&artifact_path, b"artifact").expect("artifact should be written");
+
+        let mut handle = RuntimeHandle {
+            runtime_id: Uuid::nil(),
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::ZlmProxy,
+            pid: Some(1234),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Exited,
+            command_line: None,
+            outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+            metadata: json!({
+                "managed_file_output_kind": "stream_ingest_record",
+                "companion_recording": {
+                    "kind": "stream_ingest_mp4_record",
+                    "pid": null,
+                    "output_target": artifact_path,
+                    "outputs": [artifact_path],
+                    "command_line": null,
+                    "state": "succeeded",
+                    "error": null
+                }
+            }),
+        };
+
+        attach_file_artifact_metadata(&mut handle, &SuccessCheck::ProcessExit);
+
+        let artifacts = handle.metadata["stream_ingest_record_artifacts"]
+            .as_array()
+            .expect("artifacts should be attached");
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0]["file_name"].as_str(), Some("record.mp4"));
 
         let _ = fs::remove_dir_all(temp_root);
     }
