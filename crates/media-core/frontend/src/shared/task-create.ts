@@ -144,7 +144,7 @@ export const guidedScenarios = [
 ];
 
 export function defaultSourceModeForInputKind(kind: string) {
-  if (kind === "file" || kind === "http_mp4") return "vod";
+  if (kind === "file" || kind === "ftp" || kind === "http_mp4") return "vod";
   if (
     ["rtsp", "rtmp", "http_flv", "udp_mpegts_multicast", "rtp_multicast", "gb_rtp"].includes(kind)
   ) {
@@ -265,24 +265,27 @@ export function createDefaultDraft(): TaskCreateDraft {
 export function normalizeDraftForTaskType(draft: TaskCreateDraft, taskType: string) {
   draft.task_type = taskType;
   if (taskType === "file_transcode") {
-    if (!["file", "http_mp4", "hls", "http_ts"].includes(draft.input.kind)) {
+    if (!["file", "ftp", "http_mp4", "hls", "http_ts"].includes(draft.input.kind)) {
       draft.input.kind = "file";
     }
+    const fixedSourceMode = defaultSourceModeForInputKind(draft.input.kind);
     draft.publish.kind = "file";
-    draft.input.source_mode = draft.input.source_mode || defaultSourceModeForInputKind(draft.input.kind) || "vod";
+    draft.input.source_mode = fixedSourceMode || draft.input.source_mode || "vod";
     draft.record.enabled = false;
     draft.input.loop_enabled = false;
   } else if (taskType === "stream_bridge") {
     if (draft.input.kind === "gb_rtp" || !draft.input.kind) {
       draft.input.kind = "rtsp";
     }
+    const fixedSourceMode = defaultSourceModeForInputKind(draft.input.kind);
     draft.publish.kind = draft.publish.kind || "file";
-    draft.input.source_mode = draft.input.source_mode || defaultSourceModeForInputKind(draft.input.kind) || "live";
+    draft.input.source_mode = fixedSourceMode || draft.input.source_mode || "live";
     draft.record.enabled = false;
     draft.input.loop_enabled = false;
   } else {
+    const fixedSourceMode = defaultSourceModeForInputKind(draft.input.kind);
     draft.publish.kind = "";
-    draft.input.source_mode = draft.input.source_mode || defaultSourceModeForInputKind(draft.input.kind) || "live";
+    draft.input.source_mode = fixedSourceMode || draft.input.source_mode || "live";
     if (!inputKindSupportsLoop(draft.input.kind, draft.input.source_mode)) {
       draft.input.loop_enabled = false;
     }

@@ -58,13 +58,23 @@ const createMutation = useMutation({
 
 const showExplicitSourceMode = computed(() => inputKindSupportsExplicitSourceMode(draft.input.kind));
 const showInputUrl = computed(() =>
-  ["rtsp", "rtmp", "hls", "http_mp4", "http_flv", "http_ts", "file"].includes(draft.input.kind),
+  ["rtsp", "rtmp", "hls", "ftp", "http_mp4", "http_flv", "http_ts", "file"].includes(draft.input.kind),
 );
 const showInputMulticast = computed(() =>
   ["udp_mpegts_multicast", "rtp_multicast"].includes(draft.input.kind),
 );
 const showGbRtp = computed(() => draft.input.kind === "gb_rtp");
 const showManagedFileInputHint = computed(() => draft.input.kind === "file");
+const showFtpInputHint = computed(() => draft.input.kind === "ftp");
+const inputUrlPlaceholder = computed(() => {
+  if (draft.input.kind === "file") {
+    return "demo.mp4 或 vod/demo.ts";
+  }
+  if (draft.input.kind === "ftp") {
+    return "ftp://user:pass@example.com/archive/demo.mp4";
+  }
+  return "rtsp:// / rtmp:// / http://...";
+});
 const showInputLoop = computed(
   () =>
     draft.task_type === "stream_ingest" &&
@@ -91,6 +101,10 @@ const summaryText = computed(() => humanSummary(draft));
 const managedFileInputHint = computed(
   () =>
     `任务里只填相对 ${managedFileInputRoot} 的路径，例如 demo.mp4 或 vod/demo.ts。文件实际应放到宿主机安装目录下的 data/media/work；当前标准实例路径是 ${managedFileHostPath}。如果误写成 /demo.mp4，系统会自动按 demo.mp4 处理。`,
+);
+const ftpInputHint = computed(
+  () =>
+    "FTP 输入只支持 ftp:// 远端文件/VOD 地址，不支持 ftps://。如需认证，请直接在 URL 中携带用户名和密码，例如 ftp://user:pass@example.com/archive/demo.mp4。",
 );
 const inputLoopHint = computed(
   () =>
@@ -377,7 +391,7 @@ function previewTask() {
             <el-form-item :label="draft.input.kind === 'file' ? '输入文件相对路径' : '输入 URL'">
               <el-input
                 v-model="draft.input.url"
-                :placeholder="draft.input.kind === 'file' ? 'demo.mp4 或 vod/demo.ts' : 'rtsp:// / rtmp:// / http://...'"
+                :placeholder="inputUrlPlaceholder"
               />
             </el-form-item>
           </el-col>
@@ -389,6 +403,14 @@ function previewTask() {
           :closable="false"
           title="本地文件输入只填相对路径"
           :description="managedFileInputHint"
+        />
+
+        <el-alert
+          v-if="showFtpInputHint"
+          type="info"
+          :closable="false"
+          title="FTP 输入仅支持 ftp://"
+          :description="ftpInputHint"
         />
 
         <el-row v-if="showInputLoop" :gutter="16">

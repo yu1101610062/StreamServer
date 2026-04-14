@@ -2312,6 +2312,7 @@ fn build_input_url(settings: &AgentSettings, input: &InputSpec) -> Result<String
             InputKind::Rtsp
             | InputKind::Rtmp
             | InputKind::Hls
+            | InputKind::Ftp
             | InputKind::HttpMp4
             | InputKind::HttpFlv
             | InputKind::HttpTs,
@@ -6289,6 +6290,20 @@ fi
             ExecutorError::InvalidRequest(message)
                 if message.contains("must not contain '..' segments")
         ));
+    }
+
+    #[test]
+    fn build_input_url_keeps_ftp_url_unchanged() {
+        let settings = test_settings("/tmp/work");
+        let input = InputSpec {
+            kind: Some(InputKind::Ftp),
+            url: Some("ftp://vod.example.com/archive/demo.mp4".to_string()),
+            ..InputSpec::default()
+        };
+
+        let input_url = build_input_url(&settings, &input).expect("input url should resolve");
+
+        assert_eq!(input_url, "ftp://vod.example.com/archive/demo.mp4");
     }
 
     #[test]

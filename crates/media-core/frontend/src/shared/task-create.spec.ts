@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildDraftPayload,
   createDefaultDraft,
+  defaultSourceModeForInputKind,
   deriveStreamIngestRecordMode,
   normalizeDraftForTaskType,
 } from "@/shared/task-create";
@@ -69,6 +70,40 @@ describe("buildDraftPayload", () => {
       source_mode: "vod",
       loop_enabled: true,
       url: "http://vod.example.com/archive.mp4",
+    });
+  });
+
+  it("defaults ftp input to vod mode", () => {
+    expect(defaultSourceModeForInputKind("ftp")).toBe("vod");
+  });
+
+  it("keeps ftp input when normalizing file_transcode drafts", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "ftp";
+    draft.input.url = "ftp://vod.example.com/archive/demo.mp4";
+
+    normalizeDraftForTaskType(draft, "file_transcode");
+
+    expect(draft.input.kind).toBe("ftp");
+    expect(draft.input.source_mode).toBe("vod");
+  });
+
+  it("preserves ftp input urls in task payloads", () => {
+    const draft = createDefaultDraft();
+    draft.name = "ftp-vod";
+    draft.common.created_by = "alice";
+    normalizeDraftForTaskType(draft, "file_transcode");
+    draft.input.kind = "ftp";
+    draft.input.source_mode = "vod";
+    draft.input.url = "ftp://user:pass@example.com/archive/demo.mp4";
+    draft.publish.kind = "file";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.input).toMatchObject({
+      kind: "ftp",
+      source_mode: "vod",
+      url: "ftp://user:pass@example.com/archive/demo.mp4",
     });
   });
 

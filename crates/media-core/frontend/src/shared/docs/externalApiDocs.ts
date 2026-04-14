@@ -148,6 +148,7 @@ const INPUT_KIND_ENUM = [
   "rtsp",
   "rtmp",
   "hls",
+  "ftp",
   "http_mp4",
   "http_flv",
   "http_ts",
@@ -271,7 +272,7 @@ function fieldMeta(path: string): FieldMeta | null {
     },
     {
       test: (value) => value === "input.source_mode",
-      meta: { description: "输入源语义，显式区分实时源和离线源。", enumValues: SOURCE_MODE_ENUM, required: "hls/http_ts 时必填" },
+      meta: { description: "输入源语义，显式区分实时源和离线源。", enumValues: SOURCE_MODE_ENUM, required: "hls/http_ts 时必填；ftp 固定为 vod" },
     },
     {
       test: (value) => value === "input.loop_enabled",
@@ -283,7 +284,7 @@ function fieldMeta(path: string): FieldMeta | null {
     {
       test: (value) => value === "input.url",
       meta: {
-        description: "输入 URL；当 input.kind=file 时，这里填写相对 /data/media/work 的文件路径，前导 / 会被自动忽略。",
+        description: "输入 URL；当 input.kind=file 时，这里填写相对 /data/media/work 的文件路径，前导 / 会被自动忽略；当 input.kind=ftp 时，只支持 ftp://，不支持 ftps://。",
         required: "URL/文件输入时必填",
       },
     },

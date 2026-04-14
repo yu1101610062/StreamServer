@@ -264,6 +264,7 @@ pub enum InputKind {
     Rtsp,
     Rtmp,
     Hls,
+    Ftp,
     HttpMp4,
     HttpFlv,
     HttpTs,
@@ -279,6 +280,7 @@ impl InputKind {
             Self::Rtsp => "rtsp",
             Self::Rtmp => "rtmp",
             Self::Hls => "hls",
+            Self::Ftp => "ftp",
             Self::HttpMp4 => "http_mp4",
             Self::HttpFlv => "http_flv",
             Self::HttpTs => "http_ts",
@@ -295,6 +297,7 @@ impl InputKind {
             Self::Rtsp
                 | Self::Rtmp
                 | Self::Hls
+                | Self::Ftp
                 | Self::HttpMp4
                 | Self::HttpFlv
                 | Self::HttpTs
@@ -310,13 +313,30 @@ impl InputKind {
             | Self::UdpMpegtsMulticast
             | Self::RtpMulticast
             | Self::GbRtp => Some(SourceMode::Live),
-            Self::HttpMp4 | Self::File => Some(SourceMode::Vod),
+            Self::Ftp | Self::HttpMp4 | Self::File => Some(SourceMode::Vod),
             Self::Hls | Self::HttpTs => None,
         }
     }
 }
 
 pub const MANAGED_FILE_INPUT_ROOT: &str = "/data/media/work";
+
+fn validate_ftp_input_url(value: &str) -> Result<(), &'static str> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("must be provided for ftp input");
+    }
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered.starts_with("ftps://") {
+        return Err("ftps:// is not supported; use ftp://");
+    }
+    if !lowered.starts_with("ftp://") {
+        return Err("must start with ftp:// for ftp input");
+    }
+
+    Ok(())
+}
 
 pub fn normalize_relative_file_input_path(value: &str) -> Result<String, &'static str> {
     let trimmed = value.trim();
@@ -613,6 +633,17 @@ impl TaskSpec {
                     "must be provided for file input",
                 )),
             },
+            Some(InputKind::Ftp) => match self.input.url.as_deref() {
+                Some(value) => {
+                    if let Err(message) = validate_ftp_input_url(value) {
+                        issues.push(ValidationIssue::new("input.url", message));
+                    }
+                }
+                None => issues.push(ValidationIssue::new(
+                    "input.url",
+                    "must be provided for ftp input",
+                )),
+            },
             Some(kind) if kind.is_url_based() => {
                 if self
                     .input
@@ -730,6 +761,7 @@ impl TaskSpec {
                         InputKind::Rtsp
                             | InputKind::Rtmp
                             | InputKind::Hls
+                            | InputKind::Ftp
                             | InputKind::HttpFlv
                             | InputKind::HttpTs
                             | InputKind::HttpMp4
@@ -927,11 +959,17 @@ impl TaskSpec {
             TaskType::FileTranscode => {
                 if !matches!(
                     self.input.kind,
-                    Some(InputKind::File | InputKind::HttpMp4 | InputKind::Hls | InputKind::HttpTs)
+                    Some(
+                        InputKind::File
+                            | InputKind::Ftp
+                            | InputKind::HttpMp4
+                            | InputKind::Hls
+                            | InputKind::HttpTs
+                    )
                 ) {
                     issues.push(ValidationIssue::new(
                         "input.kind",
-                        "file_transcode requires file, http_mp4, hls, or http_ts input",
+                        "file_transcode requires file, ftp, http_mp4, hls, or http_ts input",
                     ));
                 }
                 if self.input.source_mode != Some(SourceMode::Vod) {
@@ -1398,6 +1436,19 @@ mod tests {
     }
 
     #[test]
+    fn resolve_defaults_ftp_input_to_vod() {
+        let mut task = sample_task(TaskType::FileTranscode);
+        task.input.kind = Some(InputKind::Ftp);
+        task.input.source_mode = None;
+        task.input.url = Some("ftp://vod.example.com/archive/demo.mp4".to_string());
+        task.publish.kind = Some(PublishTargetKind::File);
+
+        let resolved = task.resolved();
+
+        assert_eq!(resolved.input.source_mode, Some(SourceMode::Vod));
+    }
+
+    #[test]
     fn resolve_normalizes_file_input_relative_path() {
         let mut task = sample_task(TaskType::FileTranscode);
         task.input.kind = Some(InputKind::File);
@@ -1757,6 +1808,80 @@ mod tests {
 
         task.validate()
             .expect("validation should allow http_mp4 file_transcode input");
+    }
+
+    #[test]
+    fn validate_allows_file_transcode_with_ftp_vod_input() {
+        let task = TaskSpec {
+            task_type: TaskType::FileTranscode,
+            name: "file-transcode".to_string(),
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("alice".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::Ftp),
+                source_mode: Some(SourceMode::Vod),
+                url: Some("ftp://vod.example.com/archive.mp4".to_string()),
+                ..InputSpec::default()
+            },
+            stream: StreamSpec::default(),
+            expose: ExposeSpec::default(),
+            process: ProcessSpec::default(),
+            publish: PublishSpec {
+                kind: Some(PublishTargetKind::File),
+                ..PublishSpec::default()
+            },
+            record: RecordSpec::default(),
+            recovery: RecoverySpec::default(),
+            schedule: ScheduleSpec::default(),
+            resource: ResourceSpec::default(),
+        };
+
+        task.validate()
+            .expect("validation should allow ftp file_transcode input");
+    }
+
+    #[test]
+    fn validate_allows_stream_ingest_with_ftp_vod_input() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::Ftp);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("ftp://vod.example.com/archive.ts".to_string());
+
+        task.validate()
+            .expect("validation should allow ftp ingest input");
+    }
+
+    #[test]
+    fn validate_rejects_ftp_with_live_source_mode() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::Ftp);
+        task.input.source_mode = Some(SourceMode::Live);
+        task.input.url = Some("ftp://vod.example.com/archive.ts".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+
+        assert!(error.issues.iter().any(|issue| {
+            issue.field == "input.source_mode"
+                && issue.message == "ftp input requires source_mode=vod"
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_ftps_input_url() {
+        let mut task = sample_task(TaskType::StreamIngest);
+        task.input.kind = Some(InputKind::Ftp);
+        task.input.source_mode = Some(SourceMode::Vod);
+        task.input.url = Some("ftps://vod.example.com/archive.ts".to_string());
+
+        let error = task.validate().expect_err("validation should fail");
+
+        assert!(error.issues.iter().any(|issue| {
+            issue.field == "input.url" && issue.message == "ftps:// is not supported; use ftp://"
+        }));
     }
 
     #[test]

@@ -26,6 +26,7 @@ export const INPUT_KINDS: OptionItem[] = [
   { value: "rtsp", label: "RTSP" },
   { value: "rtmp", label: "RTMP" },
   { value: "hls", label: "HLS" },
+  { value: "ftp", label: "FTP 文件" },
   { value: "http_mp4", label: "HTTP MP4" },
   { value: "http_flv", label: "HTTP-FLV" },
   { value: "http_ts", label: "HTTP-TS" },

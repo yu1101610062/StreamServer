@@ -125,7 +125,8 @@
 
 - `input.kind` 表示任务直接接收的输入源类型。
 - `input.kind=file` 时，`input.url` 必须填写相对 `/data/media/work` 的文件路径；如果误写成 `/demo.mp4`，系统会自动按 `demo.mp4` 处理。
-- `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；其他输入类型按规则自动推断。
+- `input.kind=ftp` 时，`input.url` 必须填写 `ftp://` 地址；当前不支持 `ftps://`。
+- `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；`ftp` 固定为 `vod`，其他输入类型按规则自动推断。
 - `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时关闭全部播放协议并启用录制，任务会进入快录分支，此时必须填写 `record.duration_sec` 作为快录终点。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
 - `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。对 `stream_ingest + source_mode=vod + record.enabled=true`，只要任一播放协议开启，任务就保持实时录制；全部关闭则切到快录且不再提供实时播放地址。
@@ -136,9 +137,9 @@
 
 | 任务类型 | 支持的 `input.kind` | 支持的 `publish.kind` | 支持的内部流协议暴露 |
 | --- | --- | --- | --- |
-| `stream_ingest` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` `gb_rtp` | 不允许设置 | `expose.enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
-| `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` `rtmp_push` | 不适用 |
-| `file_transcode` | `file` `http_mp4` `hls(vod)` `http_ts(vod)` | `file` | 不适用 |
+| `stream_ingest` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `ftp(vod)` `file` `udp_mpegts_multicast` `rtp_multicast` `gb_rtp` | 不允许设置 | `expose.enable_rtsp` `enable_rtmp` `enable_http_ts` `enable_http_fmp4` `enable_hls` |
+| `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `ftp(vod)` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` `rtmp_push` | 不适用 |
+| `file_transcode` | `file` `ftp(vod)` `http_mp4` `hls(vod)` `http_ts(vod)` | `file` | 不适用 |
 
 循环 VOD 输入示例：
 
