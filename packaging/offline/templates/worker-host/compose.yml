@@ -20,6 +20,7 @@ services:
     image: ${MEDIA_AGENT_IMAGE}
     restart: unless-stopped
     network_mode: host
+    entrypoint: ["/opt/streamserver/bin/media-agent"]
     depends_on:
       zlmediakit:
         condition: service_healthy
@@ -50,6 +51,7 @@ services:
       timeout: 3s
       retries: 20
     volumes:
+      - ./bin:/opt/streamserver/bin:ro
       - ./data/media/work:/data/media/work
       - ./data/media/logs:/data/media/logs
       - ./data/zlm/www:/data/zlm/www

@@ -1,9 +1,14 @@
-ARG DEBIAN_MIRROR=http://mirrors.tuna.tsinghua.edu.cn
+ARG DEBIAN_MIRROR=
 ARG UBUNTU_MIRROR=
-ARG CARGO_REGISTRY_MIRROR=sparse+https://rsproxy.cn/index/
-ARG NPM_REGISTRY_MIRROR=https://registry.npmmirror.com
+ARG CARGO_REGISTRY_MIRROR=
+ARG NPM_REGISTRY_MIRROR=
+ARG FRONTEND_BUILDER_IMAGE=node:22-bookworm
+ARG RUST_BUILDER_IMAGE=rust:1.85-bookworm
+ARG MEDIA_CORE_RUNTIME_BASE_IMAGE=debian:bookworm-slim
+ARG MEDIA_AGENT_RUNTIME_BASE_IMAGE=jrottenberg/ffmpeg:7.1-ubuntu2404
+ARG MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE=jrottenberg/ffmpeg:7.1-nvidia2204
 
-FROM node:22-bookworm AS frontend-builder
+FROM ${FRONTEND_BUILDER_IMAGE} AS frontend-builder
 
 ARG NPM_REGISTRY_MIRROR
 
@@ -19,7 +24,7 @@ COPY crates/media-core/frontend ./
 
 RUN npm run build
 
-FROM rust:1.85-bookworm AS builder
+FROM ${RUST_BUILDER_IMAGE} AS builder
 
 ARG DEBIAN_MIRROR
 ARG CARGO_REGISTRY_MIRROR
@@ -71,10 +76,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --locked --release -p media-core -p media-agent
 
-FROM debian:bookworm-slim AS media-core-runtime
+FROM scratch AS media-binaries-export
+
+COPY --from=builder /app/target/release/media-core /media-core
+COPY --from=builder /app/target/release/media-agent /media-agent
+
+FROM ${MEDIA_CORE_RUNTIME_BASE_IMAGE} AS media-core-runtime
 
 ARG DEBIAN_MIRROR
-ENV STREAMSERVER_UI_DIR=/app/ui
+ENV STREAMSERVER_UI_DIR=/app/ui \
+    STREAMSERVER_BINARY_NAME=media-core \
+    STREAMSERVER_BINARY_PATH=/opt/streamserver/bin/media-core
 
 RUN set -eux; \
     if [ -n "${DEBIAN_MIRROR:-}" ]; then \
@@ -93,42 +105,21 @@ RUN set -eux; \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/media-core /usr/local/bin/media-core
+COPY packaging/docker/exec-streamserver-binary.sh /usr/local/bin/exec-streamserver-binary
 COPY --from=frontend-builder /app/crates/media-core/ui ./ui
 COPY config ./config
 
-CMD ["media-core"]
+RUN chmod +x /usr/local/bin/exec-streamserver-binary \
+    && mkdir -p /opt/streamserver/bin
 
-FROM jrottenberg/ffmpeg:7.1-ubuntu2404 AS media-agent-runtime
-
-ARG UBUNTU_MIRROR
-
-RUN set -eux; \
-    if [ -n "${UBUNTU_MIRROR:-}" ]; then \
-      find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) -print0 \
-        | xargs -0 -r sed -i \
-          -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
-          -e "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
-          -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
-          -e "s|https://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g"; \
-    fi; \
-    apt-get update \
-    && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
-COPY config ./config
-
-RUN mkdir -p /data/media/work /data/media/logs
-
-ENTRYPOINT ["/usr/local/bin/media-agent"]
+ENTRYPOINT ["/usr/local/bin/exec-streamserver-binary"]
 CMD []
 
-FROM jrottenberg/ffmpeg:7.1-nvidia2204 AS media-agent-gpu-runtime
+FROM ${MEDIA_AGENT_RUNTIME_BASE_IMAGE} AS media-agent-runtime
 
 ARG UBUNTU_MIRROR
+ENV STREAMSERVER_BINARY_NAME=media-agent \
+    STREAMSERVER_BINARY_PATH=/opt/streamserver/bin/media-agent
 
 RUN set -eux; \
     if [ -n "${UBUNTU_MIRROR:-}" ]; then \
@@ -145,10 +136,41 @@ RUN set -eux; \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/media-agent /usr/local/bin/media-agent
+COPY packaging/docker/exec-streamserver-binary.sh /usr/local/bin/exec-streamserver-binary
 COPY config ./config
 
-RUN mkdir -p /data/media/work /data/media/logs
+RUN chmod +x /usr/local/bin/exec-streamserver-binary \
+    && mkdir -p /opt/streamserver/bin /data/media/work /data/media/logs
 
-ENTRYPOINT ["/usr/local/bin/media-agent"]
+ENTRYPOINT ["/usr/local/bin/exec-streamserver-binary"]
+CMD []
+
+FROM ${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE} AS media-agent-gpu-runtime
+
+ARG UBUNTU_MIRROR
+ENV STREAMSERVER_BINARY_NAME=media-agent \
+    STREAMSERVER_BINARY_PATH=/opt/streamserver/bin/media-agent
+
+RUN set -eux; \
+    if [ -n "${UBUNTU_MIRROR:-}" ]; then \
+      find /etc/apt -type f \( -name '*.sources' -o -name 'sources.list' \) -print0 \
+        | xargs -0 -r sed -i \
+          -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g" \
+          -e "s|https://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}/ubuntu|g"; \
+    fi; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY packaging/docker/exec-streamserver-binary.sh /usr/local/bin/exec-streamserver-binary
+COPY config ./config
+
+RUN chmod +x /usr/local/bin/exec-streamserver-binary \
+    && mkdir -p /opt/streamserver/bin /data/media/work /data/media/logs
+
+ENTRYPOINT ["/usr/local/bin/exec-streamserver-binary"]
 CMD []

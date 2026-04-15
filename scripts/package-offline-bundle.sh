@@ -6,9 +6,14 @@ OUTPUT_DIR="${ROOT_DIR}/dist"
 SKIP_IMAGES=0
 GPU_SUPPORT=""
 
-APT_MIRROR="${APT_MIRROR:-http://mirrors.tuna.tsinghua.edu.cn}"
+APT_MIRROR="${APT_MIRROR:-}"
 UBUNTU_APT_MIRROR="${UBUNTU_APT_MIRROR:-}"
-CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR:-sparse+https://rsproxy.cn/index/}"
+CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR:-}"
+FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE:-node:22-bookworm}"
+RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE:-rust:1.85-bookworm}"
+MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE:-debian:bookworm-slim}"
+MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE:-jrottenberg/ffmpeg:7.1-ubuntu2404}"
+MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE:-jrottenberg/ffmpeg:7.1-nvidia2204}"
 POSTGRES_SOURCE_IMAGE="${POSTGRES_SOURCE_IMAGE:-postgres:18.3}"
 ZLM_SOURCE_IMAGE="${ZLM_SOURCE_IMAGE:-zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f}"
 
@@ -35,9 +40,14 @@ usage() {
   默认输出到 ./dist。
 
 环境变量:
-  APT_MIRROR             默认 http://mirrors.tuna.tsinghua.edu.cn；用于 Debian 构建阶段，也会作为 media-agent Ubuntu 运行时的默认镜像源。
-  UBUNTU_APT_MIRROR      默认留空；如设置则覆盖 media-agent CPU/GPU 运行时的 Ubuntu 源。
-  CARGO_REGISTRY_MIRROR  默认 sparse+https://rsproxy.cn/index/；设为空则使用 crates.io 官方源。
+  APT_MIRROR             默认留空，使用 Debian 官方源；如设置则用于 Debian 构建阶段，也会作为 media-agent Ubuntu 运行时的默认镜像源。
+  UBUNTU_APT_MIRROR      默认留空，使用 Ubuntu 官方源；如设置则覆盖 media-agent CPU/GPU 运行时的 Ubuntu 源。
+  CARGO_REGISTRY_MIRROR  默认留空，使用 crates.io 官方源；如设置则覆盖 Cargo registry。
+  FRONTEND_BUILDER_IMAGE 默认 node:22-bookworm；可覆写前端构建基础镜像。
+  RUST_BUILDER_IMAGE     默认 rust:1.85-bookworm；可覆写 Rust 构建基础镜像。
+  MEDIA_CORE_RUNTIME_BASE_IMAGE      默认 debian:bookworm-slim；可覆写 media-core 运行时基础镜像。
+  MEDIA_AGENT_RUNTIME_BASE_IMAGE     默认 jrottenberg/ffmpeg:7.1-ubuntu2404；可覆写 media-agent CPU 运行时基础镜像。
+  MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 默认 jrottenberg/ffmpeg:7.1-nvidia2204；可覆写 media-agent GPU 运行时基础镜像。
   POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
   ZLM_SOURCE_IMAGE       可覆盖 ZLMediaKit 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
 EOF
@@ -165,6 +175,27 @@ verify_loaded_image_arch() {
   [ "${platform}" = "linux/amd64" ] || fail "镜像 ${image_ref} 平台不是 linux/amd64，而是 ${platform:-unknown}"
 }
 
+export_binaries() {
+  local output_dir="$1"
+
+  mkdir -p "${output_dir}"
+  log "导出 media-core/media-agent linux/amd64 二进制"
+  docker buildx build \
+    --platform linux/amd64 \
+    --target media-binaries-export \
+    --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
+    --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+    --build-arg FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE}" \
+    --build-arg RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE}" \
+    --build-arg MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE}" \
+    --build-arg MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" \
+    --build-arg MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" \
+    --output "type=local,dest=${output_dir}" \
+    "${ROOT_DIR}"
+
+  chmod +x "${output_dir}/media-core" "${output_dir}/media-agent"
+}
+
 resolve_media_agent_ubuntu_mirror() {
   if [ -n "${UBUNTU_APT_MIRROR}" ]; then
     printf '%s\n' "${UBUNTU_APT_MIRROR}"
@@ -173,10 +204,27 @@ resolve_media_agent_ubuntu_mirror() {
   fi
 }
 
+smoke_test_media_core_image() {
+  local image_ref="$1"
+  local binary_path="$2"
+
+  [ -x "${binary_path}" ] || fail "缺少可执行的 media-core 二进制: ${binary_path}"
+
+  log "校验 ${image_ref} 的 media-core 启动包装器"
+  docker run --rm \
+    --platform linux/amd64 \
+    -v "${binary_path}:/opt/streamserver/bin/media-core:ro" \
+    "${image_ref}" --help >/dev/null \
+    || fail "镜像 ${image_ref} 未通过 media-core 宿主机挂载二进制校验"
+}
+
 smoke_test_media_agent_image() {
   local image_ref="$1"
-  local require_nvenc="${2:-false}"
+  local binary_path="$2"
+  local require_nvenc="${3:-false}"
   local container_name="streamserver-media-agent-smoke-$RANDOM-$$"
+
+  [ -x "${binary_path}" ] || fail "缺少可执行的 media-agent 二进制: ${binary_path}"
 
   log "校验 ${image_ref} 的 FFmpeg 运行时"
   docker run --rm --platform linux/amd64 --entrypoint sh "${image_ref}" -lc '
@@ -200,6 +248,7 @@ smoke_test_media_agent_image() {
   docker run -d --rm \
     --platform linux/amd64 \
     --name "${container_name}" \
+    -v "${binary_path}:/opt/streamserver/bin/media-agent:ro" \
     -e STREAMSERVER_ENV=production \
     -e WORK_ROOT=/data/media/work \
     "${image_ref}" >/dev/null
@@ -274,6 +323,9 @@ build_or_pull_images() {
   local zlm_image="$5"
   local gpu_support="$6"
   local media_agent_ubuntu_mirror="$7"
+  local binaries_output_dir="$8"
+
+  export_binaries "${binaries_output_dir}"
 
   log "构建 media-core linux/amd64 镜像"
   docker buildx build \
@@ -281,10 +333,16 @@ build_or_pull_images() {
     --target media-core-runtime \
     --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
     --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+    --build-arg FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE}" \
+    --build-arg RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE}" \
+    --build-arg MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE}" \
+    --build-arg MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" \
+    --build-arg MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" \
     --load \
     -t "${media_core_image}" \
     "${ROOT_DIR}"
   verify_loaded_image_arch "${media_core_image}"
+  smoke_test_media_core_image "${media_core_image}" "${binaries_output_dir}/media-core"
 
   log "构建 media-agent linux/amd64 镜像"
   docker buildx build \
@@ -293,11 +351,16 @@ build_or_pull_images() {
     --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
     --build-arg UBUNTU_MIRROR="${media_agent_ubuntu_mirror}" \
     --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+    --build-arg FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE}" \
+    --build-arg RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE}" \
+    --build-arg MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE}" \
+    --build-arg MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" \
+    --build-arg MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" \
     --load \
     -t "${media_agent_image}" \
     "${ROOT_DIR}"
   verify_loaded_image_arch "${media_agent_image}"
-  smoke_test_media_agent_image "${media_agent_image}" "false"
+  smoke_test_media_agent_image "${media_agent_image}" "${binaries_output_dir}/media-agent" "false"
 
   if [ "${gpu_support}" = "true" ]; then
     log "构建 media-agent-gpu linux/amd64 镜像"
@@ -307,11 +370,16 @@ build_or_pull_images() {
       --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
       --build-arg UBUNTU_MIRROR="${media_agent_ubuntu_mirror}" \
       --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+      --build-arg FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE}" \
+      --build-arg RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE}" \
+      --build-arg MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE}" \
+      --build-arg MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" \
+      --build-arg MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" \
       --load \
       -t "${media_agent_gpu_image}" \
       "${ROOT_DIR}"
     verify_loaded_image_arch "${media_agent_gpu_image}"
-    smoke_test_media_agent_image "${media_agent_gpu_image}" "true"
+    smoke_test_media_agent_image "${media_agent_gpu_image}" "${binaries_output_dir}/media-agent" "true"
   fi
 
   prepare_source_image "${POSTGRES_SOURCE_IMAGE}" "${postgres_image}" "postgres"
@@ -345,8 +413,10 @@ POSTGRES_IMAGE=${postgres_image}
 POSTGRES_IMAGE_ARCHIVE=images/postgres-linux-amd64.tar
 MEDIA_CORE_IMAGE=${media_core_image}
 MEDIA_CORE_IMAGE_ARCHIVE=images/media-core-linux-amd64.tar
+MEDIA_CORE_BINARY_PATH=binaries/media-core-linux-amd64
 MEDIA_AGENT_IMAGE=${media_agent_image}
 MEDIA_AGENT_IMAGE_ARCHIVE=images/media-agent-linux-amd64.tar
+MEDIA_AGENT_BINARY_PATH=binaries/media-agent-linux-amd64
 MEDIA_AGENT_GPU_IMAGE=${media_agent_gpu_image_value}
 MEDIA_AGENT_GPU_IMAGE_ARCHIVE=${media_agent_gpu_archive_value}
 ZLM_IMAGE=${zlm_image}
@@ -522,6 +592,18 @@ save_images() {
   docker save -o "${bundle_root}/images/zlmediakit-linux-amd64.tar" "${zlm_image}"
 }
 
+save_binaries() {
+  local bundle_root="$1"
+  local binaries_output_dir="$2"
+
+  mkdir -p "${bundle_root}/binaries"
+  cp "${binaries_output_dir}/media-core" "${bundle_root}/binaries/media-core-linux-amd64"
+  cp "${binaries_output_dir}/media-agent" "${bundle_root}/binaries/media-agent-linux-amd64"
+  chmod 755 \
+    "${bundle_root}/binaries/media-core-linux-amd64" \
+    "${bundle_root}/binaries/media-agent-linux-amd64"
+}
+
 cleanup_macos_metadata() {
   local bundle_root="$1"
   find "${bundle_root}" \( -name '.DS_Store' -o -name '._*' \) -delete
@@ -580,6 +662,7 @@ main() {
   local stage_dir
   local bundle_root
   local archive_path
+  local binaries_output_dir
 
   parse_args "$@"
   ensure_supported_packaging_host
@@ -622,15 +705,18 @@ main() {
   stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/streamserver-offline.XXXXXX")"
   bundle_root="${stage_dir}/${bundle_name}"
   archive_path="${OUTPUT_DIR}/${bundle_name}.tar.gz"
+  binaries_output_dir="${stage_dir}/exported-binaries"
 
   mkdir -p "${bundle_root}"
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
-    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}" "${media_agent_ubuntu_mirror}"
+    build_or_pull_images "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}" "${media_agent_ubuntu_mirror}" "${binaries_output_dir}"
   else
-    log "跳过镜像构建与导出，仅生成骨架包"
+    log "跳过镜像与二进制构建导出，仅生成骨架包"
     mkdir -p "${bundle_root}/images"
+    mkdir -p "${bundle_root}/binaries"
     echo "此包由 --skip-images 生成，未包含任何镜像。" >"${bundle_root}/images/SKIPPED.txt"
+    echo "此包由 --skip-images 生成，未包含任何宿主机挂载二进制。" >"${bundle_root}/binaries/SKIPPED.txt"
   fi
 
   copy_static_assets "${bundle_root}" "${GPU_SUPPORT}"
@@ -640,6 +726,7 @@ main() {
 
   if [ "${SKIP_IMAGES}" -eq 0 ]; then
     save_images "${bundle_root}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}"
+    save_binaries "${bundle_root}" "${binaries_output_dir}"
   fi
 
   create_archive "${stage_dir}" "${bundle_name}" "${archive_path}"

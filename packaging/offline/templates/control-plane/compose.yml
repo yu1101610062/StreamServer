@@ -23,6 +23,7 @@ services:
     image: ${MEDIA_CORE_IMAGE}
     restart: unless-stopped
     network_mode: host
+    entrypoint: ["/opt/streamserver/bin/media-core"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,6 +48,7 @@ services:
       timeout: 3s
       retries: 20
     volumes:
+      - ./bin:/opt/streamserver/bin:ro
       - ./certs:/certs:ro
 
 networks:

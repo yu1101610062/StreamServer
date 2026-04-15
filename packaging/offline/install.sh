@@ -372,6 +372,14 @@ archive_for_image_key() {
   esac
 }
 
+binary_rel_for_key() {
+  case "$1" in
+    media-core) printf '%s' "${MEDIA_CORE_BINARY_PATH:-}" ;;
+    media-agent) printf '%s' "${MEDIA_AGENT_BINARY_PATH:-}" ;;
+    *) fail "未知二进制标识: $1" ;;
+  esac
+}
+
 load_image_archive() {
   local archive_rel="$1"
   local archive_path="${PACKAGE_ROOT}/${archive_rel}"
@@ -384,6 +392,36 @@ ensure_images_loaded() {
   local key
   for key in "$@"; do
     load_image_archive "$(archive_for_image_key "${key}")"
+  done
+}
+
+install_host_binary() {
+  local install_dir="$1"
+  local binary_key="$2"
+  local binary_rel
+  local source_path
+  local target_path
+
+  binary_rel="$(binary_rel_for_key "${binary_key}")"
+  [ -n "${binary_rel}" ] || fail "离线包未声明 ${binary_key} 二进制路径"
+
+  source_path="${PACKAGE_ROOT}/${binary_rel}"
+  [ -f "${source_path}" ] || fail "缺少宿主机挂载二进制 ${binary_rel}"
+
+  mkdir -p "${install_dir}/bin"
+  target_path="${install_dir}/bin/${binary_key}"
+  cp "${source_path}" "${target_path}"
+  chmod 755 "${target_path}"
+  log "已写入宿主机挂载二进制: ${target_path}"
+}
+
+install_host_binaries() {
+  local install_dir="$1"
+  shift
+  local binary_key
+
+  for binary_key in "$@"; do
+    install_host_binary "${install_dir}" "${binary_key}"
   done
 }
 
@@ -756,6 +794,7 @@ emit_manual_start_hint() {
   local install_dir="$1"
   log "已写入部署文件，稍后可执行:"
   log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} up -d"
+  log "后续如仅更新 media-core/media-agent，可直接替换 ${install_dir}/bin 下对应二进制后再重新拉起相关服务。"
 }
 
 show_tls_notice() {
@@ -913,6 +952,7 @@ configure_control_plane() {
   prepare_local_auth_assets "${INSTALL_DIR}"
   copy_compose_template "control-plane" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
+  install_host_binaries "${INSTALL_DIR}" media-core
   write_control_plane_env "${INSTALL_DIR}/.env"
   ensure_images_loaded postgres media-core
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
@@ -950,6 +990,7 @@ configure_worker_host() {
   copy_common_assets "${INSTALL_DIR}"
   copy_compose_template "worker-host-cpu" "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
+  install_host_binaries "${INSTALL_DIR}" media-agent
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
@@ -993,6 +1034,7 @@ configure_worker_host_gpu() {
   copy_common_assets "${INSTALL_DIR}"
   copy_compose_template "worker-host-gpu" "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
+  install_host_binaries "${INSTALL_DIR}" media-agent
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
@@ -1047,6 +1089,7 @@ configure_all_in_one_host() {
   copy_compose_template "all-in-one-host-cpu" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
+  install_host_binaries "${INSTALL_DIR}" media-core media-agent
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
@@ -1107,6 +1150,7 @@ configure_all_in_one_host_gpu() {
   copy_compose_template "all-in-one-host-gpu" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
+  install_host_binaries "${INSTALL_DIR}" media-core media-agent
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
