@@ -74,7 +74,7 @@ main() {
 
   mkdir -p "${OUTPUT_DIR}"
   staging_dir="$(mktemp -d "${TMPDIR:-/tmp}/streamserver-ui.XXXXXX")"
-  trap 'rm -rf "${staging_dir}"' EXIT
+  trap 'rm -rf "${staging_dir:-}"' EXIT
 
   raw_output_dir="${staging_dir}/raw-ui"
   mkdir -p "${raw_output_dir}"

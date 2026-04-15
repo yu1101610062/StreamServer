@@ -22,6 +22,7 @@ MEDIA_AGENT_GPU_IMAGE_ARCHIVE="${MEDIA_AGENT_GPU_IMAGE_ARCHIVE:-}"
 COMPOSE_CMD=()
 COMPOSE_CMD_DISPLAY=""
 COMPOSE_FILE_NAME="compose.yml"
+STACK_SYSTEMD_UNIT_NAME=""
 
 log() {
   printf '[streamserver-install] %s\n' "$*"
@@ -65,6 +66,21 @@ compose_cmd() {
 
 compose_with_file() {
   compose_cmd -f "${COMPOSE_FILE_NAME}" "$@"
+}
+
+systemd_available() {
+  command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+sanitize_systemd_fragment() {
+  printf '%s' "$1" | sed 's/[^A-Za-z0-9_.@-]/-/g; s/-\{2,\}/-/g; s/^-//; s/-$//'
+}
+
+compose_systemd_unit_name() {
+  local safe_name
+  safe_name="$(sanitize_systemd_fragment "${PROJECT_NAME:-streamserver}")"
+  [ -n "${safe_name}" ] || safe_name="streamserver"
+  printf '%s' "streamserver-compose-${safe_name}.service"
 }
 
 ensure_docker_ready() {
@@ -452,6 +468,72 @@ install_host_ui() {
   log "已写入宿主机挂载前端静态资源: ${target_path}"
 }
 
+write_compose_wrapper_script() {
+  local install_dir="$1"
+  local wrapper_path="${install_dir}/bin/streamserver-compose"
+
+  mkdir -p "${install_dir}/bin"
+  cat >"${wrapper_path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTALL_DIR="\$(cd "\$(dirname "\$0")/.." && pwd)"
+cd "\${INSTALL_DIR}"
+
+if docker compose version >/dev/null 2>&1; then
+  exec docker compose -f "${COMPOSE_FILE_NAME}" "\$@"
+fi
+
+exec docker-compose -f "${COMPOSE_FILE_NAME}" "\$@"
+EOF
+  chmod 755 "${wrapper_path}"
+}
+
+install_compose_autostart_service() {
+  local install_dir="$1"
+  local wrapper_path
+  local unit_path
+
+  STACK_SYSTEMD_UNIT_NAME=""
+  write_compose_wrapper_script "${install_dir}"
+
+  if ! systemd_available; then
+    log "当前主机未检测到 systemd，跳过开机自启动服务安装。"
+    return 0
+  fi
+
+  wrapper_path="${install_dir}/bin/streamserver-compose"
+  STACK_SYSTEMD_UNIT_NAME="$(compose_systemd_unit_name)"
+  unit_path="/etc/systemd/system/${STACK_SYSTEMD_UNIT_NAME}"
+
+  cat >"${unit_path}" <<EOF
+[Unit]
+Description=StreamServer Compose Stack (${PROJECT_NAME})
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+RequiresMountsFor=${install_dir}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${install_dir}
+ExecStartPre=/bin/sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+ExecStart=${wrapper_path} up -d
+ExecStop=-${wrapper_path} down
+ExecReload=${wrapper_path} up -d
+TimeoutStartSec=0
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${STACK_SYSTEMD_UNIT_NAME}" >/dev/null
+  log "已安装并启用开机自启动服务: ${STACK_SYSTEMD_UNIT_NAME}"
+}
+
 ensure_nvidia_runtime_ready() {
   require_cmd nvidia-smi
   nvidia-smi >/dev/null 2>&1 || fail "NVIDIA 驱动不可用，请先确认宿主机可以正常执行 nvidia-smi"
@@ -823,8 +905,15 @@ prepare_worker_layout() {
 
 emit_manual_start_hint() {
   local install_dir="$1"
-  log "已写入部署文件，稍后可执行:"
-  log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} up -d"
+  log "已写入部署文件。"
+  if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
+    log "开机自启动已启用，可手动执行:"
+    log "  systemctl start ${STACK_SYSTEMD_UNIT_NAME}"
+    log "  systemctl status ${STACK_SYSTEMD_UNIT_NAME}"
+  else
+    log "稍后可手动执行:"
+    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} up -d"
+  fi
   log "后续如仅更新 media-core/media-agent，可直接替换 ${install_dir}/bin 下对应二进制后再重新拉起相关服务。"
 }
 
@@ -833,6 +922,7 @@ show_tls_notice() {
   local grpc_host_hint="${2:-<control-plane-host>}"
   local grpc_port_hint="${3:-50051}"
 
+  install_compose_autostart_service "${install_dir}"
   mkdir -p "${install_dir}/certs/custom"
   log "已放置自签名证书到 ${install_dir}/certs/self-signed"
   log "HTTPS 和 mTLS 默认保持关闭。"
@@ -864,13 +954,21 @@ show_tls_notice() {
 start_stack_if_requested() {
   local install_dir="$1"
   if prompt_yes_no "是否立即启动该部署？" "Y"; then
-    (
-      cd "${install_dir}"
-      compose_with_file up -d
-    )
+    if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
+      systemctl start "${STACK_SYSTEMD_UNIT_NAME}"
+    else
+      (
+        cd "${install_dir}"
+        compose_with_file up -d
+      )
+    fi
     log "已启动，常用命令:"
-    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} ps"
-    log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} logs -f"
+    if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
+      log "  systemctl status ${STACK_SYSTEMD_UNIT_NAME}"
+      log "  journalctl -u ${STACK_SYSTEMD_UNIT_NAME} -f"
+    fi
+    log "  ${install_dir}/bin/streamserver-compose ps"
+    log "  ${install_dir}/bin/streamserver-compose logs -f"
   else
     emit_manual_start_hint "${install_dir}"
   fi
