@@ -40,6 +40,7 @@ message Register {
   string network_mode = 10;
   string ffmpeg_bin = 11;
   string ffprobe_bin = 12;
+  string zlm_server_id = 13;
 }
 
 message Heartbeat {
@@ -52,6 +53,9 @@ message Heartbeat {
   bool zlm_alive = 7;
   bool ffmpeg_alive = 8;
   repeated GpuRuntime gpu_runtime = 9;
+  uint32 starting_tasks = 10;
+  uint32 stopping_tasks = 11;
+  uint32 orphaned_tasks = 12;
 }
 
 message CapabilitySnapshot {
@@ -88,6 +92,7 @@ message TaskEvent {
   string event_level = 4;
   string message = 5;
   string payload_json = 6;
+  string lease_token = 7;
 }
 
 message TaskLogBatch {
@@ -95,6 +100,7 @@ message TaskLogBatch {
   int32 attempt_no = 2;
   string stream = 3;
   repeated string lines = 4;
+  string lease_token = 5;
 }
 
 message TaskProgress {
@@ -107,6 +113,7 @@ message TaskProgress {
   uint64 out_time_ms = 7;
   uint64 dup_frames = 8;
   uint64 drop_frames = 9;
+  string lease_token = 10;
 }
 
 message TaskSnapshot {
@@ -119,6 +126,7 @@ message TaskSnapshot {
   string command_line = 7;
   repeated string outputs = 8;
   string metadata_json = 9;
+  string lease_token = 10;
 }
 
 message StartTask {
@@ -137,11 +145,18 @@ message StopTask {
   string reason = 3;
   uint32 grace_period_sec = 4;
   uint32 force_after_sec = 5;
+  string lease_token = 6;
 }
 
 message ProbeCapabilities {}
 
+message ReclaimRuntime {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  string lease_token = 3;
+  string worker_kind = 4;
+}
+
 message AdoptOrphans {
-  repeated string task_ids = 1;
-  repeated string worker_kind = 2;
+  repeated ReclaimRuntime runtimes = 1;
 }

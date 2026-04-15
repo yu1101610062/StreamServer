@@ -4,7 +4,6 @@ import { useRoute, useRouter } from "vue-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage, ElMessageBox } from "element-plus";
 
-import { AUTO_REFRESH_MS } from "@/shared/api/client";
 import { nodeApi, streamApi } from "@/shared/api/resources";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { copyText } from "@/shared/utils/clipboard";
@@ -47,13 +46,11 @@ const params = computed(() => ({
 const streamsQuery = useQuery({
   queryKey: computed(() => ["streams", params.value]),
   queryFn: () => streamApi.list(params.value),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const nodesQuery = useQuery({
   queryKey: ["streams", "nodes"],
   queryFn: () => nodeApi.list(),
-  staleTime: AUTO_REFRESH_MS,
 });
 
 const closeMutation = useMutation({

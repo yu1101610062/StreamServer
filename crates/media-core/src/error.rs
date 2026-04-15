@@ -99,6 +99,12 @@ impl IntoResponse for AppError {
                     format!("task is not dispatchable from status {status}"),
                     Value::Null,
                 ),
+                RepoError::TaskDeleteForbidden(status) => (
+                    StatusCode::CONFLICT,
+                    "TASK_DELETE_FORBIDDEN",
+                    format!("task cannot be deleted from status {status}"),
+                    Value::Null,
+                ),
                 RepoError::IdempotencyConflict => (
                     StatusCode::CONFLICT,
                     "CONFLICT_IDEMPOTENCY_KEY",

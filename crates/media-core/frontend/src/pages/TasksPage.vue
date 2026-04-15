@@ -4,7 +4,6 @@ import { useRoute, useRouter } from "vue-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage, ElMessageBox } from "element-plus";
 
-import { AUTO_REFRESH_MS } from "@/shared/api/client";
 import { nodeApi, taskApi } from "@/shared/api/resources";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
@@ -25,7 +24,7 @@ const filters = reactive({
   created_to: String(route.query.created_to ?? ""),
   page: Number(route.query.page ?? 1),
   page_size: Number(route.query.page_size ?? 20),
-  sort_by: String(route.query.sort_by ?? "updated_at"),
+  sort_by: String(route.query.sort_by ?? "created_at"),
   sort_order: String(route.query.sort_order ?? "desc"),
 });
 
@@ -40,7 +39,7 @@ watch(
     filters.created_to = String(query.created_to ?? "");
     filters.page = Number(query.page ?? 1);
     filters.page_size = Number(query.page_size ?? 20);
-    filters.sort_by = String(query.sort_by ?? "updated_at");
+    filters.sort_by = String(query.sort_by ?? "created_at");
     filters.sort_order = String(query.sort_order ?? "desc");
   },
 );
@@ -61,20 +60,19 @@ const taskParams = computed(() => ({
 const tasksQuery = useQuery({
   queryKey: computed(() => ["tasks", taskParams.value]),
   queryFn: () => taskApi.list(taskParams.value),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const nodesQuery = useQuery({
   queryKey: ["task-nodes"],
   queryFn: () => nodeApi.list(),
-  staleTime: AUTO_REFRESH_MS,
 });
 
 const actionMutation = useMutation({
-  mutationFn: async ({ task, action }: { task: TaskSummary; action: "start" | "stop" | "cancel" | "retry" }) => {
+  mutationFn: async ({ task, action }: { task: TaskSummary; action: "start" | "stop" | "cancel" | "retry" | "delete" }) => {
     if (action === "start") return taskApi.start(task.id);
     if (action === "stop") return taskApi.stop(task.id);
     if (action === "cancel") return taskApi.cancel(task.id);
+    if (action === "delete") return taskApi.delete(task.id);
     return taskApi.retry(task.id);
   },
   onSuccess: () => {
@@ -95,16 +93,30 @@ async function applyFilters() {
       created_to: filters.created_to || undefined,
       page: filters.page > 1 ? String(filters.page) : undefined,
       page_size: filters.page_size !== 20 ? String(filters.page_size) : undefined,
-      sort_by: filters.sort_by !== "updated_at" ? filters.sort_by : undefined,
+      sort_by: filters.sort_by !== "created_at" ? filters.sort_by : undefined,
       sort_order: filters.sort_order !== "desc" ? filters.sort_order : undefined,
     },
   });
 }
 
-async function runAction(task: TaskSummary, action: "start" | "stop" | "cancel" | "retry") {
-  await ElMessageBox.confirm(`确认对任务 ${task.name} 执行 ${action} 吗？`, "任务操作", { type: "warning" });
+async function runAction(task: TaskSummary, action: "start" | "stop" | "cancel" | "retry" | "delete") {
+  const actionLabel =
+    action === "start"
+      ? "启动"
+      : action === "stop"
+        ? "停止"
+        : action === "cancel"
+          ? "取消"
+          : action === "retry"
+            ? "重试"
+            : "删除";
+  const message =
+    action === "delete"
+      ? `确认删除任务 ${task.name} 吗？该操作会同时删除其尝试记录、事件、录像与产物索引。`
+      : `确认对任务 ${task.name} 执行${actionLabel}吗？`;
+  await ElMessageBox.confirm(message, "任务操作", { type: "warning" });
   await actionMutation.mutateAsync({ task, action });
-  ElMessage.success(`已提交 ${action} 请求`);
+  ElMessage.success(action === "delete" ? "任务已删除" : `已提交${actionLabel}请求`);
 }
 
 async function cloneTask(task: TaskSummary) {
@@ -120,6 +132,7 @@ function rowActions(task: TaskSummary) {
     canCancel: ["CREATED", "VALIDATING", "QUEUED", "DISPATCHING", "STARTING", "RUNNING", "RECOVERING"].includes(task.status),
     canRetry: ["FAILED", "LOST"].includes(task.status),
     canClone: ["SUCCEEDED", "FAILED", "CANCELED", "LOST"].includes(task.status),
+    canDelete: ["CREATED", "VALIDATING", "QUEUED", "SUCCEEDED", "FAILED", "CANCELED"].includes(task.status),
   };
 }
 
@@ -224,8 +237,8 @@ function transcodeTagType(task: TaskSummary) {
         </el-table-column>
         <el-table-column prop="priority" label="优先级" min-width="100" />
         <el-table-column prop="created_by" label="创建人" min-width="140" />
-        <el-table-column label="更新时间" min-width="180">
-          <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
+        <el-table-column label="创建时间" min-width="180">
+          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
         </el-table-column>
         <el-table-column label="操作" min-width="320" fixed="right">
           <template #default="{ row }">
@@ -236,6 +249,7 @@ function transcodeTagType(task: TaskSummary) {
               <el-button v-if="rowActions(row).canCancel" link @click="runAction(row, 'cancel')">取消</el-button>
               <el-button v-if="rowActions(row).canRetry" link @click="runAction(row, 'retry')">重试</el-button>
               <el-button v-if="rowActions(row).canClone" link @click="cloneTask(row)">克隆</el-button>
+              <el-button v-if="rowActions(row).canDelete" link type="danger" @click="runAction(row, 'delete')">删除</el-button>
             </div>
           </template>
         </el-table-column>

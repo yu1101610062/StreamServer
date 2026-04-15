@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ptr,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -32,11 +35,11 @@ use crate::{
     config::Settings,
     heartbeat::HeartbeatSampler,
     runtime::{
-        AdoptFilter, LocalExecutor, LocalRuntimeRegistry, ManagedProcessExecutor, RuntimeEventSink,
-        RuntimeNotification, RuntimeTaskEvent, RuntimeTaskLogBatch, RuntimeTaskProgress,
-        StartTaskRequest, StopTaskRequest, TerminalRuntimeReplay, cleanup_persisted_runtime_state,
-        collect_terminal_runtime_replays, dedup_worker_kinds, is_terminal_runtime_event,
-        rejected_runtime_handle,
+        AdoptFilter, AdoptRuntimeFilter, LocalExecutor, LocalRuntimeRegistry,
+        ManagedProcessExecutor, RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent,
+        RuntimeTaskLogBatch, RuntimeTaskProgress, StartTaskRequest, StopTaskRequest,
+        TerminalRuntimeReplay, cleanup_persisted_runtime_state, collect_terminal_runtime_replays,
+        is_terminal_runtime_event, rejected_runtime_handle, runtime_session_epoch,
     },
 };
 
@@ -56,6 +59,7 @@ pub struct AgentController {
     runtime_priority_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
     runtime_log_batches: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
     start_task_permits: Arc<Semaphore>,
+    session_epoch: Arc<AtomicU64>,
 }
 
 impl AgentController {
@@ -83,6 +87,7 @@ impl AgentController {
             runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
             runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
             start_task_permits: Arc::new(Semaphore::new(START_TASK_CONCURRENCY_LIMIT)),
+            session_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -106,12 +111,19 @@ impl AgentController {
     }
 
     async fn connect_once(&self) -> anyhow::Result<()> {
+        let session_epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = self.connect_once_active(session_epoch).await;
+        self.invalidate_session_epoch(session_epoch);
+        result
+    }
+
+    async fn connect_once_active(&self, session_epoch: u64) -> anyhow::Result<()> {
         let endpoint = build_endpoint(&self.settings.agent)?;
         let channel = endpoint.connect().await?;
         let mut client = ControlPlaneClient::new(channel);
 
         let (sender, receiver) = mpsc::channel(CONTROL_BUFFER);
-        let registration = self.build_registration()?;
+        let registration = self.build_registration().await?;
         send_agent_message(
             &sender,
             AgentEnvelope {
@@ -149,13 +161,13 @@ impl AgentController {
                 biased;
                 message = inbound.message() => {
                     match message? {
-                        Some(message) => self.handle_core_envelope(&sender, message).await?,
+                        Some(message) => self.handle_core_envelope(&sender, message, session_epoch).await?,
                         None => return Ok(()),
                     }
                 }
                 runtime_notification = recv_runtime_notification(self.runtime_priority_events.clone()) => {
                     if let Some(runtime_notification) = runtime_notification {
-                        self.forward_runtime_notification(&sender, runtime_notification).await?;
+                        self.forward_runtime_notification(&sender, runtime_notification, session_epoch).await?;
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -163,11 +175,28 @@ impl AgentController {
                 }
                 log_batch = recv_runtime_log_batch(self.runtime_log_batches.clone()) => {
                     if let Some(log_batch) = log_batch {
-                        try_send_runtime_log_batch(&sender, log_batch, &mut dropped_log_lines)?;
+                        if self.current_session_epoch() == session_epoch
+                            && log_batch.session_epoch == session_epoch
+                        {
+                            try_send_runtime_log_batch(&sender, log_batch, &mut dropped_log_lines)?;
+                        }
                     }
                 }
             }
         }
+    }
+
+    fn current_session_epoch(&self) -> u64 {
+        self.session_epoch.load(Ordering::SeqCst)
+    }
+
+    fn invalidate_session_epoch(&self, session_epoch: u64) {
+        let _ = self.session_epoch.compare_exchange(
+            session_epoch,
+            session_epoch.saturating_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     async fn send_heartbeat(
@@ -177,8 +206,12 @@ impl AgentController {
     ) -> anyhow::Result<()> {
         let zlm_alive = self.capability_probe.zlm_alive(&self.settings.agent).await;
         let ffmpeg_alive = binary_available(&self.settings.agent.ffmpeg_bin);
+        let runtime_counts = self.runtime_registry.state_counts();
         let snapshot = sampler.sample(
-            self.runtime_registry.count() as u32,
+            runtime_counts.running,
+            runtime_counts.starting,
+            runtime_counts.stopping,
+            runtime_counts.orphaned,
             zlm_alive,
             ffmpeg_alive,
             probe_gpu_runtime(&self.settings.agent),
@@ -194,6 +227,9 @@ impl AgentController {
                         mem_percent: snapshot.mem_percent,
                         disk_percent: snapshot.disk_percent,
                         running_tasks: snapshot.running_tasks,
+                        starting_tasks: snapshot.starting_tasks,
+                        stopping_tasks: snapshot.stopping_tasks,
+                        orphaned_tasks: snapshot.orphaned_tasks,
                         slot_usage: snapshot.slot_usage,
                         zlm_alive: snapshot.zlm_alive,
                         ffmpeg_alive: snapshot.ffmpeg_alive,
@@ -230,6 +266,7 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
         envelope: CoreEnvelope,
+        session_epoch: u64,
     ) -> anyhow::Result<()> {
         let Some(payload) = envelope.payload else {
             return Ok(());
@@ -243,10 +280,12 @@ impl AgentController {
                 send_capability_snapshot(sender, &snapshot).await?;
             }
             media_rpc::control_plane::core_envelope::Payload::AdoptOrphans(command) => {
-                self.handle_adopt_orphans(sender, command).await?;
+                self.handle_adopt_orphans(sender, command, session_epoch)
+                    .await?;
             }
             media_rpc::control_plane::core_envelope::Payload::StartTask(command) => {
-                self.handle_start_task(sender, command).await?;
+                self.handle_start_task(sender, command, session_epoch)
+                    .await?;
             }
             media_rpc::control_plane::core_envelope::Payload::StopTask(command) => {
                 self.handle_stop_task(sender, command).await?;
@@ -272,9 +311,15 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
         notification: RuntimeNotification,
+        session_epoch: u64,
     ) -> anyhow::Result<()> {
         match notification {
             RuntimeNotification::TaskEvent(event) => {
+                if event.session_epoch != session_epoch
+                    || self.current_session_epoch() != session_epoch
+                {
+                    return Ok(());
+                }
                 let is_terminal = is_terminal_runtime_event(&event.event_type);
                 let task_id = event.task_id;
                 let attempt_no = event.attempt_no;
@@ -288,12 +333,27 @@ impl AgentController {
                 }
             }
             RuntimeNotification::TaskLogBatch(batch) => {
+                if batch.session_epoch != session_epoch
+                    || self.current_session_epoch() != session_epoch
+                {
+                    return Ok(());
+                }
                 send_runtime_log_batch(sender, batch).await?;
             }
             RuntimeNotification::TaskProgress(progress) => {
+                if progress.session_epoch != session_epoch
+                    || self.current_session_epoch() != session_epoch
+                {
+                    return Ok(());
+                }
                 send_runtime_progress(sender, progress).await?;
             }
             RuntimeNotification::TaskSnapshot(handle) => {
+                if runtime_session_epoch(&handle) != session_epoch
+                    || self.current_session_epoch() != session_epoch
+                {
+                    return Ok(());
+                }
                 send_task_snapshot(sender, &handle).await?;
             }
         }
@@ -320,26 +380,75 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
         command: AdoptOrphans,
+        session_epoch: u64,
     ) -> anyhow::Result<()> {
-        let task_ids = command
-            .task_ids
+        let runtimes = command
+            .runtimes
             .into_iter()
-            .map(|value| Uuid::parse_str(value.trim()))
-            .collect::<Result<Vec<_>, _>>()
-            .context("invalid adopt_orphans.task_ids")?;
-        let worker_kinds = dedup_worker_kinds(
-            command
-                .worker_kind
-                .into_iter()
-                .map(|value| WorkerKind::from_str(value.trim()))
-                .collect::<Result<Vec<_>, _>>()
-                .context("invalid adopt_orphans.worker_kind")?,
-        );
+            .map(|runtime| {
+                Ok(AdoptRuntimeFilter {
+                    task_id: Uuid::parse_str(runtime.task_id.trim())
+                        .context("invalid adopt_orphans.runtimes.task_id")?,
+                    attempt_no: runtime.attempt_no,
+                    lease_token: runtime.lease_token.trim().to_string(),
+                    worker_kind: WorkerKind::from_str(runtime.worker_kind.trim())
+                        .context("invalid adopt_orphans.runtimes.worker_kind")?,
+                })
+            })
+            .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
-        for handle in self.executor.adopt_orphans(&AdoptFilter {
-            task_ids,
-            worker_kinds,
-        }) {
+        if runtimes.is_empty() {
+            return Ok(());
+        }
+
+        let adopted = self.executor.adopt_orphans(&AdoptFilter {
+            session_epoch,
+            runtimes: runtimes.clone(),
+        });
+        let adopted_keys = adopted
+            .iter()
+            .map(|handle| {
+                (
+                    handle.task_id,
+                    handle.attempt_no,
+                    handle.worker_kind,
+                    handle
+                        .metadata
+                        .get("lease_token")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        for runtime in runtimes {
+            let key = (
+                runtime.task_id,
+                runtime.attempt_no,
+                runtime.worker_kind,
+                runtime.lease_token.clone(),
+            );
+            if adopted_keys.contains(&key) {
+                continue;
+            }
+            send_task_event(
+                sender,
+                runtime.task_id,
+                runtime.attempt_no,
+                runtime.lease_token,
+                "orphaned",
+                "warn",
+                "authorized runtime was not found locally",
+                json!({
+                    "worker_kind": runtime.worker_kind,
+                    "reason": "runtime_not_found",
+                }),
+            )
+            .await?;
+        }
+
+        for handle in adopted {
             send_task_snapshot(sender, &handle).await?;
         }
 
@@ -350,36 +459,59 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
         command: StartTask,
+        session_epoch: u64,
     ) -> anyhow::Result<()> {
-        let request = parse_start_task(command)?;
+        let mut request = parse_start_task(command)?;
+        request.session_epoch = session_epoch;
         let sender = sender.clone();
         let executor = self.executor.clone();
         let start_task_permits = self.start_task_permits.clone();
+        let session_guard = self.session_epoch.clone();
 
         tokio::spawn(async move {
             let Ok(_permit) = start_task_permits.acquire_owned().await else {
                 return;
             };
+            if session_guard.load(Ordering::SeqCst) != request.session_epoch {
+                return;
+            }
+
+            let _ = send_task_event(
+                &sender,
+                request.task_id,
+                request.attempt_no,
+                request.lease_token.clone(),
+                "accepted",
+                "info",
+                "task accepted by local executor",
+                json!({
+                    "worker_kind": request.task_type.default_worker_kind(),
+                }),
+            )
+            .await;
+
+            if session_guard.load(Ordering::SeqCst) != request.session_epoch {
+                return;
+            }
 
             match executor.start_task(&request) {
                 Ok(handle) => {
+                    if session_guard.load(Ordering::SeqCst) != request.session_epoch {
+                        let _ = executor.stop_task(&StopTaskRequest {
+                            task_id: request.task_id,
+                            attempt_no: request.attempt_no,
+                            lease_token: request.lease_token.clone(),
+                            reason: "stale_session_replaced".to_string(),
+                            grace_period_sec: 0,
+                            force_after_sec: 1,
+                        });
+                        return;
+                    }
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
                         request.attempt_no,
-                        "accepted",
-                        "info",
-                        "task accepted by local executor",
-                        json!({
-                            "runtime_id": handle.runtime_id,
-                            "worker_kind": handle.worker_kind,
-                        }),
-                    )
-                    .await;
-                    let _ = send_task_event(
-                        &sender,
-                        request.task_id,
-                        request.attempt_no,
+                        request.lease_token.clone(),
                         "starting",
                         "info",
                         "runtime handle created",
@@ -397,7 +529,8 @@ impl AgentController {
                         &sender,
                         request.task_id,
                         request.attempt_no,
-                        "rejected",
+                        request.lease_token.clone(),
+                        "start_rejected",
                         "error",
                         error.to_string(),
                         json!({
@@ -426,6 +559,7 @@ impl AgentController {
                     sender,
                     request.task_id,
                     request.attempt_no,
+                    request.lease_token.clone(),
                     "stopping",
                     "info",
                     "stop request accepted",
@@ -448,7 +582,8 @@ impl AgentController {
                     sender,
                     request.task_id,
                     request.attempt_no,
-                    "rejected",
+                    request.lease_token.clone(),
+                    "stop_rejected",
                     "error",
                     error.to_string(),
                     json!({
@@ -462,10 +597,16 @@ impl AgentController {
         Ok(())
     }
 
-    fn build_registration(&self) -> anyhow::Result<AgentRegistration> {
+    async fn build_registration(&self) -> anyhow::Result<AgentRegistration> {
         let hostname = detect_hostname().unwrap_or_else(|| self.settings.agent.node_name.clone());
         let interfaces = discover_interfaces();
         let network_mode = NetworkMode::from_str(self.settings.agent.network_mode.trim())?;
+        let zlm_server_id = self
+            .capability_probe
+            .zlm_server_id(&self.settings.agent)
+            .await
+            .unwrap_or_else(|| self.node_id.to_string());
+        self.executor.set_zlm_server_id(zlm_server_id.clone());
 
         Ok(AgentRegistration {
             node_id: self.node_id,
@@ -480,6 +621,7 @@ impl AgentController {
             network_mode,
             ffmpeg_bin: self.settings.agent.ffmpeg_bin.clone(),
             ffprobe_bin: self.settings.agent.ffprobe_bin.clone(),
+            zlm_server_id,
         })
     }
 }
@@ -531,6 +673,12 @@ async fn send_task_snapshot(
                     runtime_id: handle.runtime_id.to_string(),
                     task_id: handle.task_id.to_string(),
                     attempt_no: handle.attempt_no,
+                    lease_token: handle
+                        .metadata
+                        .get("lease_token")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
                     worker_kind: handle.worker_kind.as_str().to_string(),
                     pid: handle.pid.unwrap_or_default(),
                     state: handle.state.as_str().to_string(),
@@ -552,6 +700,7 @@ async fn send_runtime_task_event(
         sender,
         event.task_id,
         event.attempt_no,
+        event.lease_token,
         &event.event_type,
         &event.event_level,
         event.message,
@@ -572,6 +721,7 @@ async fn send_runtime_log_batch(
                     media_rpc::control_plane::TaskLogBatch {
                         task_id: batch.task_id.to_string(),
                         attempt_no: batch.attempt_no,
+                        lease_token: batch.lease_token,
                         stream: batch.stream,
                         lines: batch.lines,
                     },
@@ -603,6 +753,7 @@ fn try_send_runtime_log_batch(
                 media_rpc::control_plane::TaskLogBatch {
                     task_id: batch.task_id.to_string(),
                     attempt_no: batch.attempt_no,
+                    lease_token: batch.lease_token.clone(),
                     stream: batch.stream.clone(),
                     lines: batch.lines,
                 },
@@ -634,6 +785,7 @@ async fn send_runtime_progress(
                     media_rpc::control_plane::TaskProgress {
                         task_id: progress.task_id.to_string(),
                         attempt_no: progress.attempt_no,
+                        lease_token: progress.lease_token,
                         frame: progress.frame,
                         fps: progress.fps,
                         bitrate_kbps: progress.bitrate_kbps,
@@ -653,6 +805,7 @@ async fn send_task_event(
     sender: &mpsc::Sender<AgentEnvelope>,
     task_id: Uuid,
     attempt_no: i32,
+    lease_token: String,
     event_type: &str,
     event_level: &str,
     message: impl Into<String>,
@@ -665,6 +818,7 @@ async fn send_task_event(
                 media_rpc::control_plane::agent_envelope::Payload::TaskEvent(TaskEvent {
                     task_id: task_id.to_string(),
                     attempt_no,
+                    lease_token,
                     event_type: event_type.to_string(),
                     event_level: event_level.to_string(),
                     message: message.into(),
@@ -700,6 +854,7 @@ fn registration_to_rpc(registration: &AgentRegistration) -> RpcRegister {
         network_mode: registration.network_mode.as_str().to_string(),
         ffmpeg_bin: registration.ffmpeg_bin.clone(),
         ffprobe_bin: registration.ffprobe_bin.clone(),
+        zlm_server_id: registration.zlm_server_id.clone(),
     }
 }
 
@@ -712,6 +867,7 @@ fn parse_start_task(command: StartTask) -> anyhow::Result<StartTaskRequest> {
         execution_mode: command.execution_mode,
         lease_token: command.lease_token,
         trace_context: non_empty(command.trace_context),
+        session_epoch: 0,
     })
 }
 
@@ -719,6 +875,7 @@ fn parse_stop_task(command: StopTask) -> anyhow::Result<StopTaskRequest> {
     Ok(StopTaskRequest {
         task_id: Uuid::parse_str(command.task_id.trim())?,
         attempt_no: command.attempt_no,
+        lease_token: command.lease_token.trim().to_string(),
         reason: command.reason,
         grace_period_sec: command.grace_period_sec,
         force_after_sec: command.force_after_sec,

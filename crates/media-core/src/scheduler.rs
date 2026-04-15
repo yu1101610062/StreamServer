@@ -15,6 +15,7 @@ use crate::{
 
 const SCHEDULER_TICK: Duration = Duration::from_secs(5);
 const CRON_CATCH_UP_LIMIT: usize = 16;
+const STOPPING_RECONCILE_TIMEOUT: Duration = Duration::from_secs(65);
 
 pub fn spawn(
     repository: Arc<TaskRepository>,
@@ -55,6 +56,8 @@ async fn run_once(
     for schedule in repository.list_cron_schedules().await? {
         trigger_due_cron_tasks(repository, control_plane, now, schedule).await?;
     }
+
+    reconcile_stopping_tasks(repository, control_plane, now).await?;
 
     Ok(())
 }
@@ -111,4 +114,38 @@ async fn dispatch_ready_task(
         Err(ControlPlaneError::Repository(RepoError::TaskNotDispatchable(_))) => Ok(()),
         Err(error) => Err(anyhow::Error::new(error)),
     }
+}
+
+async fn reconcile_stopping_tasks(
+    repository: &TaskRepository,
+    control_plane: &ControlPlaneService,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for candidate in repository.list_stopping_reconcile_tasks().await? {
+        if candidate.attempt_status == media_domain::AttemptStatus::Orphaned {
+            let _ = repository.complete_stopping_task(&candidate).await?;
+            continue;
+        }
+        let deadline = candidate.stop_requested_at
+            + chrono::Duration::from_std(STOPPING_RECONCILE_TIMEOUT).unwrap();
+        if now >= deadline {
+            let _ = repository.mark_stopping_timeout(&candidate).await?;
+            continue;
+        }
+
+        if candidate.attempt_status == media_domain::AttemptStatus::Adopted {
+            match control_plane
+                .request_stop(candidate.task_id, "reclaim_stop", 30, 5)
+                .await
+            {
+                Ok(()) => {}
+                Err(
+                    ControlPlaneError::NoConnectedNode | ControlPlaneError::NodeDisconnected(_),
+                ) => {}
+                Err(error) => return Err(anyhow::Error::new(error)),
+            }
+        }
+    }
+
+    Ok(())
 }

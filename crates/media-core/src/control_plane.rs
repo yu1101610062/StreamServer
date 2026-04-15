@@ -17,8 +17,8 @@ use media_domain::{
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
     GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
-    ProbeCapabilities, Register as RpcRegister, TaskEvent, TaskLogBatch, TaskProgress,
-    TaskSnapshot,
+    ProbeCapabilities, ReclaimRuntime, Register as RpcRegister, TaskEvent, TaskLogBatch,
+    TaskProgress, TaskSnapshot,
     control_plane_server::{ControlPlane, ControlPlaneServer},
 };
 use reqwest::Url;
@@ -75,6 +75,9 @@ struct SessionTarget {
 struct SessionLoad {
     slot_usage: f64,
     running_tasks: u32,
+    starting_tasks: u32,
+    stopping_tasks: u32,
+    orphaned_tasks: u32,
     cpu_percent: f64,
     mem_percent: f64,
     disk_percent: f64,
@@ -104,6 +107,9 @@ pub struct NodeLiveLoad {
     pub connected: bool,
     pub slot_usage: f64,
     pub running_tasks: u32,
+    pub starting_tasks: u32,
+    pub stopping_tasks: u32,
+    pub orphaned_tasks: u32,
     pub cpu_percent: f64,
     pub mem_percent: f64,
     pub disk_percent: f64,
@@ -266,6 +272,7 @@ impl ControlPlaneService {
                 media_rpc::control_plane::StopTask {
                     task_id: command.task_id.to_string(),
                     attempt_no: command.attempt_no,
+                    lease_token: command.lease_token,
                     reason: command.reason,
                     grace_period_sec: command.grace_period_sec,
                     force_after_sec: command.force_after_sec,
@@ -294,14 +301,8 @@ impl ControlPlaneService {
         sender: mpsc::Sender<Result<CoreEnvelope, Status>>,
     ) -> Result<u64, Status> {
         let session_id = self.session_seq.fetch_add(1, Ordering::Relaxed);
-        let inserted = {
+        let replaced = {
             let mut sessions = self.sessions.lock().await;
-            if sessions.contains_key(&registration.node_id) {
-                return Err(Status::already_exists(format!(
-                    "node_id {} is already connected",
-                    registration.node_id
-                )));
-            }
             sessions.insert(
                 registration.node_id,
                 SessionHandle {
@@ -312,19 +313,16 @@ impl ControlPlaneService {
                     load: SessionLoad::default(),
                     reservations: VecDeque::new(),
                 },
-            );
-            true
+            )
         };
 
-        if inserted {
-            if let Err(error) = self
-                .repository
-                .upsert_node_registration(registration, Utc::now())
-                .await
-            {
-                self.forget_session(registration.node_id, session_id).await;
-                return Err(repo_status(error));
-            }
+        if let Err(error) = self
+            .repository
+            .upsert_node_registration(registration, Utc::now())
+            .await
+        {
+            self.forget_session(registration.node_id, session_id).await;
+            return Err(repo_status(error));
         }
 
         if let Err(error) = send_core_message(
@@ -343,26 +341,37 @@ impl ControlPlaneService {
             return Err(error);
         }
 
-        if let Err(error) = send_core_message(
-            &sender,
-            CoreEnvelope {
+        let reclaim_runtimes = self
+            .repository
+            .list_reclaim_runtimes(registration.node_id)
+            .await
+            .map_err(repo_status)?;
+        if !reclaim_runtimes.is_empty() {
+            let envelope = CoreEnvelope {
                 payload: Some(
                     media_rpc::control_plane::core_envelope::Payload::AdoptOrphans(AdoptOrphans {
-                        task_ids: Vec::new(),
-                        worker_kind: Vec::new(),
+                        runtimes: reclaim_runtimes
+                            .into_iter()
+                            .map(|runtime| ReclaimRuntime {
+                                task_id: runtime.task_id.to_string(),
+                                attempt_no: runtime.attempt_no,
+                                lease_token: runtime.lease_token,
+                                worker_kind: runtime.worker_kind.as_str().to_string(),
+                            })
+                            .collect(),
                     }),
                 ),
-            },
-        )
-        .await
-        {
-            self.close_session(registration.node_id, session_id).await;
-            return Err(error);
+            };
+            if let Err(error) = send_core_message(&sender, envelope).await {
+                self.close_session(registration.node_id, session_id).await;
+                return Err(error);
+            }
         }
 
         info!(
             node_id = %registration.node_id,
             node_name = %registration.node_name,
+            replaced_existing_session = replaced.is_some(),
             "control-plane session registered"
         );
 
@@ -393,9 +402,18 @@ impl ControlPlaneService {
                 continue;
             };
 
-            if let Err(error) = self.handle_payload(node_id, payload).await {
-                warn!(node_id = %node_id, error = %error, "failed to process control-plane payload");
+            if !self.is_current_session(node_id, session_id).await {
+                debug!(
+                    node_id = %node_id,
+                    session_id,
+                    "stale control-plane session observed after replacement"
+                );
                 break;
+            }
+
+            if let Err(error) = self.handle_payload(node_id, session_id, payload).await {
+                warn!(node_id = %node_id, error = %error, "failed to process control-plane payload");
+                continue;
             }
         }
 
@@ -405,8 +423,13 @@ impl ControlPlaneService {
     async fn handle_payload(
         &self,
         node_id: Uuid,
+        session_id: u64,
         payload: media_rpc::control_plane::agent_envelope::Payload,
     ) -> Result<(), Status> {
+        if !self.is_current_session(node_id, session_id).await {
+            return Ok(());
+        }
+
         match payload {
             media_rpc::control_plane::agent_envelope::Payload::Register(register) => {
                 let registration = registration_from_rpc(register)?;
@@ -460,6 +483,26 @@ impl ControlPlaneService {
                     .record_agent_task_event(node_id, event.clone())
                     .await
                     .map_err(repo_status)?;
+                if event.event_type == "adopted"
+                    && self
+                        .repository
+                        .attempt_has_stop_intent(event.task_id, event.attempt_no)
+                        .await
+                        .map_err(repo_status)?
+                {
+                    if let Err(error) = self
+                        .request_stop(event.task_id, "reclaim_stop", 30, 5)
+                        .await
+                    {
+                        warn!(
+                            node_id = %node_id,
+                            task_id = %event.task_id,
+                            attempt_no = event.attempt_no,
+                            error = %error,
+                            "failed to resend stop after runtime adoption"
+                        );
+                    }
+                }
                 if event_releases_dispatch_reservation(&event.event_type) {
                     self.release_dispatch_reservation(node_id, None, event.task_id)
                         .await;
@@ -595,10 +638,15 @@ impl ControlPlaneService {
         let session = sessions
             .get_mut(&node_id)
             .ok_or_else(|| Status::unavailable("control-plane session no longer exists"))?;
-        let running_increase = snapshot
-            .running_tasks
-            .saturating_sub(session.load.running_tasks);
-        for _ in 0..running_increase {
+        let previous_active = session.load.running_tasks
+            + session.load.starting_tasks
+            + session.load.stopping_tasks
+            + session.load.orphaned_tasks;
+        let current_active = snapshot.running_tasks
+            + snapshot.starting_tasks
+            + snapshot.stopping_tasks
+            + snapshot.orphaned_tasks;
+        for _ in 0..current_active.saturating_sub(previous_active) {
             if session.reservations.pop_front().is_none() {
                 break;
             }
@@ -606,6 +654,9 @@ impl ControlPlaneService {
         session.load = SessionLoad {
             slot_usage: normalized_slot_usage(snapshot.slot_usage),
             running_tasks: snapshot.running_tasks,
+            starting_tasks: snapshot.starting_tasks,
+            stopping_tasks: snapshot.stopping_tasks,
+            orphaned_tasks: snapshot.orphaned_tasks,
             cpu_percent: snapshot.cpu_percent,
             mem_percent: snapshot.mem_percent,
             disk_percent: snapshot.disk_percent,
@@ -629,6 +680,14 @@ impl ControlPlaneService {
             gpu_devices: snapshot.gpu_devices.clone(),
         };
         Ok(())
+    }
+
+    async fn is_current_session(&self, node_id: Uuid, session_id: u64) -> bool {
+        let sessions = self.sessions.lock().await;
+        matches!(
+            sessions.get(&node_id),
+            Some(current) if current.session_id == session_id
+        )
     }
 
     #[cfg(test)]
@@ -739,6 +798,9 @@ impl ControlPlaneService {
                         connected: true,
                         slot_usage: handle.load.slot_usage,
                         running_tasks: handle.load.running_tasks,
+                        starting_tasks: handle.load.starting_tasks,
+                        stopping_tasks: handle.load.stopping_tasks,
+                        orphaned_tasks: handle.load.orphaned_tasks,
                         cpu_percent: handle.load.cpu_percent,
                         mem_percent: handle.load.mem_percent,
                         disk_percent: handle.load.disk_percent,
@@ -818,6 +880,7 @@ fn registration_from_rpc(register: RpcRegister) -> Result<AgentRegistration, Sta
         network_mode,
         ffmpeg_bin: require_field("ffmpeg_bin", register.ffmpeg_bin)?,
         ffprobe_bin: require_field("ffprobe_bin", register.ffprobe_bin)?,
+        zlm_server_id: require_field("zlm_server_id", register.zlm_server_id)?,
     })
 }
 
@@ -831,6 +894,9 @@ fn heartbeat_from_rpc(heartbeat: RpcHeartbeat) -> Result<HeartbeatSnapshot, Stat
         mem_percent: heartbeat.mem_percent,
         disk_percent: heartbeat.disk_percent,
         running_tasks: heartbeat.running_tasks,
+        starting_tasks: heartbeat.starting_tasks,
+        stopping_tasks: heartbeat.stopping_tasks,
+        orphaned_tasks: heartbeat.orphaned_tasks,
         slot_usage: heartbeat.slot_usage,
         zlm_alive: heartbeat.zlm_alive,
         ffmpeg_alive: heartbeat.ffmpeg_alive,
@@ -884,6 +950,7 @@ fn parse_task_event(event: TaskEvent) -> Result<AgentTaskEventRecord, Status> {
     Ok(AgentTaskEventRecord {
         task_id: parse_uuid("task_id", &event.task_id)?,
         attempt_no: event.attempt_no,
+        lease_token: require_string("lease_token", event.lease_token)?,
         event_type: require_string("event_type", event.event_type)?,
         event_level: require_string("event_level", event.event_level)?,
         message: event.message,
@@ -895,6 +962,7 @@ fn parse_task_log_batch(batch: TaskLogBatch) -> Result<TaskLogBatchRecord, Statu
     Ok(TaskLogBatchRecord {
         task_id: parse_uuid("task_id", &batch.task_id)?,
         attempt_no: batch.attempt_no,
+        lease_token: require_string("lease_token", batch.lease_token)?,
         stream: require_string("stream", batch.stream)?,
         lines: batch.lines,
     })
@@ -904,6 +972,7 @@ fn parse_task_progress(progress: TaskProgress) -> Result<TaskProgressRecord, Sta
     Ok(TaskProgressRecord {
         task_id: parse_uuid("task_id", &progress.task_id)?,
         attempt_no: progress.attempt_no,
+        lease_token: require_string("lease_token", progress.lease_token)?,
         frame: progress.frame,
         fps: progress.fps,
         bitrate_kbps: progress.bitrate_kbps,
@@ -919,6 +988,7 @@ fn parse_task_snapshot(snapshot: TaskSnapshot) -> Result<TaskSnapshotRecord, Sta
         runtime_id: parse_uuid("runtime_id", &snapshot.runtime_id)?,
         task_id: parse_uuid("task_id", &snapshot.task_id)?,
         attempt_no: snapshot.attempt_no,
+        lease_token: require_string("lease_token", snapshot.lease_token)?,
         worker_kind: require_string("worker_kind", snapshot.worker_kind)?,
         pid: (snapshot.pid > 0).then_some(snapshot.pid),
         state: require_string("state", snapshot.state)?,
@@ -1198,7 +1268,17 @@ fn gpu_runtime_headroom(runtime: &GpuRuntimeStats) -> Option<f64> {
 }
 
 fn event_releases_dispatch_reservation(event_type: &str) -> bool {
-    matches!(event_type, "rejected" | "succeeded" | "failed" | "canceled")
+    matches!(
+        event_type,
+        "accepted"
+            | "starting"
+            | "recovering"
+            | "running"
+            | "start_rejected"
+            | "succeeded"
+            | "failed"
+            | "canceled"
+    )
 }
 
 fn pick_best_session_target(
@@ -1568,6 +1648,7 @@ mod tests {
             network_mode: NetworkMode::Bridge,
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
+            zlm_server_id: format!("zlm-{node_id}"),
         }
     }
 
@@ -1578,6 +1659,9 @@ mod tests {
             mem_percent: 0.0,
             disk_percent: 0.0,
             running_tasks,
+            starting_tasks: 0,
+            stopping_tasks: 0,
+            orphaned_tasks: 0,
             slot_usage,
             zlm_alive: true,
             ffmpeg_alive: true,
@@ -1735,6 +1819,9 @@ mod tests {
                 load: SessionLoad {
                     slot_usage: 1.0,
                     running_tasks: 1,
+                    starting_tasks: 0,
+                    stopping_tasks: 0,
+                    orphaned_tasks: 0,
                     cpu_percent: 0.0,
                     mem_percent: 0.0,
                     disk_percent: 0.0,
@@ -2280,6 +2367,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_task_second_required_labels_failure_reuses_current_attempt()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let mut spec = sample_immediate_task_spec();
+        spec.resource.required_labels = vec!["archive".to_string()];
+        let task = match repository
+            .create_task("required-labels-miss-retry", "required-labels-miss-retry-hash", spec)
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000029")?;
+        let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _session_id = service
+            .bootstrap_session(&sample_registration(node_id), sender)
+            .await?;
+
+        service.dispatch_task(task.id).await?;
+        repository.retry_task(task.id).await?;
+        service.dispatch_task(task.id).await?;
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Failed);
+        assert_eq!(summary.current_attempt_no, 2);
+        assert_eq!(summary.assigned_node_id, None);
+
+        let first_attempt = sqlx::query(
+            r#"
+            select status::text as status, failure_code
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 1
+            "#,
+        )
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(first_attempt.try_get::<String, _>("status")?, "FAILED");
+        assert_eq!(
+            first_attempt.try_get::<Option<String>, _>("failure_code")?,
+            Some("required_labels_unmatched".to_string())
+        );
+
+        let second_attempt = sqlx::query(
+            r#"
+            select status::text as status, failure_code, failure_reason
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 2
+            "#,
+        )
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(second_attempt.try_get::<String, _>("status")?, "FAILED");
+        assert_eq!(
+            second_attempt.try_get::<Option<String>, _>("failure_code")?,
+            Some("required_labels_unmatched".to_string())
+        );
+        assert!(
+            second_attempt
+                .try_get::<Option<String>, _>("failure_reason")?
+                .unwrap_or_default()
+                .contains("archive")
+        );
+
+        let third_attempt_count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*)
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 3
+            "#,
+        )
+        .bind(task.id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(third_attempt_count, 0);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fail_queued_task_returns_invariant_error_when_current_attempt_row_is_missing()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let task = match repository
+            .create_task(
+                "queued-attempt-invariant",
+                "queued-attempt-invariant-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+        repository
+            .fail_queued_task(task.id, "first_failure", "seed first failure")
+            .await?;
+        repository.retry_task(task.id).await?;
+
+        sqlx::query(
+            r#"
+            delete from task_attempts
+             where task_id = $1
+               and attempt_no = 2
+            "#,
+        )
+        .bind(task.id)
+        .execute(&db.pool)
+        .await?;
+
+        let error = repository
+            .fail_queued_task(task.id, "second_failure", "current pending attempt disappeared")
+            .await
+            .expect_err("missing current attempt row should fail fast");
+        assert!(matches!(
+            error,
+            RepoError::TaskAttemptInvariant {
+                task_id,
+                attempt_no: 2,
+                ..
+            } if task_id == task.id
+        ));
+
+        let summary = repository.get_task_summary(task.id).await?;
+        assert_eq!(summary.status, TaskStatus::Queued);
+        assert_eq!(summary.current_attempt_no, 2);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn dispatch_task_reserves_slots_to_reduce_burst_skew() -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
             return Ok(());
@@ -2423,6 +2657,7 @@ mod tests {
                 AgentTaskEventRecord {
                     task_id: task.id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "running".to_string(),
                     event_level: "info".to_string(),
                     message: "task is running".to_string(),

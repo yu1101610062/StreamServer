@@ -2,7 +2,6 @@
 import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 
-import { AUTO_REFRESH_MS } from "@/shared/api/client";
 import { nodeApi } from "@/shared/api/resources";
 import type { NodeSummary } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
@@ -13,7 +12,6 @@ const selectedNodeId = ref("");
 const nodesQuery = useQuery({
   queryKey: ["nodes"],
   queryFn: () => nodeApi.list(),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const selectedNode = computed(() =>
@@ -33,7 +31,6 @@ const heartbeatsQuery = useQuery({
   queryKey: computed(() => ["node-heartbeats", selectedNodeId.value]),
   enabled: computed(() => Boolean(selectedNodeId.value)),
   queryFn: () => nodeApi.heartbeats(selectedNodeId.value, 24),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 function openNode(node: NodeSummary) {

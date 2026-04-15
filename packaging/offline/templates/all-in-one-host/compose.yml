@@ -29,6 +29,7 @@ services:
         condition: service_healthy
     environment:
       STREAMSERVER_ENV: production
+      STREAMSERVER_UI_DIR: /opt/streamserver/ui
       CORE_HTTP_ADDR: 0.0.0.0:${CORE_HTTP_PORT}
       CORE_GRPC_ADDR: 0.0.0.0:${CORE_GRPC_PORT}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_IP}:5432/${POSTGRES_DB}
@@ -49,6 +50,7 @@ services:
       retries: 20
     volumes:
       - ./bin:/opt/streamserver/bin:ro
+      - ./ui:/opt/streamserver/ui:ro
       - ./certs:/certs:ro
 
   zlmediakit:

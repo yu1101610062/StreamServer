@@ -861,7 +861,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       { name: "created_to", location: "Query", type: "RFC3339 datetime", required: false, description: "创建时间上界。", example: "2026-04-12T23:59:59+08:00" },
       { name: "page", location: "Query", type: "integer", required: false, description: "页码，从 1 开始。", example: 1 },
       { name: "page_size", location: "Query", type: "integer", required: false, description: "每页条数。", example: 20 },
-      { name: "sort_by", location: "Query", type: "string", required: false, description: "排序字段。", example: "updated_at" },
+      { name: "sort_by", location: "Query", type: "string", required: false, description: "排序字段。", example: "created_at" },
       {
         name: "sort_order",
         location: "Query",
@@ -884,7 +884,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         created_to: "2026-04-12T23:59:59+08:00",
         page: 1,
         page_size: 20,
-        sort_by: "updated_at",
+        sort_by: "created_at",
         sort_order: "desc",
       },
     },
@@ -969,6 +969,42 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         updated_at: "2026-04-12T10:30:09+08:00",
       },
     },
+  },
+  {
+    category: "任务管理",
+    method: "DELETE",
+    path: "/api/v1/tasks/{id}",
+    title: "删除任务",
+    summary: "删除指定任务及其关联的 Attempt、事件、录像和产物索引。",
+    description:
+      "仅允许删除 CREATED、VALIDATING、QUEUED、SUCCEEDED、FAILED 和 CANCELED 状态的任务；运行中或 LOST 状态的任务需要先完成恢复/重试或人工确认节点侧已停止。",
+    successStatus: "200 OK",
+    params: [authHeaderParam(), taskIdPathParam()],
+    requestExample: {
+      headers: {
+        Authorization: authHeaderParam().example,
+      },
+      path: {
+        id: taskIdPathParam().example,
+      },
+    },
+    responseExample: {
+      id: "019d77d3-a942-7c91-8e82-ff963ccf1222",
+      name: "relay-camera-01",
+      type: "stream_ingest",
+      status: "FAILED",
+      transcode_mode: "none",
+      priority: 50,
+      created_by: "alice",
+      assigned_node_id: null,
+      current_attempt_no: 1,
+      created_at: "2026-04-12T10:30:00+08:00",
+      updated_at: "2026-04-12T10:35:21+08:00",
+    },
+    notes: [
+      "删除成功后返回被删除任务的最后快照，便于前端提示和审计记录。",
+      "如果任务仍处于 DISPATCHING、STARTING、RUNNING、STOPPING、RECOVERING 或 LOST，会返回 `TASK_DELETE_FORBIDDEN`。",
+    ],
   },
   {
     category: "业务系统回调",

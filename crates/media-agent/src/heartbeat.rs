@@ -28,6 +28,9 @@ impl HeartbeatSampler {
     pub fn sample(
         &mut self,
         running_tasks: u32,
+        starting_tasks: u32,
+        stopping_tasks: u32,
+        orphaned_tasks: u32,
         zlm_alive: bool,
         ffmpeg_alive: bool,
         gpu_runtime: Vec<GpuRuntimeStats>,
@@ -47,6 +50,9 @@ impl HeartbeatSampler {
             mem_percent,
             disk_percent,
             running_tasks,
+            starting_tasks,
+            stopping_tasks,
+            orphaned_tasks,
             slot_usage,
             zlm_alive,
             ffmpeg_alive,
@@ -140,7 +146,7 @@ mod tests {
         let mut sampler = HeartbeatSampler::new(".", 2);
         sampler.previous_cpu = Some(CpuCounters { total: 10, idle: 5 });
 
-        let heartbeat = sampler.sample(10, true, true, Vec::new());
+        let heartbeat = sampler.sample(10, 0, 0, 0, true, true, Vec::new());
         assert_eq!(heartbeat.slot_usage, 1.0);
     }
 }

@@ -16,6 +16,7 @@ pub struct CapabilityProbe {
 struct ZlmProbeResult {
     version: Option<String>,
     api_list: Vec<String>,
+    server_id: Option<String>,
 }
 
 impl CapabilityProbe {
@@ -59,6 +60,14 @@ impl CapabilityProbe {
             .unwrap_or(false)
     }
 
+    pub async fn zlm_server_id(&self, settings: &AgentSettings) -> Option<String> {
+        self.probe_zlm(settings)
+            .await
+            .ok()
+            .and_then(|result| result.server_id)
+            .filter(|value| !value.trim().is_empty())
+    }
+
     async fn probe_zlm(&self, settings: &AgentSettings) -> anyhow::Result<ZlmProbeResult> {
         let base = settings.zlm_api_base.trim();
         if base.is_empty() {
@@ -76,8 +85,17 @@ impl CapabilityProbe {
             .ok()
             .map(extract_zlm_api_list)
             .unwrap_or_default();
+        let server_id = self
+            .fetch_zlm_json(base, "/index/api/getServerConfig", &settings.zlm_api_secret)
+            .await
+            .ok()
+            .and_then(|value| extract_zlm_server_id(&value));
 
-        Ok(ZlmProbeResult { version, api_list })
+        Ok(ZlmProbeResult {
+            version,
+            api_list,
+            server_id,
+        })
     }
 
     async fn fetch_zlm_json(&self, base: &str, path: &str, secret: &str) -> anyhow::Result<Value> {
@@ -358,6 +376,22 @@ fn extract_zlm_api_list(value: Value) -> Vec<String> {
     };
 
     normalize(values)
+}
+
+fn extract_zlm_server_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            if let Some(server_id) = map.get("mediaServerId").and_then(Value::as_str) {
+                let server_id = server_id.trim();
+                if !server_id.is_empty() {
+                    return Some(server_id.to_string());
+                }
+            }
+            map.values().find_map(extract_zlm_server_id)
+        }
+        Value::Array(items) => items.iter().find_map(extract_zlm_server_id),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

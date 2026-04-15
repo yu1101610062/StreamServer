@@ -44,24 +44,48 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeRegistry {
-    inner: Arc<RwLock<HashMap<Uuid, RuntimeHandle>>>,
+    inner: Arc<RwLock<RuntimeRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeRegistryState {
+    by_runtime_id: HashMap<Uuid, RuntimeHandle>,
+    by_task_attempt: HashMap<(Uuid, i32), Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeStateCounts {
+    pub running: u32,
+    pub starting: u32,
+    pub stopping: u32,
+    pub orphaned: u32,
 }
 
 impl LocalRuntimeRegistry {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(HashMap::new())),
+            inner: Arc::new(RwLock::new(RuntimeRegistryState::default())),
         }
     }
 
     pub fn track(&self, handle: RuntimeHandle) {
         let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
-        runtimes.insert(handle.runtime_id, handle);
+        let key = (handle.task_id, handle.attempt_no);
+        if let Some(previous_runtime_id) = runtimes.by_task_attempt.insert(key, handle.runtime_id) {
+            if previous_runtime_id != handle.runtime_id {
+                runtimes.by_runtime_id.remove(&previous_runtime_id);
+            }
+        }
+        runtimes.by_runtime_id.insert(handle.runtime_id, handle);
     }
 
     pub fn remove(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
         let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
-        runtimes.remove(&runtime_id)
+        let removed = runtimes.by_runtime_id.remove(&runtime_id)?;
+        runtimes
+            .by_task_attempt
+            .remove(&(removed.task_id, removed.attempt_no));
+        Some(removed)
     }
 
     pub fn update(
@@ -70,32 +94,54 @@ impl LocalRuntimeRegistry {
         update: impl FnOnce(&mut RuntimeHandle),
     ) -> Option<RuntimeHandle> {
         let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
-        let handle = runtimes.get_mut(&runtime_id)?;
+        let handle = runtimes.by_runtime_id.get_mut(&runtime_id)?;
         update(handle);
         Some(handle.clone())
     }
 
     pub fn get(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
-        runtimes.get(&runtime_id).cloned()
+        runtimes.by_runtime_id.get(&runtime_id).cloned()
     }
 
     pub fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle> {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
-        runtimes
-            .values()
-            .find(|handle| handle.task_id == task_id && handle.attempt_no == attempt_no)
-            .cloned()
+        let runtime_id = runtimes.by_task_attempt.get(&(task_id, attempt_no))?;
+        runtimes.by_runtime_id.get(runtime_id).cloned()
     }
 
     pub fn count(&self) -> usize {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
-        runtimes.len()
+        runtimes.by_runtime_id.len()
+    }
+
+    pub fn state_counts(&self) -> RuntimeStateCounts {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        let mut counts = RuntimeStateCounts::default();
+        for handle in runtimes.by_runtime_id.values() {
+            match handle.state {
+                RuntimeState::Pending | RuntimeState::Starting => {
+                    counts.starting = counts.starting.saturating_add(1);
+                }
+                RuntimeState::Running => {
+                    counts.running = counts.running.saturating_add(1);
+                }
+                RuntimeState::Stopping => {
+                    counts.stopping = counts.stopping.saturating_add(1);
+                }
+                RuntimeState::Orphaned => {
+                    counts.orphaned = counts.orphaned.saturating_add(1);
+                }
+                RuntimeState::Exited => {}
+            }
+        }
+        counts
     }
 
     pub fn snapshots(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
         runtimes
+            .by_runtime_id
             .values()
             .filter(|handle| filter.matches(handle))
             .cloned()
@@ -118,12 +164,14 @@ pub struct StartTaskRequest {
     pub execution_mode: String,
     pub lease_token: String,
     pub trace_context: Option<String>,
+    pub session_epoch: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct StopTaskRequest {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
     pub reason: String,
     pub grace_period_sec: u32,
     pub force_after_sec: u32,
@@ -131,16 +179,30 @@ pub struct StopTaskRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct AdoptFilter {
-    pub task_ids: Vec<Uuid>,
-    pub worker_kinds: Vec<WorkerKind>,
+    pub session_epoch: u64,
+    pub runtimes: Vec<AdoptRuntimeFilter>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdoptRuntimeFilter {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub lease_token: String,
+    pub worker_kind: WorkerKind,
 }
 
 impl AdoptFilter {
     fn matches(&self, handle: &RuntimeHandle) -> bool {
-        let task_ok = self.task_ids.is_empty() || self.task_ids.contains(&handle.task_id);
-        let worker_ok =
-            self.worker_kinds.is_empty() || self.worker_kinds.contains(&handle.worker_kind);
-        task_ok && worker_ok
+        if self.runtimes.is_empty() {
+            return false;
+        }
+
+        self.runtimes.iter().any(|runtime| {
+            runtime.task_id == handle.task_id
+                && runtime.attempt_no == handle.attempt_no
+                && runtime.worker_kind == handle.worker_kind
+                && runtime.lease_token == runtime_lease_token(handle).unwrap_or_default()
+        })
     }
 }
 
@@ -148,6 +210,7 @@ pub trait LocalExecutor: Send + Sync {
     fn start_task(&self, request: &StartTaskRequest) -> Result<RuntimeHandle, ExecutorError>;
     fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError>;
     fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle>;
+    fn set_zlm_server_id(&self, _server_id: String) {}
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +219,9 @@ pub struct ManagedProcessExecutor {
     registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    stop_intents: Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
     http_client: Client,
+    zlm_server_id: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +399,8 @@ pub enum RuntimeNotification {
 pub struct RuntimeTaskEvent {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
+    pub session_epoch: u64,
     pub event_type: String,
     pub event_level: String,
     pub message: String,
@@ -344,6 +411,8 @@ pub struct RuntimeTaskEvent {
 pub struct RuntimeTaskLogBatch {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
+    pub session_epoch: u64,
     pub stream: String,
     pub lines: Vec<String>,
     pub source_line_count: usize,
@@ -353,6 +422,8 @@ pub struct RuntimeTaskLogBatch {
 pub struct RuntimeTaskProgress {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
+    pub session_epoch: u64,
     pub frame: u64,
     pub fps: f64,
     pub bitrate_kbps: f64,
@@ -452,11 +523,20 @@ impl ManagedProcessExecutor {
             registry,
             events,
             runtimes: Arc::new(RwLock::new(HashMap::new())),
+            stop_intents: Arc::new(RwLock::new(HashMap::new())),
             http_client: Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
                 .expect("failed to build runtime HTTP client"),
+            zlm_server_id: Arc::new(RwLock::new(None)),
         }
+    }
+
+    fn current_zlm_server_id(&self) -> Option<String> {
+        self.zlm_server_id
+            .read()
+            .expect("zlm_server_id lock poisoned")
+            .clone()
     }
 }
 
@@ -466,6 +546,34 @@ impl LocalExecutor for ManagedProcessExecutor {
             return Err(ExecutorError::InvalidRequest(
                 "lease_token must not be empty".to_string(),
             ));
+        }
+
+        if let Some(existing) = self
+            .registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+        {
+            let existing_lease = runtime_lease_token(&existing).unwrap_or_default();
+            if existing_lease == request.lease_token {
+                return Ok(existing);
+            }
+            return Err(ExecutorError::InvalidRequest(format!(
+                "stale dispatch for {}/{}: lease_token mismatch",
+                request.task_id, request.attempt_no
+            )));
+        }
+
+        let key = (request.task_id, request.attempt_no);
+        if self
+            .stop_intents
+            .read()
+            .expect("stop intents lock poisoned")
+            .get(&key)
+            .is_some_and(|intent| intent.lease_token == request.lease_token)
+        {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "stop already requested for {}/{}",
+                request.task_id, request.attempt_no
+            )));
         }
 
         if self.settings.max_runtime_slots > 0 {
@@ -487,13 +595,29 @@ impl LocalExecutor for ManagedProcessExecutor {
     }
 
     fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError> {
+        let key = (request.task_id, request.attempt_no);
+        self.stop_intents
+            .write()
+            .expect("stop intents lock poisoned")
+            .insert(key, request.clone());
+
         let handle = self
             .registry
             .find_by_task_attempt(request.task_id, request.attempt_no)
             .ok_or(ExecutorError::RuntimeNotFound {
                 task_id: request.task_id,
                 attempt_no: request.attempt_no,
-            })?;
+            });
+        let Ok(handle) = handle else {
+            return Ok(());
+        };
+        let handle_lease_token = runtime_lease_token(&handle).unwrap_or_default();
+        if handle_lease_token != request.lease_token {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "stale stop for {}/{}: lease_token mismatch",
+                request.task_id, request.attempt_no
+            )));
+        }
         let runtime = self
             .runtimes
             .read()
@@ -581,6 +705,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                 .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                     task_id: exited_handle.task_id,
                     attempt_no: exited_handle.attempt_no,
+                    lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&exited_handle),
                     event_type: "canceled".to_string(),
                     event_level: "info".to_string(),
                     message: "stream_ingest rtp server stopped".to_string(),
@@ -625,7 +751,31 @@ impl LocalExecutor for ManagedProcessExecutor {
     }
 
     fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
-        let mut snapshots = self.registry.snapshots(filter);
+        if filter.runtimes.is_empty() {
+            return Vec::new();
+        }
+        let zlm_server_id = self.current_zlm_server_id();
+
+        let mut snapshots = self
+            .registry
+            .snapshots(filter)
+            .into_iter()
+            .map(|handle| {
+                let updated = self
+                    .registry
+                    .update(handle.runtime_id, |runtime| {
+                        runtime.metadata["session_epoch"] = json!(filter.session_epoch);
+                        attach_zlm_server_id(&mut runtime.metadata, zlm_server_id.as_deref());
+                    })
+                    .unwrap_or_else(|| {
+                        let mut handle = handle.clone();
+                        handle.metadata["session_epoch"] = json!(filter.session_epoch);
+                        attach_zlm_server_id(&mut handle.metadata, zlm_server_id.as_deref());
+                        handle
+                    });
+                updated
+            })
+            .collect::<Vec<_>>();
         let mut seen = snapshots
             .iter()
             .map(|handle| (handle.task_id, handle.attempt_no))
@@ -645,6 +795,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                 let mut handle = persisted.handle.clone();
                 handle.state = RuntimeState::Orphaned;
                 handle.metadata["orphaned"] = json!(true);
+                handle.metadata["session_epoch"] = json!(filter.session_epoch);
+                attach_zlm_server_id(&mut handle.metadata, zlm_server_id.as_deref());
                 let companion_pids = companion_recording_from_handle(&handle)
                     .and_then(|companion| companion.pid)
                     .filter(|companion_pid| is_pid_running(*companion_pid))
@@ -729,6 +881,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                         let mut handle = persisted.handle.clone();
                         handle.state = RuntimeState::Orphaned;
                         handle.metadata["orphaned"] = json!(true);
+                        handle.metadata["session_epoch"] = json!(filter.session_epoch);
+                        attach_zlm_server_id(&mut handle.metadata, zlm_server_id.as_deref());
                         handle.metadata["rtp_server"] = json!(RtpServerMetadata {
                             local_port,
                             ..rtp_server.clone()
@@ -757,6 +911,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                                 .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                     task_id: handle.task_id,
                                     attempt_no: handle.attempt_no,
+                                    lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                                    session_epoch: runtime_session_epoch(&handle),
                                     event_type: "adopted".to_string(),
                                     event_level: "info".to_string(),
                                     message: "reattached persisted stream_ingest rtp runtime"
@@ -810,6 +966,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                 let mut handle = persisted.handle.clone();
                 handle.state = RuntimeState::Orphaned;
                 handle.metadata["orphaned"] = json!(true);
+                handle.metadata["session_epoch"] = json!(filter.session_epoch);
+                attach_zlm_server_id(&mut handle.metadata, zlm_server_id.as_deref());
                 handle.metadata["stream_online"] = json!(true);
                 handle.metadata["stream_binding"] = json!({
                     "schema": startup_probe.schema,
@@ -838,6 +996,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                     .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: handle.task_id,
                         attempt_no: handle.attempt_no,
+                        lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&handle),
                         event_type: "adopted".to_string(),
                         event_level: "info".to_string(),
                         message: "reattached persisted stream_ingest runtime".to_string(),
@@ -875,6 +1035,19 @@ impl LocalExecutor for ManagedProcessExecutor {
         }
 
         snapshots
+    }
+
+    fn set_zlm_server_id(&self, server_id: String) {
+        let server_id = server_id.trim().to_string();
+        let mut guard = self
+            .zlm_server_id
+            .write()
+            .expect("zlm_server_id lock poisoned");
+        if server_id.is_empty() {
+            *guard = None;
+        } else {
+            *guard = Some(server_id);
+        }
     }
 }
 
@@ -918,32 +1091,35 @@ impl ManagedProcessExecutor {
             })
         });
 
+        let mut metadata = json!({
+            "task_type": request.task_type,
+            "execution_mode": request.execution_mode,
+            "lease_token": request.lease_token,
+            "session_epoch": request.session_epoch,
+            "trace_context": request.trace_context,
+            "resolved_spec": request.resolved_spec,
+            "work_dir": plan.work_dir,
+            "output_target": plan.output_target,
+            "outputs": plan.outputs,
+            "startup_probe": plan.startup_probe,
+            "stream_online": plan.startup_probe.is_none(),
+            "recording": plan.recording,
+            "managed_file_output_kind": plan.managed_file_output_kind,
+            "companion_recording": companion_recording_metadata,
+        });
+        attach_zlm_server_id(&mut metadata, self.current_zlm_server_id().as_deref());
         let handle = RuntimeHandle {
             runtime_id,
             task_id: request.task_id,
             attempt_no: request.attempt_no,
-            worker_kind: WorkerKind::ZlmProxy,
+            worker_kind: request.task_type.default_worker_kind(),
             pid: Some(pid),
             started_at: Utc::now(),
             last_progress_at: None,
             state: RuntimeState::Starting,
             command_line: Some(command_line),
             outputs: plan.outputs.clone(),
-            metadata: json!({
-                "task_type": request.task_type,
-                "execution_mode": request.execution_mode,
-                "lease_token": request.lease_token,
-                "trace_context": request.trace_context,
-                "resolved_spec": request.resolved_spec,
-                "work_dir": plan.work_dir,
-                "output_target": plan.output_target,
-                "outputs": plan.outputs,
-                "startup_probe": plan.startup_probe,
-                "stream_online": plan.startup_probe.is_none(),
-                "recording": plan.recording,
-                "managed_file_output_kind": plan.managed_file_output_kind,
-                "companion_recording": companion_recording_metadata,
-            }),
+            metadata,
         };
         self.registry.track(handle.clone());
         persist_runtime_state(&plan.work_dir, &handle, &plan.success_check)?;
@@ -964,12 +1140,14 @@ impl ManagedProcessExecutor {
         if let Some(stdout) = stdout {
             let events = self.events.clone();
             let registry = self.registry.clone();
+            let progress_handle = handle.clone();
             tokio::spawn(async move {
                 read_progress_stream(
                     stdout,
                     runtime_id,
-                    handle.task_id,
-                    handle.attempt_no,
+                    progress_handle.task_id,
+                    progress_handle.attempt_no,
+                    runtime_lease_token(&progress_handle).unwrap_or_default(),
                     registry,
                     events,
                     require_stream_online,
@@ -979,12 +1157,17 @@ impl ManagedProcessExecutor {
         }
         if let Some(stderr) = stderr {
             let events = self.events.clone();
+            let log_handle = handle.clone();
+            let registry = self.registry.clone();
             tokio::spawn(async move {
                 read_log_stream(
                     stderr,
-                    handle.task_id,
-                    handle.attempt_no,
+                    runtime_id,
+                    log_handle.task_id,
+                    log_handle.attempt_no,
+                    runtime_lease_token(&log_handle).unwrap_or_default(),
                     "stderr".to_string(),
+                    registry,
                     events,
                 )
                 .await;
@@ -1032,12 +1215,17 @@ impl ManagedProcessExecutor {
 
                     if let Some(stderr) = companion_child.stderr.take() {
                         let events = self.events.clone();
+                        let recording_log_handle = handle.clone();
+                        let registry = self.registry.clone();
                         tokio::spawn(async move {
                             read_log_stream(
                                 stderr,
-                                handle.task_id,
-                                handle.attempt_no,
+                                runtime_id,
+                                recording_log_handle.task_id,
+                                recording_log_handle.attempt_no,
+                                runtime_lease_token(&recording_log_handle).unwrap_or_default(),
                                 "recording_stderr".to_string(),
+                                registry,
                                 events,
                             )
                             .await;
@@ -1081,6 +1269,8 @@ impl ManagedProcessExecutor {
                         .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: updated_handle.task_id,
                         attempt_no: updated_handle.attempt_no,
+                        lease_token: runtime_lease_token(&updated_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&updated_handle),
                         event_type: "recording_degraded".to_string(),
                         event_level: "warn".to_string(),
                         message:
@@ -1121,6 +1311,8 @@ impl ManagedProcessExecutor {
                 .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                     task_id: running_handle.task_id,
                     attempt_no: running_handle.attempt_no,
+                    lease_token: runtime_lease_token(&running_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&running_handle),
                     event_type: "running".to_string(),
                     event_level: "info".to_string(),
                     message: "child process started".to_string(),
@@ -1201,6 +1393,8 @@ impl ManagedProcessExecutor {
                 let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                     task_id: exited_handle.task_id,
                     attempt_no: exited_handle.attempt_no,
+                    lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&exited_handle),
                     event_type: "recovering".to_string(),
                     event_level: "warn".to_string(),
                     message:
@@ -1351,6 +1545,8 @@ impl ManagedProcessExecutor {
             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: exited_handle.task_id,
                 attempt_no: exited_handle.attempt_no,
+                lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&exited_handle),
                 event_type: event_type.to_string(),
                 event_level: event_level.to_string(),
                 message,
@@ -1381,6 +1577,8 @@ impl ManagedProcessExecutor {
             .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: restarted.task_id,
                 attempt_no: restarted.attempt_no,
+                lease_token: runtime_lease_token(&restarted).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&restarted),
                 event_type: "starting".to_string(),
                 event_level: "info".to_string(),
                 message: "runtime handle recreated after local recovery".to_string(),
@@ -1416,6 +1614,29 @@ impl ManagedProcessExecutor {
         let proxy_key = extract_zlm_proxy_key(&response);
         let runtime_id = Uuid::now_v7();
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let mut metadata = json!({
+            "task_type": request.task_type,
+            "execution_mode": request.execution_mode,
+            "lease_token": request.lease_token,
+            "session_epoch": request.session_epoch,
+            "trace_context": request.trace_context,
+            "resolved_spec": request.resolved_spec,
+            "work_dir": plan.work_dir,
+            "output_target": plan.outputs.first(),
+            "outputs": plan.outputs,
+            "startup_probe": plan.startup_probe,
+            "stream_online": false,
+            "stream_binding": {
+                "schema": plan.startup_probe.schema,
+                "vhost": plan.startup_probe.vhost,
+                "app": plan.startup_probe.app,
+                "stream": plan.startup_probe.stream,
+            },
+            "recording": plan.recording,
+            "zlm_proxy_key": proxy_key,
+            "source_url": plan.input_url,
+        });
+        attach_zlm_server_id(&mut metadata, self.current_zlm_server_id().as_deref());
         let handle = RuntimeHandle {
             runtime_id,
             task_id: request.task_id,
@@ -1427,27 +1648,7 @@ impl ManagedProcessExecutor {
             state: RuntimeState::Starting,
             command_line: Some(plan.command_line),
             outputs: plan.outputs.clone(),
-            metadata: json!({
-                "task_type": request.task_type,
-                "execution_mode": request.execution_mode,
-                "lease_token": request.lease_token,
-                "trace_context": request.trace_context,
-                "resolved_spec": request.resolved_spec,
-                "work_dir": plan.work_dir,
-                "output_target": plan.outputs.first(),
-                "outputs": plan.outputs,
-                "startup_probe": plan.startup_probe,
-                "stream_online": false,
-                "stream_binding": {
-                    "schema": plan.startup_probe.schema,
-                    "vhost": plan.startup_probe.vhost,
-                    "app": plan.startup_probe.app,
-                    "stream": plan.startup_probe.stream,
-                },
-                "recording": plan.recording,
-                "zlm_proxy_key": proxy_key,
-                "source_url": plan.input_url,
-            }),
+            metadata,
         };
         self.registry.track(handle.clone());
         persist_runtime_state(&plan.work_dir, &handle, &SuccessCheck::ProcessExit)?;
@@ -1468,6 +1669,8 @@ impl ManagedProcessExecutor {
             .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: handle.task_id,
                 attempt_no: handle.attempt_no,
+                lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&handle),
                 event_type: "zlm_proxy_created".to_string(),
                 event_level: "info".to_string(),
                 message: "stream_ingest proxy created in ZLM".to_string(),
@@ -1515,6 +1718,21 @@ impl ManagedProcessExecutor {
         };
         let runtime_id = Uuid::now_v7();
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let mut metadata = json!({
+            "task_type": request.task_type,
+            "execution_mode": request.execution_mode,
+            "lease_token": request.lease_token,
+            "session_epoch": request.session_epoch,
+            "trace_context": request.trace_context,
+            "resolved_spec": request.resolved_spec,
+            "work_dir": plan.work_dir,
+            "output_target": plan.outputs.first(),
+            "outputs": plan.outputs,
+            "stream_online": false,
+            "rtp_stream_id": rtp_server.stream_id,
+            "rtp_server": rtp_server,
+        });
+        attach_zlm_server_id(&mut metadata, self.current_zlm_server_id().as_deref());
         let handle = RuntimeHandle {
             runtime_id,
             task_id: request.task_id,
@@ -1526,19 +1744,7 @@ impl ManagedProcessExecutor {
             state: RuntimeState::Starting,
             command_line: Some(plan.command_line),
             outputs: plan.outputs.clone(),
-            metadata: json!({
-                "task_type": request.task_type,
-                "execution_mode": request.execution_mode,
-                "lease_token": request.lease_token,
-                "trace_context": request.trace_context,
-                "resolved_spec": request.resolved_spec,
-                "work_dir": plan.work_dir,
-                "output_target": plan.outputs.first(),
-                "outputs": plan.outputs,
-                "stream_online": false,
-                "rtp_stream_id": rtp_server.stream_id,
-                "rtp_server": rtp_server,
-            }),
+            metadata,
         };
         self.registry.track(handle.clone());
         persist_runtime_state(&plan.work_dir, &handle, &SuccessCheck::ProcessExit)?;
@@ -1559,6 +1765,8 @@ impl ManagedProcessExecutor {
             .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: handle.task_id,
                 attempt_no: handle.attempt_no,
+                lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&handle),
                 event_type: "rtp_server_opened".to_string(),
                 event_level: "info".to_string(),
                 message: "stream_ingest rtp server opened in ZLM".to_string(),
@@ -1703,17 +1911,10 @@ pub fn rejected_runtime_handle(request: &StartTaskRequest) -> RuntimeHandle {
             "task_type": request.task_type,
             "execution_mode": request.execution_mode,
             "lease_token": request.lease_token,
+            "session_epoch": request.session_epoch,
             "trace_context": request.trace_context,
         }),
     }
-}
-
-pub fn dedup_worker_kinds(worker_kinds: Vec<WorkerKind>) -> Vec<WorkerKind> {
-    let mut seen = HashSet::new();
-    worker_kinds
-        .into_iter()
-        .filter(|kind| seen.insert(*kind))
-        .collect()
 }
 
 async fn read_progress_stream(
@@ -1721,6 +1922,7 @@ async fn read_progress_stream(
     runtime_id: Uuid,
     task_id: Uuid,
     attempt_no: i32,
+    lease_token: String,
     registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
     require_stream_online: bool,
@@ -1755,6 +1957,11 @@ async fn read_progress_stream(
             let progress = RuntimeTaskProgress {
                 task_id,
                 attempt_no,
+                lease_token: lease_token.clone(),
+                session_epoch: registry
+                    .get(runtime_id)
+                    .map(|runtime| runtime_session_epoch(&runtime))
+                    .unwrap_or_default(),
                 frame: parse_u64(current.get("frame")),
                 fps: parse_f64(current.get("fps")),
                 bitrate_kbps: parse_bitrate_kbps(current.get("bitrate")),
@@ -1774,11 +1981,14 @@ async fn read_progress_stream(
 }
 
 fn flush_log_batch(
+    runtime_id: Uuid,
     task_id: Uuid,
     attempt_no: i32,
+    lease_token: &str,
     stream: &str,
     batch: &mut Vec<(String, usize)>,
     source_line_count: &mut usize,
+    registry: &LocalRuntimeRegistry,
     events: &RuntimeEventSink,
 ) {
     if batch.is_empty() {
@@ -1798,6 +2008,11 @@ fn flush_log_batch(
     let _ = events.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
         task_id,
         attempt_no,
+        lease_token: lease_token.to_string(),
+        session_epoch: registry
+            .get(runtime_id)
+            .map(|runtime| runtime_session_epoch(&runtime))
+            .unwrap_or_default(),
         stream: stream.to_string(),
         lines,
         source_line_count: emitted_line_count,
@@ -1806,9 +2021,12 @@ fn flush_log_batch(
 
 async fn read_log_stream(
     stderr: tokio::process::ChildStderr,
+    runtime_id: Uuid,
     task_id: Uuid,
     attempt_no: i32,
+    lease_token: String,
     stream: String,
+    registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
 ) {
     let mut reader = BufReader::new(stderr).lines();
@@ -1823,11 +2041,14 @@ async fn read_log_stream(
                 Ok(result) => result,
                 Err(_) => {
                     flush_log_batch(
+                        runtime_id,
                         task_id,
                         attempt_no,
+                        &lease_token,
                         &stream,
                         &mut batch,
                         &mut source_line_count,
+                        &registry,
                         &events,
                     );
                     continue;
@@ -1859,11 +2080,14 @@ async fn read_log_stream(
 
         if batch.len() >= MAX_LOG_BATCH_LINES || source_line_count >= MAX_LOG_BATCH_LINES {
             flush_log_batch(
+                runtime_id,
                 task_id,
                 attempt_no,
+                &lease_token,
                 &stream,
                 &mut batch,
                 &mut source_line_count,
+                &registry,
                 &events,
             );
             continue 'outer;
@@ -1871,11 +2095,14 @@ async fn read_log_stream(
     }
 
     flush_log_batch(
+        runtime_id,
         task_id,
         attempt_no,
+        &lease_token,
         &stream,
         &mut batch,
         &mut source_line_count,
+        &registry,
         &events,
     );
 }
@@ -4204,7 +4431,39 @@ fn restart_request_from_handle(handle: &RuntimeHandle) -> Result<StartTaskReques
             .get("trace_context")
             .and_then(Value::as_str)
             .map(str::to_string),
+        session_epoch: runtime_session_epoch(handle),
     })
+}
+
+fn runtime_lease_token(handle: &RuntimeHandle) -> Option<String> {
+    handle
+        .metadata
+        .get("lease_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn attach_zlm_server_id(metadata: &mut Value, zlm_server_id: Option<&str>) {
+    let Some(server_id) = zlm_server_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if let Some(map) = metadata.as_object_mut() {
+        map.insert(
+            "zlm_server_id".to_string(),
+            Value::String(server_id.to_string()),
+        );
+    }
+}
+
+pub(crate) fn runtime_session_epoch(handle: &RuntimeHandle) -> u64 {
+    handle
+        .metadata
+        .get("session_epoch")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
 }
 
 fn persist_runtime_state(
@@ -4389,6 +4648,8 @@ pub fn collect_terminal_runtime_replays(
                 event: RuntimeTaskEvent {
                     task_id: state.handle.task_id,
                     attempt_no: state.handle.attempt_no,
+                    lease_token: runtime_lease_token(&state.handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&state.handle),
                     event_type: event_type.to_string(),
                     event_level: event_level.to_string(),
                     message,
@@ -4523,6 +4784,8 @@ fn spawn_companion_process_monitor(
         let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
             task_id,
             attempt_no,
+            lease_token: runtime_lease_token(&updated_handle).unwrap_or_default(),
+            session_epoch: runtime_session_epoch(&updated_handle),
             event_type: "recording_degraded".to_string(),
             event_level: "warn".to_string(),
             message: "mp4 recording sidecar stopped; continuing without recording".to_string(),
@@ -4602,6 +4865,8 @@ fn spawn_adopted_companion_process_monitor(
             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: updated_handle.task_id,
                 attempt_no: updated_handle.attempt_no,
+                lease_token: runtime_lease_token(&updated_handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&updated_handle),
                 event_type: "recording_degraded".to_string(),
                 event_level: "warn".to_string(),
                 message: "mp4 recording sidecar stopped; continuing without recording".to_string(),
@@ -4672,6 +4937,8 @@ fn spawn_adopted_runtime_monitor(
             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: exited_handle.task_id,
                 attempt_no: exited_handle.attempt_no,
+                lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&exited_handle),
                 event_type: event_type.to_string(),
                 event_level: event_level.to_string(),
                 message,
@@ -4707,6 +4974,8 @@ fn spawn_startup_probe_monitor(
                     let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: handle.task_id,
                         attempt_no: handle.attempt_no,
+                        lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&handle),
                         event_type: "startup_timeout".to_string(),
                         event_level: "error".to_string(),
                         message: format!(
@@ -4785,6 +5054,9 @@ fn spawn_startup_probe_monitor(
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: updated_handle.task_id,
                                 attempt_no: updated_handle.attempt_no,
+                                lease_token: runtime_lease_token(&updated_handle)
+                                    .unwrap_or_default(),
+                                session_epoch: runtime_session_epoch(&updated_handle),
                                 event_type: "recording_started".to_string(),
                                 event_level: "info".to_string(),
                                 message: "stream recording started".to_string(),
@@ -4841,6 +5113,9 @@ fn spawn_startup_probe_monitor(
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: updated_handle.task_id,
                                 attempt_no: updated_handle.attempt_no,
+                                lease_token: runtime_lease_token(&updated_handle)
+                                    .unwrap_or_default(),
+                                session_epoch: runtime_session_epoch(&updated_handle),
                                 event_type: "zlm_api_error".to_string(),
                                 event_level: "error".to_string(),
                                 message: format!("failed to start stream recording: {error}"),
@@ -4862,6 +5137,9 @@ fn spawn_startup_probe_monitor(
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: updated_handle.task_id,
                                 attempt_no: updated_handle.attempt_no,
+                                lease_token: runtime_lease_token(&updated_handle)
+                                    .unwrap_or_default(),
+                                session_epoch: runtime_session_epoch(&updated_handle),
                                 event_type: "recording_degraded".to_string(),
                                 event_level: "warn".to_string(),
                                 message:
@@ -4896,6 +5174,8 @@ fn spawn_startup_probe_monitor(
                 let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                     task_id: running_handle.task_id,
                     attempt_no: running_handle.attempt_no,
+                    lease_token: runtime_lease_token(&running_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&running_handle),
                     event_type: "running".to_string(),
                     event_level: "info".to_string(),
                     message: "ZLM stream is online".to_string(),
@@ -4994,6 +5274,9 @@ fn spawn_live_relay_monitor(
                                     events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                         task_id: updated_handle.task_id,
                                         attempt_no: updated_handle.attempt_no,
+                                        lease_token: runtime_lease_token(&updated_handle)
+                                            .unwrap_or_default(),
+                                        session_epoch: runtime_session_epoch(&updated_handle),
                                         event_type: "recording_started".to_string(),
                                         event_level: "info".to_string(),
                                         message: "live_relay recording started".to_string(),
@@ -5040,6 +5323,9 @@ fn spawn_live_relay_monitor(
                                     events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                         task_id: degraded_handle.task_id,
                                         attempt_no: degraded_handle.attempt_no,
+                                        lease_token: runtime_lease_token(&degraded_handle)
+                                            .unwrap_or_default(),
+                                        session_epoch: runtime_session_epoch(&degraded_handle),
                                         event_type: "zlm_api_error".to_string(),
                                         event_level: "error".to_string(),
                                         message: format!(
@@ -5095,6 +5381,9 @@ fn spawn_live_relay_monitor(
                                         RuntimeTaskEvent {
                                             task_id: failed_handle.task_id,
                                             attempt_no: failed_handle.attempt_no,
+                                            lease_token: runtime_lease_token(&failed_handle)
+                                                .unwrap_or_default(),
+                                            session_epoch: runtime_session_epoch(&failed_handle),
                                             event_type: "failed".to_string(),
                                             event_level: "error".to_string(),
                                             message: "live_relay recording startup failed"
@@ -5120,6 +5409,8 @@ fn spawn_live_relay_monitor(
                                     events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                         task_id: degraded_handle.task_id,
                                         attempt_no: degraded_handle.attempt_no,
+                                        lease_token: runtime_lease_token(&degraded_handle).unwrap_or_default(),
+                                        session_epoch: runtime_session_epoch(&degraded_handle),
                                         event_type: "recording_degraded".to_string(),
                                         event_level: "warn".to_string(),
                                         message: "live_relay recording startup failed; continuing without recording"
@@ -5227,6 +5518,8 @@ fn spawn_live_relay_monitor(
                         let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                             task_id: running_handle.task_id,
                             attempt_no: running_handle.attempt_no,
+                            lease_token: runtime_lease_token(&running_handle).unwrap_or_default(),
+                            session_epoch: runtime_session_epoch(&running_handle),
                             event_type: "running".to_string(),
                             event_level: "info".to_string(),
                             message: "ZLM live_relay stream is online".to_string(),
@@ -5273,6 +5566,8 @@ fn spawn_live_relay_monitor(
                     let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: failed_handle.task_id,
                         attempt_no: failed_handle.attempt_no,
+                        lease_token: runtime_lease_token(&failed_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&failed_handle),
                         event_type: "startup_timeout".to_string(),
                         event_level: "error".to_string(),
                         message: format!(
@@ -5293,6 +5588,8 @@ fn spawn_live_relay_monitor(
                     let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: failed_handle.task_id,
                         attempt_no: failed_handle.attempt_no,
+                        lease_token: runtime_lease_token(&failed_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&failed_handle),
                         event_type: "failed".to_string(),
                         event_level: "error".to_string(),
                         message: "live_relay startup timed out".to_string(),
@@ -5370,6 +5667,8 @@ fn spawn_live_relay_monitor(
                     let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: exited_handle.task_id,
                         attempt_no: exited_handle.attempt_no,
+                        lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&exited_handle),
                         event_type: event_type.to_string(),
                         event_level: event_level.to_string(),
                         message,
@@ -5470,6 +5769,9 @@ fn spawn_rtp_receive_monitor(
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: running_handle.task_id,
                                 attempt_no: running_handle.attempt_no,
+                                lease_token: runtime_lease_token(&running_handle)
+                                    .unwrap_or_default(),
+                                session_epoch: runtime_session_epoch(&running_handle),
                                 event_type: "running".to_string(),
                                 event_level: "info".to_string(),
                                 message: "rtp_receive stream is online".to_string(),
@@ -5517,6 +5819,8 @@ fn spawn_rtp_receive_monitor(
                             events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: exited_handle.task_id,
                                 attempt_no: exited_handle.attempt_no,
+                                lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                                session_epoch: runtime_session_epoch(&exited_handle),
                                 event_type: "rtp_server_closed".to_string(),
                                 event_level: "warn".to_string(),
                                 message: "rtp_receive server disappeared from ZLM".to_string(),
@@ -6279,16 +6583,79 @@ fi
             state: RuntimeState::Running,
             command_line: Some("ffmpeg -i input".to_string()),
             outputs: vec!["rtmp://output".to_string()],
-            metadata: json!({ "source": "test" }),
+            metadata: json!({ "source": "test", "lease_token": "lease-a" }),
         };
         registry.track(handle.clone());
 
         let snapshots = registry.snapshots(&AdoptFilter {
-            task_ids: vec![handle.task_id],
-            worker_kinds: vec![WorkerKind::Ffmpeg],
+            session_epoch: 1,
+            runtimes: vec![AdoptRuntimeFilter {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: "lease-a".to_string(),
+                worker_kind: WorkerKind::Ffmpeg,
+            }],
         });
 
         assert_eq!(snapshots, vec![handle]);
+    }
+
+    #[test]
+    fn registry_replaces_duplicate_task_attempt_and_reports_state_counts() {
+        let registry = LocalRuntimeRegistry::new();
+        let task_id = Uuid::now_v7();
+        let replacement = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id,
+            attempt_no: 1,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(1002),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Starting,
+            command_line: None,
+            outputs: Vec::new(),
+            metadata: json!({ "lease_token": "lease-a" }),
+        };
+        registry.track(RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id,
+            attempt_no: 1,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(1001),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Running,
+            command_line: None,
+            outputs: Vec::new(),
+            metadata: json!({ "lease_token": "lease-a" }),
+        });
+        registry.track(replacement.clone());
+        registry.track(RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::ZlmProxy,
+            pid: None,
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Orphaned,
+            command_line: None,
+            outputs: Vec::new(),
+            metadata: json!({ "lease_token": "lease-b" }),
+        });
+
+        assert_eq!(registry.count(), 2);
+        assert_eq!(
+            registry.find_by_task_attempt(task_id, 1),
+            Some(replacement.clone())
+        );
+
+        let counts = registry.state_counts();
+        assert_eq!(counts.starting, 1);
+        assert_eq!(counts.running, 0);
+        assert_eq!(counts.stopping, 0);
+        assert_eq!(counts.orphaned, 1);
     }
 
     #[test]
@@ -6315,6 +6682,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6359,6 +6727,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6420,6 +6789,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6623,6 +6993,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6658,6 +7029,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6720,6 +7092,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let error = executor
@@ -6731,6 +7104,67 @@ fi
         ));
 
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn start_task_is_idempotent_for_same_attempt_and_lease() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-runtime-idempotent-{}",
+            Uuid::now_v7()
+        ));
+        let registry = LocalRuntimeRegistry::new();
+        let task_id = Uuid::now_v7();
+        let existing = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id,
+            attempt_no: 2,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(1234),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Running,
+            command_line: Some("ffmpeg -i input".to_string()),
+            outputs: vec!["/data/zlm/www/artifacts/transcode/output.mp4".to_string()],
+            metadata: json!({
+                "task_type": "file_transcode",
+                "lease_token": "lease-idempotent"
+            }),
+        };
+        registry.track(existing.clone());
+
+        let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+        let (log_tx, _log_rx) = mpsc::channel(8);
+        let executor = ManagedProcessExecutor::new(
+            test_settings(temp_root.to_string_lossy().as_ref()),
+            registry,
+            RuntimeEventSink::new(priority_tx, log_tx),
+        );
+        let request = StartTaskRequest {
+            task_id,
+            attempt_no: 2,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "test-idempotent",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {"kind": "file"},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease-idempotent".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        };
+
+        let returned = executor
+            .start_task(&request)
+            .expect("same attempt and lease should reuse existing handle");
+        assert_eq!(returned, existing);
     }
 
     #[test]
@@ -6771,6 +7205,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6846,6 +7281,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6918,6 +7354,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -6967,6 +7404,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7033,6 +7471,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7096,6 +7535,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7158,6 +7598,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7222,6 +7663,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7276,6 +7718,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7426,6 +7869,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7480,6 +7924,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7531,6 +7976,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7596,6 +8042,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7667,6 +8114,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7734,6 +8182,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7791,6 +8240,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7854,6 +8304,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7914,6 +8365,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -7972,6 +8424,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8020,6 +8473,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8077,6 +8531,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8128,6 +8583,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8177,6 +8633,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8231,6 +8688,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8286,6 +8744,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8338,6 +8797,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8436,6 +8896,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8481,6 +8942,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8522,6 +8984,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8611,6 +9074,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8704,6 +9168,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8828,6 +9293,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8879,6 +9345,7 @@ fi
             execution_mode: "managed".to_string(),
             lease_token: "lease".to_string(),
             trace_context: None,
+            session_epoch: 1,
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
@@ -8955,7 +9422,7 @@ fi
             state: RuntimeState::Running,
             command_line: Some("ffmpeg -re -i input".to_string()),
             outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
-            metadata: json!({"task_type": "file_to_live"}),
+            metadata: json!({"task_type": "file_to_live", "lease_token": "lease"}),
         };
 
         persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
@@ -8985,7 +9452,7 @@ fi
             state: RuntimeState::Running,
             command_line: Some("ffmpeg -re -i input".to_string()),
             outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
-            metadata: json!({"task_type": "file_to_live"}),
+            metadata: json!({"task_type": "file_to_live", "lease_token": "lease"}),
         };
 
         persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
@@ -9001,8 +9468,13 @@ fi
         );
 
         let adopted = executor.adopt_orphans(&AdoptFilter {
-            task_ids: vec![handle.task_id],
-            worker_kinds: vec![WorkerKind::Ffmpeg],
+            session_epoch: 1,
+            runtimes: vec![AdoptRuntimeFilter {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: "lease".to_string(),
+                worker_kind: WorkerKind::Ffmpeg,
+            }],
         });
 
         assert_eq!(adopted.len(), 1);
@@ -9027,6 +9499,8 @@ fi
             sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
                 task_id,
                 attempt_no: 1,
+                lease_token: "lease".to_string(),
+                session_epoch: 1,
                 stream: "stderr".to_string(),
                 lines: vec!["first".to_string()],
                 source_line_count: 1,
@@ -9037,6 +9511,8 @@ fi
             sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
                 task_id,
                 attempt_no: 1,
+                lease_token: "lease".to_string(),
+                session_epoch: 1,
                 stream: "stderr".to_string(),
                 lines: vec!["dropped".to_string()],
                 source_line_count: 3,
@@ -9051,6 +9527,8 @@ fi
             sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
                 task_id,
                 attempt_no: 1,
+                lease_token: "lease".to_string(),
+                session_epoch: 1,
                 stream: "stderr".to_string(),
                 lines: vec!["after".to_string()],
                 source_line_count: 1,

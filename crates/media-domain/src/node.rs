@@ -58,6 +58,7 @@ pub struct AgentRegistration {
     pub network_mode: NetworkMode,
     pub ffmpeg_bin: String,
     pub ffprobe_bin: String,
+    pub zlm_server_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,6 +68,9 @@ pub struct HeartbeatSnapshot {
     pub mem_percent: f64,
     pub disk_percent: f64,
     pub running_tasks: u32,
+    pub starting_tasks: u32,
+    pub stopping_tasks: u32,
+    pub orphaned_tasks: u32,
     pub slot_usage: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,

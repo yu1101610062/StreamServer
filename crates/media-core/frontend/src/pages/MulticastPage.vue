@@ -2,7 +2,6 @@
 import { computed } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 
-import { AUTO_REFRESH_MS } from "@/shared/api/client";
 import { streamApi, taskApi } from "@/shared/api/resources";
 import type { TaskDetail, TaskSummary, UnknownJson } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
@@ -29,10 +28,9 @@ const tasksQuery = useQuery({
       type: "stream_bridge",
       page: 1,
       page_size: 100,
-      sort_by: "updated_at",
+      sort_by: "created_at",
       sort_order: "desc",
     }),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const detailsQuery = useQuery({
@@ -43,13 +41,11 @@ const detailsQuery = useQuery({
     const details = await Promise.all(items.map((item) => taskApi.detail(item.id).catch(() => null)));
     return new Map(items.map((item, index) => [item.id, details[index]]));
   },
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const streamsQuery = useQuery({
   queryKey: ["multicast", "streams"],
   queryFn: () => streamApi.list({}),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const rows = computed<MulticastRow[]>(() => {

@@ -4,7 +4,6 @@ import { ApiError, type CurrentSession } from "@/shared/api/types";
 
 export const THEME_STORAGE_KEY = "streamserver.console.theme";
 export const REFRESH_TOKEN_STORAGE_KEY = "streamserver.console.refresh_token";
-export const AUTO_REFRESH_MS = 10_000;
 
 const accessToken = ref<string>("");
 const currentSession = ref<CurrentSession | null>(null);

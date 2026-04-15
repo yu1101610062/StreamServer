@@ -86,8 +86,9 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
+    Help { auth_only: bool },
     BootstrapAdmin { username: String },
     ResetPassword { username: String },
 }
@@ -95,7 +96,13 @@ enum CliCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if let Some(command) = parse_cli_command()? {
-        return run_cli_command(command).await;
+        return match command {
+            CliCommand::Help { auth_only } => {
+                print_cli_help(auth_only);
+                Ok(())
+            }
+            other => run_cli_command(other).await,
+        };
     }
 
     let settings = config::Settings::load()?;
@@ -211,7 +218,7 @@ pub(crate) fn build_app(state: AppState) -> Router {
         )
         .route("/tasks/preview", post(ui::preview_task))
         .route("/tasks", post(create_task).get(list_tasks))
-        .route("/tasks/{id}", get(get_task))
+        .route("/tasks/{id}", get(get_task).delete(delete_task))
         .route("/tasks/{id}/events", get(get_task_events))
         .route("/tasks/{id}/logs", get(get_task_logs))
         .route("/tasks/{id}/resolved-spec", get(get_resolved_spec))
@@ -778,6 +785,18 @@ async fn get_task(
     Ok(Json(task))
 }
 
+async fn delete_task(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Path(task_id): Path<Uuid>,
+) -> Result<Json<repository::TaskSummary>, AppError> {
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
+    let task = state.repository.delete_task(task_id).await?;
+    Ok(Json(task))
+}
+
 async fn get_resolved_spec(
     State(state): State<AppState>,
     PeerAddress(peer): PeerAddress,
@@ -1206,16 +1225,22 @@ fn apply_live_load(node: &mut repository::NodeSummary, load: Option<NodeLiveLoad
     if let Some(load) = load {
         node.slot_usage = Some(load.slot_usage);
         node.running_tasks = Some(load.running_tasks);
+        node.starting_tasks = Some(load.starting_tasks);
+        node.stopping_tasks = Some(load.stopping_tasks);
+        node.orphaned_tasks = Some(load.orphaned_tasks);
         node.connected = Some(load.connected);
+        node.control_connected = load.connected;
         node.cpu_percent = Some(load.cpu_percent);
         node.mem_percent = Some(load.mem_percent);
         node.disk_percent = Some(load.disk_percent);
         node.zlm_alive = Some(load.zlm_alive);
         node.ffmpeg_alive = Some(load.ffmpeg_alive);
         node.gpu_runtime = Some(load.gpu_runtime);
-        node.healthy = load.connected;
+        node.healthy = node.control_connected;
     } else {
         node.connected = Some(false);
+        node.control_connected = false;
+        node.healthy = false;
     }
 }
 
@@ -1646,7 +1671,12 @@ async fn process_zlm_hook(
             let hook = parse_publish_hook(&sanitized_payload)?;
             let publish_target = state
                 .repository
-                .find_task_for_publish_stream(node_id, &hook.app, &hook.stream)
+                .find_task_for_publish_stream(
+                    server_id.trim(),
+                    &hook.vhost,
+                    &hook.app,
+                    &hook.stream,
+                )
                 .await?;
             if let Some(target) = publish_target {
                 let resolved_spec = serde_json::from_value::<TaskSpec>(
@@ -1708,7 +1738,7 @@ async fn process_zlm_hook(
             let hook = parse_rtp_server_timeout_hook(&sanitized_payload)?;
             let timeout_target = state
                 .repository
-                .find_task_for_rtp_stream(node_id, &hook.stream_id)
+                .find_task_for_rtp_stream(server_id.trim(), &hook.stream_id)
                 .await?;
             if let Some(target) = timeout_target {
                 let _ = state
@@ -1882,7 +1912,7 @@ async fn process_zlm_hook(
                 .await?;
             state
                 .repository
-                .update_node_health(node_id, true, Some(Utc::now()))
+                .record_media_server_seen(node_id, server_id.trim(), Utc::now())
                 .await?;
             hook_ack(&hook_name)
         }
@@ -2261,17 +2291,36 @@ fn parse_hook_source_allowlist(values: &[String]) -> anyhow::Result<Vec<IpAddr>>
 }
 
 fn parse_cli_command() -> anyhow::Result<Option<CliCommand>> {
-    let mut args = std::env::args().skip(1);
+    parse_cli_command_from(std::env::args().skip(1))
+}
+
+fn parse_cli_command_from<I>(args: I) -> anyhow::Result<Option<CliCommand>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
     let Some(command) = args.next() else {
         return Ok(None);
     };
+    if is_help_flag(&command) {
+        return Ok(Some(CliCommand::Help { auth_only: false }));
+    }
     if command != "auth" {
         anyhow::bail!("unsupported command `{command}`");
     }
     let Some(subcommand) = args.next() else {
         anyhow::bail!("missing auth subcommand");
     };
+    if is_help_flag(&subcommand) {
+        return Ok(Some(CliCommand::Help { auth_only: true }));
+    }
 
+    let remaining_args: Vec<String> = args.collect();
+    if remaining_args.len() == 1 && is_help_flag(&remaining_args[0]) {
+        return Ok(Some(CliCommand::Help { auth_only: true }));
+    }
+
+    let mut args = remaining_args.into_iter();
     let mut username = None;
     let mut expects_password_stdin = false;
     while let Some(argument) = args.next() {
@@ -2301,6 +2350,43 @@ fn parse_cli_command() -> anyhow::Result<Option<CliCommand>> {
     Ok(Some(command))
 }
 
+fn is_help_flag(value: &str) -> bool {
+    matches!(value, "help" | "-h" | "--help")
+}
+
+fn print_cli_help(auth_only: bool) {
+    let help = if auth_only {
+        AUTH_CLI_HELP_TEXT
+    } else {
+        CLI_HELP_TEXT
+    };
+    println!("{help}");
+}
+
+const CLI_HELP_TEXT: &str = "\
+Usage:
+  media-core
+  media-core auth bootstrap-admin --username <name> --password-stdin
+  media-core auth reset-password --username <name> --password-stdin
+  media-core [help|-h|--help]
+  media-core auth [help|-h|--help]
+
+Description:
+  Run without a subcommand to start the media-core server.
+
+Auth commands:
+  bootstrap-admin  Create the initial enabled admin user; reads the password from stdin.
+  reset-password   Reset an existing user's password; reads the new password from stdin.";
+
+const AUTH_CLI_HELP_TEXT: &str = "\
+Usage:
+  media-core auth bootstrap-admin --username <name> --password-stdin
+  media-core auth reset-password --username <name> --password-stdin
+  media-core auth [help|-h|--help]
+
+Description:
+  Auth commands read the password value from stdin.";
+
 fn read_password_from_stdin() -> anyhow::Result<String> {
     let mut password = String::new();
     io::stdin().read_to_string(&mut password)?;
@@ -2323,6 +2409,7 @@ async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
     let password_hash = hash_password(&password)?;
 
     match command {
+        CliCommand::Help { .. } => unreachable!("help commands are handled before DB setup"),
         CliCommand::BootstrapAdmin { username } => {
             let username = normalize_username_value(&username)?;
             anyhow::ensure!(
@@ -2754,6 +2841,47 @@ mod tests {
         Ok(url.to_string())
     }
 
+    #[test]
+    fn parse_cli_command_accepts_top_level_help() {
+        let command = parse_cli_command_from(["--help".to_string()]).unwrap();
+        assert_eq!(command, Some(CliCommand::Help { auth_only: false }));
+    }
+
+    #[test]
+    fn parse_cli_command_accepts_auth_help() {
+        let command = parse_cli_command_from(["auth".to_string(), "--help".to_string()]).unwrap();
+        assert_eq!(command, Some(CliCommand::Help { auth_only: true }));
+    }
+
+    #[test]
+    fn parse_cli_command_accepts_auth_subcommand_help() {
+        let command = parse_cli_command_from([
+            "auth".to_string(),
+            "bootstrap-admin".to_string(),
+            "--help".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(command, Some(CliCommand::Help { auth_only: true }));
+    }
+
+    #[test]
+    fn parse_cli_command_parses_auth_command() {
+        let command = parse_cli_command_from([
+            "auth".to_string(),
+            "bootstrap-admin".to_string(),
+            "--username".to_string(),
+            "admin".to_string(),
+            "--password-stdin".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            command,
+            Some(CliCommand::BootstrapAdmin {
+                username: "admin".to_string(),
+            })
+        );
+    }
+
     async fn database_is_reachable(database_url: &str) -> bool {
         let Ok(url) = reqwest::Url::parse(database_url) else {
             return false;
@@ -2819,6 +2947,7 @@ mod tests {
                     network_mode: NetworkMode::Bridge,
                     ffmpeg_bin: "ffmpeg".to_string(),
                     ffprobe_bin: "ffprobe".to_string(),
+                    zlm_server_id: format!("zlm-{node_id}"),
                 },
                 Utc::now(),
             )
@@ -2882,15 +3011,18 @@ mod tests {
         sqlx::query(
             r#"
             insert into stream_bindings (
-              id, task_id, attempt_id, schema, vhost, app, stream, zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+              id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+              zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
             ) values (
-              $1, $2, $3, 'rtsp', '__defaultVhost__', $4, $5, null, null, null, $6
+              $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', $6, $7, null, null, null, $8
             )
             "#,
         )
         .bind(Uuid::now_v7())
         .bind(task_id)
         .bind(attempt_id)
+        .bind(format!("zlm-{node_id}"))
+        .bind(node_id)
         .bind(app)
         .bind(stream)
         .bind(now)
@@ -3693,6 +3825,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_task_rejects_lost_state_via_api() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let payload = sample_create_task_payload("manual");
+
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'lost-task-delete', 'stream_ingest'::task_type, 'LOST'::task_status, $2,
+              50, $3, $3, 'tester', null,
+              1, 'manual', $4, $4, $4, $4
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("lost-task-delete-{task_id}"))
+        .bind(&payload)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, null, 'ffmpeg'::worker_kind, 'FAILED'::attempt_status,
+              null, null, null, null, null, null,
+              null, null, 'node_disconnected', 'runtime may still be reclaimable',
+              null, $3, $3, $3
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        let repository = TaskRepository::new(db.pool.clone());
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/tasks/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["code"], json!("TASK_DELETE_FORBIDDEN"));
+        assert_eq!(
+            repository.get_task_summary(task_id).await?.status,
+            media_domain::TaskStatus::Lost
+        );
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn api_rejects_missing_authorization_when_auth_is_enabled() -> anyhow::Result<()> {
         let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
         let app = build_app(test_app_state_with_auth(pool));
@@ -4131,6 +4337,9 @@ mod tests {
                     mem_percent: 48.0,
                     disk_percent: 61.0,
                     running_tasks: 2,
+                    starting_tasks: 0,
+                    stopping_tasks: 0,
+                    orphaned_tasks: 0,
                     slot_usage: 0.4,
                     zlm_alive: true,
                     ffmpeg_alive: true,
@@ -4147,6 +4356,9 @@ mod tests {
                     mem_percent: 52.0,
                     disk_percent: 63.0,
                     running_tasks: 3,
+                    starting_tasks: 0,
+                    stopping_tasks: 0,
+                    orphaned_tasks: 0,
                     slot_usage: 0.55,
                     zlm_alive: true,
                     ffmpeg_alive: false,
@@ -4171,6 +4383,189 @@ mod tests {
         assert_eq!(items[0]["node_id"], json!(node_id));
         assert_eq!(items[0]["running_tasks"], json!(3));
         assert_eq!(items[1]["running_tasks"], json!(2));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        let server_id = format!("zlm-{node_id}");
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let media_seen_at = Utc::now() - chrono::Duration::seconds(40);
+        repository
+            .record_media_server_seen(node_id, &server_id, media_seen_at)
+            .await?;
+        repository
+            .record_node_heartbeat(
+                node_id,
+                &HeartbeatSnapshot {
+                    node_time: Utc::now(),
+                    cpu_percent: 10.0,
+                    mem_percent: 20.0,
+                    disk_percent: 30.0,
+                    running_tasks: 1,
+                    starting_tasks: 0,
+                    stopping_tasks: 0,
+                    orphaned_tasks: 0,
+                    slot_usage: 0.2,
+                    zlm_alive: true,
+                    ffmpeg_alive: true,
+                    gpu_runtime: Vec::new(),
+                },
+            )
+            .await?;
+
+        let nodes = repository.list_nodes().await?;
+        let node = nodes
+            .into_iter()
+            .find(|candidate| candidate.id == node_id)
+            .expect("node should exist");
+        assert_eq!(node.media_last_seen_at, Some(media_seen_at));
+        assert!(!node.media_alive);
+        assert!(node.control_connected);
+        assert!(node.healthy);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_lookup_requires_binding_when_node_has_multiple_media_servers()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        let primary_server_id = format!("zlm-{node_id}");
+        let secondary_server_id = format!("zlm-secondary-{node_id}");
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        repository
+            .record_media_server_seen(node_id, &secondary_server_id, Utc::now())
+            .await?;
+
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "relay-camera-01",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'relay-camera-01', 'stream_ingest'::task_type, 'STARTING'::task_status, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5, null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("publish-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at, lease_token
+            ) values (
+              $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'STARTING'::attempt_status,
+              null, null, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+              null, null, null, null,
+              null, $4, null, $4, 'lease-1'
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        let without_binding = repository
+            .find_task_for_publish_stream(
+                &secondary_server_id,
+                "__defaultVhost__",
+                "live",
+                "camera01",
+            )
+            .await?;
+        assert!(without_binding.is_none());
+
+        sqlx::query(
+            r#"
+            insert into stream_bindings (
+              id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+              zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+            ) values (
+              $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+              null, null, null, $6
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(task_id)
+        .bind(attempt_id)
+        .bind(&secondary_server_id)
+        .bind(node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        let with_binding = repository
+            .find_task_for_publish_stream(
+                &secondary_server_id,
+                "__defaultVhost__",
+                "live",
+                "camera01",
+            )
+            .await?;
+        assert_eq!(with_binding.map(|target| target.task_id), Some(task_id));
+
+        let primary_lookup = repository
+            .find_task_for_publish_stream(
+                &primary_server_id,
+                "__defaultVhost__",
+                "live",
+                "camera01",
+            )
+            .await?;
+        assert!(primary_lookup.is_none());
 
         db.cleanup().await?;
         Ok(())
@@ -4334,6 +4729,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "succeeded".to_string(),
                     event_level: "info".to_string(),
                     message: "finished".to_string(),
@@ -4379,7 +4775,7 @@ mod tests {
 
         repository
             .record_zlm_record_file_hook(
-                &node_id.to_string(),
+                &format!("zlm-{node_id}"),
                 "on_record_mp4",
                 "record-hook-1",
                 json!({}),
@@ -4468,6 +4864,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "running".to_string(),
                     event_level: "info".to_string(),
                     message: "task is running".to_string(),
@@ -4573,7 +4970,7 @@ mod tests {
 
         repository
             .record_zlm_record_file_hook(
-                &node_id.to_string(),
+                &format!("zlm-{node_id}"),
                 "on_record_hls",
                 "hls-expose-hook-1",
                 json!({}),
@@ -4640,7 +5037,7 @@ mod tests {
 
         repository
             .record_zlm_record_file_hook(
-                &node_id.to_string(),
+                &format!("zlm-{node_id}"),
                 "on_record_ts",
                 "hls-record-hook-ts-1",
                 json!({}),
@@ -4664,7 +5061,7 @@ mod tests {
             .await?;
         repository
             .record_zlm_record_file_hook(
-                &node_id.to_string(),
+                &format!("zlm-{node_id}"),
                 "on_record_hls",
                 "hls-record-hook-m3u8-1",
                 json!({}),
@@ -4729,7 +5126,7 @@ mod tests {
 
         repository
             .record_zlm_record_file_hook(
-                &node_id.to_string(),
+                &format!("zlm-{node_id}"),
                 "on_record_mp4",
                 "record-event-paths",
                 json!({}),
@@ -4831,6 +5228,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "running".to_string(),
                     event_level: "info".to_string(),
                     message: "task is running".to_string(),
@@ -4848,6 +5246,7 @@ mod tests {
                 repository::TaskProgressRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     frame: 10,
                     fps: 25.0,
                     bitrate_kbps: 3200.0,
@@ -4924,6 +5323,7 @@ mod tests {
                     runtime_id: Uuid::now_v7(),
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     worker_kind: "ffmpeg".to_string(),
                     pid: Some(1234),
                     state: "RUNNING".to_string(),
@@ -4947,6 +5347,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "succeeded".to_string(),
                     event_level: "info".to_string(),
                     message: "finished".to_string(),
@@ -4991,6 +5392,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphaned_event_with_stop_intent_reconciles_to_canceled() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let stop_requested_at = Utc::now() - chrono::Duration::seconds(10);
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "relay-camera-01",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'relay-camera-01', 'stream_ingest'::task_type, 'LOST'::task_status, $2,
+              50, $3, $3, 'tester', null,
+              1, 'immediate', $4, $4, $4, $4
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("orphaned-stop-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(stop_requested_at)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at,
+              lease_token, stop_requested_at, stop_reason, desired_terminal_status
+            ) values (
+              $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'STOPPING'::attempt_status,
+              null, null, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+              null, null, 'node_disconnected', 'control-plane session closed before task completed',
+              null, $4, null, $4,
+              'lease-1', $5, 'user_requested', 'CANCELED'::task_status
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(stop_requested_at)
+        .bind(stop_requested_at)
+        .execute(&db.pool)
+        .await?;
+
+        repository
+            .record_agent_task_event(
+                node_id,
+                repository::AgentTaskEventRecord {
+                    task_id,
+                    attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
+                    event_type: "orphaned".to_string(),
+                    event_level: "warn".to_string(),
+                    message: "runtime missing".to_string(),
+                    payload: json!({"reason": "runtime_not_found"}),
+                },
+            )
+            .await?;
+
+        let summary = repository.get_task_summary(task_id).await?;
+        assert_eq!(summary.status, media_domain::TaskStatus::Stopping);
+
+        let candidates = repository.list_stopping_reconcile_tasks().await?;
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].attempt_status,
+            media_domain::AttemptStatus::Orphaned
+        );
+        assert!(repository.complete_stopping_task(&candidates[0]).await?);
+
+        let completed = repository.get_task_summary(task_id).await?;
+        assert_eq!(completed.status, media_domain::TaskStatus::Canceled);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn callback_payload_includes_file_artifact_http_url_for_bridge_output()
     -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
@@ -5028,6 +5535,7 @@ mod tests {
                     runtime_id: Uuid::now_v7(),
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     worker_kind: "ffmpeg".to_string(),
                     pid: Some(2234),
                     state: "RUNNING".to_string(),
@@ -5049,6 +5557,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "succeeded".to_string(),
                     event_level: "info".to_string(),
                     message: "finished".to_string(),
@@ -5138,6 +5647,7 @@ mod tests {
                     runtime_id: Uuid::now_v7(),
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     worker_kind: "ffmpeg".to_string(),
                     pid: Some(3234),
                     state: "RUNNING".to_string(),
@@ -5164,6 +5674,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "succeeded".to_string(),
                     event_level: "info".to_string(),
                     message: "finished".to_string(),
@@ -5243,6 +5754,7 @@ mod tests {
                 repository::AgentTaskEventRecord {
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     event_type: "succeeded".to_string(),
                     event_level: "info".to_string(),
                     message: "finished".to_string(),
@@ -5275,6 +5787,7 @@ mod tests {
                     runtime_id: Uuid::now_v7(),
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     worker_kind: "ffmpeg".to_string(),
                     pid: Some(2234),
                     state: "EXITED".to_string(),
@@ -5345,6 +5858,7 @@ mod tests {
                     runtime_id: Uuid::now_v7(),
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     worker_kind: "ffmpeg".to_string(),
                     pid: Some(2234),
                     state: "RUNNING".to_string(),
@@ -5429,6 +5943,7 @@ mod tests {
                     runtime_id: Uuid::now_v7(),
                     task_id,
                     attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
                     worker_kind: "ffmpeg".to_string(),
                     pid: Some(3234),
                     state: "RUNNING".to_string(),
@@ -5556,10 +6071,10 @@ mod tests {
             "#,
         )
         .bind(Uuid::now_v7())
-        .bind(node_id.to_string())
+        .bind(format!("zlm-{node_id}"))
         .bind(Utc::now())
         .bind(Uuid::now_v7())
-        .bind(other_node_id.to_string())
+        .bind(format!("zlm-{other_node_id}"))
         .execute(&db.pool)
         .await?;
 
@@ -5576,7 +6091,7 @@ mod tests {
         let body = json_body(response).await;
         let items = body.as_array().expect("hooks should be a list");
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["server_id"], json!(node_id.to_string()));
+        assert_eq!(items[0]["server_id"], json!(format!("zlm-{node_id}")));
         assert_eq!(items[0]["hook_name"], json!("on_publish"));
         assert_eq!(
             items[0]["payload"]["file_path"],

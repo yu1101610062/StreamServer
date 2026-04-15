@@ -769,6 +769,48 @@ impl TaskRepository {
         self.fetch_task_summary(task_id).await
     }
 
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<TaskSummary, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              status::text as status,
+              priority,
+              created_by,
+              assigned_node_id,
+              current_attempt_no,
+              created_at,
+              updated_at,
+              started_at,
+              finished_at,
+              resolved_spec
+            from tasks
+            where id = $1
+            for update
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepoError::TaskNotFound(task_id))?;
+        let task = TaskSummary::from_row(&row)?;
+
+        if !task_status_allows_delete(task.status) {
+            return Err(RepoError::TaskDeleteForbidden(task.status));
+        }
+
+        sqlx::query("delete from tasks where id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(task)
+    }
+
     pub async fn get_resolved_spec(&self, task_id: Uuid) -> Result<Value, RepoError> {
         let resolved =
             sqlx::query_scalar::<_, Option<Value>>("select resolved_spec from tasks where id = $1")
@@ -1158,7 +1200,10 @@ impl TaskRepository {
               n.network_mode,
               n.interfaces,
               n.healthy,
+              n.control_connected,
               n.last_seen_at,
+              n.control_last_seen_at,
+              n.media_last_seen_at,
               n.created_at,
               n.updated_at,
               c.ffmpeg_protocols,
@@ -1196,6 +1241,9 @@ impl TaskRepository {
               mem_percent,
               disk_percent,
               running_tasks,
+              starting_tasks,
+              stopping_tasks,
+              orphaned_tasks,
               slot_usage,
               zlm_alive,
               ffmpeg_alive,
@@ -1712,7 +1760,32 @@ impl TaskRepository {
         task_id: Uuid,
         operation: TaskOperation,
     ) -> Result<TaskSummary, RepoError> {
-        let current = self.fetch_task_summary(task_id).await?;
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              status::text as status,
+              priority,
+              created_by,
+              assigned_node_id,
+              current_attempt_no,
+              created_at,
+              updated_at,
+              started_at,
+              finished_at
+            from tasks
+            where id = $1
+            for update
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = row.ok_or(RepoError::TaskNotFound(task_id))?;
+        let current = TaskSummary::from_row(&row)?;
         let next_status = current.status.apply_operation(operation)?;
         let updated_at = Utc::now();
         let finished_at = match next_status {
@@ -1720,7 +1793,6 @@ impl TaskRepository {
             _ => None,
         };
 
-        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             update tasks
@@ -1728,12 +1800,14 @@ impl TaskRepository {
                    updated_at = $2,
                    finished_at = $3
              where id = $4
+               and status = $5::task_status
             "#,
         )
         .bind(next_status.as_str())
         .bind(updated_at)
         .bind(finished_at)
         .bind(task_id)
+        .bind(current.status.as_str())
         .execute(&mut *tx)
         .await?;
 
@@ -1876,10 +1950,10 @@ impl TaskRepository {
         let rows = sqlx::query(
             r#"
             select id, status::text as status, current_attempt_no, resolved_spec
-              from tasks
+             from tasks
              where assigned_node_id = $1
                and current_attempt_no > 0
-               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
+               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING')
              order by updated_at asc
             "#,
         )
@@ -1955,11 +2029,16 @@ impl TaskRepository {
                     .await?;
                     tx.commit().await?;
                 }
-                TaskStatus::Starting | TaskStatus::Running | TaskStatus::Recovering => {
+                TaskStatus::Starting
+                | TaskStatus::Running
+                | TaskStatus::Stopping
+                | TaskStatus::Recovering => {
                     let should_retry = resolved_spec
                         .as_ref()
                         .and_then(|value| serde_json::from_value::<TaskSpec>(value.clone()).ok())
-                        .is_some_and(|spec| retry_enabled_on_disconnect(&spec));
+                        .is_some_and(|spec| {
+                            status != TaskStatus::Stopping && retry_enabled_on_disconnect(&spec)
+                        });
                     let mut tx = self.pool.begin().await?;
                     let now = Utc::now();
                     self.mark_task_lost(
@@ -2250,7 +2329,7 @@ impl TaskRepository {
         };
 
         if current.current_attempt_no > 0 {
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 update task_attempts
                    set status = 'FAILED'::attempt_status,
@@ -2270,6 +2349,13 @@ impl TaskRepository {
             .bind(attempt_no)
             .execute(&mut *tx)
             .await?;
+            if result.rows_affected() != 1 {
+                return Err(RepoError::TaskAttemptInvariant {
+                    task_id,
+                    attempt_no,
+                    detail: "queued task is missing current pending attempt".to_string(),
+                });
+            }
         } else {
             sqlx::query(
                 r#"
@@ -2393,65 +2479,36 @@ impl TaskRepository {
         let resolved_spec = row
             .try_get::<Option<Value>, _>("resolved_spec")?
             .ok_or(RepoError::TaskMissingResolvedSpec(task_id))?;
-        let attempt_no = if current.current_attempt_no > 0 {
-            current.current_attempt_no
-        } else {
-            1
-        };
+        let attempt_no = current.current_attempt_no.max(0) + 1;
         let worker_kind = current.task_type.default_worker_kind();
         let now = Utc::now();
         let lease_token = Uuid::now_v7().to_string();
         let attempt_id = Uuid::now_v7();
 
-        let updated = sqlx::query(
+        sqlx::query(
             r#"
-            update task_attempts
-               set node_id = $1,
-                   worker_kind = $2::worker_kind,
-                   status = 'PENDING'::attempt_status,
-                   pid = null,
-                   exit_code = null,
-                   failure_code = null,
-                   failure_reason = null,
-                   checkpoint_json = null,
-                   started_at = null,
-                   ended_at = null
-             where task_id = $3
-               and attempt_no = $4
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status, lease_token,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, $3, $4, $5::worker_kind, 'PENDING'::attempt_status, $6,
+              null, null, null, null, null, null,
+              null, null, null, null,
+              null, null, null, $7
+            )
             "#,
         )
-        .bind(node_id)
-        .bind(worker_kind.as_str())
+        .bind(attempt_id)
         .bind(task_id)
         .bind(attempt_no)
+        .bind(node_id)
+        .bind(worker_kind.as_str())
+        .bind(&lease_token)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
-
-        if updated.rows_affected() == 0 {
-            sqlx::query(
-                r#"
-                insert into task_attempts (
-                  id, task_id, attempt_no, node_id, worker_kind, status,
-                  pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
-                  rtp_port, exit_code, failure_code, failure_reason,
-                  checkpoint_json, started_at, ended_at, created_at
-                ) values (
-                  $1, $2, $3, $4, $5::worker_kind, 'PENDING'::attempt_status,
-                  null, null, null, null, null, null,
-                  null, null, null, null,
-                  null, null, null, $6
-                )
-                "#,
-            )
-            .bind(attempt_id)
-            .bind(task_id)
-            .bind(attempt_no)
-            .bind(node_id)
-            .bind(worker_kind.as_str())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
 
         sqlx::query(
             r#"
@@ -2596,22 +2653,296 @@ impl TaskRepository {
         grace_period_sec: u32,
         force_after_sec: u32,
     ) -> Result<Option<StopCommand>, RepoError> {
-        let task = self.fetch_task_summary(task_id).await?;
-        let Some(node_id) = task.assigned_node_id else {
+        let reason = reason.into();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select assigned_node_id, current_attempt_no
+              from tasks
+             where id = $1
+             for update
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepoError::TaskNotFound(task_id))?;
+
+        let node_id: Option<Uuid> = row.try_get("assigned_node_id")?;
+        let attempt_no: i32 = row.try_get("current_attempt_no")?;
+        let Some(node_id) = node_id else {
             return Ok(None);
         };
-        if task.current_attempt_no <= 0 {
+        if attempt_no <= 0 {
             return Ok(None);
         }
 
+        let lease_token = sqlx::query_scalar::<_, Option<String>>(
+            r#"
+            select nullif(lease_token, '')
+              from task_attempts
+             where task_id = $1
+               and attempt_no = $2
+             for update
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_optional(&mut *tx)
+        .await?
+        .flatten()
+        .ok_or_else(|| validation_error("lease_token", "current attempt is missing lease_token"))?;
+
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            update task_attempts
+               set stop_requested_at = coalesce(stop_requested_at, $1),
+                   stop_reason = $2,
+                   desired_terminal_status = coalesce(desired_terminal_status, 'CANCELED'::task_status),
+                   status = 'STOPPING'::attempt_status
+             where task_id = $3
+               and attempt_no = $4
+            "#,
+        )
+        .bind(now)
+        .bind(&reason)
+        .bind(task_id)
+        .bind(attempt_no)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            r#"
+            update tasks
+               set status = 'STOPPING'::task_status,
+                   updated_at = $1
+             where id = $2
+               and current_attempt_no = $3
+            "#,
+        )
+        .bind(now)
+        .bind(task_id)
+        .bind(attempt_no)
+        .execute(&mut *tx)
+        .await?;
+
+        self.insert_event(
+            &mut tx,
+            task_id,
+            None,
+            Some(attempt_no),
+            EventSource::Core,
+            "task_stop_intent_persisted",
+            "info",
+            json!({
+                "attempt_no": attempt_no,
+                "node_id": node_id,
+                "reason": reason,
+                "grace_period_sec": grace_period_sec,
+                "force_after_sec": force_after_sec,
+            }),
+        )
+        .await?;
+
+        tx.commit().await?;
+
         Ok(Some(StopCommand {
             task_id,
-            attempt_no: task.current_attempt_no,
+            attempt_no,
             node_id,
-            reason: reason.into(),
+            lease_token,
+            reason,
             grace_period_sec,
             force_after_sec,
         }))
+    }
+
+    pub async fn list_reclaim_runtimes(
+        &self,
+        node_id: Uuid,
+    ) -> Result<Vec<ReclaimRuntimeCommand>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              t.id as task_id,
+              ta.attempt_no,
+              nullif(ta.lease_token, '') as lease_token,
+              ta.worker_kind::text as worker_kind
+            from tasks t
+            join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = t.current_attempt_no
+            where ta.node_id = $1
+              and t.status in (
+                'STARTING'::task_status,
+                'RUNNING'::task_status,
+                'STOPPING'::task_status,
+                'RECOVERING'::task_status,
+                'LOST'::task_status
+              )
+              and coalesce(ta.lease_token, '') <> ''
+            order by t.updated_at asc, t.id asc
+            "#,
+        )
+        .bind(node_id)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ReclaimRuntimeCommand {
+                task_id: row.try_get("task_id")?,
+                attempt_no: row.try_get("attempt_no")?,
+                lease_token: row.try_get::<String, _>("lease_token")?,
+                worker_kind: WorkerKind::from_str(&row.try_get::<String, _>("worker_kind")?)?,
+            })
+        })
+        .collect()
+    }
+
+    pub async fn attempt_has_stop_intent(
+        &self,
+        task_id: Uuid,
+        attempt_no: i32,
+    ) -> Result<bool, RepoError> {
+        sqlx::query_scalar(
+            r#"
+            select exists (
+              select 1
+                from task_attempts
+               where task_id = $1
+                 and attempt_no = $2
+                 and stop_requested_at is not null
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    pub async fn list_stopping_reconcile_tasks(
+        &self,
+    ) -> Result<Vec<StoppingTaskReconcile>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              t.id as task_id,
+              t.current_attempt_no as attempt_no,
+              ta.node_id,
+              ta.status::text as attempt_status,
+              ta.stop_requested_at,
+              coalesce(ta.desired_terminal_status::text, 'CANCELED') as desired_terminal_status
+            from tasks t
+            join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = t.current_attempt_no
+            where t.status = 'STOPPING'::task_status
+              and ta.stop_requested_at is not null
+              and ta.node_id is not null
+            order by ta.stop_requested_at asc, t.updated_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(StoppingTaskReconcile {
+                task_id: row.try_get("task_id")?,
+                attempt_no: row.try_get("attempt_no")?,
+                node_id: row.try_get("node_id")?,
+                attempt_status: AttemptStatus::from_str(
+                    &row.try_get::<String, _>("attempt_status")?,
+                )?,
+                stop_requested_at: row.try_get("stop_requested_at")?,
+                desired_terminal_status: TaskStatus::from_str(
+                    &row.try_get::<String, _>("desired_terminal_status")?,
+                )?,
+            })
+        })
+        .collect()
+    }
+
+    pub async fn complete_stopping_task(
+        &self,
+        candidate: &StoppingTaskReconcile,
+    ) -> Result<bool, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select status::text as task_status, current_attempt_no
+              from tasks
+             where id = $1
+             for update
+            "#,
+        )
+        .bind(candidate.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let task_status = TaskStatus::from_str(&row.try_get::<String, _>("task_status")?)?;
+        let current_attempt_no: i32 = row.try_get("current_attempt_no")?;
+        if current_attempt_no != candidate.attempt_no || task_status != TaskStatus::Stopping {
+            return Ok(false);
+        }
+
+        self.complete_task_attempt(
+            &mut tx,
+            candidate.task_id,
+            candidate.attempt_no,
+            candidate.node_id,
+            candidate.desired_terminal_status,
+            AttemptStatus::Failed,
+            Some("stop_reconcile_completed"),
+            Some("runtime missing after stop request"),
+            Utc::now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn mark_stopping_timeout(
+        &self,
+        candidate: &StoppingTaskReconcile,
+    ) -> Result<bool, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select status::text as task_status, current_attempt_no
+              from tasks
+             where id = $1
+             for update
+            "#,
+        )
+        .bind(candidate.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let task_status = TaskStatus::from_str(&row.try_get::<String, _>("task_status")?)?;
+        let current_attempt_no: i32 = row.try_get("current_attempt_no")?;
+        if current_attempt_no != candidate.attempt_no || task_status != TaskStatus::Stopping {
+            return Ok(false);
+        }
+
+        self.mark_task_lost(
+            &mut tx,
+            candidate.task_id,
+            candidate.attempt_no,
+            candidate.node_id,
+            "stop_timeout",
+            "stop request did not converge before deadline",
+            Utc::now(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn upsert_node_registration(
@@ -2619,14 +2950,16 @@ impl TaskRepository {
         registration: &AgentRegistration,
         seen_at: DateTime<Utc>,
     ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             insert into media_nodes (
               id, node_name, hostname, labels, zlm_api_base, zlm_api_secret, agent_stream_addr,
-              network_mode, interfaces, healthy, last_seen_at, created_at, updated_at
+              network_mode, interfaces, healthy, control_connected, last_seen_at,
+              control_last_seen_at, created_at, updated_at
             ) values (
               $1, $2, $3, $4, $5, $6, $7,
-              $8, $9, true, $10, $11, $11
+              $8, $9, true, true, $10, $10, $11, $11
             )
             on conflict (id) do update
                set node_name = excluded.node_name,
@@ -2638,7 +2971,9 @@ impl TaskRepository {
                    network_mode = excluded.network_mode,
                    interfaces = excluded.interfaces,
                    healthy = true,
+                   control_connected = true,
                    last_seen_at = excluded.last_seen_at,
+                   control_last_seen_at = excluded.control_last_seen_at,
                    updated_at = excluded.updated_at
             "#,
         )
@@ -2653,8 +2988,30 @@ impl TaskRepository {
         .bind(serde_json::to_value(&registration.interfaces)?)
         .bind(seen_at)
         .bind(Utc::now())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        let zlm_server_id = registration.zlm_server_id.trim();
+        if !zlm_server_id.is_empty() {
+            sqlx::query(
+                r#"
+                insert into media_servers (server_id, node_id, last_seen_at, created_at, updated_at)
+                values ($1, $2, $3, $4, $4)
+                on conflict (server_id) do update
+                   set node_id = excluded.node_id,
+                       last_seen_at = excluded.last_seen_at,
+                       updated_at = excluded.updated_at
+                "#,
+            )
+            .bind(zlm_server_id)
+            .bind(registration.node_id)
+            .bind(seen_at)
+            .bind(Utc::now())
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
 
         Ok(())
     }
@@ -2668,7 +3025,7 @@ impl TaskRepository {
         let result = sqlx::query(
             r#"
             update media_nodes
-               set healthy = true,
+               set healthy = control_connected,
                    last_seen_at = $1,
                    updated_at = $2
              where id = $3
@@ -2688,10 +3045,12 @@ impl TaskRepository {
             r#"
             insert into node_heartbeats (
               id, node_id, cpu_percent, mem_percent, disk_percent, running_tasks,
+              starting_tasks, stopping_tasks, orphaned_tasks,
               slot_usage, zlm_alive, ffmpeg_alive, gpu_runtime, node_time, received_at
             ) values (
               $1, $2, $3, $4, $5, $6,
-              $7, $8, $9, $10, $11, $12
+              $7, $8, $9,
+              $10, $11, $12, $13, $14, $15
             )
             "#,
         )
@@ -2701,6 +3060,9 @@ impl TaskRepository {
         .bind(heartbeat.mem_percent)
         .bind(heartbeat.disk_percent)
         .bind(i32::try_from(heartbeat.running_tasks).unwrap_or(i32::MAX))
+        .bind(i32::try_from(heartbeat.starting_tasks).unwrap_or(i32::MAX))
+        .bind(i32::try_from(heartbeat.stopping_tasks).unwrap_or(i32::MAX))
+        .bind(i32::try_from(heartbeat.orphaned_tasks).unwrap_or(i32::MAX))
         .bind(heartbeat.slot_usage)
         .bind(heartbeat.zlm_alive)
         .bind(heartbeat.ffmpeg_alive)
@@ -2725,7 +3087,9 @@ impl TaskRepository {
             r#"
             update media_nodes
                set healthy = $1,
+                   control_connected = $1,
                    last_seen_at = coalesce($2, last_seen_at),
+                   control_last_seen_at = case when $1 then coalesce($2, control_last_seen_at) else control_last_seen_at end,
                    updated_at = $3
              where id = $4
             "#,
@@ -2741,6 +3105,53 @@ impl TaskRepository {
             return Err(RepoError::NodeNotFound(node_id));
         }
 
+        Ok(())
+    }
+
+    pub async fn record_media_server_seen(
+        &self,
+        node_id: Uuid,
+        server_id: &str,
+        seen_at: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            r#"
+            insert into media_servers (server_id, node_id, last_seen_at, created_at, updated_at)
+            values ($1, $2, $3, $4, $4)
+            on conflict (server_id) do update
+               set node_id = excluded.node_id,
+                   last_seen_at = excluded.last_seen_at,
+                   updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(server_id.trim())
+        .bind(node_id)
+        .bind(seen_at)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await?;
+
+        let result = sqlx::query(
+            r#"
+            update media_nodes
+               set healthy = control_connected,
+                   last_seen_at = $1,
+                   media_last_seen_at = $1,
+                   updated_at = $2
+             where id = $3
+            "#,
+        )
+        .bind(seen_at)
+        .bind(Utc::now())
+        .bind(node_id)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(RepoError::NodeNotFound(node_id));
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2797,17 +3208,38 @@ impl TaskRepository {
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        let ownership_mode = if matches!(event.event_type.as_str(), "adopted" | "orphaned") {
+            OwnershipMode::AuthorizedAttempt
+        } else {
+            OwnershipMode::CurrentOwner
+        };
+        let Some(ownership) = self
+            .validate_attempt_ownership(
+                &mut tx,
+                event.task_id,
+                event.attempt_no,
+                node_id,
+                &event.lease_token,
+                "task_event",
+                ownership_mode,
+            )
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(());
+        };
 
         self.insert_event(
             &mut tx,
             event.task_id,
-            None,
+            ownership.attempt_id,
             Some(event.attempt_no),
             EventSource::Agent,
             &event.event_type,
             &normalize_event_level(&event.event_level),
             json!({
                 "node_id": node_id,
+                "lease_token": event.lease_token,
                 "message": event.message,
                 "payload": event.payload,
             }),
@@ -2881,6 +3313,75 @@ impl TaskRepository {
                 .execute(&mut *tx)
                 .await?;
             }
+            "adopted" => {
+                sqlx::query(
+                    r#"
+                    update tasks
+                       set status = 'RECOVERING'::task_status,
+                           assigned_node_id = $1,
+                           updated_at = $2
+                     where id = $3
+                       and current_attempt_no = $4
+                    "#,
+                )
+                .bind(node_id)
+                .bind(now)
+                .bind(event.task_id)
+                .bind(event.attempt_no)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    r#"
+                    update task_attempts
+                       set status = 'ADOPTED'::attempt_status,
+                           node_id = $1,
+                           started_at = coalesce(started_at, $2)
+                     where task_id = $3
+                       and attempt_no = $4
+                    "#,
+                )
+                .bind(node_id)
+                .bind(now)
+                .bind(event.task_id)
+                .bind(event.attempt_no)
+                .execute(&mut *tx)
+                .await?;
+            }
+            "orphaned" => {
+                if ownership.stop_requested_at.is_some() {
+                    sqlx::query(
+                        r#"
+                        update tasks
+                           set status = 'STOPPING'::task_status,
+                               assigned_node_id = null,
+                               updated_at = $1
+                         where id = $2
+                           and current_attempt_no = $3
+                           and status in ('STOPPING'::task_status, 'LOST'::task_status)
+                        "#,
+                    )
+                    .bind(now)
+                    .bind(event.task_id)
+                    .bind(event.attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                sqlx::query(
+                    r#"
+                    update task_attempts
+                       set status = 'ORPHANED'::attempt_status,
+                           node_id = $1
+                     where task_id = $2
+                       and attempt_no = $3
+                    "#,
+                )
+                .bind(node_id)
+                .bind(event.task_id)
+                .bind(event.attempt_no)
+                .execute(&mut *tx)
+                .await?;
+            }
             "running" => {
                 self.promote_task_running(&mut tx, event.task_id, event.attempt_no, node_id, now)
                     .await?;
@@ -2912,42 +3413,75 @@ impl TaskRepository {
                 .execute(&mut *tx)
                 .await?;
             }
-            "rejected" => {
+            "rejected" | "start_rejected" => {
+                if ownership.task_status == TaskStatus::Stopping {
+                    self.complete_task_attempt(
+                        &mut tx,
+                        event.task_id,
+                        event.attempt_no,
+                        node_id,
+                        TaskStatus::Canceled,
+                        AttemptStatus::Failed,
+                        Some("start_rejected_after_stop"),
+                        Some(event.message.as_str()),
+                        now,
+                    )
+                    .await?;
+                } else {
+                    sqlx::query(
+                        r#"
+                        update tasks
+                           set status = 'QUEUED'::task_status,
+                               assigned_node_id = null,
+                               updated_at = $1
+                         where id = $2
+                           and current_attempt_no = $3
+                        "#,
+                    )
+                    .bind(now)
+                    .bind(event.task_id)
+                    .bind(event.attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    sqlx::query(
+                        r#"
+                        update task_attempts
+                           set status = 'FAILED'::attempt_status,
+                               node_id = $1,
+                               failure_code = 'agent_start_rejected',
+                               failure_reason = $2,
+                               ended_at = $3
+                         where task_id = $4
+                           and attempt_no = $5
+                        "#,
+                    )
+                    .bind(node_id)
+                    .bind(&event.message)
+                    .bind(now)
+                    .bind(event.task_id)
+                    .bind(event.attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
+
+                    self.delete_task_lease(&mut tx, event.task_id).await?;
+                }
+            }
+            "stop_rejected" => {
                 sqlx::query(
                     r#"
                     update tasks
-                       set status = 'QUEUED'::task_status,
-                           assigned_node_id = null,
+                       set status = 'STOPPING'::task_status,
                            updated_at = $1
                      where id = $2
+                       and current_attempt_no = $3
                     "#,
                 )
-                .bind(now)
-                .bind(event.task_id)
-                .execute(&mut *tx)
-                .await?;
-
-                sqlx::query(
-                    r#"
-                    update task_attempts
-                       set status = 'FAILED'::attempt_status,
-                           node_id = $1,
-                           failure_code = 'agent_rejected',
-                           failure_reason = $2,
-                           ended_at = $3
-                     where task_id = $4
-                       and attempt_no = $5
-                    "#,
-                )
-                .bind(node_id)
-                .bind(&event.message)
                 .bind(now)
                 .bind(event.task_id)
                 .bind(event.attempt_no)
                 .execute(&mut *tx)
                 .await?;
-
-                self.delete_task_lease(&mut tx, event.task_id).await?;
             }
             "succeeded" => {
                 self.complete_task_attempt(
@@ -3004,16 +3538,32 @@ impl TaskRepository {
         batch: TaskLogBatchRecord,
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
+        let Some(ownership) = self
+            .validate_attempt_ownership(
+                &mut tx,
+                batch.task_id,
+                batch.attempt_no,
+                node_id,
+                &batch.lease_token,
+                "task_log_batch",
+                OwnershipMode::CurrentOwner,
+            )
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(());
+        };
         self.insert_event(
             &mut tx,
             batch.task_id,
-            None,
+            ownership.attempt_id,
             Some(batch.attempt_no),
             EventSource::Agent,
             "task_log_batch",
             "info",
             json!({
                 "node_id": node_id,
+                "lease_token": batch.lease_token,
                 "stream": batch.stream,
                 "lines": batch.lines,
             }),
@@ -3030,8 +3580,24 @@ impl TaskRepository {
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        let Some(ownership) = self
+            .validate_attempt_ownership(
+                &mut tx,
+                progress.task_id,
+                progress.attempt_no,
+                node_id,
+                &progress.lease_token,
+                "task_progress",
+                OwnershipMode::CurrentOwner,
+            )
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(());
+        };
         let payload = json!({
             "node_id": node_id,
+            "lease_token": progress.lease_token,
             "frame": progress.frame,
             "fps": progress.fps,
             "bitrate_kbps": progress.bitrate_kbps,
@@ -3044,7 +3610,7 @@ impl TaskRepository {
         self.insert_event(
             &mut tx,
             progress.task_id,
-            None,
+            ownership.attempt_id,
             Some(progress.attempt_no),
             EventSource::Agent,
             "task_progress",
@@ -3080,16 +3646,33 @@ impl TaskRepository {
         snapshot: TaskSnapshotRecord,
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+        let Some(ownership) = self
+            .validate_attempt_ownership(
+                &mut tx,
+                snapshot.task_id,
+                snapshot.attempt_no,
+                node_id,
+                &snapshot.lease_token,
+                "task_snapshot",
+                OwnershipMode::AuthorizedAttempt,
+            )
+            .await?
+        else {
+            tx.commit().await?;
+            return Ok(());
+        };
         self.insert_event(
             &mut tx,
             snapshot.task_id,
-            None,
+            ownership.attempt_id,
             Some(snapshot.attempt_no),
             EventSource::Agent,
             "task_snapshot",
             "info",
             json!({
                 "node_id": node_id,
+                "lease_token": snapshot.lease_token,
                 "runtime_id": snapshot.runtime_id,
                 "worker_kind": snapshot.worker_kind,
                 "pid": snapshot.pid,
@@ -3117,10 +3700,23 @@ impl TaskRepository {
         .execute(&mut *tx)
         .await?;
 
-        self.upsert_stream_binding_from_snapshot(&mut tx, &snapshot)
+        self.upsert_stream_binding_from_snapshot(&mut tx, node_id, &snapshot)
             .await?;
         self.upsert_file_artifacts_from_snapshot(&mut tx, node_id, &snapshot)
             .await?;
+
+        if snapshot.state.eq_ignore_ascii_case("exited") {
+            self.reconcile_exited_snapshot(
+                &mut tx,
+                &ownership,
+                snapshot.task_id,
+                snapshot.attempt_no,
+                node_id,
+                &snapshot.metadata,
+                now,
+            )
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -3129,6 +3725,7 @@ impl TaskRepository {
     async fn upsert_stream_binding_from_snapshot(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
+        node_id: Uuid,
         snapshot: &TaskSnapshotRecord,
     ) -> Result<(), RepoError> {
         let Some(binding) = snapshot
@@ -3167,16 +3764,43 @@ impl TaskRepository {
             .get("rtp_stream_id")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let server_id = snapshot
+            .metadata
+            .get("zlm_server_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(server_id) = server_id else {
+            self.insert_event(
+                tx,
+                snapshot.task_id,
+                Some(attempt_id),
+                Some(snapshot.attempt_no),
+                EventSource::Core,
+                "stream_binding_snapshot_missing_server_id",
+                "warn",
+                json!({
+                    "node_id": node_id,
+                    "attempt_no": snapshot.attempt_no,
+                    "runtime_id": snapshot.runtime_id,
+                }),
+            )
+            .await?;
+            return Ok(());
+        };
 
         sqlx::query(
             r#"
             insert into stream_bindings (
-              id, task_id, attempt_id, schema, vhost, app, stream, zlm_proxy_key, zlm_pusher_key, rtp_stream_id
+              id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+              zlm_proxy_key, zlm_pusher_key, rtp_stream_id
             )
-            values ($1, $2, $3, $4, $5, $6, $7, $8, null, $9)
-            on conflict (schema, vhost, app, stream) do update
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, null, $11)
+            on conflict (server_id, schema, vhost, app, stream) do update
               set task_id = excluded.task_id,
                   attempt_id = excluded.attempt_id,
+                  node_id = excluded.node_id,
                   zlm_proxy_key = excluded.zlm_proxy_key,
                   rtp_stream_id = coalesce(excluded.rtp_stream_id, stream_bindings.rtp_stream_id)
             "#,
@@ -3184,6 +3808,8 @@ impl TaskRepository {
         .bind(Uuid::now_v7())
         .bind(snapshot.task_id)
         .bind(attempt_id)
+        .bind(server_id)
+        .bind(node_id)
         .bind(schema)
         .bind(binding.vhost)
         .bind(binding.app)
@@ -3352,15 +3978,12 @@ impl TaskRepository {
         &self,
         server_id: &str,
     ) -> Result<Option<Uuid>, RepoError> {
-        let Ok(parsed_uuid) = Uuid::parse_str(server_id.trim()) else {
-            return Ok(None);
-        };
-        let row = sqlx::query("select id from media_nodes where id = $1")
-            .bind(parsed_uuid)
+        let row = sqlx::query("select node_id from media_servers where server_id = $1")
+            .bind(server_id.trim())
             .fetch_optional(&self.pool)
             .await?;
 
-        row.map(|row| row.try_get("id"))
+        row.map(|row| row.try_get("node_id"))
             .transpose()
             .map_err(RepoError::Sqlx)
     }
@@ -3401,7 +4024,13 @@ impl TaskRepository {
         }
 
         if let Some(binding) = self
-            .find_stream_binding_for_hook(&mut tx, &record.vhost, &record.app, &record.stream)
+            .find_stream_binding_for_hook(
+                &mut tx,
+                server_id,
+                &record.vhost,
+                &record.app,
+                &record.stream,
+            )
             .await?
         {
             if should_persist_record_file_hook(hook_name, &binding, &record)? {
@@ -3504,7 +4133,13 @@ impl TaskRepository {
         }
 
         if let Some(binding) = self
-            .find_stream_binding_for_hook(&mut tx, &record.vhost, &record.app, &record.stream)
+            .find_stream_binding_for_hook(
+                &mut tx,
+                server_id,
+                &record.vhost,
+                &record.app,
+                &record.stream,
+            )
             .await?
         {
             self.insert_event(
@@ -3571,18 +4206,22 @@ impl TaskRepository {
             sqlx::query(
                 r#"
                 insert into stream_bindings (
-                  id, task_id, attempt_id, schema, vhost, app, stream, zlm_proxy_key, zlm_pusher_key, rtp_stream_id
+                  id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+                  zlm_proxy_key, zlm_pusher_key, rtp_stream_id
                 )
-                values ($1, $2, $3, $4, $5, $6, $7, null, null, $8)
-                on conflict (schema, vhost, app, stream) do update
+                values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, null, $10)
+                on conflict (server_id, schema, vhost, app, stream) do update
                   set task_id = excluded.task_id,
                       attempt_id = excluded.attempt_id,
+                      node_id = excluded.node_id,
                       rtp_stream_id = coalesce(excluded.rtp_stream_id, stream_bindings.rtp_stream_id)
                 "#,
             )
             .bind(Uuid::now_v7())
             .bind(record.task_id)
             .bind(attempt_id)
+            .bind(server_id)
+            .bind(node_id)
             .bind(&record.schema)
             .bind(&record.vhost)
             .bind(&record.app)
@@ -3664,6 +4303,59 @@ impl TaskRepository {
 
     pub async fn find_task_for_publish_stream(
         &self,
+        server_id: &str,
+        vhost: &str,
+        app: &str,
+        stream: &str,
+    ) -> Result<Option<PublishTaskTarget>, RepoError> {
+        if let Some(row) = sqlx::query(
+            r#"
+            select
+              sb.task_id,
+              ta.id as attempt_id,
+              ta.attempt_no,
+              t.resolved_spec
+            from stream_bindings sb
+            join task_attempts ta
+              on ta.id = sb.attempt_id
+            join tasks t
+              on t.id = sb.task_id
+            where sb.server_id = $1
+              and sb.vhost = $2
+              and sb.app = $3
+              and sb.stream = $4
+              and ta.attempt_no = t.current_attempt_no
+            order by sb.created_at desc
+            limit 1
+            "#,
+        )
+        .bind(server_id.trim())
+        .bind(vhost)
+        .bind(app)
+        .bind(stream)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(Some(PublishTaskTarget {
+                task_id: row.try_get("task_id")?,
+                attempt_id: row.try_get("attempt_id")?,
+                attempt_no: row.try_get("attempt_no")?,
+                resolved_spec: row.try_get("resolved_spec")?,
+            }));
+        }
+
+        let Some(node_id) = self.resolve_node_id_by_server_id(server_id).await? else {
+            return Ok(None);
+        };
+        if self.node_has_multiple_media_servers(node_id).await? {
+            return Ok(None);
+        }
+        self.find_task_for_publish_stream_on_node(node_id, app, stream)
+            .await
+    }
+
+    async fn find_task_for_publish_stream_on_node(
+        &self,
         node_id: Uuid,
         app: &str,
         stream: &str,
@@ -3714,6 +4406,53 @@ impl TaskRepository {
 
     pub async fn find_task_for_rtp_stream(
         &self,
+        server_id: &str,
+        stream_id: &str,
+    ) -> Result<Option<PublishTaskTarget>, RepoError> {
+        if let Some(row) = sqlx::query(
+            r#"
+            select
+              sb.task_id,
+              ta.id as attempt_id,
+              ta.attempt_no,
+              t.resolved_spec
+            from stream_bindings sb
+            join task_attempts ta
+              on ta.id = sb.attempt_id
+            join tasks t
+              on t.id = sb.task_id
+            where sb.server_id = $1
+              and sb.rtp_stream_id = $2
+              and ta.attempt_no = t.current_attempt_no
+            order by sb.created_at desc
+            limit 1
+            "#,
+        )
+        .bind(server_id.trim())
+        .bind(stream_id)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(Some(PublishTaskTarget {
+                task_id: row.try_get("task_id")?,
+                attempt_id: row.try_get("attempt_id")?,
+                attempt_no: row.try_get("attempt_no")?,
+                resolved_spec: row.try_get("resolved_spec")?,
+            }));
+        }
+
+        let Some(node_id) = self.resolve_node_id_by_server_id(server_id).await? else {
+            return Ok(None);
+        };
+        if self.node_has_multiple_media_servers(node_id).await? {
+            return Ok(None);
+        }
+        self.find_task_for_rtp_stream_on_node(node_id, stream_id)
+            .await
+    }
+
+    async fn find_task_for_rtp_stream_on_node(
+        &self,
         node_id: Uuid,
         stream_id: &str,
     ) -> Result<Option<PublishTaskTarget>, RepoError> {
@@ -3757,6 +4496,20 @@ impl TaskRepository {
         }
 
         Ok(None)
+    }
+
+    async fn node_has_multiple_media_servers(&self, node_id: Uuid) -> Result<bool, RepoError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            select count(*)
+              from media_servers
+             where node_id = $1
+            "#,
+        )
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 1)
     }
 
     async fn fetch_task_summary(&self, task_id: Uuid) -> Result<TaskSummary, RepoError> {
@@ -3966,6 +4719,7 @@ impl TaskRepository {
     async fn find_stream_binding_for_hook(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
+        server_id: &str,
         vhost: &str,
         app: &str,
         stream: &str,
@@ -3982,13 +4736,16 @@ impl TaskRepository {
               on ta.id = sb.attempt_id
             join tasks t
               on t.id = sb.task_id
-            where sb.vhost = $1
-              and sb.app = $2
-              and sb.stream = $3
+            where sb.server_id = $1
+              and sb.vhost = $2
+              and sb.app = $3
+              and sb.stream = $4
+              and ta.attempt_no = t.current_attempt_no
             order by sb.created_at desc
             limit 1
             "#,
         )
+        .bind(server_id)
         .bind(vhost)
         .bind(app)
         .bind(stream)
@@ -4168,6 +4925,181 @@ impl TaskRepository {
         Ok(())
     }
 
+    async fn validate_attempt_ownership(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+        node_id: Uuid,
+        lease_token: &str,
+        message_kind: &str,
+        mode: OwnershipMode,
+    ) -> Result<Option<AttemptOwnership>, RepoError> {
+        let row = sqlx::query(
+            r#"
+            select
+              t.status::text as task_status,
+              t.current_attempt_no,
+              t.assigned_node_id,
+              ta.id as attempt_id,
+              ta.node_id as attempt_node_id,
+              nullif(ta.lease_token, '') as current_lease_token,
+              ta.stop_requested_at,
+              ta.desired_terminal_status::text as desired_terminal_status
+            from tasks t
+            left join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = $2
+            where t.id = $1
+            for update of t, ta
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let task_status = TaskStatus::from_str(&row.try_get::<String, _>("task_status")?)?;
+        let current_attempt_no: i32 = row.try_get("current_attempt_no")?;
+        let assigned_node_id: Option<Uuid> = row.try_get("assigned_node_id")?;
+        let attempt_id: Option<Uuid> = row.try_get("attempt_id")?;
+        let attempt_node_id: Option<Uuid> = row.try_get("attempt_node_id")?;
+        let current_lease_token: Option<String> = row.try_get("current_lease_token")?;
+        let stop_requested_at: Option<DateTime<Utc>> = row.try_get("stop_requested_at")?;
+        let desired_terminal_status = row
+            .try_get::<Option<String>, _>("desired_terminal_status")?
+            .map(|value| TaskStatus::from_str(&value))
+            .transpose()?;
+
+        let base_owned = current_attempt_no == attempt_no
+            && attempt_node_id == Some(node_id)
+            && current_lease_token.as_deref() == Some(lease_token);
+        let owned = match mode {
+            OwnershipMode::CurrentOwner => base_owned && assigned_node_id == Some(node_id),
+            OwnershipMode::AuthorizedAttempt => base_owned,
+        };
+        if owned {
+            return Ok(Some(AttemptOwnership {
+                attempt_id,
+                task_status,
+                stop_requested_at,
+                desired_terminal_status,
+            }));
+        }
+
+        self.insert_event(
+            tx,
+            task_id,
+            attempt_id,
+            Some(attempt_no),
+            EventSource::Core,
+            "stale_agent_message",
+            "warn",
+            json!({
+                "message_kind": message_kind,
+                "incoming_node_id": node_id,
+                "incoming_attempt_no": attempt_no,
+                "incoming_lease_token": lease_token,
+                "current_attempt_no": current_attempt_no,
+                "assigned_node_id": assigned_node_id,
+                "attempt_node_id": attempt_node_id,
+                "current_lease_token": current_lease_token,
+                "ownership_mode": match mode {
+                    OwnershipMode::CurrentOwner => "current_owner",
+                    OwnershipMode::AuthorizedAttempt => "authorized_attempt",
+                },
+            }),
+        )
+        .await?;
+
+        Ok(None)
+    }
+
+    async fn reconcile_exited_snapshot(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        ownership: &AttemptOwnership,
+        task_id: Uuid,
+        attempt_no: i32,
+        node_id: Uuid,
+        metadata: &Value,
+        now: DateTime<Utc>,
+    ) -> Result<(), RepoError> {
+        let explicit_success = metadata
+            .get("completion_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "record_duration_reached")
+            || metadata.get("transcode_artifact").is_some()
+            || metadata.get("bridge_artifact").is_some()
+            || metadata
+                .get("stream_ingest_record_artifacts")
+                .and_then(Value::as_array)
+                .is_some_and(|value| !value.is_empty());
+
+        if ownership.task_status == TaskStatus::Stopping || ownership.stop_requested_at.is_some() {
+            self.complete_task_attempt(
+                tx,
+                task_id,
+                attempt_no,
+                node_id,
+                ownership
+                    .desired_terminal_status
+                    .unwrap_or(TaskStatus::Canceled),
+                AttemptStatus::Failed,
+                Some("snapshot_exited_after_stop"),
+                Some("runtime exited while stopping"),
+                now,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if explicit_success {
+            self.complete_task_attempt(
+                tx,
+                task_id,
+                attempt_no,
+                node_id,
+                TaskStatus::Succeeded,
+                AttemptStatus::Succeeded,
+                None,
+                None,
+                now,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let failure_reason = metadata
+            .get("recording_fatal_error")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                metadata
+                    .get("startup_timeout")
+                    .and_then(Value::as_bool)
+                    .filter(|value| *value)
+                    .map(|_| "runtime exited after startup timeout")
+            })
+            .unwrap_or("runtime exited without a terminal task event");
+
+        self.complete_task_attempt(
+            tx,
+            task_id,
+            attempt_no,
+            node_id,
+            TaskStatus::Failed,
+            AttemptStatus::Failed,
+            Some("snapshot_exited"),
+            Some(failure_reason),
+            now,
+        )
+        .await
+    }
+
     async fn callback_target_for_attempt(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -4289,15 +5221,18 @@ impl TaskRepository {
             r#"
             update tasks
                set status = $1::task_status,
+                   assigned_node_id = null,
                    updated_at = $2,
                    finished_at = $3
              where id = $4
+               and current_attempt_no = $5
             "#,
         )
         .bind(task_status.as_str())
         .bind(now)
         .bind(now)
         .bind(task_id)
+        .bind(attempt_no)
         .execute(&mut **tx)
         .await?;
 
@@ -4351,12 +5286,14 @@ impl TaskRepository {
                    started_at = coalesce(started_at, $2),
                    updated_at = $2
              where id = $3
+               and current_attempt_no = $4
                and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
             "#,
         )
         .bind(node_id)
         .bind(now)
         .bind(task_id)
+        .bind(attempt_no)
         .execute(&mut **tx)
         .await?;
 
@@ -4398,14 +5335,17 @@ impl TaskRepository {
             r#"
             update tasks
                set status = 'LOST'::task_status,
+                   assigned_node_id = null,
                    updated_at = $1,
                    finished_at = $1
              where id = $2
-               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
+               and current_attempt_no = $3
+               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING')
             "#,
         )
         .bind(now)
         .bind(task_id)
+        .bind(attempt_no)
         .execute(&mut **tx)
         .await?;
 
@@ -4502,9 +5442,28 @@ pub struct StopCommand {
     pub task_id: Uuid,
     pub attempt_no: i32,
     pub node_id: Uuid,
+    pub lease_token: String,
     pub reason: String,
     pub grace_period_sec: u32,
     pub force_after_sec: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReclaimRuntimeCommand {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub lease_token: String,
+    pub worker_kind: WorkerKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoppingTaskReconcile {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub node_id: Uuid,
+    pub attempt_status: AttemptStatus,
+    pub stop_requested_at: DateTime<Utc>,
+    pub desired_terminal_status: TaskStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -4762,7 +5721,11 @@ pub struct NodeSummary {
     pub network_mode: String,
     pub interfaces: Vec<String>,
     pub healthy: bool,
+    pub control_connected: bool,
+    pub media_alive: bool,
     pub last_seen_at: Option<DateTime<Utc>>,
+    pub control_last_seen_at: Option<DateTime<Utc>>,
+    pub media_last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub ffmpeg_protocols: Vec<String>,
@@ -4778,6 +5741,12 @@ pub struct NodeSummary {
     pub slot_usage: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub starting_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopping_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orphaned_tasks: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4796,6 +5765,10 @@ pub struct NodeSummary {
 
 impl NodeSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        let media_last_seen_at: Option<DateTime<Utc>> = row.try_get("media_last_seen_at")?;
+        let media_alive = media_last_seen_at
+            .map(|seen_at| seen_at >= Utc::now() - chrono::Duration::seconds(30))
+            .unwrap_or(false);
         Ok(Self {
             id: row.try_get("id")?,
             node_name: row.try_get("node_name")?,
@@ -4806,7 +5779,11 @@ impl NodeSummary {
             network_mode: row.try_get("network_mode")?,
             interfaces: serde_json::from_value(row.try_get("interfaces")?)?,
             healthy: row.try_get("healthy")?,
+            control_connected: row.try_get("control_connected")?,
+            media_alive,
             last_seen_at: row.try_get("last_seen_at")?,
+            control_last_seen_at: row.try_get("control_last_seen_at")?,
+            media_last_seen_at,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             ffmpeg_protocols: row
@@ -4848,6 +5825,9 @@ impl NodeSummary {
             capability_captured_at: row.try_get("captured_at")?,
             slot_usage: None,
             running_tasks: None,
+            starting_tasks: None,
+            stopping_tasks: None,
+            orphaned_tasks: None,
             connected: None,
             cpu_percent: None,
             mem_percent: None,
@@ -4866,6 +5846,9 @@ pub struct NodeHeartbeatSummary {
     pub mem_percent: f64,
     pub disk_percent: f64,
     pub running_tasks: u32,
+    pub starting_tasks: u32,
+    pub stopping_tasks: u32,
+    pub orphaned_tasks: u32,
     pub slot_usage: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
@@ -4883,6 +5866,12 @@ impl NodeHeartbeatSummary {
             mem_percent: row.try_get("mem_percent")?,
             disk_percent: row.try_get("disk_percent")?,
             running_tasks: u32::try_from(running_tasks).unwrap_or_default(),
+            starting_tasks: u32::try_from(row.try_get::<i32, _>("starting_tasks")?)
+                .unwrap_or_default(),
+            stopping_tasks: u32::try_from(row.try_get::<i32, _>("stopping_tasks")?)
+                .unwrap_or_default(),
+            orphaned_tasks: u32::try_from(row.try_get::<i32, _>("orphaned_tasks")?)
+                .unwrap_or_default(),
             slot_usage: row.try_get("slot_usage")?,
             zlm_alive: row.try_get("zlm_alive")?,
             ffmpeg_alive: row.try_get("ffmpeg_alive")?,
@@ -5292,21 +6281,17 @@ async fn resolve_record_http_url(
     server_id: &str,
     record: &ZlmRecordFileRecord,
 ) -> Result<Option<String>, RepoError> {
-    let Some(node_id) = Uuid::parse_str(server_id.trim()).ok() else {
-        return Ok(record.url.as_deref().and_then(|raw_url| {
-            Url::parse(raw_url.trim())
-                .ok()
-                .map(|value| value.to_string())
-        }));
-    };
     let Some(agent_stream_addr) = sqlx::query_scalar::<_, String>(
         r#"
-        select agent_stream_addr
-          from media_nodes
-         where id = $1
+        select n.agent_stream_addr
+          from media_servers s
+          join media_nodes n
+            on n.id = s.node_id
+         where s.server_id = $1
+         limit 1
         "#,
     )
-    .bind(node_id)
+    .bind(server_id.trim())
     .fetch_optional(&mut **tx)
     .await?
     else {
@@ -5641,6 +6626,7 @@ fn deep_merge(base: &mut Value, overlay: Value) {
 pub struct AgentTaskEventRecord {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
     pub event_type: String,
     pub event_level: String,
     pub message: String,
@@ -5651,6 +6637,7 @@ pub struct AgentTaskEventRecord {
 pub struct TaskLogBatchRecord {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
     pub stream: String,
     pub lines: Vec<String>,
 }
@@ -5659,6 +6646,7 @@ pub struct TaskLogBatchRecord {
 pub struct TaskProgressRecord {
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
     pub frame: u64,
     pub fps: f64,
     pub bitrate_kbps: f64,
@@ -5673,6 +6661,7 @@ pub struct TaskSnapshotRecord {
     pub runtime_id: Uuid,
     pub task_id: Uuid,
     pub attempt_no: i32,
+    pub lease_token: String,
     pub worker_kind: String,
     pub pid: Option<i32>,
     pub state: String,
@@ -5762,6 +6751,20 @@ struct HookStreamBinding {
     attempt_id: Uuid,
     attempt_no: i32,
     resolved_spec: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct AttemptOwnership {
+    attempt_id: Option<Uuid>,
+    task_status: TaskStatus,
+    stop_requested_at: Option<DateTime<Utc>>,
+    desired_terminal_status: Option<TaskStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnershipMode {
+    CurrentOwner,
+    AuthorizedAttempt,
 }
 
 impl HookStreamBinding {
@@ -6225,10 +7228,18 @@ pub enum RepoError {
     TaskMissingResolvedSpec(Uuid),
     #[error("task is not dispatchable from status {0}")]
     TaskNotDispatchable(TaskStatus),
+    #[error("task cannot be deleted from status {0}")]
+    TaskDeleteForbidden(TaskStatus),
     #[error("idempotency key already exists with different request body")]
     IdempotencyConflict,
     #[error("operation with the same idempotency key is still in progress")]
     OperationInProgress,
+    #[error("task {task_id} attempt {attempt_no} violates repository invariants: {detail}")]
+    TaskAttemptInvariant {
+        task_id: Uuid,
+        attempt_no: i32,
+        detail: String,
+    },
     #[error(transparent)]
     TaskState(#[from] TaskStateError),
     #[error(transparent)]
@@ -6256,6 +7267,18 @@ fn sort_order_clause(value: Option<&str>) -> &'static str {
         "asc" => "asc",
         _ => "desc",
     }
+}
+
+fn task_status_allows_delete(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Created
+            | TaskStatus::Validating
+            | TaskStatus::Queued
+            | TaskStatus::Succeeded
+            | TaskStatus::Failed
+            | TaskStatus::Canceled
+    )
 }
 
 fn operation_event_name(operation: TaskOperation) -> &'static str {

@@ -76,15 +76,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --locked --release -p media-core -p media-agent
 
-FROM scratch AS media-binaries-export
+FROM scratch AS media-host-assets-export
 
 COPY --from=builder /app/target/release/media-core /media-core
 COPY --from=builder /app/target/release/media-agent /media-agent
+COPY --from=frontend-builder /app/crates/media-core/ui /ui
 
 FROM ${MEDIA_CORE_RUNTIME_BASE_IMAGE} AS media-core-runtime
 
 ARG DEBIAN_MIRROR
-ENV STREAMSERVER_UI_DIR=/app/ui \
+ENV STREAMSERVER_UI_DIR=/opt/streamserver/ui \
     STREAMSERVER_BINARY_NAME=media-core \
     STREAMSERVER_BINARY_PATH=/opt/streamserver/bin/media-core
 
@@ -106,11 +107,10 @@ RUN set -eux; \
 WORKDIR /app
 
 COPY packaging/docker/exec-streamserver-binary.sh /usr/local/bin/exec-streamserver-binary
-COPY --from=frontend-builder /app/crates/media-core/ui ./ui
 COPY config ./config
 
 RUN chmod +x /usr/local/bin/exec-streamserver-binary \
-    && mkdir -p /opt/streamserver/bin
+    && mkdir -p /opt/streamserver/bin /opt/streamserver/ui
 
 ENTRYPOINT ["/usr/local/bin/exec-streamserver-binary"]
 CMD []

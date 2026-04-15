@@ -3,7 +3,6 @@ import { computed, nextTick, watch } from "vue";
 import { useRoute } from "vue-router";
 import { useQuery } from "@tanstack/vue-query";
 
-import { AUTO_REFRESH_MS } from "@/shared/api/client";
 import { artifactApi, recordApi, streamApi, taskApi } from "@/shared/api/resources";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
@@ -21,29 +20,25 @@ const canReadNodes = computed(() => sessionStore.hasPermission("node_read"));
 const tasksQuery = useQuery({
   queryKey: ["overview", "tasks"],
   enabled: canReadTasks,
-  queryFn: () => taskApi.list({ page_size: 8, sort_by: "updated_at", sort_order: "desc" }),
-  refetchInterval: AUTO_REFRESH_MS,
+  queryFn: () => taskApi.list({ page_size: 8, sort_by: "created_at", sort_order: "desc" }),
 });
 
 const streamsQuery = useQuery({
   queryKey: ["overview", "streams"],
   enabled: canReadTasks,
   queryFn: () => streamApi.list({}),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const recordsQuery = useQuery({
   queryKey: ["overview", "records"],
   enabled: canReadRecords,
   queryFn: () => recordApi.list({ page_size: 1 }),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const artifactsQuery = useQuery({
   queryKey: ["overview", "artifacts"],
   enabled: canReadRecords,
   queryFn: () => artifactApi.list({ page_size: 1 }),
-  refetchInterval: AUTO_REFRESH_MS,
 });
 
 const metrics = computed(() => {
@@ -155,7 +150,7 @@ watch(
     <div v-if="canReadTasks" class="surface-card section-stack">
       <div>
         <h3 class="page-section-title">最近任务</h3>
-        <p class="subtle">这里显示最近有更新的任务，适合快速确认创建、派发、运行和收尾状态。</p>
+        <p class="subtle">这里显示最近创建的任务，适合快速确认新任务的创建、派发、运行和收尾状态。</p>
       </div>
 
       <div class="table-scroll">
@@ -167,8 +162,8 @@ watch(
               <StatusTag :status="row.status" />
             </template>
           </el-table-column>
-          <el-table-column label="更新时间" min-width="180">
-            <template #default="{ row }">{{ formatTime(row.updated_at) }}</template>
+          <el-table-column label="创建时间" min-width="180">
+            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
           </el-table-column>
         </el-table>
       </div>

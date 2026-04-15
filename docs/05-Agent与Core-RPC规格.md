@@ -29,7 +29,7 @@ service ControlPlane {
 - 连接建立后的第一条 `AgentEnvelope` 必须是 `register`。
 - 节点身份只由 `node_id` 决定；`node_name` 仅用于展示和运维。
 - 若 Agent 未配置 `node_id`，启动时生成一个 UUID 并在该进程生命周期内复用。
-- 若 Core 发现已有活动流占用了相同 `node_id`，必须直接拒绝新连接，不允许覆盖旧会话。
+- 若 Core 发现已有活动流占用了相同 `node_id`，新连接必须顶掉旧会话；旧会话后续晚到消息一律按 stale 丢弃。
 - 若 30 秒未收到对端消息，连接视为失活并重连。
 
 ## 4. Agent -> Core 消息
@@ -65,6 +65,9 @@ service ControlPlane {
 - `mem_percent`
 - `disk_percent`
 - `running_tasks`
+- `starting_tasks`
+- `stopping_tasks`
+- `orphaned_tasks`
 - `slot_usage`
 - `zlm_alive`
 - `ffmpeg_alive`
@@ -91,6 +94,7 @@ Agent 启动探测或接到探测命令后上报。
 
 - `task_id`
 - `attempt_no`
+- `lease_token`
 - `event_type`
 - `event_level`
 - `message`
@@ -104,6 +108,7 @@ Agent 启动探测或接到探测命令后上报。
 
 - `task_id`
 - `attempt_no`
+- `lease_token`
 - `stream`
 - `lines[]`
 
@@ -115,6 +120,7 @@ Agent 启动探测或接到探测命令后上报。
 
 - `task_id`
 - `attempt_no`
+- `lease_token`
 - `frame`
 - `fps`
 - `bitrate_kbps`
@@ -131,6 +137,7 @@ Agent 启动探测或接到探测命令后上报。
 
 - `task_id`
 - `attempt_no`
+- `lease_token`
 - `worker_kind`
 - `pid`
 - `state`
@@ -154,7 +161,8 @@ Agent 启动探测或接到探测命令后上报。
 行为：
 
 - Agent 收到后先校验 `lease_token` 和本地能力。
-- 任务启动前必须回发 `task_event{event_type="accepted"}` 或 `task_event{event_type="rejected"}`。
+- Agent 必须先回发 `task_event{event_type="accepted"}`，再异步执行底层启动。
+- 底层启动失败时回发 `task_event{event_type="start_rejected"}`；不得复用旧 Attempt 直接重启。
 
 ### 5.2 `stop_task`
 
@@ -162,9 +170,16 @@ Agent 启动探测或接到探测命令后上报。
 
 - `task_id`
 - `attempt_no`
+- `lease_token`
 - `reason`
 - `grace_period_sec`
 - `force_after_sec`
+
+行为：
+
+- Agent 收到停止命令后必须先记录 stop intent，再去匹配或停止本地 runtime。
+- 若 runtime 尚未注册，不得返回通用失败；应保留 stop intent，等待后台启动路径短路。
+- 无法执行停止时回发 `task_event{event_type="stop_rejected"}`，Core 保持 `STOPPING` 并走超时/接管收敛。
 
 ### 5.3 `probe_capabilities`
 
@@ -172,24 +187,27 @@ Agent 启动探测或接到探测命令后上报。
 
 ### 5.4 `adopt_orphans`
 
-要求 Agent 扫描本地遗留进程并上报接管候选。
+要求 Agent 只对 Core 明确授权的候选执行 reclaim。
 
 字段：
 
-- `task_ids[]`
-- `worker_kind[]`
+- `runtimes[].task_id`
+- `runtimes[].attempt_no`
+- `runtimes[].lease_token`
+- `runtimes[].worker_kind`
 
 ## 6. 连接与重试
 
 - Agent 初次连接失败时，按 `1s/2s/5s/10s/30s` 退避重连。
 - 长连接断开后，Agent 必须在 3 秒内尝试重建。
-- Core 在连接恢复后立刻下发 `adopt_orphans`，并请求最新 `capability_snapshot`。
+- Core 在连接恢复后可以按需要下发精确的 `adopt_orphans` reclaim 列表，并请求最新 `capability_snapshot`。
+- 单条坏消息不得打断整条控制流；只记录节点/任务级错误并继续处理后续消息。
 
 ## 7. 任务执行确认语义
 
 | 阶段 | Core 期望 | 超时 |
 | --- | --- | --- |
-| 接单 | `accepted/rejected` 事件 | 5 秒 |
+| 接单 | `accepted` 事件 | 5 秒 |
 | 启动 | `starting` 事件 | 10 秒 |
 | 在线 | `running` 事件或健康探针成功 | 30 秒 |
 | 停止 | `stopping` 事件 | 5 秒 |
@@ -199,7 +217,8 @@ Agent 启动探测或接到探测命令后上报。
 
 - 接单超时：Task 回到 `QUEUED`，释放租约。
 - 启动超时：Task 进入 `LOST`。
-- 停止超时：升级为强制停止并记录事件。
+- `start_rejected`：结束当前 Attempt，是否重试由恢复策略决定。
+- `stop_rejected`：保持 `STOPPING`，升级为强制停止、reclaim-stop 或 `CANCELED/LOST` 收敛。
 
 ## 8. 本地执行对象模型
 
@@ -208,11 +227,17 @@ Agent 必须把本地执行对象抽象为统一 `RuntimeHandle`：
 - `runtime_id`
 - `task_id`
 - `attempt_no`
+- `lease_token`
 - `worker_kind`
 - `pid`
 - `started_at`
 - `last_progress_at`
 - `metadata`
+
+补充约束：
+
+- Agent 的本地索引主键必须是 `(task_id, attempt_no)`，`runtime_id` 只作为辅助索引。
+- 同 `(task_id, attempt_no, lease_token)` 的重复 `start_task` 必须幂等返回已有 runtime；同 Attempt 不同 `lease_token` 必须拒绝为 stale dispatch。
 
 `worker_kind` 固定值：
 

@@ -104,6 +104,7 @@ export const taskApi = {
   start: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/start`, { method: "POST" }),
   stop: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/stop`, { method: "POST" }),
   cancel: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" }),
+  delete: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}`, { method: "DELETE" }),
   retry: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/retry`, { method: "POST" }),
   clone: (taskId: string, payload: UnknownJson) =>
     apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/clone`, {

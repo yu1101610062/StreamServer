@@ -380,6 +380,13 @@ binary_rel_for_key() {
   esac
 }
 
+ui_rel_for_key() {
+  case "$1" in
+    media-core) printf '%s' "${MEDIA_CORE_UI_PATH:-}" ;;
+    *) fail "未知前端静态资源标识: $1" ;;
+  esac
+}
+
 load_image_archive() {
   local archive_rel="$1"
   local archive_path="${PACKAGE_ROOT}/${archive_rel}"
@@ -423,6 +430,26 @@ install_host_binaries() {
   for binary_key in "$@"; do
     install_host_binary "${install_dir}" "${binary_key}"
   done
+}
+
+install_host_ui() {
+  local install_dir="$1"
+  local ui_key="$2"
+  local ui_rel
+  local source_path
+  local target_path
+
+  ui_rel="$(ui_rel_for_key "${ui_key}")"
+  [ -n "${ui_rel}" ] || fail "离线包未声明 ${ui_key} 前端静态资源路径"
+
+  source_path="${PACKAGE_ROOT}/${ui_rel}"
+  [ -d "${source_path}" ] || fail "缺少宿主机挂载前端静态资源 ${ui_rel}"
+
+  target_path="${install_dir}/ui"
+  rm -rf "${target_path}"
+  mkdir -p "${target_path}"
+  cp -R "${source_path}/." "${target_path}/"
+  log "已写入宿主机挂载前端静态资源: ${target_path}"
 }
 
 ensure_nvidia_runtime_ready() {
@@ -953,6 +980,7 @@ configure_control_plane() {
   copy_compose_template "control-plane" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   install_host_binaries "${INSTALL_DIR}" media-core
+  install_host_ui "${INSTALL_DIR}" media-core
   write_control_plane_env "${INSTALL_DIR}/.env"
   ensure_images_loaded postgres media-core
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
@@ -1090,6 +1118,7 @@ configure_all_in_one_host() {
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
   install_host_binaries "${INSTALL_DIR}" media-core media-agent
+  install_host_ui "${INSTALL_DIR}" media-core
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
@@ -1151,6 +1180,7 @@ configure_all_in_one_host_gpu() {
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
   install_host_binaries "${INSTALL_DIR}" media-core media-agent
+  install_host_ui "${INSTALL_DIR}" media-core
   render_zlm_config \
     "${INSTALL_DIR}" \
     "http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}" \
