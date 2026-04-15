@@ -797,11 +797,53 @@ impl TaskRepository {
         .await?
         .ok_or(RepoError::TaskNotFound(task_id))?;
         let task = TaskSummary::from_row(&row)?;
+        let has_task_lease = sqlx::query_scalar::<_, bool>(
+            r#"
+            select exists(select 1 from task_leases where task_id = $1)
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let lost_delete_allowed =
+            task.status == TaskStatus::Lost && task.assigned_node_id.is_none() && !has_task_lease;
 
-        if !task_status_allows_delete(task.status) {
+        if !task_status_allows_delete(task.status) && !lost_delete_allowed {
             return Err(RepoError::TaskDeleteForbidden(task.status));
         }
 
+        sqlx::query("delete from task_checkpoints where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from stream_bindings where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from task_events where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from task_callback_outbox where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from record_files where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from transcode_artifacts where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from task_leases where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from task_attempts where task_id = $1")
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("delete from tasks where id = $1")
             .bind(task_id)
             .execute(&mut *tx)
@@ -2775,6 +2817,7 @@ impl TaskRepository {
              and ta.attempt_no = t.current_attempt_no
             where ta.node_id = $1
               and t.status in (
+                'DISPATCHING'::task_status,
                 'STARTING'::task_status,
                 'RUNNING'::task_status,
                 'STOPPING'::task_status,
@@ -4935,23 +4978,37 @@ impl TaskRepository {
         message_kind: &str,
         mode: OwnershipMode,
     ) -> Result<Option<AttemptOwnership>, RepoError> {
-        let row = sqlx::query(
+        let task_row = sqlx::query(
             r#"
             select
               t.status::text as task_status,
               t.current_attempt_no,
-              t.assigned_node_id,
+              t.assigned_node_id
+            from tasks t
+            where t.id = $1
+            for update
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        let Some(task_row) = task_row else {
+            return Ok(None);
+        };
+
+        let attempt_row = sqlx::query(
+            r#"
+            select
               ta.id as attempt_id,
               ta.node_id as attempt_node_id,
               nullif(ta.lease_token, '') as current_lease_token,
               ta.stop_requested_at,
               ta.desired_terminal_status::text as desired_terminal_status
-            from tasks t
-            left join task_attempts ta
-              on ta.task_id = t.id
-             and ta.attempt_no = $2
-            where t.id = $1
-            for update of t, ta
+            from task_attempts ta
+            where ta.task_id = $1
+              and ta.attempt_no = $2
+            for update
             "#,
         )
         .bind(task_id)
@@ -4959,19 +5016,35 @@ impl TaskRepository {
         .fetch_optional(&mut **tx)
         .await?;
 
-        let Some(row) = row else {
-            return Ok(None);
-        };
-
-        let task_status = TaskStatus::from_str(&row.try_get::<String, _>("task_status")?)?;
-        let current_attempt_no: i32 = row.try_get("current_attempt_no")?;
-        let assigned_node_id: Option<Uuid> = row.try_get("assigned_node_id")?;
-        let attempt_id: Option<Uuid> = row.try_get("attempt_id")?;
-        let attempt_node_id: Option<Uuid> = row.try_get("attempt_node_id")?;
-        let current_lease_token: Option<String> = row.try_get("current_lease_token")?;
-        let stop_requested_at: Option<DateTime<Utc>> = row.try_get("stop_requested_at")?;
-        let desired_terminal_status = row
-            .try_get::<Option<String>, _>("desired_terminal_status")?
+        let task_status = TaskStatus::from_str(&task_row.try_get::<String, _>("task_status")?)?;
+        let current_attempt_no: i32 = task_row.try_get("current_attempt_no")?;
+        let assigned_node_id: Option<Uuid> = task_row.try_get("assigned_node_id")?;
+        let attempt_id = attempt_row
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<Uuid>, _>("attempt_id").ok())
+            .flatten();
+        let attempt_node_id = attempt_row
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<Uuid>, _>("attempt_node_id").ok())
+            .flatten();
+        let current_lease_token = attempt_row
+            .as_ref()
+            .and_then(|row| row.try_get::<Option<String>, _>("current_lease_token").ok())
+            .flatten();
+        let stop_requested_at = attempt_row
+            .as_ref()
+            .and_then(|row| {
+                row.try_get::<Option<DateTime<Utc>>, _>("stop_requested_at")
+                    .ok()
+            })
+            .flatten();
+        let desired_terminal_status = attempt_row
+            .as_ref()
+            .and_then(|row| {
+                row.try_get::<Option<String>, _>("desired_terminal_status")
+                    .ok()
+            })
+            .flatten()
             .map(|value| TaskStatus::from_str(&value))
             .transpose()?;
 

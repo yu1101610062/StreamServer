@@ -3825,7 +3825,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_task_rejects_lost_state_via_api() -> anyhow::Result<()> {
+    async fn delete_task_allows_lost_state_without_assignment_or_lease_via_api()
+    -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
             return Ok(());
         };
@@ -3872,6 +3873,91 @@ mod tests {
         .bind(attempt_id)
         .bind(task_id)
         .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        let repository = TaskRepository::new(db.pool.clone());
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/tasks/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["id"], json!(task_id));
+        assert!(matches!(
+            repository.get_task_summary(task_id).await,
+            Err(repository::RepoError::TaskNotFound(id)) if id == task_id
+        ));
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_task_rejects_lost_state_with_live_lease_via_api() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let now = Utc::now();
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let payload = sample_create_task_payload("manual");
+
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'lost-task-delete-with-lease', 'stream_ingest'::task_type, 'LOST'::task_status, $2,
+              50, $3, $3, 'tester', null,
+              1, 'manual', $4, $4, $4, $4
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("lost-task-delete-with-lease-{task_id}"))
+        .bind(&payload)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, null, 'ffmpeg'::worker_kind, 'FAILED'::attempt_status,
+              null, null, null, null, null, null,
+              null, null, 'node_disconnected', 'runtime may still be reclaimable',
+              null, $3, $3, $3
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into task_leases (task_id, holder, lease_token, node_id, expires_at, updated_at)
+            values ($1, 'agent', 'lease-1', null, $2, $2)
+            "#,
+        )
+        .bind(task_id)
+        .bind(now + chrono::Duration::minutes(5))
         .execute(&db.pool)
         .await?;
 
@@ -5492,6 +5578,168 @@ mod tests {
 
         let completed = repository.get_task_summary(task_id).await?;
         assert_eq!(completed.status, media_domain::TaskStatus::Canceled);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_agent_snapshot_ignores_missing_attempt_without_sql_error() -> anyhow::Result<()>
+    {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+
+        let task_id = Uuid::now_v7();
+        let now = Utc::now();
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "snapshot-missing-attempt",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at
+            ) values (
+              $1, 'snapshot-missing-attempt', 'stream_ingest'::task_type, 'RUNNING'::task_status, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("snapshot-missing-attempt-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        repository
+            .record_agent_snapshot(
+                node_id,
+                repository::TaskSnapshotRecord {
+                    runtime_id: Uuid::now_v7(),
+                    task_id,
+                    attempt_no: 1,
+                    lease_token: "lease-1".to_string(),
+                    worker_kind: "ffmpeg".to_string(),
+                    pid: Some(1234),
+                    state: "RUNNING".to_string(),
+                    command_line: Some("ffmpeg ...".to_string()),
+                    outputs: Vec::new(),
+                    metadata: json!({}),
+                },
+            )
+            .await?;
+
+        let event_count: i64 =
+            sqlx::query_scalar("select count(*) from task_events where task_id = $1")
+                .bind(task_id)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(event_count, 0);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_reclaim_runtimes_includes_dispatching_attempts_with_leases() -> anyhow::Result<()>
+    {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+
+        let task_id = Uuid::now_v7();
+        let attempt_id = Uuid::now_v7();
+        let now = Utc::now();
+        let lease_token = "lease-dispatching-reclaim";
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "dispatching-reclaim",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+            "stream": {"app": "live", "name": "camera01"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at
+            ) values (
+              $1, 'dispatching-reclaim', 'stream_ingest'::task_type, 'DISPATCHING'::task_status, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5
+            )
+            "#,
+        )
+        .bind(task_id)
+        .bind(format!("dispatching-reclaim-{task_id}"))
+        .bind(&resolved_spec)
+        .bind(node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              created_at, lease_token
+            ) values (
+              $1, $2, 1, $3, 'hybrid'::worker_kind, 'PENDING'::attempt_status,
+              $4, $5
+            )
+            "#,
+        )
+        .bind(attempt_id)
+        .bind(task_id)
+        .bind(node_id)
+        .bind(now)
+        .bind(lease_token)
+        .execute(&db.pool)
+        .await?;
+
+        let reclaim = repository.list_reclaim_runtimes(node_id).await?;
+        assert!(reclaim.iter().any(|item| {
+            item.task_id == task_id
+                && item.attempt_no == 1
+                && item.lease_token == lease_token
+                && item.worker_kind == media_domain::WorkerKind::Hybrid
+        }));
 
         db.cleanup().await?;
         Ok(())

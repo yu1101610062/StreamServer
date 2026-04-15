@@ -977,7 +977,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     title: "删除任务",
     summary: "删除指定任务及其关联的 Attempt、事件、录像和产物索引。",
     description:
-      "仅允许删除 CREATED、VALIDATING、QUEUED、SUCCEEDED、FAILED 和 CANCELED 状态的任务；运行中或 LOST 状态的任务需要先完成恢复/重试或人工确认节点侧已停止。",
+      "允许删除 CREATED、VALIDATING、QUEUED、SUCCEEDED、FAILED、CANCELED，以及已经失去当前节点归属和租约的 LOST 任务；运行中任务仍需先停掉。",
     successStatus: "200 OK",
     params: [authHeaderParam(), taskIdPathParam()],
     requestExample: {
@@ -1003,7 +1003,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     },
     notes: [
       "删除成功后返回被删除任务的最后快照，便于前端提示和审计记录。",
-      "如果任务仍处于 DISPATCHING、STARTING、RUNNING、STOPPING、RECOVERING 或 LOST，会返回 `TASK_DELETE_FORBIDDEN`。",
+      "如果任务仍处于 DISPATCHING、STARTING、RUNNING、STOPPING、RECOVERING，或 LOST 但仍保留当前租约/节点归属，会返回 `TASK_DELETE_FORBIDDEN`。",
     ],
   },
   {

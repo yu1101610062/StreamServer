@@ -58,7 +58,7 @@ impl TaskStatus {
 
         let next = match (operation, self) {
             (Start, Created | Failed | Canceled) => Validating,
-            (Stop, Dispatching | Starting | Running | Recovering | Lost) => Stopping,
+            (Stop, Dispatching | Starting | Running | Recovering) => Stopping,
             (Cancel, Created | Validating | Queued) => Canceled,
             (Cancel, Dispatching | Starting | Running | Recovering) => Stopping,
             (Retry, Failed | Lost) => Queued,
@@ -138,6 +138,21 @@ mod tests {
             TaskStateError::InvalidOperation {
                 operation: TaskOperation::Stop,
                 status: TaskStatus::Created,
+            }
+        );
+    }
+
+    #[test]
+    fn stop_operation_rejects_lost_task() {
+        let error = TaskStatus::Lost
+            .apply_operation(TaskOperation::Stop)
+            .expect_err("stop should not be allowed from lost");
+
+        assert_eq!(
+            error,
+            TaskStateError::InvalidOperation {
+                operation: TaskOperation::Stop,
+                status: TaskStatus::Lost,
             }
         );
     }

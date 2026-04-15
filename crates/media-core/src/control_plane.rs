@@ -2377,7 +2377,11 @@ mod tests {
         let mut spec = sample_immediate_task_spec();
         spec.resource.required_labels = vec!["archive".to_string()];
         let task = match repository
-            .create_task("required-labels-miss-retry", "required-labels-miss-retry-hash", spec)
+            .create_task(
+                "required-labels-miss-retry",
+                "required-labels-miss-retry-hash",
+                spec,
+            )
             .await?
         {
             crate::repository::CreateTaskResult::Fresh(task)
@@ -2493,7 +2497,11 @@ mod tests {
         .await?;
 
         let error = repository
-            .fail_queued_task(task.id, "second_failure", "current pending attempt disappeared")
+            .fail_queued_task(
+                task.id,
+                "second_failure",
+                "current pending attempt disappeared",
+            )
             .await
             .expect_err("missing current attempt row should fail fast");
         assert!(matches!(

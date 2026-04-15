@@ -24,7 +24,7 @@ COPY crates/media-core/frontend ./
 
 RUN npm run build
 
-FROM ${RUST_BUILDER_IMAGE} AS builder
+FROM ${RUST_BUILDER_IMAGE} AS rust-builder-base
 
 ARG DEBIAN_MIRROR
 ARG CARGO_REGISTRY_MIRROR
@@ -72,15 +72,35 @@ COPY proto ./proto
 COPY migrations ./migrations
 COPY config ./config
 
+FROM rust-builder-base AS media-core-builder
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --locked --release -p media-core -p media-agent
+    cargo build --locked --release -p media-core
+
+FROM rust-builder-base AS media-agent-builder
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --locked --release -p media-agent
+
+FROM scratch AS media-core-bin-export
+
+COPY --from=media-core-builder /app/target/release/media-core /media-core
+
+FROM scratch AS media-agent-bin-export
+
+COPY --from=media-agent-builder /app/target/release/media-agent /media-agent
+
+FROM scratch AS media-ui-export
+
+COPY --from=frontend-builder /app/crates/media-core/ui /ui
 
 FROM scratch AS media-host-assets-export
 
-COPY --from=builder /app/target/release/media-core /media-core
-COPY --from=builder /app/target/release/media-agent /media-agent
-COPY --from=frontend-builder /app/crates/media-core/ui /ui
+COPY --from=media-core-bin-export /media-core /media-core
+COPY --from=media-agent-bin-export /media-agent /media-agent
+COPY --from=media-ui-export /ui /ui
 
 FROM ${MEDIA_CORE_RUNTIME_BASE_IMAGE} AS media-core-runtime
 

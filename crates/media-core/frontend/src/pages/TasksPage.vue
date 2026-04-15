@@ -128,11 +128,11 @@ async function cloneTask(task: TaskSummary) {
 function rowActions(task: TaskSummary) {
   return {
     canStart: ["CREATED", "VALIDATING", "FAILED", "CANCELED"].includes(task.status),
-    canStop: ["DISPATCHING", "STARTING", "RUNNING", "RECOVERING", "LOST"].includes(task.status),
+    canStop: ["DISPATCHING", "STARTING", "RUNNING", "RECOVERING"].includes(task.status),
     canCancel: ["CREATED", "VALIDATING", "QUEUED", "DISPATCHING", "STARTING", "RUNNING", "RECOVERING"].includes(task.status),
     canRetry: ["FAILED", "LOST"].includes(task.status),
     canClone: ["SUCCEEDED", "FAILED", "CANCELED", "LOST"].includes(task.status),
-    canDelete: ["CREATED", "VALIDATING", "QUEUED", "SUCCEEDED", "FAILED", "CANCELED"].includes(task.status),
+    canDelete: ["CREATED", "VALIDATING", "QUEUED", "SUCCEEDED", "FAILED", "CANCELED", "LOST"].includes(task.status),
   };
 }
 
