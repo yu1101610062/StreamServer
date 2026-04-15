@@ -572,6 +572,34 @@ impl TaskSpec {
         }
     }
 
+    pub fn stream_ingest_is_continuous(&self) -> bool {
+        if self.task_type != TaskType::StreamIngest {
+            return false;
+        }
+
+        match self.input.source_mode {
+            Some(SourceMode::Live) => self.record.duration_sec.is_none(),
+            Some(SourceMode::Vod) => {
+                self.input.loop_enabled.unwrap_or(false)
+                    && self.expose.any_playback_enabled()
+                    && self.record.duration_sec.is_none()
+            }
+            None => false,
+        }
+    }
+
+    pub fn stream_ingest_uses_wall_clock_record_duration(&self) -> bool {
+        self.task_type == TaskType::StreamIngest
+            && self.record.enabled.unwrap_or(false)
+            && self.record.duration_sec.is_some()
+            && (self.input.source_mode == Some(SourceMode::Live)
+                || self.stream_ingest_record_mode() == Some(StreamIngestRecordMode::Realtime))
+    }
+
+    pub fn stream_ingest_requires_realtime_pacing(&self) -> bool {
+        self.task_type == TaskType::StreamIngest && self.input.source_mode == Some(SourceMode::Vod)
+    }
+
     pub fn validate(&self) -> Result<(), TaskValidationError> {
         let mut issues = Vec::new();
         let resolved = self.resolved();
@@ -1134,19 +1162,11 @@ pub struct ProcessSpec {
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
-    pub video_codec: Option<String>,
-    #[serde(default)]
-    pub audio_codec: Option<String>,
-    #[serde(default)]
     pub bitrate: Option<u32>,
     #[serde(default)]
     pub fps: Option<u32>,
     #[serde(default)]
     pub gop: Option<u32>,
-    #[serde(default)]
-    pub profile: Option<String>,
-    #[serde(default)]
-    pub preset: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1283,8 +1303,6 @@ pub struct ScheduleSpec {
 pub struct ResourceSpec {
     #[serde(default)]
     pub required_labels: Vec<String>,
-    #[serde(default)]
-    pub need_gpu: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -56,10 +56,16 @@ pub struct AgentSettings {
     pub ffprobe_bin: String,
     #[serde(default = "default_zlm_api_base")]
     pub zlm_api_base: String,
+    #[serde(default = "default_zlm_rtmp_port")]
+    pub zlm_rtmp_port: u16,
+    #[serde(default = "default_zlm_rtsp_port")]
+    pub zlm_rtsp_port: u16,
     #[serde(default)]
     pub zlm_api_secret: String,
     #[serde(default)]
     pub zlm_auto_close_on_no_reader_enabled: bool,
+    #[serde(default = "default_allow_enhanced_rtmp_expose")]
+    pub allow_enhanced_rtmp_expose: bool,
     #[serde(default = "default_agent_stream_addr")]
     pub agent_stream_addr: String,
     #[serde(default)]
@@ -96,8 +102,11 @@ impl Default for AgentSettings {
             ffmpeg_bin: default_ffmpeg_bin(),
             ffprobe_bin: default_ffprobe_bin(),
             zlm_api_base: default_zlm_api_base(),
+            zlm_rtmp_port: default_zlm_rtmp_port(),
+            zlm_rtsp_port: default_zlm_rtsp_port(),
             zlm_api_secret: String::new(),
             zlm_auto_close_on_no_reader_enabled: false,
+            allow_enhanced_rtmp_expose: default_allow_enhanced_rtmp_expose(),
             agent_stream_addr: default_agent_stream_addr(),
             primary_interface_name: String::new(),
             primary_interface_ip: String::new(),
@@ -177,6 +186,14 @@ impl Settings {
             "AGENT_STREAM_ADDR must not be empty"
         );
         anyhow::ensure!(
+            self.agent.zlm_rtmp_port > 0,
+            "ZLM_RTMP_PORT must be a valid port greater than 0"
+        );
+        anyhow::ensure!(
+            self.agent.zlm_rtsp_port > 0,
+            "ZLM_RTSP_PORT must be a valid port greater than 0"
+        );
+        anyhow::ensure!(
             matches!(
                 self.agent.network_mode.trim(),
                 "bridge" | "host" | "macvlan"
@@ -230,11 +247,21 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("ZLM_API_BASE") {
         settings.agent.zlm_api_base = value;
     }
+    if let Some(value) = env("ZLM_RTMP_PORT") {
+        settings.agent.zlm_rtmp_port = value.parse().unwrap_or(default_zlm_rtmp_port());
+    }
+    if let Some(value) = env("ZLM_RTSP_PORT") {
+        settings.agent.zlm_rtsp_port = value.parse().unwrap_or(default_zlm_rtsp_port());
+    }
     if let Some(value) = env("ZLM_API_SECRET") {
         settings.agent.zlm_api_secret = value;
     }
     if let Some(value) = env("ZLM_AUTO_CLOSE_ON_NO_READER_ENABLED") {
         settings.agent.zlm_auto_close_on_no_reader_enabled =
+            matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
+    if let Some(value) = env("AGENT_ALLOW_ENHANCED_RTMP_EXPOSE") {
+        settings.agent.allow_enhanced_rtmp_expose =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
     if let Some(value) = env("AGENT_STREAM_ADDR") {
@@ -331,6 +358,14 @@ fn default_zlm_api_base() -> String {
     "http://127.0.0.1:8080".to_string()
 }
 
+fn default_zlm_rtmp_port() -> u16 {
+    1935
+}
+
+fn default_zlm_rtsp_port() -> u16 {
+    554
+}
+
 fn default_agent_stream_addr() -> String {
     "http://127.0.0.1:8081".to_string()
 }
@@ -349,4 +384,8 @@ fn default_work_root() -> String {
 
 fn default_acceleration_mode() -> String {
     "cpu".to_string()
+}
+
+fn default_allow_enhanced_rtmp_expose() -> bool {
+    true
 }

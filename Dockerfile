@@ -96,6 +96,11 @@ FROM scratch AS media-ui-export
 
 COPY --from=frontend-builder /app/crates/media-core/ui /ui
 
+FROM scratch AS media-bin-export
+
+COPY --from=media-core-bin-export /media-core /media-core
+COPY --from=media-agent-bin-export /media-agent /media-agent
+
 FROM scratch AS media-host-assets-export
 
 COPY --from=media-core-bin-export /media-core /media-core

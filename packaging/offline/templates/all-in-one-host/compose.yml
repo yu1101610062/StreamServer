@@ -100,8 +100,11 @@ services:
       FFMPEG_BIN: ffmpeg
       FFPROBE_BIN: ffprobe
       ZLM_API_BASE: http://${ZLM_API_HOST}:${ZLM_HTTP_PORT}
+      ZLM_RTMP_PORT: ${ZLM_RTMP_PORT}
+      ZLM_RTSP_PORT: ${ZLM_RTSP_PORT}
       ZLM_API_SECRET: ${HOOK_SHARED_SECRET}
       ZLM_AUTO_CLOSE_ON_NO_READER_ENABLED: "true"
+      AGENT_ALLOW_ENHANCED_RTMP_EXPOSE: "true"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${AGENT_HTTP_PORT}/health/ready >/dev/null"]
       interval: 5s

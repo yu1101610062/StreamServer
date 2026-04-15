@@ -94,7 +94,6 @@ struct SessionCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionPreference {
     CpuOnly,
-    GpuPreferred,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,15 +152,32 @@ impl ControlPlaneService {
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
         let source_affinity_ip = task_source_affinity_ip(&resolved_spec);
         let execution_preference = task_execution_preference(&resolved_spec);
-        let target = match self
-            .claim_best_session(
+        let retry_affinity_node = if task_keeps_retry_node_affinity(&resolved_spec) {
+            self.repository
+                .preferred_retry_node_after_disconnect(task_id)
+                .await?
+        } else {
+            None
+        };
+        let claim = if let Some(node_id) = retry_affinity_node {
+            self.claim_session_by_node(
+                node_id,
                 source_affinity_ip,
                 task_id,
                 &resolved_spec,
                 execution_preference,
             )
             .await
-        {
+        } else {
+            self.claim_best_session(
+                source_affinity_ip,
+                task_id,
+                &resolved_spec,
+                execution_preference,
+            )
+            .await
+        };
+        let target = match claim {
             ClaimResult::Selected(target) => target,
             ClaimResult::NoConnectedNode => return Err(ControlPlaneError::NoConnectedNode),
             ClaimResult::MissingRequiredLabels => {
@@ -750,6 +766,56 @@ impl ControlPlaneService {
         })
     }
 
+    async fn claim_session_by_node(
+        &self,
+        node_id: Uuid,
+        source_affinity_ip: Option<IpAddr>,
+        task_id: Uuid,
+        spec: &TaskSpec,
+        preference: ExecutionPreference,
+    ) -> ClaimResult {
+        let mut sessions = self.sessions.lock().await;
+        let Some(handle) = sessions.get_mut(&node_id) else {
+            return ClaimResult::NoConnectedNode;
+        };
+        if !node_matches_required_labels(spec, &handle.registration) {
+            return ClaimResult::MissingRequiredLabels;
+        }
+        let reservations = reservation_count(handle);
+        if !session_execution_eligible(
+            spec,
+            preference,
+            &handle.capabilities,
+            &handle.load,
+            reservations,
+        ) {
+            return ClaimResult::NoConnectedNode;
+        }
+        handle
+            .reservations
+            .push_back(DispatchReservation { task_id });
+        let score = dispatch_score(
+            node_id,
+            &handle.registration,
+            &handle.capabilities,
+            &handle.load,
+            source_affinity_ip,
+            reservation_count(handle),
+            false,
+        );
+        ClaimResult::Selected(SessionTarget {
+            node_id,
+            session_id: handle.session_id,
+            sender: handle.sender.clone(),
+            same_subnet: score.same_subnet,
+            has_gpu_devices: !handle.capabilities.gpu_devices.is_empty(),
+            using_gpu_path: false,
+            gpu_headroom: score.gpu_headroom,
+            slot_usage: score.slot_usage,
+            running_tasks: score.running_tasks,
+        })
+    }
+
     async fn release_dispatch_reservation(
         &self,
         node_id: Uuid,
@@ -1093,75 +1159,8 @@ fn reservation_count(handle: &SessionHandle) -> u32 {
 }
 
 fn task_execution_preference(spec: &TaskSpec) -> ExecutionPreference {
-    match spec.task_type {
-        TaskType::FileTranscode => {
-            if spec.process.mode.as_deref() == Some("passthrough") {
-                ExecutionPreference::CpuOnly
-            } else {
-                ExecutionPreference::GpuPreferred
-            }
-        }
-        TaskType::StreamBridge => {
-            if stream_bridge_requires_video_reencode(spec) {
-                ExecutionPreference::GpuPreferred
-            } else {
-                ExecutionPreference::CpuOnly
-            }
-        }
-        TaskType::StreamIngest => match stream_ingest_execution_mode(spec) {
-            StreamIngestExecutionMode::ZlmProxy | StreamIngestExecutionMode::RtpServer => {
-                ExecutionPreference::CpuOnly
-            }
-            StreamIngestExecutionMode::ManagedProcess => {
-                if spec.process.mode.as_deref() == Some("passthrough") {
-                    ExecutionPreference::CpuOnly
-                } else {
-                    ExecutionPreference::GpuPreferred
-                }
-            }
-        },
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamIngestExecutionMode {
-    ZlmProxy,
-    RtpServer,
-    ManagedProcess,
-}
-
-fn stream_ingest_execution_mode(spec: &TaskSpec) -> StreamIngestExecutionMode {
-    match (spec.input.kind, spec.input.source_mode) {
-        (Some(InputKind::GbRtp), _) => StreamIngestExecutionMode::RtpServer,
-        (Some(InputKind::Rtsp | InputKind::Rtmp | InputKind::HttpFlv), _) => {
-            StreamIngestExecutionMode::ZlmProxy
-        }
-        (Some(InputKind::Hls | InputKind::HttpTs), Some(media_domain::SourceMode::Live)) => {
-            StreamIngestExecutionMode::ZlmProxy
-        }
-        _ => StreamIngestExecutionMode::ManagedProcess,
-    }
-}
-
-fn stream_bridge_requires_video_reencode(spec: &TaskSpec) -> bool {
-    let mode = spec.process.mode.as_deref().unwrap_or("passthrough");
-    if mode != "passthrough" {
-        return true;
-    }
-
-    matches!(
-        spec.input.kind,
-        Some(
-            InputKind::Rtsp
-                | InputKind::Rtmp
-                | InputKind::Hls
-                | InputKind::HttpFlv
-                | InputKind::HttpTs
-        )
-    ) && matches!(
-        spec.publish.kind,
-        Some(media_domain::PublishTargetKind::UdpMpegtsMulticast)
-    )
+    let _ = spec;
+    ExecutionPreference::CpuOnly
 }
 
 fn effective_running_tasks(load: &SessionLoad, reserved_dispatches: u32) -> u32 {
@@ -1209,6 +1208,13 @@ fn task_requires_zlm(spec: &TaskSpec) -> bool {
     }
 }
 
+fn task_keeps_retry_node_affinity(spec: &TaskSpec) -> bool {
+    matches!(
+        spec.task_type,
+        TaskType::StreamIngest | TaskType::StreamBridge
+    )
+}
+
 fn base_execution_eligible(spec: &TaskSpec, load: &SessionLoad, reserved_dispatches: u32) -> bool {
     if session_is_saturated(load, reserved_dispatches) || !load.ffmpeg_alive {
         return false;
@@ -1216,15 +1222,16 @@ fn base_execution_eligible(spec: &TaskSpec, load: &SessionLoad, reserved_dispatc
     !task_requires_zlm(spec) || load.zlm_alive
 }
 
-fn gpu_execution_eligible(
+fn session_execution_eligible(
     spec: &TaskSpec,
-    capabilities: &SessionCapabilities,
+    preference: ExecutionPreference,
+    _capabilities: &SessionCapabilities,
     load: &SessionLoad,
     reserved_dispatches: u32,
 ) -> bool {
-    base_execution_eligible(spec, load, reserved_dispatches)
-        && !capabilities.gpu_devices.is_empty()
-        && best_gpu_headroom(&load.gpu_runtime).is_some()
+    match preference {
+        ExecutionPreference::CpuOnly => base_execution_eligible(spec, load, reserved_dispatches),
+    }
 }
 
 fn node_matches_required_labels(spec: &TaskSpec, registration: &AgentRegistration) -> bool {
@@ -1295,11 +1302,14 @@ fn pick_best_session_target(
                     return false;
                 }
                 let reservations = reservation_count(handle);
-                if gpu_only {
-                    gpu_execution_eligible(spec, &handle.capabilities, &handle.load, reservations)
-                } else {
-                    base_execution_eligible(spec, &handle.load, reservations)
-                }
+                let _ = gpu_only;
+                session_execution_eligible(
+                    spec,
+                    preference,
+                    &handle.capabilities,
+                    &handle.load,
+                    reservations,
+                )
             })
             .min_by(|(left_id, left_handle), (right_id, right_handle)| {
                 compare_dispatch_score(
@@ -1349,7 +1359,6 @@ fn pick_best_session_target(
 
     match preference {
         ExecutionPreference::CpuOnly => select(false),
-        ExecutionPreference::GpuPreferred => select(true).or_else(|| select(false)),
     }
 }
 
@@ -2054,7 +2063,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gpu_preferred_tasks_prefer_gpu_eligible_nodes() {
+    async fn cpu_only_dispatch_still_prefers_lower_load_gpu_node_as_cpu_candidate() {
         let pool = PgPoolOptions::new()
             .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
             .expect("lazy test pool should parse");
@@ -2104,13 +2113,13 @@ mod tests {
             .pick_best_session(
                 None,
                 &sample_immediate_task_spec(),
-                ExecutionPreference::GpuPreferred,
+                ExecutionPreference::CpuOnly,
             )
             .await
-            .expect("gpu preferred task should find a target");
+            .expect("cpu-only task should find a target");
 
         assert_eq!(target.node_id, gpu_node);
-        assert!(target.using_gpu_path);
+        assert!(!target.using_gpu_path);
     }
 
     #[tokio::test]
@@ -2170,10 +2179,10 @@ mod tests {
             .pick_best_session(
                 None,
                 &sample_immediate_task_spec(),
-                ExecutionPreference::GpuPreferred,
+                ExecutionPreference::CpuOnly,
             )
             .await
-            .expect("gpu preferred task should fall back to a base-eligible node");
+            .expect("cpu-only task should fall back to a base-eligible node");
 
         assert_eq!(target.node_id, gpu_node);
         assert!(!target.using_gpu_path);
@@ -2302,6 +2311,87 @@ mod tests {
         let summary = repository.get_task_summary(task.id).await?;
         assert_eq!(summary.status, TaskStatus::Queued);
         assert_eq!(summary.assigned_node_id, None);
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+        let service = ControlPlaneService::new(repository.clone());
+        let task = match repository
+            .create_task(
+                "stream-retry-affinity",
+                "stream-retry-affinity-hash",
+                sample_immediate_task_spec(),
+            )
+            .await?
+        {
+            crate::repository::CreateTaskResult::Fresh(task)
+            | crate::repository::CreateTaskResult::Replay(task) => task,
+        };
+        let task = repository.ensure_task_queued(task.id).await?;
+
+        let original_node = Uuid::parse_str("00000000-0000-0000-0000-000000000041")?;
+        let standby_node = Uuid::parse_str("00000000-0000-0000-0000-000000000042")?;
+        let (original_sender, _original_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let original_session_id = service
+            .bootstrap_session(&sample_registration(original_node), original_sender)
+            .await?;
+        service
+            .update_session_load(original_node, &sample_heartbeat(0, 0.0))
+            .await?;
+
+        service.dispatch_task(task.id).await?;
+        let dispatched = repository.get_task_summary(task.id).await?;
+        assert_eq!(dispatched.assigned_node_id, Some(original_node));
+        assert_eq!(dispatched.current_attempt_no, 1);
+
+        let (standby_sender, _standby_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _standby_session_id = service
+            .bootstrap_session(&sample_registration(standby_node), standby_sender)
+            .await?;
+        service
+            .update_session_load(standby_node, &sample_heartbeat(0, 0.0))
+            .await?;
+
+        service
+            .close_session(original_node, original_session_id)
+            .await;
+
+        let retried = repository.get_task_summary(task.id).await?;
+        assert_eq!(retried.status, TaskStatus::Queued);
+        assert_eq!(retried.assigned_node_id, None);
+        assert_eq!(retried.current_attempt_no, 2);
+
+        let error = service
+            .dispatch_task(task.id)
+            .await
+            .expect_err("stream retry should wait for the original node");
+        assert!(matches!(error, ControlPlaneError::NoConnectedNode));
+
+        let waiting = repository.get_task_summary(task.id).await?;
+        assert_eq!(waiting.status, TaskStatus::Queued);
+        assert_eq!(waiting.assigned_node_id, None);
+        assert_eq!(waiting.current_attempt_no, 2);
+
+        let (reconnected_sender, _reconnected_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+        let _reconnected_session_id = service
+            .bootstrap_session(&sample_registration(original_node), reconnected_sender)
+            .await?;
+        service
+            .update_session_load(original_node, &sample_heartbeat(0, 0.0))
+            .await?;
+
+        service.dispatch_task(task.id).await?;
+        let redispatched = repository.get_task_summary(task.id).await?;
+        assert_eq!(redispatched.status, TaskStatus::Dispatching);
+        assert_eq!(redispatched.assigned_node_id, Some(original_node));
+        assert_eq!(redispatched.current_attempt_no, 2);
 
         db.cleanup().await?;
         Ok(())

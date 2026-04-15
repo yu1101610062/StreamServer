@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${ROOT_DIR}/dist"
 SKIP_IMAGES=0
 GPU_SUPPORT=""
+HOST_BINARY_TARGET_TRIPLE="x86_64-unknown-linux-musl"
+BUILD_MUSL_BIN_SCRIPT="${ROOT_DIR}/scripts/build_musl_bin_by_docker.sh"
 
 APT_MIRROR="${APT_MIRROR:-}"
 UBUNTU_APT_MIRROR="${UBUNTU_APT_MIRROR:-}"
@@ -47,6 +49,8 @@ usage() {
   NPM_REGISTRY_MIRROR    默认留空，使用 npm 官方源；如设置则覆盖前端构建 registry。
   FRONTEND_BUILDER_IMAGE 默认 node:22-bookworm；可覆写前端构建基础镜像。
   RUST_BUILDER_IMAGE     默认 rust:1.85-bookworm；可覆写 Rust 构建基础镜像。
+  MUSL_CARGO_HOME_DIR    默认 ./.build-cache/musl/cargo-home；可覆写 musl 构建的 Cargo 缓存目录。
+  MUSL_CARGO_TARGET_DIR  默认 ./target/docker-musl；可覆写 musl 构建的 target 缓存目录。
   MEDIA_CORE_RUNTIME_BASE_IMAGE      默认 debian:bookworm-slim；可覆写 media-core 运行时基础镜像。
   MEDIA_AGENT_RUNTIME_BASE_IMAGE     默认 jrottenberg/ffmpeg:7.1-ubuntu2404；可覆写 media-agent CPU 运行时基础镜像。
   MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 默认 jrottenberg/ffmpeg:7.1-nvidia2204；可覆写 media-agent GPU 运行时基础镜像。
@@ -177,26 +181,30 @@ verify_loaded_image_arch() {
   [ "${platform}" = "linux/amd64" ] || fail "镜像 ${image_ref} 平台不是 linux/amd64，而是 ${platform:-unknown}"
 }
 
-export_host_artifacts() {
+export_host_binaries() {
   local output_dir="$1"
 
   mkdir -p "${output_dir}"
-  log "导出 media-core/media-agent linux/amd64 宿主机挂载物"
+  log "构建 media-core/media-agent linux/amd64 宿主机挂载二进制"
+  "${BUILD_MUSL_BIN_SCRIPT}" \
+    --target-triple "${HOST_BINARY_TARGET_TRIPLE}" \
+    --package media-core \
+    --package media-agent \
+    --output-dir "${output_dir}"
+}
+
+export_ui_assets() {
+  local output_dir="$1"
+
+  mkdir -p "${output_dir}"
+  log "导出 media-core 前端静态资源"
   docker buildx build \
     --platform linux/amd64 \
-    --target media-host-assets-export \
-    --build-arg DEBIAN_MIRROR="${APT_MIRROR}" \
-    --build-arg CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
+    --target media-ui-export \
     --build-arg NPM_REGISTRY_MIRROR="${NPM_REGISTRY_MIRROR}" \
     --build-arg FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE}" \
-    --build-arg RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE}" \
-    --build-arg MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE}" \
-    --build-arg MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" \
-    --build-arg MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" \
     --output "type=local,dest=${output_dir}" \
     "${ROOT_DIR}"
-
-  chmod +x "${output_dir}/media-core" "${output_dir}/media-agent"
 }
 
 resolve_media_agent_ubuntu_mirror() {
@@ -337,7 +345,8 @@ build_or_pull_images() {
   local media_agent_ubuntu_mirror="$7"
   local host_artifacts_output_dir="$8"
 
-  export_host_artifacts "${host_artifacts_output_dir}"
+  export_host_binaries "${host_artifacts_output_dir}"
+  export_ui_assets "${host_artifacts_output_dir}"
 
   log "构建 media-core linux/amd64 镜像"
   docker buildx build \

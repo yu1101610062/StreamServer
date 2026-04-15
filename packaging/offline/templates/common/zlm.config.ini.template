@@ -67,6 +67,7 @@ appName=record
 
 [rtmp]
 port=__ZLM_RTMP_PORT__
+enhanced=1
 
 [rtsp]
 port=__ZLM_RTSP_PORT__

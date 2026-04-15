@@ -138,6 +138,11 @@ impl AgentController {
         let mut inbound = response.into_inner();
 
         let snapshot = self.capability_probe.snapshot(&self.settings.agent).await;
+        self.executor.set_zlm_rtmp_enhanced_enabled(
+            self.capability_probe
+                .zlm_rtmp_enhanced_enabled(&self.settings.agent)
+                .await,
+        );
         send_capability_snapshot(&sender, &snapshot).await?;
         self.replay_terminal_runtimes(&sender).await?;
 
@@ -277,6 +282,11 @@ impl AgentController {
                 ProbeCapabilities {},
             ) => {
                 let snapshot = self.capability_probe.snapshot(&self.settings.agent).await;
+                self.executor.set_zlm_rtmp_enhanced_enabled(
+                    self.capability_probe
+                        .zlm_rtmp_enhanced_enabled(&self.settings.agent)
+                        .await,
+                );
                 send_capability_snapshot(sender, &snapshot).await?;
             }
             media_rpc::control_plane::core_envelope::Payload::AdoptOrphans(command) => {
@@ -607,6 +617,11 @@ impl AgentController {
             .await
             .unwrap_or_else(|| self.node_id.to_string());
         self.executor.set_zlm_server_id(zlm_server_id.clone());
+        self.executor.set_zlm_rtmp_enhanced_enabled(
+            self.capability_probe
+                .zlm_rtmp_enhanced_enabled(&self.settings.agent)
+                .await,
+        );
 
         Ok(AgentRegistration {
             node_id: self.node_id,

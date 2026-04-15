@@ -32,15 +32,10 @@ use tokio::{
     sync::mpsc,
     time::{sleep, timeout},
 };
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{
-    capability::{
-        ffmpeg_supports_decoder, ffmpeg_supports_encoder, ffmpeg_supports_hwaccel,
-        gpu_acceleration_enabled, probe_gpu_devices,
-    },
-    config::AgentSettings,
-};
+use crate::{capability::gpu_acceleration_enabled, config::AgentSettings};
 
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeRegistry {
@@ -211,6 +206,7 @@ pub trait LocalExecutor: Send + Sync {
     fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError>;
     fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle>;
     fn set_zlm_server_id(&self, _server_id: String) {}
+    fn set_zlm_rtmp_enhanced_enabled(&self, _enabled: Option<bool>) {}
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +218,7 @@ pub struct ManagedProcessExecutor {
     stop_intents: Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
     http_client: Client,
     zlm_server_id: Arc<RwLock<Option<String>>>,
+    zlm_rtmp_enhanced_enabled: Arc<RwLock<Option<bool>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +241,7 @@ struct ProcessPlan {
     recording: Option<LiveRelayRecording>,
     managed_file_output_kind: Option<ManagedFileOutputKind>,
     companion_recording: Option<CompanionProcessPlan>,
+    internal_ingress_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +253,11 @@ struct CompanionProcessPlan {
     outputs: Vec<String>,
     success_check: SuccessCheck,
     kind: CompanionProcessKind,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeCapabilityHints {
+    zlm_rtmp_enhanced_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,11 +384,16 @@ const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_PROBE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const STOP_REQUESTED_STILL_RUNNING_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const AUTO_STOP_FORCE_KILL_DELAY: Duration = Duration::from_secs(1);
+const RECORD_DURATION_FORCE_KILL_DELAY: Duration = Duration::from_millis(250);
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_BATCH_LINES: usize = 64;
 const DEFAULT_INPUT_PROBE_TIMEOUT_MS: u64 = 7000;
 const FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ZLM_RUNTIME_VHOST: &str = "__defaultVhost__";
+const LIVE_STREAM_OFFLINE_GRACE_POLLS: u32 = 3;
+const RTP_SERVER_MISSING_GRACE_POLLS: u32 = 3;
 
 #[derive(Debug, Clone)]
 pub enum RuntimeNotification {
@@ -529,6 +537,7 @@ impl ManagedProcessExecutor {
                 .build()
                 .expect("failed to build runtime HTTP client"),
             zlm_server_id: Arc::new(RwLock::new(None)),
+            zlm_rtmp_enhanced_enabled: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -537,6 +546,13 @@ impl ManagedProcessExecutor {
             .read()
             .expect("zlm_server_id lock poisoned")
             .clone()
+    }
+
+    fn current_zlm_rtmp_enhanced_enabled(&self) -> Option<bool> {
+        *self
+            .zlm_rtmp_enhanced_enabled
+            .read()
+            .expect("zlm_rtmp_enhanced_enabled lock poisoned")
     }
 }
 
@@ -727,24 +743,14 @@ impl LocalExecutor for ManagedProcessExecutor {
             let _ = persist_runtime_state(&work_dir, &handle, &success_check_from_handle(&handle));
         }
 
-        if runtime.pid.is_some() {
-            let pids = runtime_pids(&runtime);
-            let runtimes = self.runtimes.clone();
-            tokio::spawn(async move {
-                if force_after_sec == 0 {
-                    return;
-                }
-                sleep(Duration::from_secs(force_after_sec as u64)).await;
-                let still_running = runtimes
-                    .read()
-                    .expect("runtime map lock poisoned")
-                    .contains_key(&runtime_id);
-                if still_running {
-                    for pid in pids {
-                        let _ = signal_pid(pid, libc::SIGKILL);
-                    }
-                }
-            });
+        if runtime.pid.is_some() && force_after_sec > 0 {
+            schedule_force_kill_if_running(
+                runtime_id,
+                runtime_pids(&runtime),
+                self.runtimes.clone(),
+                Duration::from_secs(force_after_sec as u64),
+                "stop_task_force_after",
+            );
         }
 
         Ok(())
@@ -1049,6 +1055,14 @@ impl LocalExecutor for ManagedProcessExecutor {
             *guard = Some(server_id);
         }
     }
+
+    fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
+        let mut guard = self
+            .zlm_rtmp_enhanced_enabled
+            .write()
+            .expect("zlm_rtmp_enhanced_enabled lock poisoned");
+        *guard = enabled;
+    }
 }
 
 impl ManagedProcessExecutor {
@@ -1056,7 +1070,13 @@ impl ManagedProcessExecutor {
         &self,
         request: &StartTaskRequest,
     ) -> Result<RuntimeHandle, ExecutorError> {
-        let plan = build_process_plan(&self.settings, request)?;
+        let plan = build_process_plan(
+            &self.settings,
+            request,
+            RuntimeCapabilityHints {
+                zlm_rtmp_enhanced_enabled: self.current_zlm_rtmp_enhanced_enabled(),
+            },
+        )?;
         prepare_plan_paths(&plan)?;
 
         let command_line = render_command_line(&plan.executable, &plan.args);
@@ -1107,6 +1127,9 @@ impl ManagedProcessExecutor {
             "managed_file_output_kind": plan.managed_file_output_kind,
             "companion_recording": companion_recording_metadata,
         });
+        if let Some(protocol) = plan.internal_ingress_protocol.as_deref() {
+            metadata["internal_ingress_protocol"] = json!(protocol);
+        }
         attach_zlm_server_id(&mut metadata, self.current_zlm_server_id().as_deref());
         let handle = RuntimeHandle {
             runtime_id,
@@ -1471,6 +1494,25 @@ impl ManagedProcessExecutor {
                         json!({
                             "exit_code": status.code(),
                             "output_target": output_target,
+                        }),
+                    )
+                }
+                Ok(status)
+                    if status.success()
+                        && task_type_from_handle(&exited_handle)
+                            == Some(TaskType::StreamIngest)
+                        && task_runtime_mode_from_handle(&exited_handle)
+                            == Some(TaskRuntimeMode::ManagedProcess)
+                        && continuous_stream_ingest_from_handle(&exited_handle) =>
+                {
+                    (
+                        "failed",
+                        "error",
+                        "continuous stream_ingest process exited unexpectedly".to_string(),
+                        json!({
+                            "exit_code": status.code(),
+                            "output_target": output_target,
+                            "reason": "unexpected_stream_exit",
                         }),
                     )
                 }
@@ -2110,6 +2152,7 @@ async fn read_log_stream(
 fn build_process_plan(
     settings: &AgentSettings,
     request: &StartTaskRequest,
+    capability_hints: RuntimeCapabilityHints,
 ) -> Result<ProcessPlan, ExecutorError> {
     let spec = parse_task_spec(request)?;
 
@@ -2122,7 +2165,12 @@ fn build_process_plan(
                     "stream_ingest task should not run in the managed process executor".to_string(),
                 ));
             }
-            build_stream_ingest_plan(settings, request, &spec)
+            build_stream_ingest_plan_with_capability_hints(
+                settings,
+                request,
+                &spec,
+                capability_hints,
+            )
         }
     }
 }
@@ -2132,11 +2180,25 @@ fn build_stream_ingest_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<ProcessPlan, ExecutorError> {
+    build_stream_ingest_plan_with_capability_hints(
+        settings,
+        request,
+        spec,
+        RuntimeCapabilityHints::default(),
+    )
+}
+
+fn build_stream_ingest_plan_with_capability_hints(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+    capability_hints: RuntimeCapabilityHints,
+) -> Result<ProcessPlan, ExecutorError> {
     match spec.stream_ingest_record_mode() {
         Some(StreamIngestRecordMode::Fast) => {
             build_stream_ingest_fast_record_plan(settings, request, spec)
         }
-        _ => build_file_to_live_plan(settings, request, spec),
+        _ => build_stream_ingest_realtime_plan(settings, request, spec, capability_hints),
     }
 }
 
@@ -2259,6 +2321,7 @@ fn allocate_managed_output(
         success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
         target,
         format,
+        output_args: Vec::new(),
     }
 }
 
@@ -2336,13 +2399,8 @@ fn build_file_transcode_plan(
         append_audio_bitstream_filter_arg(&mut args, filter);
     }
 
-    args.extend([
-        "-threads".to_string(),
-        "0".to_string(),
-        "-f".to_string(),
-        output.format.clone(),
-        output.target.clone(),
-    ]);
+    args.extend(["-threads".to_string(), "0".to_string()]);
+    append_publish_output_args(&mut args, &output);
 
     Ok(ProcessPlan {
         executable: settings.ffmpeg_bin.clone(),
@@ -2355,99 +2413,85 @@ fn build_file_transcode_plan(
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::Transcode),
         companion_recording: None,
+        internal_ingress_protocol: None,
     })
 }
 
-fn build_file_to_live_plan(
+fn build_stream_ingest_realtime_plan(
     settings: &AgentSettings,
     request: &StartTaskRequest,
     spec: &TaskSpec,
+    capability_hints: RuntimeCapabilityHints,
 ) -> Result<ProcessPlan, ExecutorError> {
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let startup_probe = build_startup_probe(request.task_id, spec)?;
-    let publish_output = build_internal_stream_output(settings, &startup_probe);
+    let profile = probe_input_media_profile(settings, spec, input_url.as_str());
+    let ingress_protocol = select_internal_ingress_protocol(settings, &profile, capability_hints);
+    let startup_probe =
+        build_managed_stream_ingest_startup_probe(request.task_id, spec, ingress_protocol)?;
+    let publish_output = build_internal_stream_output(settings, &startup_probe, ingress_protocol);
     let mut outputs = vec![publish_output.target.clone()];
     let success_check = publish_output.success_check.clone();
     let mut recording = None;
-    let mut managed_file_output_kind = None;
-    let mut companion_recording = None;
+    let managed_file_output_kind = None;
+    let process_output_format = ingress_protocol.compatibility_output_format();
 
-    let mut args = ffmpeg_base_args(input_url.clone(), true);
+    let mut args = ffmpeg_base_args(
+        input_url.clone(),
+        spec.stream_ingest_requires_realtime_pacing(),
+    );
     if should_loop_file_to_live_input(spec) {
         insert_ffmpeg_input_args(
             &mut args,
             vec!["-stream_loop".to_string(), "-1".to_string()],
         );
     }
-    let audio_copy_decoration = append_process_args(
+    if spec.input.source_mode != Some(SourceMode::Vod) {
+        let mut input_args = vec![
+            "-thread_queue_size".to_string(),
+            "1024".to_string(),
+            "-use_wallclock_as_timestamps".to_string(),
+            "1".to_string(),
+            "-fflags".to_string(),
+            "+genpts+discardcorrupt".to_string(),
+            "-err_detect".to_string(),
+            "ignore_err".to_string(),
+        ];
+        if matches!(spec.input.kind, Some(InputKind::UdpMpegtsMulticast)) {
+            input_args.extend(["-max_delay".to_string(), "500000".to_string()]);
+        }
+        insert_ffmpeg_input_args(&mut args, input_args);
+    }
+    let audio_copy_decoration = append_process_args_with_profile(
         &mut args,
         settings,
         spec,
         "copy_or_transcode",
         input_url.as_str(),
-        publish_output.format.as_str(),
-        VideoOutputPolicy::ForceH264,
-        AudioOutputPolicy::Aac,
+        process_output_format,
+        VideoOutputPolicy::CopyWhitelistedElseH264,
+        AudioOutputPolicy::CopyWhitelistedElseAac,
+        Some(&profile),
     )?;
     args.extend(["-threads".to_string(), "0".to_string()]);
-    if let Some(duration_sec) = spec.record.duration_sec {
-        args.extend(["-t".to_string(), duration_sec.to_string()]);
+    if !spec.stream_ingest_uses_wall_clock_record_duration() {
+        if let Some(duration_sec) = spec.record.duration_sec {
+            args.extend(["-t".to_string(), duration_sec.to_string()]);
+        }
     }
 
+    if let Some(filter) = audio_copy_decoration
+        .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
+    {
+        append_audio_bitstream_filter_arg(&mut args, filter);
+    }
+    append_publish_output_args(&mut args, &publish_output);
+
     if spec.record.enabled.unwrap_or(false) {
-        match spec
-            .record
-            .format
-            .unwrap_or(media_domain::RecordFormat::Mp4)
-        {
-            media_domain::RecordFormat::Mp4 => {
-                if let Some(filter) = audio_copy_decoration
-                    .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
-                {
-                    append_audio_bitstream_filter_arg(&mut args, filter);
-                }
-                args.extend([
-                    "-f".to_string(),
-                    publish_output.format.clone(),
-                    publish_output.target.clone(),
-                ]);
-                companion_recording = Some(build_stream_ingest_mp4_recording_plan(
-                    settings,
-                    spec,
-                    input_url.as_str(),
-                    &work_dir,
-                )?);
-                managed_file_output_kind = Some(ManagedFileOutputKind::StreamIngestRecord);
-            }
-            media_domain::RecordFormat::Hls | media_domain::RecordFormat::Both => {
-                if let Some(filter) = audio_copy_decoration
-                    .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
-                {
-                    append_audio_bitstream_filter_arg(&mut args, filter);
-                }
-                args.extend([
-                    "-f".to_string(),
-                    publish_output.format.clone(),
-                    publish_output.target.clone(),
-                ]);
-                recording = build_live_relay_recording(spec, &work_dir)?;
-                if let Some(recording_plan) = &recording {
-                    outputs.push(recording_plan.root_path.clone());
-                }
-            }
+        recording = build_live_relay_recording(spec, &work_dir)?;
+        if let Some(recording_plan) = &recording {
+            outputs.push(recording_plan.root_path.clone());
         }
-    } else {
-        if let Some(filter) = audio_copy_decoration
-            .and_then(|value| value.filter_for_output(publish_output.format.as_str()))
-        {
-            append_audio_bitstream_filter_arg(&mut args, filter);
-        }
-        args.extend([
-            "-f".to_string(),
-            publish_output.format.clone(),
-            publish_output.target.clone(),
-        ]);
     }
 
     Ok(ProcessPlan {
@@ -2460,52 +2504,26 @@ fn build_file_to_live_plan(
         startup_probe: Some(startup_probe),
         recording,
         managed_file_output_kind,
-        companion_recording,
+        companion_recording: None,
+        internal_ingress_protocol: Some(ingress_protocol.metadata_value().to_string()),
     })
 }
 
-fn build_stream_ingest_mp4_recording_plan(
+fn build_file_to_live_plan(
     settings: &AgentSettings,
+    request: &StartTaskRequest,
     spec: &TaskSpec,
-    input_url: &str,
-    work_dir: &Path,
-) -> Result<CompanionProcessPlan, ExecutorError> {
-    let mut args = ffmpeg_base_args(input_url.to_string(), true);
-    if should_loop_file_to_live_input(spec) {
-        insert_ffmpeg_input_args(
-            &mut args,
-            vec!["-stream_loop".to_string(), "-1".to_string()],
-        );
-    }
-    let audio_copy_decoration = append_process_args(
-        &mut args,
-        settings,
-        spec,
-        "copy_or_transcode",
-        input_url,
-        "mp4",
-        VideoOutputPolicy::ForceH264,
-        AudioOutputPolicy::Aac,
-    )?;
-    args.extend(["-threads".to_string(), "0".to_string()]);
-    if let Some(duration_sec) = spec.record.duration_sec {
-        args.extend(["-t".to_string(), duration_sec.to_string()]);
-    }
-    if let Some(filter) = audio_copy_decoration.and_then(|value| value.filter_for_output("mp4")) {
-        append_audio_bitstream_filter_arg(&mut args, filter);
-    }
-    let record_path = work_dir.join("record.mp4").to_string_lossy().to_string();
-    args.extend(["-f".to_string(), "mp4".to_string(), record_path.clone()]);
+) -> Result<ProcessPlan, ExecutorError> {
+    build_stream_ingest_realtime_plan(settings, request, spec, RuntimeCapabilityHints::default())
+}
 
-    Ok(CompanionProcessPlan {
-        executable: settings.ffmpeg_bin.clone(),
-        args,
-        work_dir: work_dir.to_path_buf(),
-        output_target: record_path.clone(),
-        outputs: vec![record_path.clone()],
-        success_check: SuccessCheck::FileExists(PathBuf::from(record_path)),
-        kind: CompanionProcessKind::StreamIngestMp4Record,
-    })
+fn build_file_to_live_plan_with_capability_hints(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+    capability_hints: RuntimeCapabilityHints,
+) -> Result<ProcessPlan, ExecutorError> {
+    build_stream_ingest_realtime_plan(settings, request, spec, capability_hints)
 }
 
 fn build_stream_ingest_fast_record_plan(
@@ -2537,8 +2555,8 @@ fn build_stream_ingest_fast_record_plan(
         "copy_or_transcode",
         input_url.as_str(),
         preferred_output_format,
-        VideoOutputPolicy::KeepSourceFamily,
-        AudioOutputPolicy::Aac,
+        VideoOutputPolicy::CopyWhitelistedElseH264,
+        AudioOutputPolicy::CopyWhitelistedElseAac,
     )?;
     args.extend(["-threads".to_string(), "0".to_string()]);
     if let Some(duration_sec) = spec.record.duration_sec {
@@ -2639,6 +2657,7 @@ fn build_stream_ingest_fast_record_plan(
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::StreamIngestRecord),
         companion_recording: None,
+        internal_ingress_protocol: None,
     })
 }
 
@@ -2694,13 +2713,8 @@ fn build_multicast_bridge_plan(
             append_audio_bitstream_filter_arg(&mut args, filter);
         }
     }
-    args.extend([
-        "-threads".to_string(),
-        "0".to_string(),
-        "-f".to_string(),
-        output.format.clone(),
-        output.target.clone(),
-    ]);
+    args.extend(["-threads".to_string(), "0".to_string()]);
+    append_publish_output_args(&mut args, &output);
 
     Ok(ProcessPlan {
         executable: settings.ffmpeg_bin.clone(),
@@ -2713,6 +2727,7 @@ fn build_multicast_bridge_plan(
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::Bridge),
         companion_recording: None,
+        internal_ingress_protocol: None,
     })
 }
 
@@ -2925,12 +2940,14 @@ fn insert_ffmpeg_input_args(args: &mut Vec<String>, extra_args: Vec<String>) {
 enum VideoOutputPolicy {
     KeepSourceFamily,
     ForceH264,
+    CopyWhitelistedElseH264,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioOutputPolicy {
     Copy,
     Aac,
+    CopyWhitelistedElseAac,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2953,7 +2970,7 @@ enum AudioCopyDecoration {
 
 impl AudioCopyDecoration {
     fn filter_for_output(self, output_format: &str) -> Option<AudioBitstreamFilter> {
-        match output_format.trim().to_ascii_lowercase().as_str() {
+        match canonical_output_muxer(output_format) {
             "flv" | "mp4" | "mov" => Some(AudioBitstreamFilter::AacAdtsToAsc),
             _ => None,
         }
@@ -2964,6 +2981,9 @@ impl AudioCopyDecoration {
 enum VideoCodecFamily {
     H264,
     Hevc,
+    Vp8,
+    Vp9,
+    Av1,
     Unknown,
 }
 
@@ -2975,6 +2995,45 @@ enum InputSourceFamily {
     Matroska,
     RtspRtmp,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalIngressProtocol {
+    Rtmp,
+    EnhancedRtmp,
+    Rtsp,
+}
+
+impl InternalIngressProtocol {
+    fn schema(self) -> &'static str {
+        match self {
+            Self::Rtmp | Self::EnhancedRtmp => "rtmp",
+            Self::Rtsp => "rtsp",
+        }
+    }
+
+    fn muxer_format(self) -> &'static str {
+        match self {
+            Self::Rtmp | Self::EnhancedRtmp => "flv",
+            Self::Rtsp => "rtsp",
+        }
+    }
+
+    fn compatibility_output_format(self) -> &'static str {
+        match self {
+            Self::Rtmp => "internal_flv",
+            Self::EnhancedRtmp => "internal_enhanced_flv",
+            Self::Rtsp => "internal_rtsp",
+        }
+    }
+
+    fn metadata_value(self) -> &'static str {
+        match self {
+            Self::Rtmp => "rtmp",
+            Self::EnhancedRtmp => "enhanced_rtmp",
+            Self::Rtsp => "rtsp",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3091,6 +3150,15 @@ fn append_audio_bitstream_filter_arg(args: &mut Vec<String>, filter: AudioBitstr
     args.extend(["-bsf:a".to_string(), filter.as_ffmpeg_name().to_string()]);
 }
 
+fn append_publish_output_args(args: &mut Vec<String>, output: &PublishOutput) {
+    args.extend(output.output_args.clone());
+    args.extend([
+        "-f".to_string(),
+        output.format.clone(),
+        output.target.clone(),
+    ]);
+}
+
 fn normalized_process_mode<'a>(spec: &'a TaskSpec, default_mode: &'a str) -> &'a str {
     match spec.process.mode.as_deref().unwrap_or(default_mode) {
         "transcode" => "force_transcode",
@@ -3108,11 +3176,40 @@ fn append_process_args(
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
 ) -> Result<Option<AudioCopyDecoration>, ExecutorError> {
+    append_process_args_with_profile(
+        args,
+        settings,
+        spec,
+        default_mode,
+        input_url,
+        output_format,
+        video_policy,
+        audio_policy,
+        None,
+    )
+}
+
+fn append_process_args_with_profile(
+    args: &mut Vec<String>,
+    settings: &AgentSettings,
+    spec: &TaskSpec,
+    default_mode: &str,
+    input_url: &str,
+    output_format: &str,
+    video_policy: VideoOutputPolicy,
+    audio_policy: AudioOutputPolicy,
+    input_profile: Option<&InputMediaProfile>,
+) -> Result<Option<AudioCopyDecoration>, ExecutorError> {
     let mode = normalized_process_mode(spec, default_mode);
     match mode {
         "passthrough" => {
-            let audio_copy_decoration =
-                resolve_passthrough_audio_copy_decoration(settings, spec, input_url, output_format);
+            let audio_copy_decoration = resolve_passthrough_audio_copy_decoration(
+                settings,
+                spec,
+                input_url,
+                output_format,
+                input_profile,
+            );
             args.extend([
                 "-c:v".to_string(),
                 "copy".to_string(),
@@ -3130,6 +3227,7 @@ fn append_process_args(
                 output_format,
                 video_policy,
                 audio_policy,
+                input_profile,
             );
             if !selection.input_args.is_empty() {
                 insert_ffmpeg_input_args(args, selection.input_args);
@@ -3165,14 +3263,22 @@ fn resolve_process_selection(
     output_format: &str,
     video_policy: VideoOutputPolicy,
     audio_policy: AudioOutputPolicy,
+    input_profile: Option<&InputMediaProfile>,
 ) -> TranscodeSelection {
     if mode == "force_transcode" {
         return resolve_transcode_selection(settings, spec, input_url, video_policy, audio_policy);
     }
 
-    let profile = probe_input_media_profile(settings, spec, input_url);
-    let video_copy = should_copy_video_stream(spec, output_format, &profile, video_policy);
-    let audio_copy = resolve_audio_copy_selection(spec, output_format, &profile, audio_policy);
+    let probed_profile;
+    let profile = match input_profile {
+        Some(profile) => profile,
+        None => {
+            probed_profile = probe_input_media_profile(settings, spec, input_url);
+            &probed_profile
+        }
+    };
+    let video_copy = should_copy_video_stream(spec, output_format, profile, video_policy);
+    let audio_copy = resolve_audio_copy_selection(spec, output_format, profile, audio_policy);
     if video_copy && audio_copy.copy {
         return TranscodeSelection {
             input_args: Vec::new(),
@@ -3217,7 +3323,7 @@ fn should_copy_video_stream(
     spec: &TaskSpec,
     output_format: &str,
     profile: &InputMediaProfile,
-    _video_policy: VideoOutputPolicy,
+    video_policy: VideoOutputPolicy,
 ) -> bool {
     if !profile.has_video {
         return true;
@@ -3228,7 +3334,16 @@ fn should_copy_video_stream(
         return false;
     }
 
-    format_supports_video_codec_copy(output_format, profile.video_codec_name.as_deref())
+    let format_allows_copy =
+        format_supports_video_codec_copy(output_format, profile.video_codec_name.as_deref());
+    if !format_allows_copy {
+        return false;
+    }
+
+    match video_policy {
+        VideoOutputPolicy::KeepSourceFamily | VideoOutputPolicy::CopyWhitelistedElseH264 => true,
+        VideoOutputPolicy::ForceH264 => profile.video_family == VideoCodecFamily::H264,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3261,14 +3376,14 @@ fn resolve_audio_copy_selection(
             copy: format_supports_audio_codec_copy(
                 output_format,
                 profile.audio_codec_name.as_deref(),
-            ),
+            ) && !requires_audio_reencode_for_output(output_format, profile),
             decoration: None,
         },
-        AudioOutputPolicy::Aac => {
+        AudioOutputPolicy::Aac | AudioOutputPolicy::CopyWhitelistedElseAac => {
             let copy = format_supports_audio_codec_copy(
                 output_format,
                 profile.audio_codec_name.as_deref(),
-            );
+            ) && !requires_audio_reencode_for_output(output_format, profile);
             AudioCopySelection {
                 copy,
                 decoration: if copy {
@@ -3289,8 +3404,16 @@ fn resolve_passthrough_audio_copy_decoration(
     spec: &TaskSpec,
     input_url: &str,
     output_format: &str,
+    input_profile: Option<&InputMediaProfile>,
 ) -> Option<AudioCopyDecoration> {
-    let profile = probe_input_media_profile(settings, spec, input_url);
+    let probed_profile;
+    let profile = match input_profile {
+        Some(profile) => profile,
+        None => {
+            probed_profile = probe_input_media_profile(settings, spec, input_url);
+            &probed_profile
+        }
+    };
     if !profile.has_audio
         || !format_supports_audio_codec_copy(output_format, profile.audio_codec_name.as_deref())
     {
@@ -3312,35 +3435,12 @@ fn resolve_audio_copy_decoration(
 }
 
 fn process_requires_video_transcode(spec: &TaskSpec) -> bool {
-    spec.process.bitrate.is_some()
-        || spec.process.fps.is_some()
-        || spec.process.gop.is_some()
-        || spec
-            .process
-            .video_codec
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        || spec
-            .process
-            .profile
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-        || spec
-            .process
-            .preset
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
+    spec.process.bitrate.is_some() || spec.process.fps.is_some() || spec.process.gop.is_some()
 }
 
 fn process_requires_audio_transcode(spec: &TaskSpec) -> bool {
-    spec.process
-        .audio_codec
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
+    let _ = spec;
+    false
 }
 
 fn format_supports_video_codec_copy(output_format: &str, codec_name: Option<&str>) -> bool {
@@ -3348,8 +3448,23 @@ fn format_supports_video_codec_copy(output_format: &str, codec_name: Option<&str
         return false;
     };
 
-    match output_format.trim().to_ascii_lowercase().as_str() {
+    match normalized_output_format_label(output_format).as_str() {
+        "internal_flv" => matches!(codec_name.as_str(), "h264"),
+        "internal_enhanced_flv" => {
+            matches!(
+                codec_name.as_str(),
+                "h264" | "hevc" | "h265" | "av1" | "vp9"
+            )
+        }
+        "internal_rtsp" => matches!(
+            codec_name.as_str(),
+            "h264" | "hevc" | "h265" | "av1" | "vp8" | "vp9"
+        ),
         "flv" => matches!(codec_name.as_str(), "h264" | "hevc" | "h265"),
+        "rtsp" => matches!(
+            codec_name.as_str(),
+            "h264" | "hevc" | "h265" | "av1" | "vp8" | "vp9"
+        ),
         "mp4" => matches!(
             codec_name.as_str(),
             "h264" | "hevc" | "h265" | "av1" | "vp9" | "mpeg4" | "mjpeg"
@@ -3385,8 +3500,24 @@ fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str
         return false;
     };
 
-    match output_format.trim().to_ascii_lowercase().as_str() {
+    match normalized_output_format_label(output_format).as_str() {
+        "internal_flv" => matches!(
+            codec_name.as_str(),
+            "aac" | "mp3" | "pcm_alaw" | "pcm_mulaw"
+        ),
+        "internal_enhanced_flv" => matches!(
+            codec_name.as_str(),
+            "aac" | "mp3" | "opus" | "pcm_alaw" | "pcm_mulaw"
+        ),
+        "internal_rtsp" => matches!(
+            codec_name.as_str(),
+            "aac" | "mp2" | "mp3" | "opus" | "pcm_alaw" | "pcm_mulaw" | "pcm_s16be" | "pcm_s16le"
+        ),
         "flv" => matches!(codec_name.as_str(), "aac" | "mp3"),
+        "rtsp" => matches!(
+            codec_name.as_str(),
+            "aac" | "mp2" | "mp3" | "opus" | "pcm_alaw" | "pcm_mulaw" | "pcm_s16be" | "pcm_s16le"
+        ),
         "mp4" => matches!(codec_name.as_str(), "aac" | "mp3" | "ac3" | "eac3" | "alac"),
         "mov" => matches!(
             codec_name.as_str(),
@@ -3427,6 +3558,53 @@ fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str
     }
 }
 
+fn requires_audio_reencode_for_output(output_format: &str, profile: &InputMediaProfile) -> bool {
+    let Some(audio_codec_name) = profile.audio_codec_name.as_deref() else {
+        return false;
+    };
+
+    if is_rtsp_output_profile(output_format)
+        && audio_codec_name == "aac"
+        && matches!(
+            profile.source_family,
+            InputSourceFamily::MpegTs | InputSourceFamily::Hls
+        )
+        && !profile.audio_extradata_present
+    {
+        return true;
+    }
+
+    is_flv_output_profile(output_format)
+        && audio_codec_name == "mp3"
+        && !matches!(profile.audio_sample_rate, Some(44_100 | 22_050 | 11_025))
+}
+
+fn normalized_output_format_label(output_format: &str) -> String {
+    output_format.trim().to_ascii_lowercase()
+}
+
+fn canonical_output_muxer(output_format: &str) -> &'static str {
+    match normalized_output_format_label(output_format).as_str() {
+        "internal_flv" | "internal_enhanced_flv" => "flv",
+        "internal_rtsp" => "rtsp",
+        "flv" => "flv",
+        "rtsp" => "rtsp",
+        "mp4" => "mp4",
+        "mov" => "mov",
+        "matroska" | "mkv" => "mkv",
+        "mpegts" | "rtp_mpegts" | "hls" => "mpegts",
+        _ => "",
+    }
+}
+
+fn is_flv_output_profile(output_format: &str) -> bool {
+    matches!(canonical_output_muxer(output_format), "flv")
+}
+
+fn is_rtsp_output_profile(output_format: &str) -> bool {
+    matches!(canonical_output_muxer(output_format), "rtsp")
+}
+
 fn resolve_transcode_selection(
     settings: &AgentSettings,
     spec: &TaskSpec,
@@ -3451,28 +3629,15 @@ fn resolve_transcode_selection_for_input_family(
 ) -> TranscodeSelection {
     let output_family = output_video_family(input_family, video_policy);
     let use_gpu = gpu_acceleration_enabled(settings)
-        && !probe_gpu_devices(settings).is_empty()
-        && ffmpeg_supports_hwaccel(&settings.ffmpeg_bin, "cuda")
         && matches!(
             output_family,
             VideoCodecFamily::H264 | VideoCodecFamily::Hevc
         );
 
-    let mut input_args = Vec::new();
     let video_encoder = if use_gpu {
         match output_family {
-            VideoCodecFamily::Hevc
-                if ffmpeg_supports_encoder(&settings.ffmpeg_bin, "hevc_nvenc") =>
-            {
-                maybe_add_cuda_decoder(&mut input_args, settings, input_family);
-                "hevc_nvenc".to_string()
-            }
-            _ if ffmpeg_supports_encoder(&settings.ffmpeg_bin, "h264_nvenc") => {
-                maybe_add_cuda_decoder(&mut input_args, settings, input_family);
-                "h264_nvenc".to_string()
-            }
-            VideoCodecFamily::Hevc => "libx265".to_string(),
-            _ => "libx264".to_string(),
+            VideoCodecFamily::Hevc => "hevc_nvenc".to_string(),
+            _ => "h264_nvenc".to_string(),
         }
     } else {
         match output_family {
@@ -3483,11 +3648,11 @@ fn resolve_transcode_selection_for_input_family(
 
     let audio_encoder = match audio_policy {
         AudioOutputPolicy::Copy => "copy".to_string(),
-        AudioOutputPolicy::Aac => "aac".to_string(),
+        AudioOutputPolicy::Aac | AudioOutputPolicy::CopyWhitelistedElseAac => "aac".to_string(),
     };
 
     TranscodeSelection {
-        input_args,
+        input_args: Vec::new(),
         video_encoder,
         audio_encoder,
         audio_copy_decoration: None,
@@ -3503,7 +3668,9 @@ fn output_video_family(
             VideoCodecFamily::Hevc => VideoCodecFamily::Hevc,
             _ => VideoCodecFamily::H264,
         },
-        VideoOutputPolicy::ForceH264 => VideoCodecFamily::H264,
+        VideoOutputPolicy::ForceH264 | VideoOutputPolicy::CopyWhitelistedElseH264 => {
+            VideoCodecFamily::H264
+        }
     }
 }
 
@@ -3523,8 +3690,12 @@ struct InputMediaProfile {
     has_video: bool,
     video_family: VideoCodecFamily,
     video_codec_name: Option<String>,
+    video_extradata_present: bool,
     has_audio: bool,
     audio_codec_name: Option<String>,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<u32>,
+    audio_extradata_present: bool,
     source_family: InputSourceFamily,
 }
 
@@ -3534,8 +3705,12 @@ impl Default for InputMediaProfile {
             has_video: false,
             video_family: VideoCodecFamily::Unknown,
             video_codec_name: None,
+            video_extradata_present: false,
             has_audio: false,
             audio_codec_name: None,
+            audio_sample_rate: None,
+            audio_channels: None,
+            audio_extradata_present: false,
             source_family: InputSourceFamily::Unknown,
         }
     }
@@ -3557,6 +3732,9 @@ struct FfprobeFormat {
 struct FfprobeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    sample_rate: Option<String>,
+    channels: Option<u32>,
+    extradata_size: Option<u64>,
 }
 
 fn probe_input_media_profile(
@@ -3572,7 +3750,7 @@ fn probe_input_media_profile(
         "-v",
         "error",
         "-show_entries",
-        "stream=codec_type,codec_name:format=format_name",
+        "stream=codec_type,codec_name,sample_rate,channels,extradata_size:format=format_name",
         "-of",
         "json",
         input_url,
@@ -3618,8 +3796,12 @@ fn probe_input_media_profile(
                 profile.video_family = match profile.video_codec_name.as_deref() {
                     Some("h264") => VideoCodecFamily::H264,
                     Some("hevc") | Some("h265") => VideoCodecFamily::Hevc,
+                    Some("vp8") => VideoCodecFamily::Vp8,
+                    Some("vp9") => VideoCodecFamily::Vp9,
+                    Some("av1") => VideoCodecFamily::Av1,
                     _ => VideoCodecFamily::Unknown,
                 };
+                profile.video_extradata_present = stream.extradata_size.unwrap_or_default() > 0;
             }
             Some("audio") if !profile.has_audio => {
                 profile.has_audio = true;
@@ -3629,6 +3811,12 @@ fn probe_input_media_profile(
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_ascii_lowercase);
+                profile.audio_sample_rate = stream
+                    .sample_rate
+                    .as_deref()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                profile.audio_channels = stream.channels;
+                profile.audio_extradata_present = stream.extradata_size.unwrap_or_default() > 0;
             }
             _ => {}
         }
@@ -3739,33 +3927,6 @@ fn classify_input_source_family_from_path(input_url: &str) -> InputSourceFamily 
     }
 }
 
-fn maybe_add_cuda_decoder(
-    input_args: &mut Vec<String>,
-    settings: &AgentSettings,
-    input_family: VideoCodecFamily,
-) {
-    let decoder = match input_family {
-        VideoCodecFamily::H264 if ffmpeg_supports_decoder(&settings.ffmpeg_bin, "h264_cuvid") => {
-            Some("h264_cuvid")
-        }
-        VideoCodecFamily::Hevc if ffmpeg_supports_decoder(&settings.ffmpeg_bin, "hevc_cuvid") => {
-            Some("hevc_cuvid")
-        }
-        _ => None,
-    };
-
-    if let Some(decoder) = decoder {
-        input_args.extend([
-            "-hwaccel".to_string(),
-            "cuda".to_string(),
-            "-hwaccel_output_format".to_string(),
-            "cuda".to_string(),
-            "-c:v".to_string(),
-            decoder.to_string(),
-        ]);
-    }
-}
-
 fn probe_primary_video_codec_family(
     settings: &AgentSettings,
     input_url: &str,
@@ -3798,6 +3959,9 @@ fn probe_primary_video_codec_family(
     match String::from_utf8_lossy(&output.stdout).trim() {
         "h264" => VideoCodecFamily::H264,
         "hevc" | "h265" => VideoCodecFamily::Hevc,
+        "vp8" => VideoCodecFamily::Vp8,
+        "vp9" => VideoCodecFamily::Vp9,
+        "av1" => VideoCodecFamily::Av1,
         _ => VideoCodecFamily::Unknown,
     }
 }
@@ -3807,24 +3971,77 @@ struct PublishOutput {
     target: String,
     format: String,
     success_check: SuccessCheck,
+    output_args: Vec<String>,
 }
 
-fn build_internal_stream_output(settings: &AgentSettings, probe: &StartupProbe) -> PublishOutput {
+fn select_internal_ingress_protocol(
+    settings: &AgentSettings,
+    profile: &InputMediaProfile,
+    capability_hints: RuntimeCapabilityHints,
+) -> InternalIngressProtocol {
+    let audio_codec = profile.audio_codec_name.as_deref();
+    let video_codec = profile.video_codec_name.as_deref();
+    let enhanced_enabled = settings.allow_enhanced_rtmp_expose
+        && capability_hints.zlm_rtmp_enhanced_enabled.unwrap_or(false);
+
+    if matches!(video_codec, Some("vp8")) || matches!(audio_codec, Some("mp2")) {
+        return InternalIngressProtocol::Rtsp;
+    }
+
+    if matches!(video_codec, Some("hevc" | "h265" | "vp9" | "av1"))
+        || matches!(audio_codec, Some("opus"))
+    {
+        return if enhanced_enabled {
+            InternalIngressProtocol::EnhancedRtmp
+        } else {
+            InternalIngressProtocol::Rtsp
+        };
+    }
+
+    if matches!(video_codec, Some("h264")) || !profile.has_video || video_codec.is_none() {
+        return InternalIngressProtocol::Rtmp;
+    }
+
+    InternalIngressProtocol::Rtsp
+}
+
+fn build_internal_stream_output(
+    settings: &AgentSettings,
+    probe: &StartupProbe,
+    protocol: InternalIngressProtocol,
+) -> PublishOutput {
     PublishOutput {
         success_check: SuccessCheck::ProcessExit,
-        target: build_internal_stream_target(settings, probe),
-        // Internal ingest always pushes into ZLM via RTMP, regardless of which
-        // playback protocols are later exposed for the stream.
-        format: "flv".to_string(),
+        target: build_internal_stream_target(settings, probe, protocol),
+        format: protocol.muxer_format().to_string(),
+        output_args: match protocol {
+            InternalIngressProtocol::Rtsp => {
+                vec!["-rtsp_transport".to_string(), "tcp".to_string()]
+            }
+            InternalIngressProtocol::Rtmp | InternalIngressProtocol::EnhancedRtmp => Vec::new(),
+        },
     }
 }
 
-fn build_internal_stream_target(settings: &AgentSettings, probe: &StartupProbe) -> String {
+fn build_internal_stream_target(
+    settings: &AgentSettings,
+    probe: &StartupProbe,
+    protocol: InternalIngressProtocol,
+) -> String {
     let host = Url::parse(&settings.zlm_api_base)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    format!("rtmp://{host}/{}/{}", probe.app, probe.stream)
+    match protocol {
+        InternalIngressProtocol::Rtmp | InternalIngressProtocol::EnhancedRtmp => format!(
+            "rtmp://{}:{}/{}/{}",
+            host, settings.zlm_rtmp_port, probe.app, probe.stream
+        ),
+        InternalIngressProtocol::Rtsp => format!(
+            "rtsp://{}:{}/{}/{}",
+            host, settings.zlm_rtsp_port, probe.app, probe.stream
+        ),
+    }
 }
 
 fn build_publish_output(
@@ -3878,12 +4095,14 @@ fn build_publish_output(
                 success_check: SuccessCheck::ProcessExit,
                 target,
                 format,
+                output_args: Vec::new(),
             })
         }
         Some(PublishTargetKind::RtmpPush) => Ok(PublishOutput {
             success_check: SuccessCheck::ProcessExit,
             target: required_nonempty("publish.url", publish.url.as_deref())?,
             format: "flv".to_string(),
+            output_args: Vec::new(),
         }),
         None => Err(ExecutorError::InvalidRequest(
             "publish.kind must be provided".to_string(),
@@ -4104,6 +4323,16 @@ fn build_startup_probe(task_id: Uuid, spec: &TaskSpec) -> Result<StartupProbe, E
     })
 }
 
+fn build_managed_stream_ingest_startup_probe(
+    task_id: Uuid,
+    spec: &TaskSpec,
+    protocol: InternalIngressProtocol,
+) -> Result<StartupProbe, ExecutorError> {
+    let mut probe = build_startup_probe(task_id, spec)?;
+    probe.schema = Some(protocol.schema().to_string());
+    Ok(probe)
+}
+
 fn preferred_publish_schema(expose: &ExposeSpec) -> String {
     if expose.enable_rtmp.unwrap_or(true) {
         "rtmp".to_string()
@@ -4298,7 +4527,8 @@ fn should_start_live_relay_recording(recording: &LiveRelayRecording) -> bool {
 }
 
 fn should_fail_on_recording_start_error(recording: &LiveRelayRecording) -> bool {
-    recording.duration_sec.is_some()
+    let _ = recording;
+    true
 }
 
 fn recording_duration_reached(recording: &LiveRelayRecording, now: DateTime<Utc>) -> bool {
@@ -4309,6 +4539,15 @@ fn recording_duration_reached(recording: &LiveRelayRecording, now: DateTime<Utc>
         return false;
     };
     now >= started_at + chrono::Duration::seconds(i64::from(duration_sec))
+}
+
+fn recording_elapsed_seconds(recording: &LiveRelayRecording, now: DateTime<Utc>) -> Option<f64> {
+    recording.recording_started_at.and_then(|started_at| {
+        now.signed_duration_since(started_at)
+            .to_std()
+            .ok()
+            .map(|elapsed| elapsed.as_secs_f64())
+    })
 }
 
 fn mark_recording_started(
@@ -4341,6 +4580,15 @@ fn mark_recording_completion(
     updated
 }
 
+fn should_auto_stop_live_relay_recording(
+    recording: &LiveRelayRecording,
+    now: DateTime<Utc>,
+) -> bool {
+    recording.started
+        && !recording.auto_stop_requested
+        && recording_duration_reached(recording, now)
+}
+
 fn live_relay_auto_close_enabled(settings: &AgentSettings, spec: &TaskSpec) -> bool {
     settings.zlm_auto_close_on_no_reader_enabled && spec.expose.stop_on_no_reader.unwrap_or(false)
 }
@@ -4367,6 +4615,10 @@ fn recovery_policy_from_handle(handle: &RuntimeHandle) -> Option<RecoveryPolicy>
         .and_then(|spec| spec.recovery.policy)
 }
 
+fn continuous_stream_ingest_from_handle(handle: &RuntimeHandle) -> bool {
+    resolved_spec_from_handle(handle).is_some_and(|spec| spec.stream_ingest_is_continuous())
+}
+
 fn should_auto_restart_process(
     handle: &RuntimeHandle,
     was_stopped: bool,
@@ -4375,6 +4627,7 @@ fn should_auto_restart_process(
     if was_stopped
         || task_type_from_handle(handle) != Some(TaskType::StreamIngest)
         || task_runtime_mode_from_handle(handle) != Some(TaskRuntimeMode::ManagedProcess)
+        || !continuous_stream_ingest_from_handle(handle)
         || !stream_online(handle)
         || fatal_recording_error_from_handle(handle).is_some()
     {
@@ -4388,9 +4641,41 @@ fn should_auto_restart_process(
         return false;
     }
 
+    should_restart_continuous_stream_ingest(status)
+}
+
+fn should_restart_continuous_stream_ingest(
+    status: &Result<std::process::ExitStatus, std::io::Error>,
+) -> bool {
     match status {
-        Ok(exit_status) => !exit_status.success(),
+        Ok(_) => true,
         Err(_) => true,
+    }
+}
+
+fn next_live_relay_offline_polls(
+    current: u32,
+    stream_was_online: bool,
+    stream_state: Result<bool, ()>,
+) -> (u32, bool) {
+    match stream_state {
+        Ok(true) => (0, false),
+        Ok(false) if stream_was_online => {
+            let next = current.saturating_add(1);
+            (next, next >= LIVE_STREAM_OFFLINE_GRACE_POLLS)
+        }
+        Ok(false) | Err(()) => (0, false),
+    }
+}
+
+fn next_rtp_server_missing_polls(current: u32, server_present: Result<bool, ()>) -> (u32, bool) {
+    match server_present {
+        Ok(true) => (0, false),
+        Ok(false) => {
+            let next = current.saturating_add(1);
+            (next, next >= RTP_SERVER_MISSING_GRACE_POLLS)
+        }
+        Err(()) => (0, false),
     }
 }
 
@@ -4701,6 +4986,79 @@ fn signal_runtime_pids(runtime: &ManagedRuntime, signal: i32) -> Result<(), Exec
     Ok(())
 }
 
+fn schedule_force_kill_if_running(
+    runtime_id: Uuid,
+    pids: Vec<i32>,
+    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    delay: Duration,
+    reason: &'static str,
+) {
+    if pids.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        sleep(delay).await;
+        let runtime_still_tracked = runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .contains_key(&runtime_id);
+        if !runtime_still_tracked {
+            return;
+        }
+
+        for pid in pids {
+            if !is_pid_running(pid) {
+                continue;
+            }
+            warn!(
+                runtime_id = %runtime_id,
+                pid,
+                delay_sec = delay.as_secs_f64(),
+                reason,
+                "process still running after graceful stop; sending SIGKILL"
+            );
+            let _ = signal_pid(pid, libc::SIGKILL);
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordDurationStopAction {
+    SignalProcess { pid: i32 },
+    CloseStream,
+}
+
+async fn request_live_relay_record_duration_stop(
+    handle: &RuntimeHandle,
+    binding: &StreamBinding,
+    settings: &AgentSettings,
+    http_client: &Client,
+    runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+) -> Result<RecordDurationStopAction, ExecutorError> {
+    if let Some(pid) = handle.pid {
+        signal_pid(pid, libc::SIGTERM)
+            .map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
+        schedule_force_kill_if_running(
+            handle.runtime_id,
+            vec![pid],
+            runtimes.clone(),
+            RECORD_DURATION_FORCE_KILL_DELAY,
+            "record_duration_reached",
+        );
+        Ok(RecordDurationStopAction::SignalProcess { pid })
+    } else {
+        call_zlm_api(
+            http_client,
+            settings,
+            "/index/api/close_streams",
+            &build_close_stream_params(binding, true),
+        )
+        .await?;
+        Ok(RecordDurationStopAction::CloseStream)
+    }
+}
+
 async fn wait_for_companion_pids_exit(pids: &[i32], timeout_after_signal: Duration) {
     let started_at = Instant::now();
     loop {
@@ -4891,6 +5249,8 @@ fn spawn_adopted_runtime_monitor(
 ) {
     let runtime_id = handle.runtime_id;
     tokio::spawn(async move {
+        let mut stop_requested_wait_started_at: Option<Instant> = None;
+        let mut last_stop_requested_running_log_at: Option<Instant> = None;
         loop {
             sleep(Duration::from_secs(2)).await;
 
@@ -4907,11 +5267,39 @@ fn spawn_adopted_runtime_monitor(
             let Some(pid) = runtime.pid else {
                 return;
             };
+            let stop_requested = runtime.stop_requested.load(Ordering::Relaxed);
             if is_pid_running(pid) {
+                if stop_requested {
+                    let waited_since =
+                        stop_requested_wait_started_at.get_or_insert_with(Instant::now);
+                    let should_log = last_stop_requested_running_log_at.map_or(true, |logged_at| {
+                        logged_at.elapsed() >= STOP_REQUESTED_STILL_RUNNING_LOG_INTERVAL
+                    });
+                    if should_log {
+                        let current_handle =
+                            registry.get(runtime_id).unwrap_or_else(|| handle.clone());
+                        warn!(
+                            task_id = %current_handle.task_id,
+                            attempt_no = current_handle.attempt_no,
+                            runtime_id = %current_handle.runtime_id,
+                            pid,
+                            state = ?current_handle.state,
+                            completion_reason =
+                                completion_reason_from_handle(&current_handle).unwrap_or_default(),
+                            command_line = current_handle.command_line.as_deref().unwrap_or(""),
+                            last_progress_at = ?current_handle.last_progress_at,
+                            waited_for_exit_sec = waited_since.elapsed().as_secs_f64(),
+                            "runtime stop requested but process is still running"
+                        );
+                        last_stop_requested_running_log_at = Some(Instant::now());
+                    }
+                } else {
+                    stop_requested_wait_started_at = None;
+                    last_stop_requested_running_log_at = None;
+                }
                 continue;
             }
 
-            let stop_requested = runtime.stop_requested.load(Ordering::Relaxed);
             runtimes
                 .write()
                 .expect("runtime map lock poisoned")
@@ -4963,8 +5351,9 @@ fn spawn_startup_probe_monitor(
 ) {
     tokio::spawn(async move {
         let started_at = tokio::time::Instant::now();
+        let mut startup_completed = false;
         loop {
-            if started_at.elapsed() >= STARTUP_PROBE_TIMEOUT {
+            if !startup_completed && started_at.elapsed() >= STARTUP_PROBE_TIMEOUT {
                 let updated = registry.update(runtime_id, |runtime| {
                     runtime.metadata["startup_timeout"] = json!(true);
                     runtime.metadata["stream_online"] = json!(false);
@@ -4999,7 +5388,15 @@ fn spawn_startup_probe_monitor(
                     .get(&runtime_id)
                     .cloned()
                 {
-                    let _ = signal_runtime_pids(&runtime, libc::SIGTERM);
+                    if signal_runtime_pids(&runtime, libc::SIGTERM).is_ok() {
+                        schedule_force_kill_if_running(
+                            runtime_id,
+                            runtime_pids(&runtime),
+                            runtimes.clone(),
+                            AUTO_STOP_FORCE_KILL_DELAY,
+                            "startup_probe_timeout",
+                        );
+                    }
                 }
                 return;
             }
@@ -5019,6 +5416,8 @@ fn spawn_startup_probe_monitor(
                 .await
                 .unwrap_or(false)
             {
+                let wall_clock_duration = resolved_spec_from_handle(&handle)
+                    .is_some_and(|spec| spec.stream_ingest_uses_wall_clock_record_duration());
                 let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
                     schema: startup_probe.schema.clone(),
                     vhost: startup_probe.vhost.clone(),
@@ -5131,7 +5530,15 @@ fn spawn_startup_probe_monitor(
                             if fatal {
                                 let _ =
                                     events.send(RuntimeNotification::TaskSnapshot(updated_handle));
-                                let _ = signal_pid(pid, libc::SIGTERM);
+                                if signal_pid(pid, libc::SIGTERM).is_ok() {
+                                    schedule_force_kill_if_running(
+                                        runtime_id,
+                                        vec![pid],
+                                        runtimes.clone(),
+                                        AUTO_STOP_FORCE_KILL_DELAY,
+                                        "recording_start_fatal",
+                                    );
+                                }
                                 return;
                             }
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
@@ -5157,40 +5564,166 @@ fn spawn_startup_probe_monitor(
                         }
                     }
                 }
-                let running_handle = registry
-                    .update(runtime_id, |runtime| {
-                        runtime.state = RuntimeState::Running;
-                        runtime.last_progress_at = Some(Utc::now());
-                        runtime.metadata["stream_online"] = json!(true);
-                        runtime.metadata["stream_binding"] = json!({
+                if let Some(recording) = live_relay_recording_from_handle(&handle) {
+                    let now = Utc::now();
+                    if should_auto_stop_live_relay_recording(&recording, now) {
+                        info!(
+                            task_id = %handle.task_id,
+                            attempt_no = handle.attempt_no,
+                            runtime_id = %handle.runtime_id,
+                            pid,
+                            stream_schema = binding.schema.as_deref().unwrap_or(""),
+                            stream_vhost = %binding.vhost,
+                            stream_app = %binding.app,
+                            stream_name = %binding.stream,
+                            recording_started_at = ?recording.recording_started_at,
+                            duration_sec = recording.duration_sec.unwrap_or_default(),
+                            now = %now.to_rfc3339(),
+                            elapsed_sec = recording_elapsed_seconds(&recording, now)
+                                .unwrap_or_default(),
+                            command_line = handle.command_line.as_deref().unwrap_or(""),
+                            "wall-clock recording duration reached in startup probe monitor"
+                        );
+                        let completed_recording =
+                            mark_recording_completion(&recording, "record_duration_reached");
+                        let completion_handle = registry
+                            .update(runtime_id, |runtime| {
+                                runtime.state = RuntimeState::Stopping;
+                                runtime.last_progress_at = Some(Utc::now());
+                                runtime.metadata["recording"] = json!(completed_recording.clone());
+                                runtime.metadata["completion_reason"] =
+                                    json!("record_duration_reached");
+                                runtime.metadata["stop"] = json!({
+                                    "reason": "record_duration_reached",
+                                    "grace_period_sec": 0,
+                                    "force_after_sec": RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                                });
+                            })
+                            .unwrap_or_else(|| {
+                                let mut handle = handle.clone();
+                                handle.state = RuntimeState::Stopping;
+                                handle.last_progress_at = Some(Utc::now());
+                                handle.metadata["recording"] = json!(completed_recording.clone());
+                                handle.metadata["completion_reason"] =
+                                    json!("record_duration_reached");
+                                handle.metadata["stop"] = json!({
+                                    "reason": "record_duration_reached",
+                                    "grace_period_sec": 0,
+                                    "force_after_sec": RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                                });
+                                handle
+                            });
+                        let _ =
+                            persist_runtime_state(&work_dir, &completion_handle, &success_check);
+                        info!(
+                            task_id = %completion_handle.task_id,
+                            attempt_no = completion_handle.attempt_no,
+                            runtime_id = %completion_handle.runtime_id,
+                            pid,
+                            auto_stop_requested = completed_recording.auto_stop_requested,
+                            completion_reason = completed_recording
+                                .completion_reason
+                                .as_deref()
+                                .unwrap_or(""),
+                            last_progress_at = ?completion_handle.last_progress_at,
+                            "updated runtime metadata after wall-clock recording duration reached"
+                        );
+                        if let Some(runtime) = runtimes
+                            .read()
+                            .expect("runtime map lock poisoned")
+                            .get(&runtime_id)
+                            .cloned()
+                        {
+                            runtime.stop_requested.store(true, Ordering::Relaxed);
+                        }
+                        match request_live_relay_record_duration_stop(
+                            &completion_handle,
+                            &binding,
+                            &settings,
+                            &http_client,
+                            &runtimes,
+                        )
+                        .await
+                        {
+                            Ok(RecordDurationStopAction::SignalProcess { pid }) => info!(
+                                task_id = %completion_handle.task_id,
+                                attempt_no = completion_handle.attempt_no,
+                                runtime_id = %completion_handle.runtime_id,
+                                pid,
+                                signal = "SIGTERM",
+                                force_after_sec = RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                                "requested process shutdown after wall-clock recording duration reached"
+                            ),
+                            Ok(RecordDurationStopAction::CloseStream) => info!(
+                                task_id = %completion_handle.task_id,
+                                attempt_no = completion_handle.attempt_no,
+                                runtime_id = %completion_handle.runtime_id,
+                                stream_schema = binding.schema.as_deref().unwrap_or(""),
+                                stream_vhost = %binding.vhost,
+                                stream_app = %binding.app,
+                                stream_name = %binding.stream,
+                                "closed live_relay stream after wall-clock recording duration reached"
+                            ),
+                            Err(error) => error!(
+                                task_id = %completion_handle.task_id,
+                                attempt_no = completion_handle.attempt_no,
+                                runtime_id = %completion_handle.runtime_id,
+                                error = %error,
+                                "failed to stop live_relay after wall-clock recording duration reached"
+                            ),
+                        }
+                        return;
+                    }
+                }
+
+                let should_emit_running = !startup_completed
+                    || handle.state != RuntimeState::Running
+                    || !stream_online(&handle)
+                    || recording_started;
+                let running_handle = if should_emit_running {
+                    let running_handle = registry
+                        .update(runtime_id, |runtime| {
+                            runtime.state = RuntimeState::Running;
+                            runtime.last_progress_at = Some(Utc::now());
+                            runtime.metadata["stream_online"] = json!(true);
+                            runtime.metadata["stream_binding"] = json!({
+                                "schema": startup_probe.schema,
+                                "vhost": startup_probe.vhost,
+                                "app": startup_probe.app,
+                                "stream": startup_probe.stream,
+                            });
+                        })
+                        .unwrap_or_else(|| handle.clone());
+                    let _ = persist_runtime_state(&work_dir, &running_handle, &success_check);
+                    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                        task_id: running_handle.task_id,
+                        attempt_no: running_handle.attempt_no,
+                        lease_token: runtime_lease_token(&running_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&running_handle),
+                        event_type: "running".to_string(),
+                        event_level: "info".to_string(),
+                        message: "ZLM stream is online".to_string(),
+                        payload: json!({
+                            "runtime_id": running_handle.runtime_id,
+                            "pid": running_handle.pid,
                             "schema": startup_probe.schema,
                             "vhost": startup_probe.vhost,
                             "app": startup_probe.app,
                             "stream": startup_probe.stream,
-                        });
-                    })
-                    .unwrap_or(handle);
+                            "recording_started": recording_started,
+                        }),
+                    }));
+                    let _ = events.send(RuntimeNotification::TaskSnapshot(running_handle.clone()));
+                    running_handle
+                } else {
+                    handle.clone()
+                };
+
+                startup_completed = true;
+                if !wall_clock_duration {
+                    return;
+                }
                 let _ = persist_runtime_state(&work_dir, &running_handle, &success_check);
-                let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-                    task_id: running_handle.task_id,
-                    attempt_no: running_handle.attempt_no,
-                    lease_token: runtime_lease_token(&running_handle).unwrap_or_default(),
-                    session_epoch: runtime_session_epoch(&running_handle),
-                    event_type: "running".to_string(),
-                    event_level: "info".to_string(),
-                    message: "ZLM stream is online".to_string(),
-                    payload: json!({
-                        "runtime_id": running_handle.runtime_id,
-                        "pid": running_handle.pid,
-                        "schema": startup_probe.schema,
-                        "vhost": startup_probe.vhost,
-                        "app": startup_probe.app,
-                        "stream": startup_probe.stream,
-                        "recording_started": recording_started,
-                    }),
-                }));
-                let _ = events.send(RuntimeNotification::TaskSnapshot(running_handle));
-                return;
             }
 
             sleep(STARTUP_PROBE_POLL_INTERVAL).await;
@@ -5210,6 +5743,7 @@ fn spawn_live_relay_monitor(
 ) {
     tokio::spawn(async move {
         let started_at = tokio::time::Instant::now();
+        let mut offline_polls = 0_u32;
         loop {
             let runtime = {
                 runtimes
@@ -5232,8 +5766,15 @@ fn spawn_live_relay_monitor(
             };
 
             let stream_state = zlm_stream_online(&http_client, &settings, &startup_probe).await;
+            let stream_was_online = stream_online(&handle);
+            let (next_offline_polls, offline_threshold_reached) = next_live_relay_offline_polls(
+                offline_polls,
+                stream_was_online,
+                stream_state.as_ref().map(|value| *value).map_err(|_| ()),
+            );
             match stream_state {
                 Ok(true) => {
+                    offline_polls = next_offline_polls;
                     let mut recording_started = false;
                     if let Some(recording) = live_relay_recording_from_handle(&handle)
                         .filter(should_start_live_relay_recording)
@@ -5429,33 +5970,42 @@ fn spawn_live_relay_monitor(
                         }
                     }
                     let handle = registry.get(runtime_id).unwrap_or(handle.clone());
-                    if let Some(recording) = live_relay_recording_from_handle(&handle)
-                        .filter(|recording| recording.started)
-                        .filter(|recording| recording_duration_reached(recording, Utc::now()))
+                    if let Some(recording) =
+                        live_relay_recording_from_handle(&handle).filter(|recording| {
+                            should_auto_stop_live_relay_recording(recording, Utc::now())
+                        })
                     {
-                        let completion_handle = if recording.auto_stop_requested {
-                            handle.clone()
-                        } else {
-                            let completed_recording =
-                                mark_recording_completion(&recording, "record_duration_reached");
-                            registry
-                                .update(runtime_id, |runtime| {
-                                    runtime.last_progress_at = Some(Utc::now());
-                                    runtime.metadata["recording"] =
-                                        json!(completed_recording.clone());
-                                    runtime.metadata["completion_reason"] =
-                                        json!("record_duration_reached");
-                                })
-                                .unwrap_or_else(|| {
-                                    let mut handle = handle.clone();
-                                    handle.last_progress_at = Some(Utc::now());
-                                    handle.metadata["recording"] =
-                                        json!(completed_recording.clone());
-                                    handle.metadata["completion_reason"] =
-                                        json!("record_duration_reached");
-                                    handle
-                                })
-                        };
+                        let completed_recording =
+                            mark_recording_completion(&recording, "record_duration_reached");
+                        let completion_handle = registry
+                            .update(runtime_id, |runtime| {
+                                runtime.state = RuntimeState::Stopping;
+                                runtime.last_progress_at = Some(Utc::now());
+                                runtime.metadata["recording"] =
+                                    json!(completed_recording.clone());
+                                runtime.metadata["completion_reason"] =
+                                    json!("record_duration_reached");
+                                runtime.metadata["stop"] = json!({
+                                    "reason": "record_duration_reached",
+                                    "grace_period_sec": 0,
+                                    "force_after_sec": RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                                });
+                            })
+                            .unwrap_or_else(|| {
+                                let mut handle = handle.clone();
+                                handle.state = RuntimeState::Stopping;
+                                handle.last_progress_at = Some(Utc::now());
+                                handle.metadata["recording"] =
+                                    json!(completed_recording.clone());
+                                handle.metadata["completion_reason"] =
+                                    json!("record_duration_reached");
+                                handle.metadata["stop"] = json!({
+                                    "reason": "record_duration_reached",
+                                    "grace_period_sec": 0,
+                                    "force_after_sec": RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                                });
+                                handle
+                            });
                         let _ = persist_runtime_state(
                             &work_dir,
                             &completion_handle,
@@ -5477,18 +6027,12 @@ fn spawn_live_relay_monitor(
                                 stream: startup_probe.stream.clone(),
                             },
                         );
-                        let _ = stop_live_relay_recording(
-                            &http_client,
-                            &settings,
+                        let _ = request_live_relay_record_duration_stop(
+                            &completion_handle,
                             &binding,
-                            &recording,
-                        )
-                        .await;
-                        let _ = call_zlm_api(
-                            &http_client,
                             &settings,
-                            "/index/api/close_streams",
-                            &build_close_stream_params(&binding, true),
+                            &http_client,
+                            &runtimes,
                         )
                         .await;
                         continue;
@@ -5612,7 +6156,12 @@ fn spawn_live_relay_monitor(
                     let _ = registry.remove(runtime_id);
                     return;
                 }
-                Ok(false) if stream_online(&handle) => {
+                Ok(false) if stream_was_online => {
+                    offline_polls = next_offline_polls;
+                    if !offline_threshold_reached {
+                        sleep(STARTUP_PROBE_POLL_INTERVAL).await;
+                        continue;
+                    }
                     let exited_handle = registry
                         .update(runtime_id, |runtime| {
                             runtime.state = RuntimeState::Exited;
@@ -5688,7 +6237,9 @@ fn spawn_live_relay_monitor(
                     let _ = registry.remove(runtime_id);
                     return;
                 }
-                Ok(false) | Err(_) => {}
+                Ok(false) | Err(_) => {
+                    offline_polls = next_offline_polls;
+                }
             }
 
             sleep(STARTUP_PROBE_POLL_INTERVAL).await;
@@ -5707,6 +6258,7 @@ fn spawn_rtp_receive_monitor(
     events: RuntimeEventSink,
 ) {
     tokio::spawn(async move {
+        let mut missing_polls = 0_u32;
         loop {
             let runtime = {
                 runtimes
@@ -5728,8 +6280,17 @@ fn spawn_rtp_receive_monitor(
                 return;
             };
 
-            match zlm_rtp_server_port(&http_client, &settings, &stream_id).await {
+            let server_port = zlm_rtp_server_port(&http_client, &settings, &stream_id).await;
+            let (next_missing_polls, missing_threshold_reached) = next_rtp_server_missing_polls(
+                missing_polls,
+                server_port
+                    .as_ref()
+                    .map(|value| value.is_some())
+                    .map_err(|_| ()),
+            );
+            match server_port {
                 Ok(Some(local_port)) => {
+                    missing_polls = next_missing_polls;
                     let should_emit_running =
                         handle.state != RuntimeState::Running || !stream_online(&handle);
                     if should_emit_running {
@@ -5790,6 +6351,11 @@ fn spawn_rtp_receive_monitor(
                     }
                 }
                 Ok(None) => {
+                    missing_polls = next_missing_polls;
+                    if !missing_threshold_reached {
+                        sleep(STARTUP_PROBE_POLL_INTERVAL).await;
+                        continue;
+                    }
                     runtimes
                         .write()
                         .expect("runtime map lock poisoned")
@@ -5833,7 +6399,9 @@ fn spawn_rtp_receive_monitor(
                     let _ = registry.remove(runtime_id);
                     return;
                 }
-                Err(_) => {}
+                Err(_) => {
+                    missing_polls = next_missing_polls;
+                }
             }
 
             sleep(STARTUP_PROBE_POLL_INTERVAL).await;
@@ -6136,16 +6704,6 @@ fn attach_file_artifact_metadata(handle: &mut RuntimeHandle, success_check: &Suc
             .filter_map(|output| file_artifact_metadata_from_path(Path::new(output)))
             .collect::<Vec<_>>();
         if artifacts.is_empty() {
-            if let Some(companion) = companion_recording_from_handle(handle) {
-                artifacts.extend(
-                    companion
-                        .outputs
-                        .iter()
-                        .filter_map(|output| file_artifact_metadata_from_path(Path::new(output))),
-                );
-            }
-        }
-        if artifacts.is_empty() {
             if let SuccessCheck::FileExists(path) = success_check {
                 if let Some(metadata) = file_artifact_metadata_from_path(path) {
                     artifacts.push(metadata);
@@ -6253,15 +6811,28 @@ fn classify_adopted_exit(
                 if task_runtime_mode_from_handle(handle)
                     == Some(TaskRuntimeMode::ManagedProcess) =>
             {
-                (
-                    "succeeded",
-                    "info",
-                    "adopted stream_ingest process exited; treating as completed".to_string(),
-                    json!({
-                        "output_target": output_target,
-                        "orphaned": true,
-                    }),
-                )
+                if continuous_stream_ingest_from_handle(handle) {
+                    (
+                        "failed",
+                        "error",
+                        "adopted continuous stream_ingest process exited unexpectedly".to_string(),
+                        json!({
+                            "output_target": output_target,
+                            "orphaned": true,
+                            "reason": "unexpected_stream_exit",
+                        }),
+                    )
+                } else {
+                    (
+                        "succeeded",
+                        "info",
+                        "adopted stream_ingest process completed".to_string(),
+                        json!({
+                            "output_target": output_target,
+                            "orphaned": true,
+                        }),
+                    )
+                }
             }
             _ => (
                 "failed",
@@ -6405,6 +6976,7 @@ fn parse_bitrate_kbps(value: Option<&String>) -> f64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
 
     fn test_settings(work_root: &str) -> AgentSettings {
         AgentSettings {
@@ -6419,8 +6991,11 @@ mod tests {
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
             zlm_api_base: String::new(),
+            zlm_rtmp_port: 1935,
+            zlm_rtsp_port: 554,
             zlm_api_secret: String::new(),
             zlm_auto_close_on_no_reader_enabled: false,
+            allow_enhanced_rtmp_expose: true,
             agent_stream_addr: "http://127.0.0.1:8081".to_string(),
             primary_interface_name: String::new(),
             primary_interface_ip: String::new(),
@@ -6443,32 +7018,52 @@ mod tests {
         fs::set_permissions(path, permissions).expect("script permissions should update");
     }
 
-    fn create_mock_ffmpeg_binary(root: &Path) -> String {
-        let path = root.join("mock-ffmpeg.sh");
-        write_executable(
-            &path,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-case "${1:-}" in
-  -version)
-    echo "ffmpeg version mock"
-    ;;
-  -hwaccels)
-    printf '%s\n' "Hardware acceleration methods:" "cuda"
-    ;;
-  -encoders)
-    printf '%s\n' "Encoders:" " V....D h264_nvenc" " V....D hevc_nvenc"
-    ;;
-  -decoders)
-    printf '%s\n' "Decoders:" " V..... h264_cuvid" " V..... hevc_cuvid"
-    ;;
-  *)
-    exit 0
-    ;;
-esac
-"#,
-        );
-        path.to_string_lossy().to_string()
+    fn success_exit_status() -> std::process::ExitStatus {
+        ExitStatusExt::from_raw(0)
+    }
+
+    fn continuous_stream_ingest_handle() -> RuntimeHandle {
+        let resolved_spec = json!({
+            "type": "stream_ingest",
+            "name": "continuous-ingest",
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "http_mp4",
+                "source_mode": "vod",
+                "url": "http://vod.example.com/archive.mp4",
+                "loop_enabled": true
+            },
+            "stream": {"app": "live", "name": "continuous-stream"},
+            "process": {"mode": "copy_or_transcode"},
+            "expose": {
+                "enable_rtsp": true,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "record": {"enabled": false},
+            "recovery": {"policy": "auto"},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(1234),
+            started_at: Utc::now(),
+            last_progress_at: Some(Utc::now()),
+            state: RuntimeState::Running,
+            command_line: Some("ffmpeg -i input".to_string()),
+            outputs: vec!["rtsp://127.0.0.1:554/live/continuous-stream".to_string()],
+            metadata: json!({
+                "task_type": "stream_ingest",
+                "stream_online": true,
+                "resolved_spec": resolved_spec,
+            }),
+        }
     }
 
     fn create_mock_ffprobe_binary(
@@ -6476,11 +7071,15 @@ esac
         video_codec_name: &str,
         audio_codec_name: Option<&str>,
     ) -> String {
-        create_mock_ffprobe_binary_with_format(
+        create_mock_ffprobe_binary_with_profile(
             root,
             "mov,mp4,m4a,3gp,3g2,mj2",
             video_codec_name,
             audio_codec_name,
+            Some(48_000),
+            Some(2),
+            Some(32),
+            audio_codec_name.map(|_| 2),
         )
     }
 
@@ -6490,13 +7089,46 @@ esac
         video_codec_name: &str,
         audio_codec_name: Option<&str>,
     ) -> String {
+        create_mock_ffprobe_binary_with_profile(
+            root,
+            format_name,
+            video_codec_name,
+            audio_codec_name,
+            Some(48_000),
+            Some(2),
+            Some(32),
+            audio_codec_name.map(|_| 2),
+        )
+    }
+
+    fn create_mock_ffprobe_binary_with_profile(
+        root: &Path,
+        format_name: &str,
+        video_codec_name: &str,
+        audio_codec_name: Option<&str>,
+        audio_sample_rate: Option<u32>,
+        audio_channels: Option<u32>,
+        video_extradata_size: Option<u64>,
+        audio_extradata_size: Option<u64>,
+    ) -> String {
         let path = root.join("mock-ffprobe.sh");
         let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
+            let sample_rate = audio_sample_rate
+                .map(|value| format!(",\"sample_rate\":\"{value}\""))
+                .unwrap_or_default();
+            let channels = audio_channels
+                .map(|value| format!(",\"channels\":{value}"))
+                .unwrap_or_default();
+            let extradata_size = audio_extradata_size
+                .map(|value| format!(",\"extradata_size\":{value}"))
+                .unwrap_or_default();
             format!(
-                r#",
-    {{"codec_type":"audio","codec_name":"{codec}"}}"#
+                ",\n    {{\"codec_type\":\"audio\",\"codec_name\":\"{codec}\"{sample_rate}{channels}{extradata_size}}}"
             )
         });
+        let video_extradata_size = video_extradata_size
+            .map(|value| format!(",\"extradata_size\":{value}"))
+            .unwrap_or_default();
         let body = format!(
             r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -6512,7 +7144,7 @@ done
 if [ "$want_json" = "1" ]; then
   cat <<'EOF'
 {{"streams":[
-    {{"codec_type":"video","codec_name":"{video_codec_name}"}}{audio_stream}
+    {{"codec_type":"video","codec_name":"{video_codec_name}"{video_extradata_size}}}{audio_stream}
 ],"format":{{"format_name":"{format_name}"}}}}
 EOF
 else
@@ -6534,7 +7166,7 @@ fi
         let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
             format!(
                 r#",
-    {{"codec_type":"audio","codec_name":"{codec}"}}"#
+    {{"codec_type":"audio","codec_name":"{codec}","sample_rate":"48000","channels":2,"extradata_size":2}}"#
             )
         });
         let body = format!(
@@ -6557,7 +7189,7 @@ done
 if [ "$want_json" = "1" ]; then
   cat <<'EOF'
 {{"streams":[
-    {{"codec_type":"video","codec_name":"{video_codec_name}"}}{audio_stream}
+    {{"codec_type":"video","codec_name":"{video_codec_name}","extradata_size":32}}{audio_stream}
 ],"format":{{"format_name":"mpegts"}}}}
 EOF
 else
@@ -6865,8 +7497,12 @@ fi
         assert!(profile.has_video);
         assert_eq!(profile.video_family, VideoCodecFamily::H264);
         assert_eq!(profile.video_codec_name.as_deref(), Some("h264"));
+        assert!(profile.video_extradata_present);
         assert!(profile.has_audio);
         assert_eq!(profile.audio_codec_name.as_deref(), Some("aac"));
+        assert_eq!(profile.audio_sample_rate, Some(48_000));
+        assert_eq!(profile.audio_channels, Some(2));
+        assert!(profile.audio_extradata_present);
         assert_eq!(profile.source_family, InputSourceFamily::Mp4Mov);
 
         let _ = fs::remove_dir_all(temp_root);
@@ -6911,6 +7547,8 @@ fi
         assert!(!profile.has_video);
         assert!(!profile.has_audio);
         assert_eq!(profile.video_family, VideoCodecFamily::Unknown);
+        assert!(!profile.video_extradata_present);
+        assert!(!profile.audio_extradata_present);
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -6942,30 +7580,20 @@ fi
     }
 
     #[test]
-    fn maybe_add_cuda_decoder_uses_hevc_decoder_when_available() {
-        let temp_root =
-            std::env::temp_dir().join(format!("streamserver-gpu-decoder-{}", Uuid::now_v7()));
-        fs::create_dir_all(&temp_root).expect("temp root should exist");
-
+    fn resolve_transcode_selection_uses_node_gpu_policy_without_decoder_probe() {
         let mut settings = test_settings("/tmp/work");
-        settings.ffmpeg_bin = create_mock_ffmpeg_binary(&temp_root);
+        settings.acceleration_mode = "gpu".to_string();
 
-        let mut input_args = Vec::new();
-        maybe_add_cuda_decoder(&mut input_args, &settings, VideoCodecFamily::Hevc);
-
-        assert_eq!(
-            input_args,
-            vec![
-                "-hwaccel".to_string(),
-                "cuda".to_string(),
-                "-hwaccel_output_format".to_string(),
-                "cuda".to_string(),
-                "-c:v".to_string(),
-                "hevc_cuvid".to_string(),
-            ]
+        let selection = resolve_transcode_selection_for_input_family(
+            &settings,
+            VideoCodecFamily::Hevc,
+            VideoOutputPolicy::KeepSourceFamily,
+            AudioOutputPolicy::CopyWhitelistedElseAac,
         );
 
-        let _ = fs::remove_dir_all(temp_root);
+        assert!(selection.input_args.is_empty());
+        assert_eq!(selection.video_encoder, "hevc_nvenc");
+        assert_eq!(selection.audio_encoder, "aac");
     }
 
     #[test]
@@ -7499,7 +8127,7 @@ fi
     }
 
     #[test]
-    fn build_multicast_bridge_plan_copy_or_transcode_copies_hevc_aac_to_external_rtmp() {
+    fn build_multicast_bridge_plan_copy_or_transcode_transcodes_hevc_for_external_rtmp() {
         let temp_root = std::env::temp_dir().join(format!(
             "streamserver-bridge-copy-hevc-rtmp-{}",
             Uuid::now_v7()
@@ -7545,18 +8173,12 @@ fi
         assert!(
             plan.args
                 .windows(2)
-                .any(|window| window == ["-c:v", "copy"])
+                .any(|window| window == ["-c:v", "libx264"])
         );
         assert!(
             plan.args
                 .windows(2)
                 .any(|window| window == ["-c:a", "copy"])
-        );
-        assert!(
-            !plan
-                .args
-                .windows(2)
-                .any(|window| window == ["-c:v", "libx264"])
         );
 
         let _ = fs::remove_dir_all(temp_root);
@@ -7845,7 +8467,7 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_uses_companion_mp4_recording_process() {
+    fn build_file_to_live_plan_uses_zlm_recording_for_mp4_record() {
         let settings = test_settings("/tmp/work");
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
@@ -7874,23 +8496,28 @@ fi
 
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
-        let companion = plan
-            .companion_recording
-            .clone()
-            .expect("mp4 recording should use a companion process");
 
-        assert!(plan.args.iter().any(|arg| arg == "-re"));
         assert!(!plan.args.iter().any(|arg| arg == "tee"));
-        assert_eq!(plan.output_target, "rtmp://127.0.0.1/live/stream");
+        assert_eq!(plan.output_target, "rtmp://127.0.0.1:1935/live/stream");
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-rtsp_transport", "tcp"])
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
         assert_eq!(
             plan.outputs,
-            vec!["rtmp://127.0.0.1/live/stream".to_string()]
+            vec![
+                "rtmp://127.0.0.1:1935/live/stream".to_string(),
+                ZLM_RECORD_HTTP_ROOT.to_string(),
+            ]
         );
-        assert_eq!(
-            companion.output_target,
-            "/tmp/work/00000000-0000-0000-0000-000000000000/attempt-1/record.mp4".to_string()
-        );
-        assert!(companion.args.iter().any(|arg| arg == "mp4"));
+        assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtmp"));
+        assert!(plan.companion_recording.is_none());
+        let recording = plan.recording.expect("recording should use ZLM API");
+        assert_eq!(recording.formats, vec![ZlmRecordKind::Mp4]);
+        assert_eq!(recording.root_path, ZLM_RECORD_HTTP_ROOT);
     }
 
     #[test]
@@ -7930,6 +8557,7 @@ fi
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
 
+        assert_eq!(plan.output_target, "rtmp://127.0.0.1:1935/live/stream");
         assert!(
             plan.args
                 .windows(2)
@@ -8199,6 +8827,8 @@ fi
                 .any(|window| window == ["-c:a", "copy"])
         );
         assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "hls"]));
+        assert!(plan.internal_ingress_protocol.is_none());
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -8337,7 +8967,7 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_copy_or_transcode_copies_mpegts_aac_into_internal_rtmp_with_bsf() {
+    fn build_file_to_live_plan_copy_or_transcode_routes_mpegts_aac_to_internal_rtmp() {
         let temp_root =
             std::env::temp_dir().join(format!("streamserver-file-live-mpegts-{}", Uuid::now_v7()));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -8371,6 +9001,7 @@ fi
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
 
+        assert_eq!(plan.output_target, "rtmp://127.0.0.1:1935/live/stream");
         assert!(
             plan.args
                 .windows(2)
@@ -8392,6 +9023,8 @@ fi
                 .windows(2)
                 .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
         );
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+        assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtmp"));
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -8430,6 +9063,7 @@ fi
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
 
+        assert_eq!(plan.output_target, "rtmp://127.0.0.1:1935/live/stream");
         assert!(
             plan.args
                 .windows(2)
@@ -8446,7 +9080,7 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_copy_or_transcode_copies_hevc_aac_into_internal_rtmp() {
+    fn build_file_to_live_plan_copy_or_transcode_copies_hevc_aac_into_internal_enhanced_rtmp() {
         let temp_root =
             std::env::temp_dir().join(format!("streamserver-file-live-hevc-{}", Uuid::now_v7()));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -8477,8 +9111,17 @@ fi
         };
 
         let spec = parse_task_spec(&request).expect("spec should parse");
-        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+        let plan = build_file_to_live_plan_with_capability_hints(
+            &settings,
+            &request,
+            &spec,
+            RuntimeCapabilityHints {
+                zlm_rtmp_enhanced_enabled: Some(true),
+            },
+        )
+        .expect("plan should build");
 
+        assert_eq!(plan.output_target, "rtmp://127.0.0.1:1935/live/stream");
         assert!(
             plan.args
                 .windows(2)
@@ -8496,6 +9139,70 @@ fi
                 .any(|window| window == ["-c:v", "libx264"])
         );
         assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+        assert_eq!(
+            plan.internal_ingress_protocol.as_deref(),
+            Some("enhanced_rtmp")
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_falls_back_to_rtsp_and_transcodes_aac_when_enhanced_is_unavailable()
+    {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-hevc-aac-rtsp-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary_with_profile(
+            &temp_root,
+            "mpegts",
+            "hevc",
+            Some("aac"),
+            Some(48_000),
+            Some(2),
+            Some(32),
+            Some(0),
+        );
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-hevc-aac-rtsp-fallback",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.ts"},
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert_eq!(plan.output_target, "rtsp://127.0.0.1:554/live/stream");
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "rtsp"]));
+        assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtsp"));
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -8509,8 +9216,16 @@ fi
         fs::create_dir_all(&temp_root).expect("temp root should exist");
 
         let mut settings = test_settings("/tmp/work");
-        settings.ffprobe_bin =
-            create_mock_ffprobe_binary_with_format(&temp_root, "mpegts", "h264", Some("mp3"));
+        settings.ffprobe_bin = create_mock_ffprobe_binary_with_profile(
+            &temp_root,
+            "mpegts",
+            "h264",
+            Some("mp3"),
+            Some(44_100),
+            Some(2),
+            Some(32),
+            Some(2),
+        );
 
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
@@ -8548,12 +9263,70 @@ fi
                 .any(|window| window == ["-c:a", "copy"])
         );
         assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
 
         let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
-    fn build_file_to_live_plan_copy_or_transcode_transcodes_opus_audio_for_flv() {
+    fn build_file_to_live_plan_copy_or_transcode_transcodes_mp3_when_flv_sample_rate_is_unsupported()
+     {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-mp3-transcode-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary_with_profile(
+            &temp_root,
+            "mpegts",
+            "h264",
+            Some("mp3"),
+            Some(48_000),
+            Some(2),
+            Some(32),
+            Some(2),
+        );
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "file-live-mp3-transcode",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.ts"},
+                "stream": {"app": "live", "name": "stream"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:v", "copy"])
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_copy_or_transcode_copies_opus_audio_for_internal_rtsp() {
         let temp_root = std::env::temp_dir().join(format!(
             "streamserver-file-live-opus-transcode-{}",
             Uuid::now_v7()
@@ -8594,7 +9367,14 @@ fi
                 .windows(2)
                 .any(|window| window == ["-c:v", "copy"])
         );
-        assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(
+            plan.args
+                .windows(2)
+                .any(|window| window == ["-c:a", "copy"])
+        );
+        assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "rtsp"]));
+        assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtsp"));
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -8767,7 +9547,7 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_uses_bsf_when_recording_mp4_from_mpegts_aac() {
+    fn build_file_to_live_plan_uses_zlm_recording_when_recording_mp4_from_mpegts_aac() {
         let temp_root = std::env::temp_dir().join(format!(
             "streamserver-file-live-recording-mpegts-{}",
             Uuid::now_v7()
@@ -8802,10 +9582,6 @@ fi
 
         let spec = parse_task_spec(&request).expect("spec should parse");
         let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
-        let companion = plan
-            .companion_recording
-            .clone()
-            .expect("mp4 recording should use a companion process");
 
         assert!(
             plan.args
@@ -8819,15 +9595,17 @@ fi
         );
         assert!(!plan.args.iter().any(|arg| arg == "tee"));
         assert!(plan.args.iter().any(|arg| arg == "aac_adtstoasc"));
-        assert!(companion.args.iter().any(|arg| arg == "aac_adtstoasc"));
+        assert!(plan.companion_recording.is_none());
+        let recording = plan.recording.expect("recording should use ZLM");
+        assert_eq!(recording.formats, vec![ZlmRecordKind::Mp4]);
 
         let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
-    fn attach_file_artifact_metadata_uses_companion_recording_outputs() {
+    fn attach_file_artifact_metadata_uses_stream_ingest_outputs() {
         let temp_root = std::env::temp_dir().join(format!(
-            "streamserver-stream-ingest-sidecar-artifact-{}",
+            "streamserver-stream-ingest-artifact-{}",
             Uuid::now_v7()
         ));
         fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -8844,18 +9622,9 @@ fi
             last_progress_at: None,
             state: RuntimeState::Exited,
             command_line: None,
-            outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+            outputs: vec![artifact_path.to_string_lossy().to_string()],
             metadata: json!({
-                "managed_file_output_kind": "stream_ingest_record",
-                "companion_recording": {
-                    "kind": "stream_ingest_mp4_record",
-                    "pid": null,
-                    "output_target": artifact_path,
-                    "outputs": [artifact_path],
-                    "command_line": null,
-                    "state": "succeeded",
-                    "error": null
-                }
+                "managed_file_output_kind": "stream_ingest_record"
             }),
         };
 
@@ -8881,7 +9650,7 @@ fi
                 "type": "stream_ingest",
                 "name": "file-live-http",
                 "common": {"created_by": "tester"},
-                "input": {"kind": "http_mp4", "url": "http://vod.example.com/archive.mp4"},
+                "input": {"kind": "http_mp4", "source_mode": "vod", "url": "http://vod.example.com/archive.mp4"},
                 "stream": {"app": "live", "name": "stream"},
                 "process": {"mode": "copy_or_transcode"},
                 "record": {
@@ -8912,8 +9681,15 @@ fi
     }
 
     #[test]
-    fn build_file_to_live_plan_uses_flv_for_internal_rtmp_publish() {
-        let settings = test_settings("/tmp/work");
+    fn build_file_to_live_plan_uses_rtmp_for_internal_publish() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-internal-publish-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+        let mut settings = test_settings("/tmp/work");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
         let request = StartTaskRequest {
             task_id: Uuid::nil(),
             attempt_no: 1,
@@ -8950,10 +9726,115 @@ fi
 
         assert_eq!(
             plan.output_target,
-            "rtmp://127.0.0.1/live/internal-flv-check"
+            "rtmp://127.0.0.1:1935/live/internal-flv-check"
+        );
+        assert!(
+            !plan
+                .args
+                .windows(2)
+                .any(|window| window == ["-rtsp_transport", "tcp"])
         );
         assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
-        assert!(!plan.args.windows(2).any(|window| window == ["-f", "rtmp"]));
+        assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtmp"));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_uses_configured_zlm_rtsp_port() {
+        let mut settings = test_settings("/tmp/work");
+        settings.zlm_rtsp_port = 9554;
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-rtsp-port-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+        settings.ffprobe_bin =
+            create_mock_ffprobe_binary_with_format(&temp_root, "mpegts", "h264", Some("mp2"));
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "configured-rtsp-port",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "http_mp4", "source_mode": "vod", "url": "http://vod.example.com/archive.mp4"},
+                "stream": {"app": "live", "name": "configured-port"},
+                "process": {"mode": "copy_or_transcode"},
+                "expose": {
+                    "enable_rtsp": true,
+                    "enable_rtmp": false,
+                    "enable_http_ts": false,
+                    "enable_http_fmp4": false,
+                    "enable_hls": false
+                },
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert_eq!(
+            plan.output_target,
+            "rtsp://127.0.0.1:9554/live/configured-port"
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "rtsp"]));
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn build_file_to_live_plan_uses_configured_zlm_rtmp_port() {
+        let mut settings = test_settings("/tmp/work");
+        settings.zlm_rtmp_port = 2935;
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-file-live-rtmp-port-{}",
+            Uuid::now_v7()
+        ));
+        fs::create_dir_all(&temp_root).expect("temp root should exist");
+        settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
+
+        let request = StartTaskRequest {
+            task_id: Uuid::nil(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: json!({
+                "type": "stream_ingest",
+                "name": "configured-rtmp-port",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "http_mp4", "source_mode": "vod", "url": "http://vod.example.com/archive.mp4"},
+                "stream": {"app": "live", "name": "configured-port"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        };
+
+        let spec = parse_task_spec(&request).expect("spec should parse");
+        let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+
+        assert_eq!(
+            plan.output_target,
+            "rtmp://127.0.0.1:2935/live/configured-port"
+        );
+        assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
@@ -9119,6 +10000,42 @@ fi
     }
 
     #[test]
+    fn should_auto_stop_live_relay_recording_requires_started_and_not_already_requested() {
+        let started_at = Utc::now();
+        let base = LiveRelayRecording {
+            formats: vec![ZlmRecordKind::Mp4],
+            root_path: "/var/media/archive".to_string(),
+            duration_sec: Some(60),
+            segment_sec: None,
+            as_player: false,
+            recording_started_at: Some(started_at),
+            auto_stop_requested: false,
+            completion_reason: None,
+            started: true,
+            failed: false,
+        };
+
+        assert!(should_auto_stop_live_relay_recording(
+            &base,
+            started_at + chrono::Duration::seconds(60)
+        ));
+
+        let mut already_requested = base.clone();
+        already_requested.auto_stop_requested = true;
+        assert!(!should_auto_stop_live_relay_recording(
+            &already_requested,
+            started_at + chrono::Duration::seconds(60)
+        ));
+
+        let mut not_started = base;
+        not_started.started = false;
+        assert!(!should_auto_stop_live_relay_recording(
+            &not_started,
+            started_at + chrono::Duration::seconds(60)
+        ));
+    }
+
+    #[test]
     fn classify_adopted_exit_treats_record_duration_reached_as_success() {
         let handle = RuntimeHandle {
             runtime_id: Uuid::now_v7(),
@@ -9141,6 +10058,65 @@ fi
             classify_adopted_exit(&handle, &SuccessCheck::ProcessExit, true);
         assert_eq!(event_type, "succeeded");
         assert_eq!(payload["reason"], json!("record_duration_reached"));
+    }
+
+    #[test]
+    fn should_auto_restart_process_restarts_continuous_stream_on_zero_exit() {
+        let handle = continuous_stream_ingest_handle();
+
+        assert!(should_auto_restart_process(
+            &handle,
+            false,
+            &Ok(success_exit_status()),
+        ));
+    }
+
+    #[test]
+    fn classify_adopted_exit_marks_unstopped_continuous_stream_exit_as_failed() {
+        let mut handle = continuous_stream_ingest_handle();
+        handle.state = RuntimeState::Exited;
+
+        let (event_type, _, message, payload) =
+            classify_adopted_exit(&handle, &SuccessCheck::ProcessExit, false);
+
+        assert_eq!(event_type, "failed");
+        assert_eq!(
+            message,
+            "adopted continuous stream_ingest process exited unexpectedly"
+        );
+        assert_eq!(payload["reason"], json!("unexpected_stream_exit"));
+    }
+
+    #[test]
+    fn live_relay_monitor_requires_consecutive_offline_before_failure() {
+        let (polls, should_fail) = next_live_relay_offline_polls(0, true, Ok(false));
+        assert_eq!(polls, 1);
+        assert!(!should_fail);
+
+        let (polls, should_fail) =
+            next_live_relay_offline_polls(LIVE_STREAM_OFFLINE_GRACE_POLLS - 1, true, Ok(false));
+        assert_eq!(polls, LIVE_STREAM_OFFLINE_GRACE_POLLS);
+        assert!(should_fail);
+
+        let (polls, should_fail) = next_live_relay_offline_polls(polls, true, Err(()));
+        assert_eq!(polls, 0);
+        assert!(!should_fail);
+    }
+
+    #[test]
+    fn rtp_receive_monitor_requires_consecutive_missing_before_failure() {
+        let (polls, should_fail) = next_rtp_server_missing_polls(0, Ok(false));
+        assert_eq!(polls, 1);
+        assert!(!should_fail);
+
+        let (polls, should_fail) =
+            next_rtp_server_missing_polls(RTP_SERVER_MISSING_GRACE_POLLS - 1, Ok(false));
+        assert_eq!(polls, RTP_SERVER_MISSING_GRACE_POLLS);
+        assert!(should_fail);
+
+        let (polls, should_fail) = next_rtp_server_missing_polls(polls, Err(()));
+        assert_eq!(polls, 0);
+        assert!(!should_fail);
     }
 
     #[test]

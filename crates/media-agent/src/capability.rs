@@ -17,6 +17,7 @@ struct ZlmProbeResult {
     version: Option<String>,
     api_list: Vec<String>,
     server_id: Option<String>,
+    rtmp_enhanced_enabled: Option<bool>,
 }
 
 impl CapabilityProbe {
@@ -68,6 +69,13 @@ impl CapabilityProbe {
             .filter(|value| !value.trim().is_empty())
     }
 
+    pub async fn zlm_rtmp_enhanced_enabled(&self, settings: &AgentSettings) -> Option<bool> {
+        self.probe_zlm(settings)
+            .await
+            .ok()
+            .and_then(|result| result.rtmp_enhanced_enabled)
+    }
+
     async fn probe_zlm(&self, settings: &AgentSettings) -> anyhow::Result<ZlmProbeResult> {
         let base = settings.zlm_api_base.trim();
         if base.is_empty() {
@@ -85,16 +93,20 @@ impl CapabilityProbe {
             .ok()
             .map(extract_zlm_api_list)
             .unwrap_or_default();
-        let server_id = self
+        let server_config = self
             .fetch_zlm_json(base, "/index/api/getServerConfig", &settings.zlm_api_secret)
             .await
-            .ok()
-            .and_then(|value| extract_zlm_server_id(&value));
+            .ok();
+        let server_id = server_config.as_ref().and_then(extract_zlm_server_id);
+        let rtmp_enhanced_enabled = server_config
+            .as_ref()
+            .and_then(extract_zlm_rtmp_enhanced_enabled);
 
         Ok(ZlmProbeResult {
             version,
             api_list,
             server_id,
+            rtmp_enhanced_enabled,
         })
     }
 
@@ -190,24 +202,6 @@ pub fn summarize_gpu_devices(devices: &[GpuDeviceInfo]) -> Vec<String> {
         .collect()
 }
 
-pub fn ffmpeg_supports_hwaccel(binary: &str, hwaccel: &str) -> bool {
-    probe_ffmpeg_entries(binary, &["-hwaccels"], parse_ffmpeg_hwaccels)
-        .iter()
-        .any(|value| value == hwaccel)
-}
-
-pub fn ffmpeg_supports_encoder(binary: &str, encoder: &str) -> bool {
-    probe_ffmpeg_entries(binary, &["-encoders"], parse_ffmpeg_codecs)
-        .iter()
-        .any(|value| value == encoder)
-}
-
-pub fn ffmpeg_supports_decoder(binary: &str, decoder: &str) -> bool {
-    probe_ffmpeg_entries(binary, &["-decoders"], parse_ffmpeg_codecs)
-        .iter()
-        .any(|value| value == decoder)
-}
-
 fn probe_ffmpeg_entries(
     binary: &str,
     args: &[&str],
@@ -282,20 +276,6 @@ fn parse_ffmpeg_codecs(text: &str) -> Vec<String> {
                 }
                 Some(codec.to_string())
             })
-            .collect(),
-    )
-}
-
-fn parse_ffmpeg_hwaccels(text: &str) -> Vec<String> {
-    normalize(
-        text.lines()
-            .map(str::trim)
-            .filter(|line| {
-                !line.is_empty()
-                    && !line.starts_with("Hardware acceleration methods:")
-                    && !line.starts_with("Supported hardware device types:")
-            })
-            .map(str::to_string)
             .collect(),
     )
 }
@@ -394,6 +374,35 @@ fn extract_zlm_server_id(value: &Value) -> Option<String> {
     }
 }
 
+fn extract_zlm_rtmp_enhanced_enabled(value: &Value) -> Option<bool> {
+    match value {
+        Value::Object(map) => {
+            if map.get("key").and_then(Value::as_str) == Some("rtmp.enhanced") {
+                return map.get("value").and_then(parse_bool_like_value);
+            }
+            if let Some(enabled) = map.get("rtmp.enhanced").and_then(parse_bool_like_value) {
+                return Some(enabled);
+            }
+            map.values().find_map(extract_zlm_rtmp_enhanced_enabled)
+        }
+        Value::Array(items) => items.iter().find_map(extract_zlm_rtmp_enhanced_enabled),
+        _ => None,
+    }
+}
+
+fn parse_bool_like_value(value: &Value) -> Option<bool> {
+    match value {
+        Value::Bool(value) => Some(*value),
+        Value::Number(value) => value.as_i64().map(|value| value != 0),
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +448,27 @@ Encoders:
 "#;
 
         assert_eq!(parse_ffmpeg_codecs(output), vec!["aac", "libx264"]);
+    }
+
+    #[test]
+    fn extracts_zlm_rtmp_enhanced_flag_from_key_value_entries() {
+        let value = serde_json::json!({
+            "code": 0,
+            "data": [
+                {"key": "general.mediaServerId", "value": "zlm-1"},
+                {"key": "rtmp.enhanced", "value": "1"}
+            ]
+        });
+
+        assert_eq!(extract_zlm_rtmp_enhanced_enabled(&value), Some(true));
+    }
+
+    #[test]
+    fn extracts_zlm_rtmp_enhanced_flag_from_flat_object() {
+        let value = serde_json::json!({
+            "rtmp.enhanced": 0
+        });
+
+        assert_eq!(extract_zlm_rtmp_enhanced_enabled(&value), Some(false));
     }
 }

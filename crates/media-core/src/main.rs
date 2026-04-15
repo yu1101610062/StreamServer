@@ -971,6 +971,7 @@ async fn list_streams(
             .filter_map(|(index, stream)| (!stale_indexes.contains(&index)).then_some(stream))
             .collect();
     }
+    streams = collapse_duplicate_streams(streams);
     if let Some(expected_has_viewer) = expected_has_viewer {
         streams.retain(|stream| stream_has_viewers(stream) == Some(expected_has_viewer));
     }
@@ -1301,18 +1302,10 @@ async fn enrich_streams_with_runtime(
                 warn!(
                     node_id = %node_id,
                     error = %error,
-                    "failed to enrich stream runtime from ZLM; using stored summary only"
+                    "failed to enrich stream runtime from ZLM; omitting unverified streams"
                 );
                 for stream_index in indexes {
-                    let stream = &mut streams[stream_index];
-                    if stream.play_urls.is_empty() {
-                        stream.play_urls = build_fallback_play_urls(
-                            &node.agent_stream_addr,
-                            &stream.schema,
-                            &stream.app,
-                            &stream.stream,
-                        );
-                    }
+                    stale_indexes.insert(stream_index);
                 }
             }
         }
@@ -1326,6 +1319,71 @@ fn stream_has_viewers(stream: &repository::StreamSummary) -> Option<bool> {
         .viewer_count
         .map(|count| count > 0)
         .or(stream.has_viewer)
+}
+
+fn collapse_duplicate_streams(
+    streams: Vec<repository::StreamSummary>,
+) -> Vec<repository::StreamSummary> {
+    let mut collapsed = Vec::with_capacity(streams.len());
+    let mut indexes = HashMap::new();
+
+    for stream in streams {
+        let key = (
+            stream.task_id,
+            stream.attempt_id,
+            stream.vhost.clone(),
+            stream.app.clone(),
+            stream.stream.clone(),
+        );
+        if let Some(index) = indexes.get(&key).copied() {
+            merge_stream_summary(&mut collapsed[index], stream);
+        } else {
+            indexes.insert(key, collapsed.len());
+            collapsed.push(stream);
+        }
+    }
+
+    collapsed
+}
+
+fn merge_stream_summary(
+    existing: &mut repository::StreamSummary,
+    incoming: repository::StreamSummary,
+) {
+    if existing.zlm_proxy_key.is_none() {
+        existing.zlm_proxy_key = incoming.zlm_proxy_key;
+    }
+    if existing.zlm_pusher_key.is_none() {
+        existing.zlm_pusher_key = incoming.zlm_pusher_key;
+    }
+    if existing.rtp_stream_id.is_none() {
+        existing.rtp_stream_id = incoming.rtp_stream_id;
+    }
+    if existing.started_at.is_none() {
+        existing.started_at = incoming.started_at;
+    }
+    existing.updated_at = existing.updated_at.max(incoming.updated_at);
+    existing.viewer_count = match (existing.viewer_count, incoming.viewer_count) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    existing.bitrate_kbps = match (existing.bitrate_kbps, incoming.bitrate_kbps) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+    existing.has_viewer = match (existing.has_viewer, incoming.has_viewer) {
+        (Some(left), Some(right)) => Some(left || right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    };
+
+    if !incoming.play_urls.is_empty() {
+        let mut merged = existing.play_urls.iter().cloned().collect::<BTreeSet<_>>();
+        merged.extend(incoming.play_urls);
+        existing.play_urls = merged.into_iter().collect();
+    }
 }
 
 async fn load_zlm_media_index(
@@ -4726,6 +4784,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_streams_collapses_duplicate_bindings_for_same_logical_stream()
+    -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let (zlm_base, zlm_handle) = spawn_zlm_stub().await?;
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-01",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {
+                "enable_rtsp": true,
+                "enable_rtmp": true,
+                "enable_http_ts": true,
+                "enable_http_fmp4": true,
+                "enable_hls": true
+            },
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let task_id =
+            insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01")
+                .await?;
+        let attempt_id: Uuid = sqlx::query_scalar(
+            r#"
+            select id
+              from task_attempts
+             where task_id = $1
+               and attempt_no = 1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into stream_bindings (
+              id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+              zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+            ) values (
+              $1, $2, $3, $4, $5, 'rtmp', '__defaultVhost__', 'live', 'camera01',
+              null, null, null, $6
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(task_id)
+        .bind(attempt_id)
+        .bind(format!("zlm-{node_id}"))
+        .bind(node_id)
+        .bind(Utc::now())
+        .execute(&db.pool)
+        .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("streams should be a list");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["schema"], json!("rtsp"));
+        assert_eq!(items[0]["stream"], json!("camera01"));
+
+        zlm_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_streams_omits_entries_when_runtime_lookup_fails() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let repository = TaskRepository::new(db.pool.clone());
+        let node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            node_id,
+            "http://127.0.0.1:65535",
+            "http://stream.example",
+        )
+        .await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-runtime-down",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {},
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("streams should be a list");
+        assert!(items.is_empty());
+
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn create_task_rejects_invalid_callback_url() -> anyhow::Result<()> {
         let Some(db) = require_test_database(true).await? else {
             return Ok(());
@@ -6281,6 +6466,192 @@ mod tests {
         let items = body.as_array().expect("streams should be a list");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["stream"], json!("camera01"));
+
+        zlm_handle.abort();
+        db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_streams_omits_terminal_and_non_current_attempt_bindings() -> anyhow::Result<()> {
+        let Some(db) = require_test_database(true).await? else {
+            return Ok(());
+        };
+        let (zlm_base, zlm_handle) = spawn_zlm_stub().await?;
+        let repository = TaskRepository::new(db.pool.clone());
+        let terminal_node_id = Uuid::now_v7();
+        let stale_node_id = Uuid::now_v7();
+        upsert_test_node(
+            &repository,
+            terminal_node_id,
+            &zlm_base,
+            "http://stream-terminal.example",
+        )
+        .await?;
+        upsert_test_node(
+            &repository,
+            stale_node_id,
+            &zlm_base,
+            "http://stream-stale.example",
+        )
+        .await?;
+        let resolved_spec = json!({
+            "type": "live_relay",
+            "name": "relay-camera-stale",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "publish": {},
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        });
+        let now = Utc::now();
+
+        let terminal_task_id = Uuid::now_v7();
+        let terminal_attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'terminal-stream', 'stream_ingest'::task_type, 'SUCCEEDED'::task_status, $2,
+              50, $3, $3, 'tester', $4,
+              1, 'immediate', $5, $5, $5, $5
+            )
+            "#,
+        )
+        .bind(terminal_task_id)
+        .bind(format!("terminal-{terminal_task_id}"))
+        .bind(&resolved_spec)
+        .bind(terminal_node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values (
+              $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'SUCCEEDED'::attempt_status,
+              null, null, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+              null, 0, null, null,
+              null, $4, $4, $4
+            )
+            "#,
+        )
+        .bind(terminal_attempt_id)
+        .bind(terminal_task_id)
+        .bind(terminal_node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into stream_bindings (
+              id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+              zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+            ) values (
+              $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+              null, null, null, $6
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(terminal_task_id)
+        .bind(terminal_attempt_id)
+        .bind(format!("zlm-{terminal_node_id}"))
+        .bind(terminal_node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        let stale_task_id = Uuid::now_v7();
+        let stale_attempt_id = Uuid::now_v7();
+        let current_attempt_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into tasks (
+              id, name, type, status, idempotency_key,
+              priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+              current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+            ) values (
+              $1, 'stale-attempt-stream', 'stream_ingest'::task_type, 'STARTING'::task_status, $2,
+              50, $3, $3, 'tester', $4,
+              2, 'immediate', $5, $5, $5, null
+            )
+            "#,
+        )
+        .bind(stale_task_id)
+        .bind(format!("stale-{stale_task_id}"))
+        .bind(&resolved_spec)
+        .bind(stale_node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into task_attempts (
+              id, task_id, attempt_no, node_id, worker_kind, status,
+              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+              rtp_port, exit_code, failure_code, failure_reason,
+              checkpoint_json, started_at, ended_at, created_at
+            ) values
+              ($1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'SUCCEEDED'::attempt_status,
+               null, null, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+               null, 0, null, null,
+               null, $4, $4, $4),
+              ($5, $2, 2, $3, 'zlm_proxy'::worker_kind, 'STARTING'::attempt_status,
+               null, null, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+               null, null, null, null,
+               null, $4, null, $4)
+            "#,
+        )
+        .bind(stale_attempt_id)
+        .bind(stale_task_id)
+        .bind(stale_node_id)
+        .bind(now)
+        .bind(current_attempt_id)
+        .execute(&db.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            insert into stream_bindings (
+              id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+              zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+            ) values (
+              $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+              null, null, null, $6
+            )
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(stale_task_id)
+        .bind(stale_attempt_id)
+        .bind(format!("zlm-{stale_node_id}"))
+        .bind(stale_node_id)
+        .bind(now)
+        .execute(&db.pool)
+        .await?;
+
+        let app = build_app(test_app_state(db.pool.clone()));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/streams")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        let items = body.as_array().expect("streams should be a list");
+        assert!(items.is_empty());
 
         zlm_handle.abort();
         db.cleanup().await?;

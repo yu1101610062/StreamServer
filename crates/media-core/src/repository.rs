@@ -1000,7 +1000,7 @@ impl TaskRepository {
               ta.attempt_no,
               t.name as task_name,
               t.assigned_node_id as node_id,
-              sb.schema,
+              coalesce(nullif(ta.zlm_schema, ''), sb.schema) as schema,
               sb.vhost,
               sb.app,
               sb.stream,
@@ -1025,6 +1025,9 @@ impl TaskRepository {
             join tasks t on t.id = sb.task_id
             join task_attempts ta on ta.id = sb.attempt_id
             where 1 = 1
+              and t.current_attempt_no > 0
+              and ta.attempt_no = t.current_attempt_no
+              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING')
             "#,
         );
         if let Some(schema) = filter
@@ -1062,7 +1065,7 @@ impl TaskRepository {
             builder.push(" and t.assigned_node_id = ");
             builder.push_bind(node_id);
         }
-        builder.push(" order by t.updated_at desc, sb.schema asc, sb.app asc, sb.stream asc");
+        builder.push(" order by t.updated_at desc, sb.created_at desc, sb.schema asc, sb.app asc, sb.stream asc");
         let mut streams = builder
             .build()
             .fetch_all(&self.pool)
@@ -1983,6 +1986,34 @@ impl TaskRepository {
             started_at: None,
             ended_at: None,
         })
+    }
+
+    pub async fn preferred_retry_node_after_disconnect(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Option<Uuid>, RepoError> {
+        let row = sqlx::query(
+            r#"
+            select previous_attempt.node_id
+              from tasks t
+              join task_attempts current_attempt
+                on current_attempt.task_id = t.id
+               and current_attempt.attempt_no = t.current_attempt_no
+              join task_attempts previous_attempt
+                on previous_attempt.task_id = t.id
+               and previous_attempt.attempt_no = t.current_attempt_no - 1
+             where t.id = $1
+               and t.status = 'QUEUED'::task_status
+               and current_attempt.status = 'PENDING'::attempt_status
+               and previous_attempt.failure_code = 'node_disconnected'
+             limit 1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|row| row.try_get::<Option<Uuid>, _>("node_id").ok().flatten()))
     }
 
     pub async fn recover_tasks_for_disconnected_node(
@@ -6399,7 +6430,6 @@ fn build_resolved_task_json(
     }
     deep_merge(&mut merged, request_overrides.clone());
     merged["type"] = Value::String(task_type.as_str().to_string());
-    strip_legacy_dispatch_fields(&mut merged);
     Ok(merged)
 }
 
@@ -6655,18 +6685,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
     }
 
     Value::Object(overlay)
-}
-
-fn strip_legacy_dispatch_fields(value: &mut Value) {
-    if let Some(process) = value.get_mut("process").and_then(Value::as_object_mut) {
-        process.remove("video_codec");
-        process.remove("audio_codec");
-        process.remove("profile");
-        process.remove("preset");
-    }
-    if let Some(resource) = value.get_mut("resource").and_then(Value::as_object_mut) {
-        resource.remove("need_gpu");
-    }
 }
 
 fn overlay_optional_fields(fields: &[(&str, Option<Value>)]) -> Option<Value> {
