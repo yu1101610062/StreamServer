@@ -16,6 +16,7 @@ export const useSessionStore = defineStore("session", () => {
   const loading = ref(true);
   const error = ref<ApiError | null>(null);
   const refreshToken = ref(readRefreshToken());
+  let initializePromise: Promise<void> | null = null;
 
   async function fetchSession() {
     const current = await authApi.currentSession();
@@ -26,31 +27,38 @@ export const useSessionStore = defineStore("session", () => {
   }
 
   async function initialize() {
-    loading.value = true;
-    try {
-      await fetchSession();
-    } catch (cause) {
-      const authError = cause as ApiError;
-      if (authError.status === 403 && refreshToken.value) {
-        try {
-          const tokens = await authApi.refresh(refreshToken.value);
-          setAccessToken(tokens.access_token);
-          if (tokens.refresh_token) {
-            refreshToken.value = tokens.refresh_token;
-            writeRefreshToken(tokens.refresh_token);
-          }
-          await fetchSession();
-        } catch (refreshError) {
-          clearSession();
-          error.value = refreshError as ApiError;
-        }
-      } else {
-        clearSession();
-        error.value = authError;
-      }
-    } finally {
-      loading.value = false;
+    if (initializePromise) {
+      return initializePromise;
     }
+    initializePromise = (async () => {
+      loading.value = true;
+      try {
+        await fetchSession();
+      } catch (cause) {
+        const authError = cause as ApiError;
+        if (authError.status === 403 && refreshToken.value) {
+          try {
+            const tokens = await authApi.refresh(refreshToken.value);
+            setAccessToken(tokens.access_token);
+            if (tokens.refresh_token) {
+              refreshToken.value = tokens.refresh_token;
+              writeRefreshToken(tokens.refresh_token);
+            }
+            await fetchSession();
+          } catch (refreshError) {
+            clearSession();
+            error.value = refreshError as ApiError;
+          }
+        } else {
+          clearSession();
+          error.value = authError;
+        }
+      } finally {
+        loading.value = false;
+        initializePromise = null;
+      }
+    })();
+    return initializePromise;
   }
 
   async function login(username: string, password: string) {
