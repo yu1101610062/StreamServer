@@ -679,16 +679,20 @@ impl TaskRepository {
         let recent_events = sqlx::query(
             r#"
             select
-              id,
-              attempt_no,
-              source::text as source,
-              event_type,
-              event_level,
-              payload,
-              created_at
+              task_events.id,
+              task_events.attempt_no,
+              task_events.source::text as source,
+              task_events.event_type,
+              task_events.event_level,
+              task_events.payload,
+              task_events.created_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from task_events
-            where task_id = $1
-            order by created_at desc
+            left join task_attempts ta on ta.id = task_events.attempt_id
+            left join media_nodes n on n.id = ta.node_id
+            where task_events.task_id = $1
+            order by task_events.created_at desc
             limit 20
             "#,
         )
@@ -883,8 +887,12 @@ impl TaskRepository {
               event_type,
               event_level,
               payload,
-              created_at
+              created_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from task_events
+            left join task_attempts ta on ta.id = task_events.attempt_id
+            left join media_nodes n on n.id = ta.node_id
             where task_id = "#,
         );
         builder.push_bind(task_id);
@@ -1102,10 +1110,15 @@ impl TaskRepository {
               rf.time_len,
               rf.start_time,
               rf.source,
-              rf.created_at
+              rf.created_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from record_files rf
+            join task_attempts ta on ta.id = rf.attempt_id
+            join media_nodes n on n.id = ta.node_id
             join tasks t on t.id = rf.task_id
             where 1 = 1
+              and rf.file_path like '/data/zlm/www/output/%'
             "#,
         );
         apply_record_filters(&mut builder, &filter);
@@ -1144,9 +1157,14 @@ impl TaskRepository {
               rf.time_len,
               rf.start_time,
               rf.source,
-              rf.created_at
+              rf.created_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from record_files rf
+            join task_attempts ta on ta.id = rf.attempt_id
+            join media_nodes n on n.id = ta.node_id
             where rf.task_id = $1
+              and rf.file_path like '/data/zlm/www/output/%'
             order by coalesce(rf.start_time, rf.created_at) desc, rf.id desc
             "#,
         )
@@ -1178,10 +1196,14 @@ impl TaskRepository {
               ta.file_path,
               ta.http_url,
               ta.file_size,
-              ta.created_at
+              ta.created_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from transcode_artifacts ta
             join tasks t on t.id = ta.task_id
+            join media_nodes n on n.id = ta.node_id
             where 1 = 1
+              and ta.file_path like '/data/zlm/www/output/%'
             "#,
         );
         apply_file_artifact_filters(&mut builder, &filter);
@@ -1217,10 +1239,14 @@ impl TaskRepository {
               ta.file_path,
               ta.http_url,
               ta.file_size,
-              ta.created_at
+              ta.created_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from transcode_artifacts ta
             join tasks t on t.id = ta.task_id
+            join media_nodes n on n.id = ta.node_id
             where ta.task_id = $1
+              and ta.file_path like '/data/zlm/www/output/%'
             order by created_at desc, id desc
             "#,
         )
@@ -1343,14 +1369,18 @@ impl TaskRepository {
               dedup_key,
               payload,
               received_at,
-              processed_at
+              processed_at,
+              n.output_mount_relative_prefix_mp4,
+              n.output_mount_relative_prefix_hls
             from hook_events
+            left join media_servers ms on ms.server_id = hook_events.server_id
+            left join media_nodes n on n.id = ms.node_id
             where 1 = 1
             "#,
         );
         if let Some(node_id) = filter.node_id {
-            builder.push(" and server_id = ");
-            builder.push_bind(node_id.to_string());
+            builder.push(" and ms.node_id = ");
+            builder.push_bind(node_id);
         }
         if let Some(hook_name) = filter
             .hook_name
@@ -3029,11 +3059,12 @@ impl TaskRepository {
             r#"
             insert into media_nodes (
               id, node_name, hostname, labels, zlm_api_base, zlm_api_secret, agent_stream_addr,
+              output_mount_relative_prefix_mp4, output_mount_relative_prefix_hls,
               network_mode, interfaces, healthy, control_connected, last_seen_at,
               control_last_seen_at, created_at, updated_at
             ) values (
               $1, $2, $3, $4, $5, $6, $7,
-              $8, $9, true, true, $10, $10, $11, $11
+              $8, $9, $10, $11, true, true, $12, $12, $13, $13
             )
             on conflict (id) do update
                set node_name = excluded.node_name,
@@ -3042,6 +3073,10 @@ impl TaskRepository {
                    zlm_api_base = excluded.zlm_api_base,
                    zlm_api_secret = excluded.zlm_api_secret,
                    agent_stream_addr = excluded.agent_stream_addr,
+                   output_mount_relative_prefix_mp4 =
+                     excluded.output_mount_relative_prefix_mp4,
+                   output_mount_relative_prefix_hls =
+                     excluded.output_mount_relative_prefix_hls,
                    network_mode = excluded.network_mode,
                    interfaces = excluded.interfaces,
                    healthy = true,
@@ -3058,6 +3093,8 @@ impl TaskRepository {
         .bind(&registration.zlm_api_base)
         .bind(&registration.zlm_api_secret)
         .bind(&registration.agent_stream_addr)
+        .bind(&registration.output_mount_relative_prefix_mp4)
+        .bind(&registration.output_mount_relative_prefix_hls)
         .bind(registration.network_mode.as_str())
         .bind(serde_json::to_value(&registration.interfaces)?)
         .bind(seen_at)
@@ -4643,7 +4680,7 @@ impl TaskRepository {
 
     async fn count_record_files(&self, filter: &RecordListFilter) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from record_files rf join tasks t on t.id = rf.task_id where 1 = 1",
+            "select count(*) as total from record_files rf join task_attempts ta on ta.id = rf.attempt_id join media_nodes n on n.id = ta.node_id join tasks t on t.id = rf.task_id where 1 = 1 and rf.file_path like '/data/zlm/www/output/%'",
         );
         apply_record_filters(&mut builder, filter);
 
@@ -4657,7 +4694,7 @@ impl TaskRepository {
         filter: &FileArtifactListFilter,
     ) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id where 1 = 1",
+            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id join media_nodes n on n.id = ta.node_id where 1 = 1 and ta.file_path like '/data/zlm/www/output/%'",
         );
         apply_file_artifact_filters(&mut builder, filter);
 
@@ -5725,6 +5762,7 @@ pub struct RecordFileSummary {
 
 impl RecordFileSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        let prefixes = OutputMountPrefixes::from_row(row)?;
         Ok(Self {
             id: row.try_get("id")?,
             task_id: row.try_get("task_id")?,
@@ -5732,7 +5770,11 @@ impl RecordFileSummary {
             vhost: row.try_get("vhost")?,
             app: row.try_get("app")?,
             stream: row.try_get("stream")?,
-            file_path: externalize_managed_path(row.try_get::<&str, _>("file_path")?, "file_path")?,
+            file_path: externalize_managed_path(
+                row.try_get::<&str, _>("file_path")?,
+                "file_path",
+                &prefixes,
+            )?,
             http_url: row.try_get("http_url")?,
             file_size: row.try_get("file_size")?,
             time_len: row.try_get("time_len")?,
@@ -5799,6 +5841,7 @@ pub struct FileArtifactSummary {
 
 impl FileArtifactSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        let prefixes = OutputMountPrefixes::from_row(row)?;
         Ok(Self {
             id: row.try_get("id")?,
             artifact_kind: FileArtifactKind::from_task_type(row.try_get::<&str, _>("task_type")?)?,
@@ -5806,7 +5849,11 @@ impl FileArtifactSummary {
             attempt_id: row.try_get("attempt_id")?,
             node_id: row.try_get("node_id")?,
             file_name: row.try_get("file_name")?,
-            file_path: externalize_managed_path(row.try_get::<&str, _>("file_path")?, "file_path")?,
+            file_path: externalize_managed_path(
+                row.try_get::<&str, _>("file_path")?,
+                "file_path",
+                &prefixes,
+            )?,
             http_url: row.try_get("http_url")?,
             file_size: row.try_get("file_size")?,
             created_at: row.try_get("created_at")?,
@@ -6019,12 +6066,16 @@ pub struct HookEventSummary {
 
 impl HookEventSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        let prefixes = OutputMountPrefixes::from_optional_row(row)?;
         Ok(Self {
             id: row.try_get("id")?,
             server_id: row.try_get("server_id")?,
             hook_name: row.try_get("hook_name")?,
             dedup_key: row.try_get("dedup_key")?,
-            payload: externalize_path_fields_in_payload(row.try_get("payload")?)?,
+            payload: externalize_path_fields_in_payload(
+                row.try_get("payload")?,
+                prefixes.as_ref(),
+            )?,
             received_at: row.try_get("received_at")?,
             processed_at: row.try_get("processed_at")?,
         })
@@ -6140,8 +6191,50 @@ fn apply_file_artifact_filters<'a>(
 }
 
 const ZLM_HTTP_ROOT: &str = "/data/zlm/www";
-const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
-const MEDIA_WORK_ROOT: &str = "/data/media/work";
+const ZLM_OUTPUT_HTTP_ROOT: &str = "/data/zlm/www/output";
+const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
+const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedOutputBucket {
+    Mp4,
+    Hls,
+}
+
+#[derive(Debug, Clone)]
+struct OutputMountPrefixes {
+    mp4: String,
+    hls: String,
+}
+
+impl OutputMountPrefixes {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            mp4: row.try_get("output_mount_relative_prefix_mp4")?,
+            hls: row.try_get("output_mount_relative_prefix_hls")?,
+        })
+    }
+
+    fn from_optional_row(row: &PgRow) -> Result<Option<Self>, RepoError> {
+        let mp4: Option<String> = row.try_get("output_mount_relative_prefix_mp4")?;
+        let hls: Option<String> = row.try_get("output_mount_relative_prefix_hls")?;
+        match (mp4, hls) {
+            (Some(mp4), Some(hls)) => Ok(Some(Self { mp4, hls })),
+            (None, None) => Ok(None),
+            _ => Err(validation_error(
+                "file_path",
+                "node output mount prefixes are incomplete",
+            )),
+        }
+    }
+
+    fn relative_prefix_for_bucket(&self, bucket: ManagedOutputBucket) -> &str {
+        match bucket {
+            ManagedOutputBucket::Mp4 => self.mp4.as_str(),
+            ManagedOutputBucket::Hls => self.hls.as_str(),
+        }
+    }
+}
 
 fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     if path == root {
@@ -6245,21 +6338,47 @@ fn artifact_http_url_from_path(
     })
 }
 
-fn external_relative_path_from_normalized(path: &str) -> Option<String> {
-    for root in [ZLM_HTTP_ROOT, MEDIA_WORK_ROOT] {
-        if path == root {
-            return Some("/".to_string());
-        }
-        if let Some(relative) = relative_path_under_root(path, root) {
-            return Some(format!("/{}", relative.trim_start_matches('/')));
-        }
+fn managed_output_bucket_from_path(path: &str) -> Option<ManagedOutputBucket> {
+    if path == ZLM_OUTPUT_MP4_ROOT || relative_path_under_root(path, ZLM_OUTPUT_MP4_ROOT).is_some()
+    {
+        return Some(ManagedOutputBucket::Mp4);
+    }
+    if path == ZLM_OUTPUT_HLS_ROOT || relative_path_under_root(path, ZLM_OUTPUT_HLS_ROOT).is_some()
+    {
+        return Some(ManagedOutputBucket::Hls);
     }
     None
 }
 
-fn externalize_managed_path(path: &str, field: &'static str) -> Result<String, RepoError> {
+fn visible_root_for_bucket(bucket: ManagedOutputBucket, prefixes: &OutputMountPrefixes) -> String {
+    let relative_prefix = prefixes.relative_prefix_for_bucket(bucket);
+    if relative_prefix.is_empty() {
+        ZLM_HTTP_ROOT.to_string()
+    } else {
+        format!("{ZLM_HTTP_ROOT}/{relative_prefix}")
+    }
+}
+
+fn external_relative_path_from_normalized(
+    path: &str,
+    prefixes: &OutputMountPrefixes,
+) -> Option<String> {
+    let bucket = managed_output_bucket_from_path(path)?;
+    let visible_root = visible_root_for_bucket(bucket, prefixes);
+    if path == visible_root {
+        return Some("/".to_string());
+    }
+    relative_path_under_root(path, &visible_root)
+        .map(|relative| format!("/{}", relative.trim_start_matches('/')))
+}
+
+fn externalize_managed_path(
+    path: &str,
+    field: &'static str,
+    prefixes: &OutputMountPrefixes,
+) -> Result<String, RepoError> {
     let normalized = normalized_absolute_path(path)?;
-    if let Some(relative) = external_relative_path_from_normalized(&normalized) {
+    if let Some(relative) = external_relative_path_from_normalized(&normalized, prefixes) {
         return Ok(relative);
     }
 
@@ -6270,24 +6389,27 @@ fn externalize_managed_path(path: &str, field: &'static str) -> Result<String, R
     );
     Err(validation_error(
         field,
-        format!("must be under {ZLM_HTTP_ROOT} or {MEDIA_WORK_ROOT}"),
+        format!("must be under {ZLM_OUTPUT_HTTP_ROOT}"),
     ))
 }
 
-fn externalize_path_fields_in_payload(value: Value) -> Result<Value, RepoError> {
+fn externalize_path_fields_in_payload(
+    value: Value,
+    prefixes: Option<&OutputMountPrefixes>,
+) -> Result<Value, RepoError> {
     match value {
         Value::Array(items) => items
             .into_iter()
-            .map(externalize_path_fields_in_payload)
+            .map(|item| externalize_path_fields_in_payload(item, prefixes))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
         Value::Object(entries) => {
             let mut normalized = serde_json::Map::with_capacity(entries.len());
             for (key, value) in entries {
                 let rewritten = match key.as_str() {
-                    "file_path" => externalize_path_field_value(value, "file_path")?,
-                    "folder" => externalize_path_field_value(value, "folder")?,
-                    _ => externalize_path_fields_in_payload(value)?,
+                    "file_path" => externalize_path_field_value(value, "file_path", prefixes)?,
+                    "folder" => externalize_path_field_value(value, "folder", prefixes)?,
+                    _ => externalize_path_fields_in_payload(value, prefixes)?,
                 };
                 normalized.insert(key, rewritten);
             }
@@ -6297,17 +6419,29 @@ fn externalize_path_fields_in_payload(value: Value) -> Result<Value, RepoError> 
     }
 }
 
-fn externalize_path_field_value(value: Value, field: &'static str) -> Result<Value, RepoError> {
+fn externalize_path_field_value(
+    value: Value,
+    field: &'static str,
+    prefixes: Option<&OutputMountPrefixes>,
+) -> Result<Value, RepoError> {
     match value {
         Value::Null => Ok(Value::Null),
         Value::String(path) if path.trim().is_empty() => Ok(Value::String(path)),
-        Value::String(path) => externalize_managed_path(&path, field).map(Value::String),
+        Value::String(path) => {
+            if let Some(prefixes) = prefixes {
+                externalize_managed_path(&path, field, prefixes).map(Value::String)
+            } else {
+                Ok(Value::String(path))
+            }
+        }
         Value::Array(items) => items
             .into_iter()
-            .map(|item| externalize_path_field_value(item, field))
+            .map(|item| externalize_path_field_value(item, field, prefixes))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
-        Value::Object(entries) => externalize_path_fields_in_payload(Value::Object(entries)),
+        Value::Object(entries) => {
+            externalize_path_fields_in_payload(Value::Object(entries), prefixes)
+        }
         other => Ok(other),
     }
 }
@@ -6371,8 +6505,8 @@ fn is_hls_playlist_record_path(file_path: &str) -> bool {
     let Ok(normalized) = normalized_absolute_path(file_path) else {
         return false;
     };
-    let in_record_root = normalized == ZLM_RECORD_HTTP_ROOT
-        || relative_path_under_root(&normalized, ZLM_RECORD_HTTP_ROOT).is_some();
+    let in_record_root = normalized == ZLM_OUTPUT_HLS_ROOT
+        || relative_path_under_root(&normalized, ZLM_OUTPUT_HLS_ROOT).is_some();
     in_record_root
         && Path::new(&normalized)
             .extension()
@@ -7195,6 +7329,7 @@ impl TaskEventSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
         let source = EventSource::from_str(row.try_get::<&str, _>("source")?)
             .map_err(RepoError::ParseEnum)?;
+        let prefixes = OutputMountPrefixes::from_optional_row(row)?;
 
         Ok(Self {
             id: row.try_get("id")?,
@@ -7202,7 +7337,10 @@ impl TaskEventSummary {
             source,
             event_type: row.try_get("event_type")?,
             event_level: row.try_get("event_level")?,
-            payload: externalize_path_fields_in_payload(row.try_get("payload")?)?,
+            payload: externalize_path_fields_in_payload(
+                row.try_get("payload")?,
+                prefixes.as_ref(),
+            )?,
             created_at: row.try_get("created_at")?,
         })
     }
@@ -7678,13 +7816,13 @@ mod tests {
     fn artifact_http_url_from_path_uses_node_stream_base() {
         let url = artifact_http_url_from_path(
             "http://192.168.1.10:8081",
-            "/data/zlm/www/artifacts/transcode/2026/clip.mp4",
+            "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
         )
         .expect("artifact url should build");
 
         assert_eq!(
             url,
-            "http://192.168.1.10:8081/artifacts/transcode/2026/clip.mp4"
+            "http://192.168.1.10:8081/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
         );
     }
 
@@ -7692,79 +7830,99 @@ mod tests {
     fn record_http_url_from_path_uses_web_root_directly() {
         let url = record_http_url_from_path(
             "http://192.168.1.10:8081",
-            "/data/zlm/www/record/live/camera01/clip.mp4",
+            "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
         )
         .expect("record url should build");
 
         assert_eq!(
             url,
-            "http://192.168.1.10:8081/record/live/camera01/clip.mp4"
+            "http://192.168.1.10:8081/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
         );
     }
 
     #[test]
     fn externalize_managed_path_strips_mount_roots() {
+        let prefixes = OutputMountPrefixes {
+            mp4: "output/mp4".to_string(),
+            hls: "output/hls".to_string(),
+        };
         assert_eq!(
-            externalize_managed_path("/data/zlm/www/record/live/camera01/clip.mp4", "file_path")
-                .expect("record path should externalize"),
-            "/record/live/camera01/clip.mp4"
+            externalize_managed_path(
+                "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
+                "file_path",
+                &prefixes,
+            )
+            .expect("mp4 path should externalize"),
+            "/node-192_168_1_10-mp4/task-1/clip.mp4"
         );
         assert_eq!(
-            externalize_managed_path("/data/zlm/www/artifacts/transcode/output.mp4", "file_path",)
-                .expect("artifact path should externalize"),
-            "/artifacts/transcode/output.mp4"
-        );
-        assert_eq!(
-            externalize_managed_path("/data/media/work/mp4/test.mp4", "file_path")
-                .expect("work path should externalize"),
-            "/mp4/test.mp4"
+            externalize_managed_path(
+                "/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index.m3u8",
+                "file_path",
+                &prefixes,
+            )
+            .expect("hls path should externalize"),
+            "/node-192_168_1_10-hls/task-1/index.m3u8"
         );
     }
 
     #[test]
     fn resolve_absolute_http_url_accepts_relative_paths() {
-        let url = resolve_absolute_http_url("http://worker.example:8081", "/record/live.m3u8")
-            .expect("relative hook url should resolve");
-        assert_eq!(url, "http://worker.example:8081/record/live.m3u8");
+        let url = resolve_absolute_http_url(
+            "http://worker.example:8081",
+            "/output/hls/node-192_168_1_10-hls/task-1/index.m3u8",
+        )
+        .expect("relative hook url should resolve");
+        assert_eq!(
+            url,
+            "http://worker.example:8081/output/hls/node-192_168_1_10-hls/task-1/index.m3u8"
+        );
     }
 
     #[test]
     fn is_hls_playlist_record_path_accepts_record_root_m3u8_only() {
         assert!(is_hls_playlist_record_path(
-            "/data/zlm/www/record/live/camera01/index.m3u8"
+            "/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index.m3u8"
         ));
         assert!(!is_hls_playlist_record_path(
-            "/data/zlm/www/live/camera01/hls.m3u8"
+            "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
         ));
         assert!(!is_hls_playlist_record_path(
-            "/data/zlm/www/record/live/camera01/index-00001.ts"
+            "/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index-00001.ts"
         ));
     }
 
     #[test]
     fn externalize_path_fields_in_payload_rewrites_file_path_and_folder() {
+        let prefixes = OutputMountPrefixes {
+            mp4: "output/mp4".to_string(),
+            hls: "output/hls".to_string(),
+        };
         let payload = externalize_path_fields_in_payload(json!({
-            "file_path": "/data/zlm/www/record/live/camera01/index.m3u8",
-            "folder": "/data/zlm/www/record/live/camera01",
+            "file_path": "/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index.m3u8",
+            "folder": "/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1",
             "records": [
                 {
-                    "file_path": "/data/zlm/www/artifacts/transcode/out.mp4",
-                    "folder": "/data/media/work/mp4"
+                    "file_path": "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/out.mp4",
+                    "folder": "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1"
                 }
             ]
-        }))
+        }), Some(&prefixes))
         .expect("payload should externalize");
 
         assert_eq!(
             payload["file_path"],
-            json!("/record/live/camera01/index.m3u8")
+            json!("/node-192_168_1_10-hls/task-1/index.m3u8")
         );
-        assert_eq!(payload["folder"], json!("/record/live/camera01"));
+        assert_eq!(payload["folder"], json!("/node-192_168_1_10-hls/task-1"));
         assert_eq!(
             payload["records"][0]["file_path"],
-            json!("/artifacts/transcode/out.mp4")
+            json!("/node-192_168_1_10-mp4/task-1/out.mp4")
         );
-        assert_eq!(payload["records"][0]["folder"], json!("/mp4"));
+        assert_eq!(
+            payload["records"][0]["folder"],
+            json!("/node-192_168_1_10-mp4/task-1")
+        );
     }
 
     #[test]

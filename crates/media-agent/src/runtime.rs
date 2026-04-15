@@ -4,7 +4,7 @@ use std::{
     fs,
     future::Future,
     io::Read,
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     process::Stdio,
     ptr,
@@ -285,6 +285,7 @@ struct RtpReceivePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum SuccessCheck {
     FileExists(PathBuf),
+    FilesExist(Vec<PathBuf>),
     ProcessExit,
 }
 
@@ -320,7 +321,8 @@ enum ZlmRecordKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LiveRelayRecording {
     formats: Vec<ZlmRecordKind>,
-    root_path: String,
+    root_path_mp4: Option<String>,
+    root_path_hls: Option<String>,
     duration_sec: Option<u32>,
     segment_sec: Option<u32>,
     as_player: bool,
@@ -334,6 +336,36 @@ struct LiveRelayRecording {
     started: bool,
     #[serde(default)]
     failed: bool,
+}
+
+impl LiveRelayRecording {
+    fn root_path_for_kind(&self, kind: &ZlmRecordKind) -> Option<&str> {
+        match kind {
+            ZlmRecordKind::Mp4 => self.root_path_mp4.as_deref(),
+            ZlmRecordKind::Hls => self.root_path_hls.as_deref(),
+        }
+    }
+
+    fn primary_root_path(&self) -> Option<&str> {
+        self.formats
+            .iter()
+            .find_map(|kind| self.root_path_for_kind(kind))
+    }
+
+    fn all_root_paths(&self) -> Vec<String> {
+        self.formats
+            .iter()
+            .filter_map(|kind| self.root_path_for_kind(kind))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn root_paths_payload(&self) -> Value {
+        json!({
+            "mp4": self.root_path_mp4,
+            "hls": self.root_path_hls,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1538,6 +1570,35 @@ impl ManagedProcessExecutor {
                             "output_target": output_target,
                         }),
                     ),
+                    SuccessCheck::FilesExist(paths) if paths.iter().all(|path| path.exists()) => (
+                        "succeeded",
+                        "info",
+                        "child process completed".to_string(),
+                        json!({
+                            "exit_code": status.code(),
+                            "output_target": output_target,
+                        }),
+                    ),
+                    SuccessCheck::FilesExist(paths) => {
+                        let missing = paths
+                            .iter()
+                            .filter(|path| !path.exists())
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>();
+                        (
+                            "failed",
+                            "error",
+                            format!(
+                                "child process finished without artifacts: {}",
+                                missing.join(", ")
+                            ),
+                            json!({
+                                "exit_code": status.code(),
+                                "output_target": output_target,
+                                "missing_outputs": missing,
+                            }),
+                        )
+                    }
                     SuccessCheck::ProcessExit => (
                         "succeeded",
                         "info",
@@ -2224,10 +2285,8 @@ fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
     }
 }
 
-const ZLM_RECORD_HTTP_ROOT: &str = "/data/zlm/www/record";
-const TRANSCODE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/transcode";
-const BRIDGE_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/bridge";
-const STREAM_INGEST_RECORD_ARTIFACT_ROOT: &str = "/data/zlm/www/artifacts/stream-ingest-record";
+const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
+const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
 // ZLMediaKit falls back to a time-sliced mp4 recorder and does not expose a true
 // unlimited mode, so use a long horizon to approximate "single file" recording.
 const ZLM_SINGLE_FILE_MP4_MAX_SECOND: u32 = 31_536_000;
@@ -2241,19 +2300,33 @@ enum ManagedFileOutputKind {
 }
 
 impl ManagedFileOutputKind {
-    fn root(self) -> &'static str {
-        match self {
-            Self::Transcode => TRANSCODE_ARTIFACT_ROOT,
-            Self::Bridge => BRIDGE_ARTIFACT_ROOT,
-            Self::StreamIngestRecord => STREAM_INGEST_RECORD_ARTIFACT_ROOT,
-        }
-    }
-
     fn metadata_key(self) -> &'static str {
         match self {
             Self::Transcode => "transcode_artifact",
             Self::Bridge => "bridge_artifact",
             Self::StreamIngestRecord => "stream_ingest_record_artifacts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedOutputBucket {
+    Mp4,
+    Hls,
+}
+
+impl ManagedOutputBucket {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Hls => "hls",
+        }
+    }
+
+    fn root(self) -> &'static str {
+        match self {
+            Self::Mp4 => ZLM_OUTPUT_MP4_ROOT,
+            Self::Hls => ZLM_OUTPUT_HLS_ROOT,
         }
     }
 }
@@ -2298,17 +2371,87 @@ fn default_file_extension_for_format(format: &str) -> String {
     }
 }
 
+fn managed_output_bucket_for_format(format: &str) -> ManagedOutputBucket {
+    if format.eq_ignore_ascii_case("hls") {
+        ManagedOutputBucket::Hls
+    } else {
+        ManagedOutputBucket::Mp4
+    }
+}
+
+fn sanitize_output_node_token(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut previous_was_separator = false;
+    for value in value.trim().chars() {
+        let mapped = match value {
+            value if value.is_ascii_alphanumeric() => Some(value.to_ascii_lowercase()),
+            '-' => Some('-'),
+            '_' | '.' | ':' => Some('_'),
+            _ => Some('_'),
+        };
+        let Some(mapped) = mapped else {
+            continue;
+        };
+        if mapped == '_' {
+            if previous_was_separator {
+                continue;
+            }
+            previous_was_separator = true;
+        } else {
+            previous_was_separator = false;
+        }
+        sanitized.push(mapped);
+    }
+    let sanitized = sanitized.trim_matches('_').to_string();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn managed_output_node_token(settings: &AgentSettings) -> String {
+    if settings
+        .primary_interface_ip
+        .trim()
+        .parse::<IpAddr>()
+        .is_ok()
+    {
+        return sanitize_output_node_token(&settings.primary_interface_ip);
+    }
+    if let Ok(url) = Url::parse(settings.agent_stream_addr.trim()) {
+        if let Some(host) = url.host_str() {
+            if host.parse::<IpAddr>().is_ok() {
+                return sanitize_output_node_token(host);
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn managed_output_dir(settings: &AgentSettings, task_id: Uuid, format: &str) -> PathBuf {
+    let bucket = managed_output_bucket_for_format(format);
+    let node_dir = format!(
+        "node-{}-{}",
+        managed_output_node_token(settings),
+        bucket.as_str()
+    );
+    PathBuf::from(bucket.root())
+        .join(node_dir)
+        .join(task_id.to_string())
+}
+
 fn allocate_managed_output(
-    kind: ManagedFileOutputKind,
+    settings: &AgentSettings,
+    task_id: Uuid,
     requested_format: Option<&str>,
 ) -> PublishOutput {
     let format =
         normalize_optional_publish_format(requested_format).unwrap_or_else(|| "mp4".to_string());
     let extension = default_file_extension_for_format(&format);
     let timestamp = Local::now().naive_local();
-    let relative_dir = timestamp.format("%Y/%m/%d").to_string();
     let file_stem = timestamp.format("%H%M%S").to_string();
-    let dir = PathBuf::from(kind.root()).join(relative_dir);
+    let dir = managed_output_dir(settings, task_id, &format);
     let mut path = dir.join(format!("{file_stem}.{extension}"));
     let mut suffix = 1_u32;
     while path.exists() {
@@ -2342,7 +2485,8 @@ fn hls_segment_template(playlist_path: &str) -> String {
 }
 
 fn allocate_managed_file_output(
-    kind: ManagedFileOutputKind,
+    settings: &AgentSettings,
+    task_id: Uuid,
     publish: &PublishSpec,
 ) -> Result<PublishOutput, ExecutorError> {
     if publish
@@ -2356,7 +2500,11 @@ fn allocate_managed_file_output(
         ));
     }
 
-    Ok(allocate_managed_output(kind, publish.format.as_deref()))
+    Ok(allocate_managed_output(
+        settings,
+        task_id,
+        publish.format.as_deref(),
+    ))
 }
 
 fn build_file_transcode_plan(
@@ -2369,7 +2517,7 @@ fn build_file_transcode_plan(
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
     let output = match spec.publish.kind {
         Some(PublishTargetKind::File) => {
-            allocate_managed_file_output(ManagedFileOutputKind::Transcode, &spec.publish)?
+            allocate_managed_file_output(settings, request.task_id, &spec.publish)?
         }
         Some(_) => {
             return Err(ExecutorError::InvalidRequest(
@@ -2488,9 +2636,9 @@ fn build_stream_ingest_realtime_plan(
     append_publish_output_args(&mut args, &publish_output);
 
     if spec.record.enabled.unwrap_or(false) {
-        recording = build_live_relay_recording(spec, &work_dir)?;
+        recording = build_live_relay_recording(settings, request.task_id, spec)?;
         if let Some(recording_plan) = &recording {
-            outputs.push(recording_plan.root_path.clone());
+            outputs.extend(recording_plan.all_root_paths());
         }
     }
 
@@ -2564,14 +2712,13 @@ fn build_stream_ingest_fast_record_plan(
     }
 
     let mut outputs = Vec::new();
-    let primary_output = match spec
+    let (primary_output, success_check) = match spec
         .record
         .format
         .unwrap_or(media_domain::RecordFormat::Mp4)
     {
         media_domain::RecordFormat::Mp4 => {
-            let output =
-                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("mp4"));
+            let output = allocate_managed_output(settings, request.task_id, Some("mp4"));
             append_default_output_maps(&mut args);
             if let Some(filter) = audio_copy_decoration
                 .and_then(|value| value.filter_for_output(output.format.as_str()))
@@ -2584,11 +2731,10 @@ fn build_stream_ingest_fast_record_plan(
                 output.target.clone(),
             ]);
             outputs.push(output.target.clone());
-            output
+            (output.clone(), output.success_check)
         }
         media_domain::RecordFormat::Hls => {
-            let output =
-                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("hls"));
+            let output = allocate_managed_output(settings, request.task_id, Some("hls"));
             let segment_template = hls_segment_template(output.target.as_str());
             append_default_output_maps(&mut args);
             args.extend([
@@ -2603,13 +2749,11 @@ fn build_stream_ingest_fast_record_plan(
                 output.target.clone(),
             ]);
             outputs.push(output.target.clone());
-            output
+            (output.clone(), output.success_check)
         }
         media_domain::RecordFormat::Both => {
-            let mp4_output =
-                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("mp4"));
-            let hls_output =
-                allocate_managed_output(ManagedFileOutputKind::StreamIngestRecord, Some("hls"));
+            let mp4_output = allocate_managed_output(settings, request.task_id, Some("mp4"));
+            let hls_output = allocate_managed_output(settings, request.task_id, Some("hls"));
             let segment_template = hls_segment_template(hls_output.target.as_str());
             args.extend([
                 "-map".to_string(),
@@ -2642,7 +2786,13 @@ fn build_stream_ingest_fast_record_plan(
             ]);
             outputs.push(mp4_output.target.clone());
             outputs.push(hls_output.target.clone());
-            mp4_output
+            (
+                mp4_output,
+                SuccessCheck::FilesExist(vec![
+                    PathBuf::from(&outputs[0]),
+                    PathBuf::from(&outputs[1]),
+                ]),
+            )
         }
     };
 
@@ -2652,7 +2802,7 @@ fn build_stream_ingest_fast_record_plan(
         work_dir,
         output_target: primary_output.target.clone(),
         outputs,
-        success_check: primary_output.success_check,
+        success_check,
         startup_probe: None,
         recording: None,
         managed_file_output_kind: Some(ManagedFileOutputKind::StreamIngestRecord),
@@ -2668,7 +2818,7 @@ fn build_multicast_bridge_plan(
 ) -> Result<ProcessPlan, ExecutorError> {
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let output = build_publish_output(settings, spec.task_type, &spec.publish)?;
+    let output = build_publish_output(settings, request.task_id, spec.task_type, &spec.publish)?;
     let startup_probe = None;
     let realtime = spec.input.source_mode == Some(SourceMode::Vod)
         && matches!(
@@ -2810,7 +2960,7 @@ fn build_live_relay_plan(
     let input_url = required_nonempty("input.url", spec.input.url.as_deref())?;
     let startup_probe = build_startup_probe(request.task_id, spec)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let recording = build_live_relay_recording(spec, &work_dir)?;
+    let recording = build_live_relay_recording(settings, request.task_id, spec)?;
     let command_line = format!(
         "zlm addStreamProxy --url {} --vhost {} --app {} --stream {}",
         input_url, startup_probe.vhost, startup_probe.app, startup_probe.stream
@@ -2820,7 +2970,7 @@ fn build_live_relay_plan(
         startup_probe.vhost, startup_probe.app, startup_probe.stream
     )];
     if let Some(recording) = &recording {
-        outputs.push(recording.root_path.clone());
+        outputs.extend(recording.all_root_paths());
     }
 
     Ok(LiveRelayPlan {
@@ -2892,10 +3042,14 @@ fn prepare_work_dir(work_dir: &Path) -> Result<(), ExecutorError> {
     })
 }
 
-fn prepare_plan_paths(plan: &ProcessPlan) -> Result<(), ExecutorError> {
-    prepare_work_dir(&plan.work_dir)?;
+fn prepare_success_check_paths(success_check: &SuccessCheck) -> Result<(), ExecutorError> {
+    let paths: Vec<&PathBuf> = match success_check {
+        SuccessCheck::FileExists(path) => vec![path],
+        SuccessCheck::FilesExist(paths) => paths.iter().collect(),
+        SuccessCheck::ProcessExit => Vec::new(),
+    };
 
-    if let SuccessCheck::FileExists(path) = &plan.success_check {
+    for path in paths {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -2909,20 +3063,26 @@ fn prepare_plan_paths(plan: &ProcessPlan) -> Result<(), ExecutorError> {
         }
     }
 
-    if let Some(companion) = &plan.companion_recording {
-        if let SuccessCheck::FileExists(path) = &companion.success_check {
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                fs::create_dir_all(parent).map_err(|error| {
-                    ExecutorError::ProcessSpawn(format!(
-                        "failed to prepare output dir {}: {error}",
-                        parent.display()
-                    ))
-                })?;
-            }
+    Ok(())
+}
+
+fn prepare_plan_paths(plan: &ProcessPlan) -> Result<(), ExecutorError> {
+    prepare_work_dir(&plan.work_dir)?;
+    prepare_success_check_paths(&plan.success_check)?;
+
+    if let Some(recording) = &plan.recording {
+        for root_path in recording.all_root_paths() {
+            fs::create_dir_all(&root_path).map_err(|error| {
+                ExecutorError::ProcessSpawn(format!(
+                    "failed to prepare recording root {}: {error}",
+                    root_path
+                ))
+            })?;
         }
+    }
+
+    if let Some(companion) = &plan.companion_recording {
+        prepare_success_check_paths(&companion.success_check)?;
     }
 
     Ok(())
@@ -4046,6 +4206,7 @@ fn build_internal_stream_target(
 
 fn build_publish_output(
     settings: &AgentSettings,
+    task_id: Uuid,
     task_type: TaskType,
     publish: &PublishSpec,
 ) -> Result<PublishOutput, ExecutorError> {
@@ -4056,7 +4217,7 @@ fn build_publish_output(
                     "publish.kind=file is only supported for managed file output tasks".to_string(),
                 )
             })
-            .and_then(|kind| allocate_managed_file_output(kind, publish)),
+            .and_then(|_kind| allocate_managed_file_output(settings, task_id, publish)),
         Some(PublishTargetKind::UdpMpegtsMulticast | PublishTargetKind::RtpMulticast) => {
             let target = build_multicast_url(
                 match publish.kind.expect("kind checked") {
@@ -4262,8 +4423,9 @@ fn build_open_rtp_server_params(plan: &RtpReceivePlan) -> Vec<(String, String)> 
 }
 
 fn build_live_relay_recording(
+    settings: &AgentSettings,
+    task_id: Uuid,
     spec: &TaskSpec,
-    _work_dir: &Path,
 ) -> Result<Option<LiveRelayRecording>, ExecutorError> {
     if !spec.record.enabled.unwrap_or(false) {
         return Ok(None);
@@ -4278,11 +4440,27 @@ fn build_live_relay_recording(
         media_domain::RecordFormat::Hls => vec![ZlmRecordKind::Hls],
         media_domain::RecordFormat::Both => vec![ZlmRecordKind::Mp4, ZlmRecordKind::Hls],
     };
-    let root_path = ZLM_RECORD_HTTP_ROOT.to_string();
+    let root_path_mp4 = formats
+        .iter()
+        .any(|kind| matches!(kind, ZlmRecordKind::Mp4))
+        .then(|| {
+            managed_output_dir(settings, task_id, "mp4")
+                .to_string_lossy()
+                .to_string()
+        });
+    let root_path_hls = formats
+        .iter()
+        .any(|kind| matches!(kind, ZlmRecordKind::Hls))
+        .then(|| {
+            managed_output_dir(settings, task_id, "hls")
+                .to_string_lossy()
+                .to_string()
+        });
 
     Ok(Some(LiveRelayRecording {
         formats,
-        root_path,
+        root_path_mp4,
+        root_path_hls,
         duration_sec: spec.record.duration_sec,
         segment_sec: spec.record.segment_sec,
         as_player: spec.record.as_player.unwrap_or(false),
@@ -4805,13 +4983,18 @@ fn persist_runtime_state(
 }
 
 fn success_check_from_handle(handle: &RuntimeHandle) -> SuccessCheck {
-    handle
+    let local_outputs = handle
         .outputs
         .iter()
-        .rev()
-        .find(|output| !output.contains("://"))
-        .map(|output| SuccessCheck::FileExists(PathBuf::from(output)))
-        .unwrap_or(SuccessCheck::ProcessExit)
+        .filter(|output| !output.contains("://"))
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+
+    match local_outputs.as_slice() {
+        [] => SuccessCheck::ProcessExit,
+        [path] => SuccessCheck::FileExists(path.clone()),
+        _ => SuccessCheck::FilesExist(local_outputs),
+    }
 }
 
 fn scan_persisted_runtimes(work_root: &str) -> Vec<PersistedRuntimeState> {
@@ -5101,6 +5284,9 @@ fn spawn_companion_process_monitor(
 
         let succeeded = match (&status, &companion_plan.success_check) {
             (Ok(status), SuccessCheck::FileExists(path)) => status.success() && path.exists(),
+            (Ok(status), SuccessCheck::FilesExist(paths)) => {
+                status.success() && paths.iter().all(|path| path.exists())
+            }
             (Ok(status), SuccessCheck::ProcessExit) => status.success(),
             (Err(_), _) => false,
         };
@@ -5461,7 +5647,8 @@ fn spawn_startup_probe_monitor(
                                 message: "stream recording started".to_string(),
                                 payload: json!({
                                     "formats": recording.formats,
-                                    "root_path": recording.root_path,
+                                    "root_path": recording.primary_root_path(),
+                                    "root_paths": recording.root_paths_payload(),
                                     "duration_sec": recording.duration_sec,
                                     "segment_sec": recording.segment_sec,
                                     "as_player": recording.as_player,
@@ -5523,7 +5710,8 @@ fn spawn_startup_probe_monitor(
                                     "vhost": binding.vhost,
                                     "app": binding.app,
                                     "stream": binding.stream,
-                                    "record_root": recording.root_path,
+                                    "record_root": recording.primary_root_path(),
+                                    "record_roots": recording.root_paths_payload(),
                                     "duration_sec": recording.duration_sec,
                                 }),
                             }));
@@ -5557,7 +5745,8 @@ fn spawn_startup_probe_monitor(
                                     "vhost": binding.vhost,
                                     "app": binding.app,
                                     "stream": binding.stream,
-                                    "record_root": recording.root_path,
+                                    "record_root": recording.primary_root_path(),
+                                    "record_roots": recording.root_paths_payload(),
                                 }),
                             }));
                             let _ = events.send(RuntimeNotification::TaskSnapshot(updated_handle));
@@ -5823,7 +6012,8 @@ fn spawn_live_relay_monitor(
                                         message: "live_relay recording started".to_string(),
                                         payload: json!({
                                             "formats": recording.formats,
-                                            "root_path": recording.root_path,
+                                            "root_path": recording.primary_root_path(),
+                                            "root_paths": recording.root_paths_payload(),
                                             "duration_sec": recording.duration_sec,
                                             "segment_sec": recording.segment_sec,
                                             "as_player": recording.as_player,
@@ -5877,7 +6067,8 @@ fn spawn_live_relay_monitor(
                                             "vhost": binding.vhost,
                                             "app": binding.app,
                                             "stream": binding.stream,
-                                            "record_root": recording.root_path,
+                                            "record_root": recording.primary_root_path(),
+                                            "record_roots": recording.root_paths_payload(),
                                             "duration_sec": recording.duration_sec,
                                         }),
                                     }));
@@ -5934,7 +6125,8 @@ fn spawn_live_relay_monitor(
                                                 "vhost": binding.vhost,
                                                 "app": binding.app,
                                                 "stream": binding.stream,
-                                                "record_root": recording.root_path,
+                                                "record_root": recording.primary_root_path(),
+                                                "record_roots": recording.root_paths_payload(),
                                                 "reason": "recording_start_failed",
                                             }),
                                         },
@@ -5961,7 +6153,8 @@ fn spawn_live_relay_monitor(
                                             "vhost": binding.vhost,
                                             "app": binding.app,
                                             "stream": binding.stream,
-                                            "record_root": recording.root_path,
+                                            "record_root": recording.primary_root_path(),
+                                            "record_roots": recording.root_paths_payload(),
                                         }),
                                     }));
                                 let _ =
@@ -6642,12 +6835,16 @@ fn build_record_api_params(
     recording: &LiveRelayRecording,
     kind: &ZlmRecordKind,
 ) -> Vec<(String, String)> {
+    let customized_path = recording
+        .root_path_for_kind(kind)
+        .expect("recording root path must exist for format")
+        .to_string();
     let mut params = vec![
         ("type".to_string(), zlm_record_kind_code(kind).to_string()),
         ("vhost".to_string(), binding.vhost.clone()),
         ("app".to_string(), binding.app.clone()),
         ("stream".to_string(), binding.stream.clone()),
-        ("customized_path".to_string(), recording.root_path.clone()),
+        ("customized_path".to_string(), customized_path),
     ];
     if let Some(schema) = &binding.schema {
         params.push(("schema".to_string(), schema.clone()));
@@ -6806,6 +7003,35 @@ fn classify_adopted_exit(
                 "orphaned": true,
             }),
         ),
+        SuccessCheck::FilesExist(paths) if paths.iter().all(|path| path.exists()) => (
+            "succeeded",
+            "info",
+            "adopted child process completed".to_string(),
+            json!({
+                "output_target": output_target,
+                "orphaned": true,
+            }),
+        ),
+        SuccessCheck::FilesExist(paths) => {
+            let missing = paths
+                .iter()
+                .filter(|path| !path.exists())
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            (
+                "failed",
+                "error",
+                format!(
+                    "adopted child process exited without artifacts: {}",
+                    missing.join(", ")
+                ),
+                json!({
+                    "output_target": output_target,
+                    "orphaned": true,
+                    "missing_outputs": missing,
+                }),
+            )
+        }
         SuccessCheck::ProcessExit => match task_type_from_handle(handle) {
             Some(TaskType::StreamIngest)
                 if task_runtime_mode_from_handle(handle)
@@ -6999,6 +7225,8 @@ mod tests {
             agent_stream_addr: "http://127.0.0.1:8081".to_string(),
             primary_interface_name: String::new(),
             primary_interface_ip: String::new(),
+            output_mount_relative_prefix_mp4: String::new(),
+            output_mount_relative_prefix_hls: String::new(),
             multicast_interface_name: String::new(),
             multicast_interface_ip: String::new(),
             network_mode: "bridge".to_string(),
@@ -7322,8 +7550,48 @@ fi
             build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
         assert_eq!(plan.executable, "ffmpeg");
         assert!(plan.args.iter().any(|arg| arg == "pipe:1"));
-        assert!(plan.output_target.starts_with(TRANSCODE_ARTIFACT_ROOT));
+        assert!(
+            plan.output_target.starts_with(
+                managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
         assert!(plan.output_target.ends_with(".mp4"));
+    }
+
+    #[test]
+    fn managed_output_dir_uses_primary_interface_ip_and_bucket_layout() {
+        let mut settings = test_settings("/tmp/work");
+        settings.primary_interface_ip = "172.17.13.196".to_string();
+        let task_id = Uuid::nil();
+
+        assert_eq!(
+            managed_output_dir(&settings, task_id, "mp4"),
+            PathBuf::from("/data/zlm/www/output/mp4")
+                .join("node-172_17_13_196-mp4")
+                .join(task_id.to_string())
+        );
+        assert_eq!(
+            managed_output_dir(&settings, task_id, "hls"),
+            PathBuf::from("/data/zlm/www/output/hls")
+                .join("node-172_17_13_196-hls")
+                .join(task_id.to_string())
+        );
+    }
+
+    #[test]
+    fn managed_output_dir_falls_back_to_stream_addr_ip() {
+        let mut settings = test_settings("/tmp/work");
+        settings.agent_stream_addr = "http://10.20.30.40:8081".to_string();
+        let task_id = Uuid::nil();
+
+        assert_eq!(
+            managed_output_dir(&settings, task_id, "mp4"),
+            PathBuf::from("/data/zlm/www/output/mp4")
+                .join("node-10_20_30_40-mp4")
+                .join(task_id.to_string())
+        );
     }
 
     #[test]
@@ -7664,7 +7932,13 @@ fi
         let plan =
             build_multicast_bridge_plan(&settings, &request, &spec).expect("plan should build");
 
-        assert!(plan.output_target.starts_with(BRIDGE_ARTIFACT_ROOT));
+        assert!(
+            plan.output_target.starts_with(
+                managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
         assert!(plan.output_target.ends_with(".mp4"));
         assert!(plan.args.iter().any(|arg| arg == "mp4"));
     }
@@ -8510,14 +8784,24 @@ fi
             plan.outputs,
             vec![
                 "rtmp://127.0.0.1:1935/live/stream".to_string(),
-                ZLM_RECORD_HTTP_ROOT.to_string(),
+                managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .to_string(),
             ]
         );
         assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtmp"));
         assert!(plan.companion_recording.is_none());
         let recording = plan.recording.expect("recording should use ZLM API");
         assert_eq!(recording.formats, vec![ZlmRecordKind::Mp4]);
-        assert_eq!(recording.root_path, ZLM_RECORD_HTTP_ROOT);
+        assert_eq!(
+            recording.root_path_mp4.as_deref(),
+            Some(
+                managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(recording.root_path_hls, None);
     }
 
     #[test]
@@ -8618,8 +8902,11 @@ fi
             Some(ManagedFileOutputKind::StreamIngestRecord)
         );
         assert!(
-            plan.output_target
-                .starts_with(STREAM_INGEST_RECORD_ARTIFACT_ROOT)
+            plan.output_target.starts_with(
+                managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
         assert!(plan.output_target.ends_with(".mp4"));
         assert!(plan.args.windows(2).any(|window| window == ["-t", "300"]));
@@ -8886,6 +9173,103 @@ fi
                 .windows(2)
                 .any(|window| window == ["-hls_time", "8"])
         );
+        match &plan.success_check {
+            SuccessCheck::FilesExist(paths) => {
+                assert_eq!(paths.len(), 2);
+                assert!(
+                    paths
+                        .iter()
+                        .any(|path| path.to_string_lossy().ends_with(".mp4"))
+                );
+                assert!(
+                    paths
+                        .iter()
+                        .any(|path| path.to_string_lossy().ends_with(".m3u8"))
+                );
+            }
+            other => panic!("expected FilesExist success check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_plan_paths_creates_all_dual_output_parent_dirs() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-prepare-dual-output-{}",
+            Uuid::now_v7()
+        ));
+        let work_dir = temp_root.join("task").join("attempt-1");
+        let mp4_path = temp_root.join("output/mp4/node-1-mp4/task/out.mp4");
+        let hls_path = temp_root.join("output/hls/node-1-hls/task/out.m3u8");
+
+        let plan = ProcessPlan {
+            executable: "ffmpeg".to_string(),
+            args: Vec::new(),
+            work_dir: work_dir.clone(),
+            output_target: mp4_path.to_string_lossy().to_string(),
+            outputs: vec![
+                mp4_path.to_string_lossy().to_string(),
+                hls_path.to_string_lossy().to_string(),
+            ],
+            success_check: SuccessCheck::FilesExist(vec![mp4_path.clone(), hls_path.clone()]),
+            startup_probe: None,
+            recording: None,
+            managed_file_output_kind: Some(ManagedFileOutputKind::StreamIngestRecord),
+            companion_recording: None,
+            internal_ingress_protocol: None,
+        };
+
+        prepare_plan_paths(&plan).expect("plan paths should prepare");
+
+        assert!(work_dir.exists());
+        assert!(mp4_path.parent().expect("mp4 parent").exists());
+        assert!(hls_path.parent().expect("hls parent").exists());
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn prepare_plan_paths_creates_live_relay_recording_root_dirs() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "streamserver-prepare-record-roots-{}",
+            Uuid::now_v7()
+        ));
+        let work_dir = temp_root.join("task").join("attempt-1");
+        let mp4_root = temp_root.join("output/mp4/node-1-mp4/task");
+        let hls_root = temp_root.join("output/hls/node-1-hls/task");
+
+        let plan = ProcessPlan {
+            executable: "ffmpeg".to_string(),
+            args: Vec::new(),
+            work_dir: work_dir.clone(),
+            output_target: "rtmp://127.0.0.1/live/test".to_string(),
+            outputs: vec!["rtmp://127.0.0.1/live/test".to_string()],
+            success_check: SuccessCheck::ProcessExit,
+            startup_probe: None,
+            recording: Some(LiveRelayRecording {
+                formats: vec![ZlmRecordKind::Mp4, ZlmRecordKind::Hls],
+                root_path_mp4: Some(mp4_root.to_string_lossy().to_string()),
+                root_path_hls: Some(hls_root.to_string_lossy().to_string()),
+                duration_sec: None,
+                segment_sec: None,
+                as_player: false,
+                recording_started_at: None,
+                auto_stop_requested: false,
+                completion_reason: None,
+                started: false,
+                failed: false,
+            }),
+            managed_file_output_kind: None,
+            companion_recording: None,
+            internal_ingress_protocol: None,
+        };
+
+        prepare_plan_paths(&plan).expect("recording roots should prepare");
+
+        assert!(work_dir.exists());
+        assert!(mp4_root.exists());
+        assert!(hls_root.exists());
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
@@ -9963,14 +10347,23 @@ fi
         let recording = plan.recording.expect("recording should be present");
 
         assert_eq!(recording.formats, vec![ZlmRecordKind::Mp4]);
-        assert_eq!(recording.root_path, "/data/zlm/www/record");
+        assert_eq!(
+            recording.root_path_mp4.as_deref(),
+            Some(
+                managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(recording.root_path_hls, None);
         assert_eq!(recording.duration_sec, None);
         assert_eq!(recording.segment_sec, Some(120));
-        assert!(
-            plan.outputs
-                .iter()
-                .any(|output| output == "/data/zlm/www/record")
-        );
+        assert!(plan.outputs.iter().any(|output| {
+            output
+                == &managed_output_dir(&settings, request.task_id, "mp4")
+                    .to_string_lossy()
+                    .to_string()
+        }));
     }
 
     #[test]
@@ -9978,7 +10371,8 @@ fi
         let started_at = Utc::now();
         let recording = LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
-            root_path: "/var/media/archive".to_string(),
+            root_path_mp4: Some("/var/media/archive".to_string()),
+            root_path_hls: None,
             duration_sec: Some(300),
             segment_sec: None,
             as_player: false,
@@ -10004,7 +10398,8 @@ fi
         let started_at = Utc::now();
         let base = LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
-            root_path: "/var/media/archive".to_string(),
+            root_path_mp4: Some("/var/media/archive".to_string()),
+            root_path_hls: None,
             duration_sec: Some(60),
             segment_sec: None,
             as_player: false,
@@ -10151,7 +10546,15 @@ fi
         let plan = build_live_relay_plan(&settings, &request, &spec).expect("plan should build");
         let recording = plan.recording.expect("recording should be present");
 
-        assert_eq!(recording.root_path, "/data/zlm/www/record");
+        assert_eq!(
+            recording.root_path_hls.as_deref(),
+            Some(
+                managed_output_dir(&settings, request.task_id, "hls")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+        assert_eq!(recording.root_path_mp4, None);
     }
 
     #[test]
@@ -10164,7 +10567,8 @@ fi
         };
         let recording = LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
-            root_path: "/var/media/archive".to_string(),
+            root_path_mp4: Some("/var/media/archive".to_string()),
+            root_path_hls: None,
             duration_sec: None,
             segment_sec: Some(90),
             as_player: false,
@@ -10198,7 +10602,8 @@ fi
         };
         let recording = LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
-            root_path: "/var/media/archive".to_string(),
+            root_path_mp4: Some("/var/media/archive".to_string()),
+            root_path_hls: None,
             duration_sec: Some(300),
             segment_sec: None,
             as_player: false,
@@ -10226,7 +10631,8 @@ fi
         };
         let recording = LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
-            root_path: "/var/media/archive".to_string(),
+            root_path_mp4: Some("/var/media/archive".to_string()),
+            root_path_hls: None,
             duration_sec: None,
             segment_sec: None,
             as_player: false,
@@ -10370,7 +10776,8 @@ fi
     fn failed_live_relay_recording_is_not_retried() {
         assert!(!should_start_live_relay_recording(&LiveRelayRecording {
             formats: vec![ZlmRecordKind::Mp4],
-            root_path: "/var/media/archive".to_string(),
+            root_path_mp4: Some("/var/media/archive".to_string()),
+            root_path_hls: None,
             duration_sec: None,
             segment_sec: None,
             as_player: false,

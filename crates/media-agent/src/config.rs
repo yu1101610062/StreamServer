@@ -73,6 +73,10 @@ pub struct AgentSettings {
     #[serde(default)]
     pub primary_interface_ip: String,
     #[serde(default)]
+    pub output_mount_relative_prefix_mp4: String,
+    #[serde(default)]
+    pub output_mount_relative_prefix_hls: String,
+    #[serde(default)]
     pub multicast_interface_name: String,
     #[serde(default)]
     pub multicast_interface_ip: String,
@@ -110,6 +114,8 @@ impl Default for AgentSettings {
             agent_stream_addr: default_agent_stream_addr(),
             primary_interface_name: String::new(),
             primary_interface_ip: String::new(),
+            output_mount_relative_prefix_mp4: String::new(),
+            output_mount_relative_prefix_hls: String::new(),
             multicast_interface_name: String::new(),
             multicast_interface_ip: String::new(),
             network_mode: default_network_mode(),
@@ -272,6 +278,12 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("AGENT_PRIMARY_INTERFACE_IP") {
         settings.agent.primary_interface_ip = value;
+    }
+    if let Some(value) = env("OUTPUT_MOUNT_RELATIVE_PREFIX_MP4") {
+        settings.agent.output_mount_relative_prefix_mp4 = value;
+    }
+    if let Some(value) = env("OUTPUT_MOUNT_RELATIVE_PREFIX_HLS") {
+        settings.agent.output_mount_relative_prefix_hls = value;
     }
     if let Some(value) = env("AGENT_MULTICAST_INTERFACE_NAME") {
         settings.agent.multicast_interface_name = value;

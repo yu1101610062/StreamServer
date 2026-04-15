@@ -182,7 +182,7 @@
 
 - `publish.kind=file`：
   - 输出路径由平台托管生成，不能通过 `publish.url` 指定目录或文件名
-  - `stream_bridge(file)` 产物落到 `/data/zlm/www/artifacts/bridge/YYYY/MM/DD/HHMMSS[-NN].ext`
+  - `stream_bridge(file)` 产物落到 `/data/zlm/www/output/mp4/node-<node-ip>-mp4/<task-id>/HHMMSS[-NN].ext`
 - `publish.kind=rtmp_push`：
   - `publish.url` 必填，且必须是完整的 `rtmp://` 或 `rtmps://` 目标地址
   - `publish.format` 留空或填 `flv`；其他格式不允许
@@ -297,8 +297,8 @@
   "records": [
     {
       "id": "019d....",
-      "file_path": "/record/live/camera01/clip.mp4",
-      "http_url": "http://192.168.6.10/record/live/camera01/clip.mp4"
+      "file_path": "/node-192_168_6_10-mp4/019d....../clip.mp4",
+      "http_url": "http://192.168.6.10/output/mp4/node-192_168_6_10-mp4/019d....../clip.mp4"
     }
   ],
   "file_artifacts": [
@@ -306,8 +306,8 @@
       "artifact_kind": "transcode_output",
       "id": "019d....",
       "file_name": "output.mp4",
-      "file_path": "/artifacts/transcode/output.mp4",
-      "http_url": "http://192.168.6.10/artifacts/transcode/output.mp4"
+      "file_path": "/node-192_168_6_10-mp4/019d....../output.mp4",
+      "http_url": "http://192.168.6.10/output/mp4/node-192_168_6_10-mp4/019d....../output.mp4"
     }
   ],
   "latest_event": {
@@ -448,7 +448,7 @@
 说明：
 
 - `file_path` 返回平台受管挂载根下的相对路径，而不是容器内绝对路径。
-- 录像中心中的 `file_path` 通常表现为 `/record/...`，文件产物中的 `file_path` 通常表现为 `/artifacts/...`。
+- 相对路径按“节点自己的网络挂载前缀”裁剪；常见表现为 `/node-<node-ip>-<type>/<task-id>/...`。
 
 - 该接口只覆盖实时录制产生的录像。
 - `record.format=hls` 时，列表按播放列表 `m3u8` 展示逻辑录像条目，不展开底层 `ts` segment。

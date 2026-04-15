@@ -41,6 +41,8 @@ message Register {
   string ffmpeg_bin = 11;
   string ffprobe_bin = 12;
   string zlm_server_id = 13;
+  string output_mount_relative_prefix_mp4 = 14;
+  string output_mount_relative_prefix_hls = 15;
 }
 
 message Heartbeat {

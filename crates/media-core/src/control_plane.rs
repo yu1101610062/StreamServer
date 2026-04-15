@@ -12,7 +12,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot,
-    InputKind, NetworkMode, TaskSpec, TaskType,
+    InputKind, NetworkMode, TaskSpec, TaskType, normalize_output_mount_relative_prefix,
 };
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
@@ -947,6 +947,18 @@ fn registration_from_rpc(register: RpcRegister) -> Result<AgentRegistration, Sta
         ffmpeg_bin: require_field("ffmpeg_bin", register.ffmpeg_bin)?,
         ffprobe_bin: require_field("ffprobe_bin", register.ffprobe_bin)?,
         zlm_server_id: require_field("zlm_server_id", register.zlm_server_id)?,
+        output_mount_relative_prefix_mp4: normalize_output_mount_relative_prefix(
+            &register.output_mount_relative_prefix_mp4,
+        )
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid output_mount_relative_prefix_mp4: {error}"))
+        })?,
+        output_mount_relative_prefix_hls: normalize_output_mount_relative_prefix(
+            &register.output_mount_relative_prefix_hls,
+        )
+        .map_err(|error| {
+            Status::invalid_argument(format!("invalid output_mount_relative_prefix_hls: {error}"))
+        })?,
     })
 }
 
@@ -1658,6 +1670,8 @@ mod tests {
             ffmpeg_bin: "ffmpeg".to_string(),
             ffprobe_bin: "ffprobe".to_string(),
             zlm_server_id: format!("zlm-{node_id}"),
+            output_mount_relative_prefix_mp4: String::new(),
+            output_mount_relative_prefix_hls: String::new(),
         }
     }
 

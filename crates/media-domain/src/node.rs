@@ -1,4 +1,8 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    path::{Component, Path},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -59,6 +63,36 @@ pub struct AgentRegistration {
     pub ffmpeg_bin: String,
     pub ffprobe_bin: String,
     pub zlm_server_id: String,
+    pub output_mount_relative_prefix_mp4: String,
+    pub output_mount_relative_prefix_hls: String,
+}
+
+pub fn normalize_output_mount_relative_prefix(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("must be a relative path".to_string());
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => parts.push(value.to_string_lossy().to_string()),
+            Component::ParentDir => {
+                return Err("must not contain parent segments".to_string());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err("must be a relative path".to_string());
+            }
+        }
+    }
+
+    Ok(parts.join("/"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,5 +219,32 @@ mod tests {
         let state = RuntimeState::from_str("running").expect("state should parse");
         assert_eq!(state, RuntimeState::Running);
         assert_eq!(state.to_string(), "running");
+    }
+
+    #[test]
+    fn normalize_output_mount_relative_prefix_cleans_current_dir_segments() {
+        assert_eq!(
+            normalize_output_mount_relative_prefix("./output/mp4/./node-a")
+                .expect("prefix should normalize"),
+            "output/mp4/node-a"
+        );
+        assert_eq!(
+            normalize_output_mount_relative_prefix("  output/hls  ").expect("prefix should trim"),
+            "output/hls"
+        );
+    }
+
+    #[test]
+    fn normalize_output_mount_relative_prefix_rejects_unsafe_paths() {
+        assert!(
+            normalize_output_mount_relative_prefix("../output/mp4")
+                .expect_err("parent path should fail")
+                .contains("parent")
+        );
+        assert!(
+            normalize_output_mount_relative_prefix("/output/mp4")
+                .expect_err("absolute path should fail")
+                .contains("relative")
+        );
     }
 }

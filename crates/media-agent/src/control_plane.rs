@@ -13,7 +13,10 @@ use std::{
 };
 
 use anyhow::Context;
-use media_domain::{AgentRegistration, NetworkMode, RuntimeHandle, TaskType, WorkerKind};
+use media_domain::{
+    AgentRegistration, NetworkMode, RuntimeHandle, TaskType, WorkerKind,
+    normalize_output_mount_relative_prefix,
+};
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
     GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
@@ -622,6 +625,14 @@ impl AgentController {
                 .zlm_rtmp_enhanced_enabled(&self.settings.agent)
                 .await,
         );
+        let output_mount_relative_prefix_mp4 = normalize_output_mount_relative_prefix(
+            &self.settings.agent.output_mount_relative_prefix_mp4,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid OUTPUT_MOUNT_RELATIVE_PREFIX_MP4: {error}"))?;
+        let output_mount_relative_prefix_hls = normalize_output_mount_relative_prefix(
+            &self.settings.agent.output_mount_relative_prefix_hls,
+        )
+        .map_err(|error| anyhow::anyhow!("invalid OUTPUT_MOUNT_RELATIVE_PREFIX_HLS: {error}"))?;
 
         Ok(AgentRegistration {
             node_id: self.node_id,
@@ -637,6 +648,8 @@ impl AgentController {
             ffmpeg_bin: self.settings.agent.ffmpeg_bin.clone(),
             ffprobe_bin: self.settings.agent.ffprobe_bin.clone(),
             zlm_server_id,
+            output_mount_relative_prefix_mp4,
+            output_mount_relative_prefix_hls,
         })
     }
 }
@@ -870,6 +883,8 @@ fn registration_to_rpc(registration: &AgentRegistration) -> RpcRegister {
         ffmpeg_bin: registration.ffmpeg_bin.clone(),
         ffprobe_bin: registration.ffprobe_bin.clone(),
         zlm_server_id: registration.zlm_server_id.clone(),
+        output_mount_relative_prefix_mp4: registration.output_mount_relative_prefix_mp4.clone(),
+        output_mount_relative_prefix_hls: registration.output_mount_relative_prefix_hls.clone(),
     }
 }
 

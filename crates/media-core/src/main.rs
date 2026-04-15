@@ -3006,6 +3006,8 @@ mod tests {
                     ffmpeg_bin: "ffmpeg".to_string(),
                     ffprobe_bin: "ffprobe".to_string(),
                     zlm_server_id: format!("zlm-{node_id}"),
+                    output_mount_relative_prefix_mp4: String::new(),
+                    output_mount_relative_prefix_hls: String::new(),
                 },
                 Utc::now(),
             )
