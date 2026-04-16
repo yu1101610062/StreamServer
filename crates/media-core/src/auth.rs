@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "tests/auth.rs"]
+mod tests;
+
 use std::{fs, sync::Arc};
 
 use argon2::{
@@ -30,21 +34,6 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
-    #[cfg(test)]
-    pub fn from_public_key(enabled: bool, pem: &str) -> anyhow::Result<Self> {
-        if enabled {
-            Ok(Self {
-                mode: AuthMode::ExternalJwt,
-                verifier: Some(Arc::new(JwtVerifier::from_public_key_pem(pem)?)),
-                signer: None,
-                access_token_ttl: Duration::minutes(15),
-                refresh_token_ttl: Duration::days(7),
-            })
-        } else {
-            Ok(Self::disabled())
-        }
-    }
-
     pub fn from_settings(settings: &CoreSettings) -> anyhow::Result<Self> {
         match settings.auth_mode {
             AuthMode::Disabled => Ok(Self {
@@ -76,18 +65,6 @@ impl AuthConfig {
             }
         }
     }
-
-    #[cfg(test)]
-    pub fn disabled() -> Self {
-        Self {
-            mode: AuthMode::Disabled,
-            verifier: None,
-            signer: None,
-            access_token_ttl: Duration::minutes(15),
-            refresh_token_ttl: Duration::days(7),
-        }
-    }
-
     pub fn session(&self, headers: &HeaderMap) -> Result<AuthenticatedPrincipal, AppError> {
         if self.mode == AuthMode::Disabled {
             return Ok(AuthenticatedPrincipal::disabled_admin());
@@ -459,65 +436,4 @@ pub fn verify_password(password_hash: &str, password: &str) -> anyhow::Result<bo
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .is_ok())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const ED25519_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMAlSI3/XdPzRT72Rw08g6NnTnJ2eaq1JoJoW5Vlbm/T\n-----END PRIVATE KEY-----";
-    const ED25519_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA5Q5gilpT0f2fcLhC7l30Wou7Ng/gESlFWWx8z6TGJw=\n-----END PUBLIC KEY-----";
-
-    #[test]
-    fn disabled_auth_returns_admin() {
-        let config = AuthConfig::disabled();
-        let principal = config
-            .authorize(&HeaderMap::new(), ApiPermission::DebugRead)
-            .expect("auth should be bypassed");
-
-        assert_eq!(principal.role(), ApiRole::Admin);
-        assert_eq!(principal.subject(), "auth_disabled");
-    }
-
-    #[test]
-    fn machine_principal_has_limited_permissions() {
-        let principal = AuthenticatedPrincipal::machine_allowlisted("10.0.0.5");
-        assert!(
-            principal
-                .require_permission(ApiPermission::TaskWrite)
-                .is_ok()
-        );
-        assert!(
-            principal
-                .require_permission(ApiPermission::RecordRead)
-                .is_ok()
-        );
-        assert!(
-            principal
-                .require_permission(ApiPermission::NodeRead)
-                .is_err()
-        );
-        assert!(
-            principal
-                .require_permission(ApiPermission::DebugRead)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn signer_and_verifier_round_trip() {
-        let signer = JwtSigner::from_private_key_pem(ED25519_PRIVATE_KEY).expect("private key");
-        let verifier = JwtVerifier::from_public_key_pem(ED25519_PUBLIC_KEY).expect("public key");
-        let issued = signer
-            .issue("alice", ApiRole::Admin, Duration::minutes(5))
-            .expect("token should issue");
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            axum::http::header::AUTHORIZATION,
-            format!("Bearer {}", issued.token).parse().expect("header"),
-        );
-        let principal = verifier.verify(&headers).expect("token should verify");
-        assert_eq!(principal.subject(), "alice");
-        assert_eq!(principal.role(), ApiRole::Admin);
-    }
 }
