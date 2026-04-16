@@ -3148,6 +3148,43 @@ fn build_live_relay_plan_uses_managed_recording_root_when_enabled() {
 }
 
 #[test]
+fn build_live_relay_plan_omits_playback_probe_schema_for_record_only_recording() {
+    let settings = test_settings("/tmp/work");
+    let request = StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "relay-record-only",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "rtsp", "url": "rtsp://camera.example/live"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "record": {"enabled": true, "format": "mp4"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_live_relay_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert_eq!(plan.startup_probe.schema, None);
+    assert!(plan.recording.is_some());
+}
+
+#[test]
 fn recording_duration_reached_uses_recording_start_time() {
     let started_at = Utc::now();
     let recording = LiveRelayRecording {
@@ -3551,6 +3588,29 @@ fn zlm_stream_online_in_body_matches_vhost_and_schema() {
             ..target
         }
     ));
+}
+
+#[test]
+fn zlm_stream_online_in_body_allows_any_schema_when_probe_schema_is_absent() {
+    let body = json!({
+        "code": 0,
+        "data": [
+            {
+                "schema": "rtmp",
+                "vhost": "__defaultVhost__",
+                "app": "relay",
+                "stream": "stream-1"
+            }
+        ]
+    });
+    let target = StartupProbe {
+        schema: None,
+        vhost: "__defaultVhost__".to_string(),
+        app: "relay".to_string(),
+        stream: "stream-1".to_string(),
+    };
+
+    assert!(zlm_stream_online_in_body(&body, &target));
 }
 
 #[test]

@@ -4494,7 +4494,7 @@ fn build_startup_probe(task_id: Uuid, spec: &TaskSpec) -> Result<StartupProbe, E
         .map(str::to_string)
         .unwrap_or_else(|| task_id.to_string());
     Ok(StartupProbe {
-        schema: Some(preferred_publish_schema(&spec.expose)),
+        schema: playback_probe_schema(&spec.expose),
         vhost: spec
             .stream
             .vhost
@@ -4513,6 +4513,12 @@ fn build_managed_stream_ingest_startup_probe(
     let mut probe = build_startup_probe(task_id, spec)?;
     probe.schema = Some(protocol.schema().to_string());
     Ok(probe)
+}
+
+fn playback_probe_schema(expose: &ExposeSpec) -> Option<String> {
+    expose
+        .any_playback_enabled()
+        .then(|| preferred_publish_schema(expose))
 }
 
 fn preferred_publish_schema(expose: &ExposeSpec) -> String {
@@ -4650,6 +4656,10 @@ fn stream_online(handle: &RuntimeHandle) -> bool {
         .get("stream_online")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn live_relay_uses_recording_startup(startup_probe: &StartupProbe, handle: &RuntimeHandle) -> bool {
+    startup_probe.schema.is_none() && live_relay_recording_from_handle(handle).is_some()
 }
 
 fn completion_reason_from_handle(handle: &RuntimeHandle) -> Option<String> {
@@ -5957,6 +5967,278 @@ fn spawn_live_relay_monitor(
                     .remove(&runtime_id);
                 return;
             };
+
+            if live_relay_uses_recording_startup(&startup_probe, &handle) {
+                let mut recording_started = false;
+                if let Some(recording) = live_relay_recording_from_handle(&handle)
+                    .filter(should_start_live_relay_recording)
+                {
+                    let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
+                        schema: startup_probe.schema.clone(),
+                        vhost: startup_probe.vhost.clone(),
+                        app: startup_probe.app.clone(),
+                        stream: startup_probe.stream.clone(),
+                    });
+                    match start_stream_recording(
+                        &http_client,
+                        &settings,
+                        &binding,
+                        &recording,
+                        Utc::now(),
+                    )
+                    .await
+                    {
+                        Ok(updated_recording) => {
+                            let updated_handle = registry
+                                .update(runtime_id, |runtime| {
+                                    runtime.metadata["recording"] =
+                                        json!(updated_recording.clone());
+                                    runtime.metadata["recording_error"] = Value::Null;
+                                })
+                                .unwrap_or_else(|| {
+                                    let mut handle = handle.clone();
+                                    handle.metadata["recording"] = json!(updated_recording);
+                                    handle.metadata["recording_error"] = Value::Null;
+                                    handle
+                                });
+                            let _ = persist_runtime_state(
+                                &work_dir,
+                                &updated_handle,
+                                &SuccessCheck::ProcessExit,
+                            );
+                            let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                                task_id: updated_handle.task_id,
+                                attempt_no: updated_handle.attempt_no,
+                                lease_token: runtime_lease_token(&updated_handle)
+                                    .unwrap_or_default(),
+                                session_epoch: runtime_session_epoch(&updated_handle),
+                                event_type: "recording_started".to_string(),
+                                event_level: "info".to_string(),
+                                message: "live_relay recording started".to_string(),
+                                payload: json!({
+                                    "formats": recording.formats,
+                                    "root_path": recording.primary_root_path(),
+                                    "root_paths": recording.root_paths_payload(),
+                                    "duration_sec": recording.duration_sec,
+                                    "segment_sec": recording.segment_sec,
+                                    "as_player": recording.as_player,
+                                }),
+                            }));
+                            recording_started = true;
+                        }
+                        Err(error) => {
+                            let updated_handle = registry
+                                .update(runtime_id, |runtime| {
+                                    runtime.last_progress_at = Some(Utc::now());
+                                    runtime.metadata["recording_error"] = json!(error.to_string());
+                                })
+                                .unwrap_or_else(|| {
+                                    let mut handle = handle.clone();
+                                    handle.last_progress_at = Some(Utc::now());
+                                    handle.metadata["recording_error"] = json!(error.to_string());
+                                    handle
+                                });
+                            let _ = persist_runtime_state(
+                                &work_dir,
+                                &updated_handle,
+                                &SuccessCheck::ProcessExit,
+                            );
+                        }
+                    }
+                }
+
+                let handle = registry.get(runtime_id).unwrap_or(handle.clone());
+                if let Some(recording) =
+                    live_relay_recording_from_handle(&handle).filter(|recording| {
+                        should_auto_stop_live_relay_recording(recording, Utc::now())
+                    })
+                {
+                    let completed_recording =
+                        mark_recording_completion(&recording, "record_duration_reached");
+                    let completion_handle = registry
+                        .update(runtime_id, |runtime| {
+                            runtime.state = RuntimeState::Stopping;
+                            runtime.last_progress_at = Some(Utc::now());
+                            runtime.metadata["recording"] = json!(completed_recording.clone());
+                            runtime.metadata["completion_reason"] =
+                                json!("record_duration_reached");
+                            runtime.metadata["stop"] = json!({
+                                "reason": "record_duration_reached",
+                                "grace_period_sec": 0,
+                                "force_after_sec": RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                            });
+                        })
+                        .unwrap_or_else(|| {
+                            let mut handle = handle.clone();
+                            handle.state = RuntimeState::Stopping;
+                            handle.last_progress_at = Some(Utc::now());
+                            handle.metadata["recording"] = json!(completed_recording.clone());
+                            handle.metadata["completion_reason"] = json!("record_duration_reached");
+                            handle.metadata["stop"] = json!({
+                                "reason": "record_duration_reached",
+                                "grace_period_sec": 0,
+                                "force_after_sec": RECORD_DURATION_FORCE_KILL_DELAY.as_secs_f64(),
+                            });
+                            handle
+                        });
+                    let _ = persist_runtime_state(
+                        &work_dir,
+                        &completion_handle,
+                        &SuccessCheck::ProcessExit,
+                    );
+                    if let Some(runtime) = runtimes
+                        .read()
+                        .expect("runtime map lock poisoned")
+                        .get(&runtime_id)
+                        .cloned()
+                    {
+                        runtime.stop_requested.store(true, Ordering::Relaxed);
+                    }
+                    let binding =
+                        stream_binding_from_handle(&completion_handle).unwrap_or(StreamBinding {
+                            schema: startup_probe.schema.clone(),
+                            vhost: startup_probe.vhost.clone(),
+                            app: startup_probe.app.clone(),
+                            stream: startup_probe.stream.clone(),
+                        });
+                    let _ = request_live_relay_record_duration_stop(
+                        &completion_handle,
+                        &binding,
+                        &settings,
+                        &http_client,
+                        &runtimes,
+                    )
+                    .await;
+                    continue;
+                }
+
+                let startup_ready = live_relay_recording_from_handle(&handle)
+                    .is_some_and(|recording| recording.started);
+                if startup_ready {
+                    let should_emit_running = handle.state != RuntimeState::Running
+                        || !stream_online(&handle)
+                        || recording_started;
+                    if should_emit_running {
+                        let running_handle = registry
+                            .update(runtime_id, |runtime| {
+                                runtime.state = RuntimeState::Running;
+                                runtime.last_progress_at = Some(Utc::now());
+                                runtime.metadata["stream_online"] = json!(true);
+                                runtime.metadata["stream_binding"] = json!({
+                                    "schema": startup_probe.schema,
+                                    "vhost": startup_probe.vhost,
+                                    "app": startup_probe.app,
+                                    "stream": startup_probe.stream,
+                                });
+                            })
+                            .unwrap_or(handle);
+                        let _ = persist_runtime_state(
+                            &work_dir,
+                            &running_handle,
+                            &SuccessCheck::ProcessExit,
+                        );
+                        let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                            task_id: running_handle.task_id,
+                            attempt_no: running_handle.attempt_no,
+                            lease_token: runtime_lease_token(&running_handle).unwrap_or_default(),
+                            session_epoch: runtime_session_epoch(&running_handle),
+                            event_type: "running".to_string(),
+                            event_level: "info".to_string(),
+                            message: "ZLM live_relay recording is active".to_string(),
+                            payload: json!({
+                                "runtime_id": running_handle.runtime_id,
+                                "schema": startup_probe.schema,
+                                "vhost": startup_probe.vhost,
+                                "app": startup_probe.app,
+                                "stream": startup_probe.stream,
+                            }),
+                        }));
+                        let _ = events.send(RuntimeNotification::TaskSnapshot(running_handle));
+                    }
+                    sleep(STARTUP_PROBE_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                if started_at.elapsed() >= STARTUP_PROBE_TIMEOUT {
+                    let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
+                        schema: startup_probe.schema.clone(),
+                        vhost: startup_probe.vhost.clone(),
+                        app: startup_probe.app.clone(),
+                        stream: startup_probe.stream.clone(),
+                    });
+                    let _ = call_zlm_api(
+                        &http_client,
+                        &settings,
+                        "/index/api/close_streams",
+                        &build_close_stream_params(&binding, true),
+                    )
+                    .await;
+                    let failed_handle = registry
+                        .update(runtime_id, |runtime| {
+                            runtime.state = RuntimeState::Exited;
+                            runtime.last_progress_at = Some(Utc::now());
+                            runtime.metadata["startup_timeout"] = json!(true);
+                            runtime.metadata["stream_online"] = json!(false);
+                        })
+                        .unwrap_or_else(|| {
+                            let mut handle = handle.clone();
+                            handle.state = RuntimeState::Exited;
+                            handle.last_progress_at = Some(Utc::now());
+                            handle
+                        });
+                    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                        task_id: failed_handle.task_id,
+                        attempt_no: failed_handle.attempt_no,
+                        lease_token: runtime_lease_token(&failed_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&failed_handle),
+                        event_type: "startup_timeout".to_string(),
+                        event_level: "error".to_string(),
+                        message: format!(
+                            "live_relay recording for {}/{}/{} did not start within {} seconds",
+                            startup_probe.vhost,
+                            startup_probe.app,
+                            startup_probe.stream,
+                            STARTUP_PROBE_TIMEOUT.as_secs()
+                        ),
+                        payload: json!({
+                            "schema": startup_probe.schema,
+                            "vhost": startup_probe.vhost,
+                            "app": startup_probe.app,
+                            "stream": startup_probe.stream,
+                        }),
+                    }));
+                    let _ = events.send(RuntimeNotification::TaskSnapshot(failed_handle.clone()));
+                    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                        task_id: failed_handle.task_id,
+                        attempt_no: failed_handle.attempt_no,
+                        lease_token: runtime_lease_token(&failed_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&failed_handle),
+                        event_type: "failed".to_string(),
+                        event_level: "error".to_string(),
+                        message: "live_relay startup timed out".to_string(),
+                        payload: json!({
+                            "schema": startup_probe.schema,
+                            "vhost": startup_probe.vhost,
+                            "app": startup_probe.app,
+                            "stream": startup_probe.stream,
+                        }),
+                    }));
+                    let _ = persist_runtime_state(
+                        &work_dir,
+                        &failed_handle,
+                        &SuccessCheck::ProcessExit,
+                    );
+                    runtimes
+                        .write()
+                        .expect("runtime map lock poisoned")
+                        .remove(&runtime_id);
+                    let _ = registry.remove(runtime_id);
+                    return;
+                }
+
+                sleep(STARTUP_PROBE_POLL_INTERVAL).await;
+                continue;
+            }
 
             let stream_state = zlm_stream_online(&http_client, &settings, &startup_probe).await;
             let stream_was_online = stream_online(&handle);
