@@ -146,6 +146,16 @@ impl LocalRuntimeRegistry {
             .cloned()
             .collect()
     }
+
+    pub fn tracked_task_ids(&self) -> HashSet<Uuid> {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        runtimes
+            .by_runtime_id
+            .values()
+            .filter(|handle| handle.state != RuntimeState::Exited)
+            .map(|handle| handle.task_id)
+            .collect()
+    }
 }
 
 impl Default for LocalRuntimeRegistry {

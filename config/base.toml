@@ -45,3 +45,9 @@ network_mode = "bridge"
 labels = []
 max_runtime_slots = 0
 work_root = "/data/media/work"
+
+[agent.artifact_cleanup]
+enabled = true
+threshold_percent = 85
+strategy = "delete_oldest_then_reject"
+check_interval_sec = 30

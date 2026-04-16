@@ -1,3 +1,4 @@
+mod artifact_cleanup;
 mod capability;
 mod config;
 mod control_plane;

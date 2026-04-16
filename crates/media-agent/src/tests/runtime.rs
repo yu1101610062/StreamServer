@@ -32,6 +32,7 @@ fn test_settings(work_root: &str) -> AgentSettings {
         labels: Vec::new(),
         max_runtime_slots: 2,
         work_root: work_root.to_string(),
+        artifact_cleanup: crate::config::AgentArtifactCleanupSettings::default(),
     }
 }
 

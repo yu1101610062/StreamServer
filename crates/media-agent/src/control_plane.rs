@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    artifact_cleanup::ArtifactCleanupManager,
     capability::{CapabilityProbe, binary_available, probe_gpu_runtime},
     config::Settings,
     heartbeat::HeartbeatSampler,
@@ -58,6 +59,7 @@ pub struct AgentController {
     node_id: Uuid,
     capability_probe: CapabilityProbe,
     runtime_registry: LocalRuntimeRegistry,
+    artifact_cleanup: ArtifactCleanupManager,
     executor: Arc<dyn LocalExecutor>,
     runtime_priority_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
     runtime_log_batches: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
@@ -80,12 +82,15 @@ impl AgentController {
             runtime_registry.clone(),
             RuntimeEventSink::new(runtime_priority_tx, runtime_log_tx),
         ));
+        let artifact_cleanup =
+            ArtifactCleanupManager::new(&settings.agent, runtime_registry.clone());
 
         Ok(Self {
             settings: Arc::new(settings),
             node_id,
             capability_probe: CapabilityProbe::new()?,
             runtime_registry,
+            artifact_cleanup,
             executor,
             runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
             runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
@@ -95,6 +100,8 @@ impl AgentController {
     }
 
     pub async fn run(self) {
+        self.artifact_cleanup.refresh_now().await;
+        self.artifact_cleanup.start_background();
         let mut backoff_idx = 0usize;
 
         loop {
@@ -152,6 +159,7 @@ impl AgentController {
         let mut heartbeat_sampler = HeartbeatSampler::new(
             self.settings.agent.work_root.clone(),
             self.settings.agent.max_runtime_slots,
+            Some(self.artifact_cleanup.clone()),
         );
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -478,6 +486,7 @@ impl AgentController {
         request.session_epoch = session_epoch;
         let sender = sender.clone();
         let executor = self.executor.clone();
+        let artifact_cleanup = self.artifact_cleanup.clone();
         let start_task_permits = self.start_task_permits.clone();
         let session_guard = self.session_epoch.clone();
 
@@ -486,6 +495,26 @@ impl AgentController {
                 return;
             };
             if session_guard.load(Ordering::SeqCst) != request.session_epoch {
+                return;
+            }
+
+            if let Err(error) = artifact_cleanup.ensure_task_start_allowed(&request.resolved_spec) {
+                let handle = rejected_runtime_handle(&request);
+                let _ = send_task_event(
+                    &sender,
+                    request.task_id,
+                    request.attempt_no,
+                    request.lease_token.clone(),
+                    "start_rejected",
+                    "error",
+                    error.to_string(),
+                    json!({
+                        "runtime_id": handle.runtime_id,
+                        "worker_kind": handle.worker_kind,
+                        "resolved_spec": request.resolved_spec,
+                    }),
+                )
+                .await;
                 return;
             }
 

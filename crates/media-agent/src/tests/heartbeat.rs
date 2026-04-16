@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn slot_usage_is_capped() {
-    let mut sampler = HeartbeatSampler::new(".", 2);
+    let mut sampler = HeartbeatSampler::new(".", 2, None);
     sampler.previous_cpu = Some(CpuCounters { total: 10, idle: 5 });
 
     let heartbeat = sampler.sample(10, 0, 0, 0, true, true, Vec::new());

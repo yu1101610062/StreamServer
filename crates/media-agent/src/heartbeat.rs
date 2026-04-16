@@ -7,10 +7,13 @@ use std::{ffi::CString, fs};
 use chrono::Utc;
 use media_domain::{GpuRuntimeStats, HeartbeatSnapshot};
 
+use crate::artifact_cleanup::ArtifactCleanupManager;
+
 #[derive(Debug, Clone)]
 pub struct HeartbeatSampler {
     work_root: String,
     max_runtime_slots: u32,
+    artifact_cleanup: Option<ArtifactCleanupManager>,
     previous_cpu: Option<CpuCounters>,
 }
 
@@ -21,10 +24,15 @@ struct CpuCounters {
 }
 
 impl HeartbeatSampler {
-    pub fn new(work_root: impl Into<String>, max_runtime_slots: u32) -> Self {
+    pub fn new(
+        work_root: impl Into<String>,
+        max_runtime_slots: u32,
+        artifact_cleanup: Option<ArtifactCleanupManager>,
+    ) -> Self {
         Self {
             work_root: work_root.into(),
             max_runtime_slots,
+            artifact_cleanup,
             previous_cpu: None,
         }
     }
@@ -41,7 +49,12 @@ impl HeartbeatSampler {
     ) -> HeartbeatSnapshot {
         let cpu_percent = self.sample_cpu_percent().unwrap_or(0.0);
         let mem_percent = sample_mem_percent().unwrap_or(0.0);
-        let disk_percent = sample_disk_percent(&self.work_root).unwrap_or(0.0);
+        let disk_percent = self
+            .artifact_cleanup
+            .as_ref()
+            .and_then(ArtifactCleanupManager::current_disk_percent)
+            .or_else(|| sample_disk_percent(&self.work_root))
+            .unwrap_or(0.0);
         let slot_usage = if self.max_runtime_slots == 0 {
             0.0
         } else {

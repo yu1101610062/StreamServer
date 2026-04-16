@@ -90,6 +90,20 @@ pub struct AgentSettings {
     pub work_root: String,
     #[serde(default = "default_acceleration_mode")]
     pub acceleration_mode: String,
+    #[serde(default)]
+    pub artifact_cleanup: AgentArtifactCleanupSettings,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentArtifactCleanupSettings {
+    #[serde(default = "default_artifact_cleanup_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_artifact_cleanup_threshold_percent")]
+    pub threshold_percent: f64,
+    #[serde(default = "default_artifact_cleanup_strategy")]
+    pub strategy: String,
+    #[serde(default = "default_artifact_cleanup_check_interval_sec")]
+    pub check_interval_sec: u64,
 }
 
 impl Default for AgentSettings {
@@ -123,6 +137,18 @@ impl Default for AgentSettings {
             max_runtime_slots: default_max_runtime_slots(),
             work_root: default_work_root(),
             acceleration_mode: default_acceleration_mode(),
+            artifact_cleanup: AgentArtifactCleanupSettings::default(),
+        }
+    }
+}
+
+impl Default for AgentArtifactCleanupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: default_artifact_cleanup_enabled(),
+            threshold_percent: default_artifact_cleanup_threshold_percent(),
+            strategy: default_artifact_cleanup_strategy(),
+            check_interval_sec: default_artifact_cleanup_check_interval_sec(),
         }
     }
 }
@@ -213,6 +239,23 @@ impl Settings {
         anyhow::ensure!(
             matches!(self.agent.acceleration_mode.trim(), "cpu" | "gpu"),
             "AGENT_ACCELERATION_MODE must be one of cpu/gpu"
+        );
+        anyhow::ensure!(
+            self.agent.artifact_cleanup.threshold_percent.is_finite()
+                && self.agent.artifact_cleanup.threshold_percent >= 0.0
+                && self.agent.artifact_cleanup.threshold_percent <= 100.0,
+            "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT must be between 0 and 100"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.agent.artifact_cleanup.strategy.trim(),
+                "delete_oldest_then_reject" | "reject_only"
+            ),
+            "AGENT_ARTIFACT_CLEANUP_STRATEGY must be one of delete_oldest_then_reject/reject_only"
+        );
+        anyhow::ensure!(
+            self.agent.artifact_cleanup.check_interval_sec > 0,
+            "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC must be greater than 0"
         );
 
         Ok(())
@@ -305,6 +348,23 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("AGENT_ACCELERATION_MODE") {
         settings.agent.acceleration_mode = value;
+    }
+    if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_ENABLED") {
+        settings.agent.artifact_cleanup.enabled =
+            matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
+    if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT") {
+        settings.agent.artifact_cleanup.threshold_percent = value
+            .parse()
+            .unwrap_or(default_artifact_cleanup_threshold_percent());
+    }
+    if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_STRATEGY") {
+        settings.agent.artifact_cleanup.strategy = value;
+    }
+    if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC") {
+        settings.agent.artifact_cleanup.check_interval_sec = value
+            .parse()
+            .unwrap_or(default_artifact_cleanup_check_interval_sec());
     }
     if let Some(value) = env("LOG_LEVEL") {
         settings.logging.level = value;
@@ -400,4 +460,20 @@ fn default_acceleration_mode() -> String {
 
 fn default_allow_enhanced_rtmp_expose() -> bool {
     true
+}
+
+fn default_artifact_cleanup_enabled() -> bool {
+    true
+}
+
+fn default_artifact_cleanup_threshold_percent() -> f64 {
+    85.0
+}
+
+fn default_artifact_cleanup_strategy() -> String {
+    "delete_oldest_then_reject".to_string()
+}
+
+fn default_artifact_cleanup_check_interval_sec() -> u64 {
+    30
 }
