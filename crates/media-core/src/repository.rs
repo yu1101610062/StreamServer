@@ -899,23 +899,23 @@ impl TaskRepository {
         let mut builder = QueryBuilder::<Postgres>::new(
             r#"
             select
-              id,
-              attempt_no,
-              source::text as source,
-              event_type,
-              event_level,
-              payload,
-              created_at,
+              task_events.id,
+              task_events.attempt_no,
+              task_events.source::text as source,
+              task_events.event_type,
+              task_events.event_level,
+              task_events.payload,
+              task_events.created_at,
               n.output_mount_relative_prefix_mp4,
               n.output_mount_relative_prefix_hls
             from task_events
             left join task_attempts ta on ta.id = task_events.attempt_id
             left join media_nodes n on n.id = ta.node_id
-            where task_id = "#,
+            where task_events.task_id = "#,
         );
         builder.push_bind(task_id);
         apply_task_event_filters(&mut builder, &filter);
-        builder.push(" order by created_at desc, id desc limit ");
+        builder.push(" order by task_events.created_at desc, task_events.id desc limit ");
         builder.push_bind(i64::from(page_size));
         builder.push(" offset ");
         builder.push_bind(i64::from((page - 1) * page_size));
