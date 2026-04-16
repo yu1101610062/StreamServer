@@ -3293,7 +3293,10 @@ fn build_process_plan_uses_internal_startup_schema_for_record_only_live_http_ts(
         .as_ref()
         .expect("managed process plan should include startup probe");
 
-    assert_eq!(task_runtime_mode(&parse_task_spec(&request).expect("spec should parse")), TaskRuntimeMode::ManagedProcess);
+    assert_eq!(
+        task_runtime_mode(&parse_task_spec(&request).expect("spec should parse")),
+        TaskRuntimeMode::ManagedProcess
+    );
     assert!(startup_probe.schema.is_some());
     assert!(plan.recording.is_some());
 }
@@ -3824,6 +3827,184 @@ async fn cleanup_live_relay_runtime_deletes_proxy_before_closing_stream() {
     );
 
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn stop_record(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("stopRecord".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    async fn close_streams(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("close_streams".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/stopRecord", get(stop_record))
+        .route("/index/api/close_streams", get(close_streams))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let temp_root = std::env::temp_dir().join(format!("streamserver-stop-task-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+    let executor = ManagedProcessExecutor::new(
+        settings,
+        registry.clone(),
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep should spawn");
+    let task_id = Uuid::now_v7();
+    let runtime_id = Uuid::now_v7();
+    let started_at = Utc::now();
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-record-only-http-ts",
+        "common": {"created_by": "tester"},
+        "input": {
+            "kind": "http_ts",
+            "source_mode": "live",
+            "url": "http://camera.example/live.ts"
+        },
+        "stream": {"app": "objective", "name": "objective-1"},
+        "expose": {
+            "enable_rtsp": false,
+            "enable_rtmp": false,
+            "enable_http_ts": false,
+            "enable_http_fmp4": false,
+            "enable_hls": false
+        },
+        "record": {"enabled": true, "format": "mp4"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let handle = RuntimeHandle {
+        runtime_id,
+        task_id,
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(child.id() as i32),
+        started_at,
+        last_progress_at: None,
+        state: RuntimeState::Running,
+        command_line: Some("ffmpeg -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/objective/objective-1".to_string()],
+        metadata: json!({
+            "task_type": "stream_ingest",
+            "execution_mode": "managed",
+            "lease_token": "lease",
+            "resolved_spec": resolved_spec,
+            "stream_binding": {
+                "schema": "rtmp",
+                "vhost": "__defaultVhost__",
+                "app": "objective",
+                "stream": "objective-1"
+            },
+            "recording": LiveRelayRecording {
+                formats: vec![ZlmRecordKind::Mp4],
+                root_path_mp4: Some("/data/zlm/www/output/mp4/task".to_string()),
+                root_path_hls: None,
+                duration_sec: None,
+                segment_sec: None,
+                as_player: false,
+                recording_started_at: Some(started_at),
+                auto_stop_requested: false,
+                completion_reason: None,
+                started: true,
+                failed: false,
+            }
+        }),
+    };
+    registry.track(handle);
+    executor
+        .runtimes
+        .write()
+        .expect("runtime map lock poisoned")
+        .insert(
+            runtime_id,
+            ManagedRuntime {
+                pid: Some(child.id() as i32),
+                companion_pids: Vec::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                suppress_companion_events: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+    executor
+        .stop_task(&StopTaskRequest {
+            task_id,
+            attempt_no: 1,
+            lease_token: "lease".to_string(),
+            reason: "user_requested".to_string(),
+            grace_period_sec: 0,
+            force_after_sec: 0,
+        })
+        .expect("stop should succeed");
+
+    let status = child.wait().expect("sleep should exit after SIGTERM");
+    assert!(!status.success());
+
+    let captured = calls.lock().await.clone();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].0, "stopRecord");
+    assert_eq!(captured[0].1.get("type").map(String::as_str), Some("1"));
+    assert_eq!(captured[1].0, "close_streams");
+    assert_eq!(
+        captured[1].1.get("stream").map(String::as_str),
+        Some("objective-1")
+    );
+
+    server.abort();
+    let _ = fs::remove_dir_all(temp_root);
 }
 
 #[test]

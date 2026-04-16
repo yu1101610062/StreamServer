@@ -9,8 +9,8 @@ use axum::{
 };
 use media_domain::{AgentRegistration, HeartbeatSnapshot, NetworkMode};
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 use tokio::{
     net::{TcpListener, TcpStream},
     task::JoinHandle,
@@ -478,6 +478,33 @@ async fn wait_for_callback_count(
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+async fn pending_callback_deliver_after(
+    pool: &sqlx::PgPool,
+    task_id: Uuid,
+    attempt_no: i32,
+    reason: &str,
+) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+    sqlx::query_scalar(
+        r#"
+        select deliver_after
+          from task_callback_outbox
+         where task_id = $1
+           and attempt_no = $2
+           and event_type = 'task.completed'
+           and reason = $3
+           and status in ('pending', 'retrying')
+         order by created_at desc
+         limit 1
+        "#,
+    )
+    .bind(task_id)
+    .bind(attempt_no)
+    .bind(reason)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
 }
 
 async fn insert_running_transcode_task(
@@ -1099,6 +1126,95 @@ async fn stop_task_rejects_created_state_via_api() -> anyhow::Result<()> {
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let body = json_body(response).await;
     assert_eq!(body["code"], json!("TASK_INVALID_STATE"));
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_task_is_idempotent_when_task_is_already_stopping_via_api() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let now = Utc::now();
+    let task_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let node_id = Uuid::now_v7();
+    let payload = sample_create_task_payload("manual");
+
+    sqlx::query(
+        r#"
+        insert into tasks (
+          id, name, type, status, idempotency_key,
+          priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+          current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+        ) values (
+          $1, 'stopping-task', 'stream_ingest'::task_type, 'STOPPING'::task_status, $2,
+          50, $3, $3, 'tester', $4,
+          1, 'manual', $5, $5, $5, null
+        )
+        "#,
+    )
+    .bind(task_id)
+    .bind(format!("stopping-task-{task_id}"))
+    .bind(&payload)
+    .bind(node_id)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        insert into task_attempts (
+          id, task_id, attempt_no, node_id, worker_kind, status,
+          pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+          rtp_port, exit_code, failure_code, failure_reason,
+          checkpoint_json, started_at, ended_at, created_at,
+          lease_token, stop_requested_at, stop_reason, desired_terminal_status
+        ) values (
+          $1, $2, 1, $3, 'hybrid'::worker_kind, 'STOPPING'::attempt_status,
+          4321, null, null, null, null, null,
+          null, null, null, null,
+          null, $4, null, $4,
+          'lease-1', $5, 'user_requested', 'CANCELED'::task_status
+        )
+        "#,
+    )
+    .bind(attempt_id)
+    .bind(task_id)
+    .bind(node_id)
+    .bind(now)
+    .bind(now - chrono::Duration::seconds(10))
+    .execute(&db.pool)
+    .await?;
+
+    let app = build_app(test_app_state(db.pool.clone()));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/tasks/{task_id}/stop"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert_eq!(body["id"], json!(task_id));
+    assert_eq!(body["status"], json!("STOPPING"));
+
+    let stop_request_events: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+          from task_events
+         where task_id = $1
+           and event_type = 'task_stop_requested'
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(stop_request_events, 0);
 
     db.cleanup().await?;
     Ok(())
@@ -2163,14 +2279,15 @@ async fn create_task_rejects_invalid_callback_url() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn callback_dispatcher_delivers_terminal_and_artifact_update_callbacks() -> anyhow::Result<()>
-{
+async fn callback_dispatcher_waits_for_record_artifact_before_first_terminal_callback()
+-> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
-    let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+    let repository = Arc::new(TaskRepository::with_callback_delays(
         db.pool.clone(),
         chrono::Duration::zero(),
+        chrono::Duration::seconds(30),
     ));
     let node_id = Uuid::now_v7();
     upsert_test_node(
@@ -2212,6 +2329,15 @@ async fn callback_dispatcher_delivers_terminal_and_artifact_update_callbacks() -
         )
         .await?;
 
+    let initial_deliver_after =
+        pending_callback_deliver_after(&db.pool, task_id, 1, "terminal_state")
+            .await?
+            .expect("terminal callback should be enqueued");
+    assert!(
+        initial_deliver_after >= Utc::now() + chrono::Duration::seconds(25),
+        "record-producing tasks should hold terminal callbacks for artifact wait"
+    );
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let dispatcher = callback::spawn(
         repository.clone(),
@@ -2225,27 +2351,8 @@ async fn callback_dispatcher_delivers_terminal_and_artifact_update_callbacks() -
         },
         shutdown_rx,
     );
-
-    let first_calls = wait_for_callback_count(&calls, 1).await?;
-    assert_eq!(first_calls.len(), 1);
-    assert_eq!(first_calls[0].1["event_type"], json!("task.completed"));
-    assert_eq!(first_calls[0].1["reason"], json!("terminal_state"));
-    assert_eq!(first_calls[0].1["task"]["status"], json!("SUCCEEDED"));
-    assert!(
-        first_calls[0].1["streams"][0]["play_urls"]
-            .as_array()
-            .unwrap_or(&Vec::new())
-            .iter()
-            .any(|value| value == "rtsp://stream.example/live/camera01")
-    );
-    assert_eq!(
-        first_calls[0]
-            .0
-            .get("X-StreamServer-Signature")
-            .and_then(|value| value.to_str().ok())
-            .is_some(),
-        true
-    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(calls.lock().await.len(), 0);
 
     repository
         .record_zlm_record_file_hook(
@@ -2270,16 +2377,42 @@ async fn callback_dispatcher_delivers_terminal_and_artifact_update_callbacks() -
         )
         .await?;
 
-    let second_calls = wait_for_callback_count(&calls, 2).await?;
-    assert_eq!(second_calls[1].1["reason"], json!("artifact_update"));
+    let expedited_deliver_after =
+        pending_callback_deliver_after(&db.pool, task_id, 1, "terminal_state")
+            .await?
+            .expect("terminal callback should remain pending until delivery");
+    assert!(expedited_deliver_after <= Utc::now());
+
+    let delivered_calls = wait_for_callback_count(&calls, 1).await?;
+    assert_eq!(delivered_calls.len(), 1);
+    assert_eq!(delivered_calls[0].1["event_type"], json!("task.completed"));
+    assert_eq!(delivered_calls[0].1["reason"], json!("terminal_state"));
+    assert_eq!(delivered_calls[0].1["task"]["status"], json!("SUCCEEDED"));
+    assert!(
+        delivered_calls[0].1["streams"][0]["play_urls"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|value| value == "rtsp://stream.example/live/camera01")
+    );
     assert_eq!(
-        second_calls[1].1["records"][0]["http_url"],
+        delivered_calls[0]
+            .0
+            .get("X-StreamServer-Signature")
+            .and_then(|value| value.to_str().ok())
+            .is_some(),
+        true
+    );
+    assert_eq!(
+        delivered_calls[0].1["records"][0]["http_url"],
         json!("http://stream.example/record/live/camera01/clip.mp4")
     );
     assert_eq!(
-        second_calls[1].1["records"][0]["file_path"],
+        delivered_calls[0].1["records"][0]["file_path"],
         json!("/record/live/camera01/clip.mp4")
     );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(calls.lock().await.len(), 1);
 
     let detail = repository.get_task(task_id).await?;
     assert_eq!(
@@ -3344,13 +3477,237 @@ async fn callback_payload_includes_file_artifact_http_url_for_stream_ingest_fast
 }
 
 #[tokio::test]
-async fn callback_dispatcher_delivers_bridge_artifact_update_callback() -> anyhow::Result<()> {
+async fn callback_dispatcher_falls_back_to_terminal_callback_when_artifact_wait_times_out()
+-> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
-    let repository = Arc::new(TaskRepository::with_callback_settle_delay(
+    let repository = Arc::new(TaskRepository::with_callback_delays(
         db.pool.clone(),
         chrono::Duration::zero(),
+        chrono::Duration::milliseconds(200),
+    ));
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+    let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+    let resolved_spec = json!({
+        "type": "stream_bridge",
+        "name": "bridge-job-01",
+        "common": {"created_by": "tester", "callback_url": callback_url},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "publish": {"kind": "file", "format": "mp4"},
+        "record": {},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id = insert_running_bridge_task(&db.pool, node_id, resolved_spec).await?;
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "succeeded".to_string(),
+                event_level: "info".to_string(),
+                message: "finished".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await?;
+
+    let initial_deliver_after =
+        pending_callback_deliver_after(&db.pool, task_id, 1, "terminal_state")
+            .await?
+            .expect("terminal callback should be enqueued");
+    assert!(initial_deliver_after > Utc::now());
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let dispatcher = callback::spawn(
+        repository.clone(),
+        Client::new(),
+        callback::CallbackConfig {
+            timeout: std::time::Duration::from_secs(2),
+            max_attempts: 3,
+            initial_backoff: std::time::Duration::from_millis(50),
+            max_backoff: std::time::Duration::from_millis(200),
+            shared_secret: None,
+        },
+        shutdown_rx,
+    );
+
+    let delivered_calls = wait_for_callback_count(&calls, 1).await?;
+    assert_eq!(delivered_calls[0].1["reason"], json!("terminal_state"));
+    assert_eq!(delivered_calls[0].1["records"], json!([]));
+    assert_eq!(delivered_calls[0].1["file_artifacts"], json!([]));
+
+    let _ = shutdown_tx.send(true);
+    dispatcher.abort();
+    callback_handle.abort();
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_callback_uses_normal_settle_delay_for_tasks_without_expected_artifacts()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::with_callback_delays(
+        db.pool.clone(),
+        chrono::Duration::zero(),
+        chrono::Duration::seconds(30),
+    ));
+    let node_id = Uuid::now_v7();
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester", "callback_url": "http://example.invalid/callback"},
+        "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+        "publish": {
+            "enable_rtsp": true,
+            "enable_http_ts": true
+        },
+        "record": {"enabled": false},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "succeeded".to_string(),
+                event_level: "info".to_string(),
+                message: "finished".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await?;
+
+    let deliver_after = pending_callback_deliver_after(&db.pool, task_id, 1, "terminal_state")
+        .await?
+        .expect("terminal callback should be enqueued");
+    assert!(deliver_after <= Utc::now());
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_callback_does_not_wait_when_artifacts_already_exist_before_terminal_state()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::with_callback_delays(
+        db.pool.clone(),
+        chrono::Duration::zero(),
+        chrono::Duration::seconds(30),
+    ));
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "ingest-fast-record-01",
+        "common": {"created_by": "tester", "callback_url": "http://example.invalid/callback"},
+        "input": {"kind": "http_mp4", "source_mode": "vod", "url": "http://vod.example.com/archive.mp4"},
+        "stream": {"app": "live", "name": "archive-fast"},
+        "expose": {
+            "enable_rtsp": false,
+            "enable_rtmp": false,
+            "enable_http_ts": false,
+            "enable_http_fmp4": false,
+            "enable_hls": false
+        },
+        "process": {"mode": "copy_or_transcode"},
+        "record": {"enabled": true, "format": "mp4", "duration_sec": 300},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id = insert_running_ingest_task(&db.pool, node_id, resolved_spec).await?;
+    repository
+        .record_agent_snapshot(
+            node_id,
+            repository::TaskSnapshotRecord {
+                runtime_id: Uuid::now_v7(),
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                worker_kind: "ffmpeg".to_string(),
+                pid: Some(3234),
+                state: "RUNNING".to_string(),
+                command_line: Some("ffmpeg ...".to_string()),
+                outputs: vec![
+                    "/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4"
+                        .to_string(),
+                ],
+                metadata: json!({
+                    "stream_ingest_record_artifacts": [
+                        {
+                            "file_name": "output.mp4",
+                            "file_path": "/data/zlm/www/artifacts/stream-ingest-record/verify/output.mp4",
+                            "file_size": 16384
+                        }
+                    ]
+                }),
+            },
+        )
+        .await?;
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "succeeded".to_string(),
+                event_level: "info".to_string(),
+                message: "finished".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await?;
+
+    let deliver_after = pending_callback_deliver_after(&db.pool, task_id, 1, "terminal_state")
+        .await?
+        .expect("terminal callback should be enqueued");
+    assert!(deliver_after <= Utc::now());
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn callback_dispatcher_delivers_bridge_artifact_update_callback_for_late_artifacts()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::with_callback_delays(
+        db.pool.clone(),
+        chrono::Duration::zero(),
+        chrono::Duration::milliseconds(200),
     ));
     let node_id = Uuid::now_v7();
     upsert_test_node(
@@ -3447,6 +3804,249 @@ async fn callback_dispatcher_delivers_bridge_artifact_update_callback() -> anyho
     let _ = shutdown_tx.send(true);
     dispatcher.abort();
     callback_handle.abort();
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn late_record_hook_without_stream_binding_backfills_record_and_artifact_callback()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::with_callback_delays(
+        db.pool.clone(),
+        chrono::Duration::zero(),
+        chrono::Duration::milliseconds(200),
+    ));
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+    let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "record-only-live",
+        "common": {"created_by": "tester", "callback_url": callback_url},
+        "input": {
+            "kind": "http_ts",
+            "source_mode": "live",
+            "url": "http://camera.example/live.ts"
+        },
+        "stream": {"app": "objective", "name": "objective-1"},
+        "expose": {
+            "enable_rtsp": false,
+            "enable_rtmp": false,
+            "enable_http_ts": false,
+            "enable_http_fmp4": false,
+            "enable_hls": false
+        },
+        "process": {"mode": "copy_or_transcode"},
+        "record": {"enabled": true, "format": "mp4"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "objective", "objective-1")
+            .await?;
+    let record_started_at = Utc::now();
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "canceled".to_string(),
+                event_level: "info".to_string(),
+                message: "stopped".to_string(),
+                payload: json!({}),
+            },
+        )
+        .await?;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let dispatcher = callback::spawn(
+        repository.clone(),
+        Client::new(),
+        callback::CallbackConfig {
+            timeout: std::time::Duration::from_secs(2),
+            max_attempts: 3,
+            initial_backoff: std::time::Duration::from_millis(50),
+            max_backoff: std::time::Duration::from_millis(200),
+            shared_secret: None,
+        },
+        shutdown_rx,
+    );
+
+    let first_calls = wait_for_callback_count(&calls, 1).await?;
+    assert_eq!(first_calls[0].1["reason"], json!("terminal_state"));
+    let binding_count: i64 =
+        sqlx::query_scalar("select count(*) from stream_bindings where task_id = $1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(binding_count, 0);
+
+    repository
+        .record_zlm_record_file_hook(
+            &format!("zlm-{node_id}"),
+            "on_record_mp4",
+            "late-record-hook-without-binding",
+            json!({}),
+            repository::ZlmRecordFileRecord {
+                record_format: Some("mp4".to_string()),
+                schema: Some("rtmp".to_string()),
+                vhost: "__defaultVhost__".to_string(),
+                app: "objective".to_string(),
+                stream: "objective-1".to_string(),
+                file_path: format!(
+                    "/data/zlm/www/output/mp4/node-stream_example-mp4/{task_id}/record/objective/objective-1/2026-04-16/clip.mp4"
+                ),
+                file_size: 4096,
+                time_len_sec: Some(12),
+                start_time: Some(record_started_at),
+                file_name: Some("clip.mp4".to_string()),
+                folder: Some(format!(
+                    "/data/zlm/www/output/mp4/node-stream_example-mp4/{task_id}/record/objective/objective-1/2026-04-16"
+                )),
+                url: None,
+            },
+        )
+        .await?;
+
+    let second_calls = wait_for_callback_count(&calls, 2).await?;
+    assert_eq!(second_calls[1].1["reason"], json!("artifact_update"));
+    assert_eq!(
+        second_calls[1].1["records"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    let records = repository.list_task_record_files(task_id).await?;
+    assert_eq!(records.len(), 1);
+    assert!(records[0].file_path.contains(&task_id.to_string()));
+    assert!(
+        records[0]
+            .http_url
+            .as_deref()
+            .is_some_and(|value| value.contains(&task_id.to_string()))
+    );
+
+    let _ = shutdown_tx.send(true);
+    dispatcher.abort();
+    callback_handle.abort();
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_hook_prefers_task_id_from_managed_output_path_over_active_binding()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "record-only-live",
+        "common": {"created_by": "tester"},
+        "input": {
+            "kind": "http_ts",
+            "source_mode": "live",
+            "url": "http://camera.example/live.ts"
+        },
+        "stream": {"app": "objective", "name": "objective-1"},
+        "expose": {
+            "enable_rtsp": false,
+            "enable_rtmp": false,
+            "enable_http_ts": false,
+            "enable_http_fmp4": false,
+            "enable_hls": false
+        },
+        "process": {"mode": "copy_or_transcode"},
+        "record": {"enabled": true, "format": "mp4"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+
+    let first_task_id = insert_running_stream_task(
+        &db.pool,
+        node_id,
+        resolved_spec.clone(),
+        "objective",
+        "objective-1",
+    )
+    .await?;
+    let second_task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "objective", "objective-1")
+            .await?;
+
+    let active_binding_task_id: Uuid = sqlx::query_scalar(
+        "select task_id from stream_bindings where server_id = $1 and schema = 'rtsp' and vhost = '__defaultVhost__' and app = 'objective' and stream = 'objective-1'",
+    )
+    .bind(format!("zlm-{node_id}"))
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(active_binding_task_id, second_task_id);
+
+    repository
+        .record_zlm_record_file_hook(
+            &format!("zlm-{node_id}"),
+            "on_record_mp4",
+            "record-hook-prefers-path-task-id",
+            json!({}),
+            repository::ZlmRecordFileRecord {
+                record_format: Some("mp4".to_string()),
+                schema: Some("rtmp".to_string()),
+                vhost: "__defaultVhost__".to_string(),
+                app: "objective".to_string(),
+                stream: "objective-1".to_string(),
+                file_path: format!(
+                    "/data/zlm/www/output/mp4/node-172_17_13_196-mp4/{first_task_id}/record/objective/objective-1/2026-04-16/clip.mp4"
+                ),
+                file_size: 4096,
+                time_len_sec: Some(12),
+                start_time: None,
+                file_name: Some("clip.mp4".to_string()),
+                folder: Some(format!(
+                    "/data/zlm/www/output/mp4/node-172_17_13_196-mp4/{first_task_id}/record/objective/objective-1/2026-04-16"
+                )),
+                url: None,
+            },
+        )
+        .await?;
+
+    let first_records = repository.list_task_record_files(first_task_id).await?;
+    let second_records = repository.list_task_record_files(second_task_id).await?;
+    assert_eq!(first_records.len(), 1);
+    assert!(second_records.is_empty());
+    assert!(
+        first_records[0]
+            .file_path
+            .contains(&first_task_id.to_string())
+    );
+    assert!(
+        first_records[0]
+            .http_url
+            .as_deref()
+            .is_some_and(|value| value.contains(&first_task_id.to_string()))
+    );
+
     db.cleanup().await?;
     Ok(())
 }

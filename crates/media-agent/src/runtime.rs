@@ -707,7 +707,17 @@ impl LocalExecutor for ManagedProcessExecutor {
         });
 
         if runtime.pid.is_some() {
+            let managed_live_relay = matches!(
+                task_runtime_mode_from_handle(&handle),
+                Some(TaskRuntimeMode::ManagedProcess)
+            ) && stream_binding_from_handle(&handle).is_some();
+            if managed_live_relay {
+                self.stop_live_relay_recording(&handle)?;
+            }
             signal_runtime_pids(&runtime, libc::SIGTERM)?;
+            if managed_live_relay {
+                self.close_live_relay(&handle, true)?;
+            }
         } else if matches!(
             task_runtime_mode_from_handle(&handle),
             Some(TaskRuntimeMode::ZlmProxy)

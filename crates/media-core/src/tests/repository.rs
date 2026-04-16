@@ -339,6 +339,8 @@ fn should_persist_record_file_hook_only_keeps_hls_record_playlists() {
             "schedule": {"start_mode": "immediate"},
             "resource": {}
         })),
+        started_at: None,
+        ended_at: None,
     };
     let playlist = ZlmRecordFileRecord {
         record_format: Some("hls".to_string()),

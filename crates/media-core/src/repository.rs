@@ -29,20 +29,34 @@ use uuid::Uuid;
 pub struct TaskRepository {
     pool: PgPool,
     callback_settle_delay: chrono::Duration,
+    artifact_callback_wait_timeout: chrono::Duration,
 }
 
 impl TaskRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self::with_callback_settle_delay(pool, chrono::Duration::milliseconds(8_000))
+        Self::with_callback_delays(
+            pool,
+            chrono::Duration::milliseconds(8_000),
+            chrono::Duration::milliseconds(30_000),
+        )
     }
 
     pub fn with_callback_settle_delay(
         pool: PgPool,
         callback_settle_delay: chrono::Duration,
     ) -> Self {
+        Self::with_callback_delays(pool, callback_settle_delay, callback_settle_delay)
+    }
+
+    pub fn with_callback_delays(
+        pool: PgPool,
+        callback_settle_delay: chrono::Duration,
+        artifact_callback_wait_timeout: chrono::Duration,
+    ) -> Self {
         Self {
             pool,
             callback_settle_delay,
+            artifact_callback_wait_timeout,
         }
     }
 
@@ -2525,12 +2539,15 @@ impl TaskRepository {
         )
         .await?;
 
+        let deliver_after = self
+            .terminal_state_callback_deliver_after(&mut tx, task_id, now)
+            .await?;
         self.enqueue_task_completed_callback(
             &mut tx,
             task_id,
             attempt_no,
             "terminal_state",
-            now + self.callback_settle_delay,
+            deliver_after,
         )
         .await?;
 
@@ -4187,13 +4204,7 @@ impl TaskRepository {
         }
 
         if let Some(binding) = self
-            .find_stream_binding_for_hook(
-                &mut tx,
-                server_id,
-                &record.vhost,
-                &record.app,
-                &record.stream,
-            )
+            .find_stream_binding_for_record_hook(&mut tx, server_id, &record)
             .await?
         {
             if should_persist_record_file_hook(hook_name, &binding, &record)? {
@@ -4893,7 +4904,9 @@ impl TaskRepository {
               sb.task_id,
               sb.attempt_id,
               ta.attempt_no,
-              t.resolved_spec
+              t.resolved_spec,
+              ta.started_at,
+              ta.ended_at
             from stream_bindings sb
             join task_attempts ta
               on ta.id = sb.attempt_id
@@ -4916,6 +4929,85 @@ impl TaskRepository {
         .await?
         .map(|row| HookStreamBinding::from_row(&row))
         .transpose()
+    }
+
+    async fn find_stream_binding_for_record_hook(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        server_id: &str,
+        record: &ZlmRecordFileRecord,
+    ) -> Result<Option<HookStreamBinding>, RepoError> {
+        if let Some(task_id) = task_id_from_managed_output_path(&record.file_path) {
+            if let Some(binding) = self
+                .find_record_hook_binding_for_task(tx, server_id, task_id, record)
+                .await?
+            {
+                return Ok(Some(binding));
+            }
+        }
+
+        self.find_stream_binding_for_hook(tx, server_id, &record.vhost, &record.app, &record.stream)
+            .await
+    }
+
+    async fn find_record_hook_binding_for_task(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        server_id: &str,
+        task_id: Uuid,
+        record: &ZlmRecordFileRecord,
+    ) -> Result<Option<HookStreamBinding>, RepoError> {
+        let rows = sqlx::query(
+            r#"
+            select
+              ta.task_id,
+              ta.id as attempt_id,
+              ta.attempt_no,
+              t.resolved_spec,
+              ta.started_at,
+              ta.ended_at
+            from task_attempts ta
+            join tasks t
+              on t.id = ta.task_id
+            join media_servers ms
+              on ms.node_id = ta.node_id
+            where ta.task_id = $1
+              and ms.server_id = $2
+            order by ta.attempt_no desc
+            "#,
+        )
+        .bind(task_id)
+        .bind(server_id.trim())
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let mut latest_matching = None;
+        for row in rows {
+            let binding = HookStreamBinding::from_row(&row)?;
+            let Some(spec) = binding.resolved_task_spec()? else {
+                continue;
+            };
+            if !publish_stream_matches(
+                binding.task_id,
+                binding.attempt_no,
+                &spec,
+                &record.app,
+                &record.stream,
+            ) {
+                continue;
+            }
+            if latest_matching.is_none() {
+                latest_matching = Some(binding.clone());
+            }
+            if record
+                .start_time
+                .is_some_and(|start_time| binding.matches_record_start(start_time))
+            {
+                return Ok(Some(binding));
+            }
+        }
+
+        Ok(latest_matching)
     }
 
     async fn enqueue_task_completed_callback(
@@ -5031,9 +5123,12 @@ impl TaskRepository {
         task_id: Uuid,
         attempt_no: i32,
     ) -> Result<(), RepoError> {
-        let task_status: Option<String> = sqlx::query_scalar(
+        let task_row = sqlx::query(
             r#"
-            select status::text
+            select
+              status::text as task_status,
+              type::text as task_type,
+              coalesce(resolved_spec, requested_spec) as task_spec
               from tasks
              where id = $1
             "#,
@@ -5041,13 +5136,25 @@ impl TaskRepository {
         .bind(task_id)
         .fetch_optional(&mut **tx)
         .await?;
-        let Some(task_status) = task_status else {
+        let Some(task_row) = task_row else {
             return Ok(());
         };
+        let task_status: String = task_row.try_get("task_status")?;
         if !matches!(
             task_status.as_str(),
             "SUCCEEDED" | "FAILED" | "CANCELED" | "LOST"
         ) {
+            return Ok(());
+        }
+        let task_type: String = task_row.try_get("task_type")?;
+        let task_spec: Option<Value> = task_row.try_get("task_spec")?;
+        let now = Utc::now();
+
+        if task_expects_artifacts_from_value(task_type.as_str(), task_spec.as_ref())
+            && self
+                .release_pending_terminal_callback_for_artifact(tx, task_id, attempt_no, now)
+                .await?
+        {
             return Ok(());
         }
 
@@ -5072,8 +5179,35 @@ impl TaskRepository {
             return Ok(());
         }
 
-        self.enqueue_task_completed_callback(tx, task_id, attempt_no, "artifact_update", Utc::now())
+        self.enqueue_task_completed_callback(tx, task_id, attempt_no, "artifact_update", now)
             .await
+    }
+
+    async fn release_pending_terminal_callback_for_artifact(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        attempt_no: i32,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RepoError> {
+        let result = sqlx::query(
+            r#"
+            update task_callback_outbox
+               set deliver_after = least(deliver_after, $3),
+                   updated_at = $3
+             where task_id = $1
+               and attempt_no = $2
+               and event_type = 'task.completed'
+               and reason = 'terminal_state'
+               and status in ('pending', 'retrying')
+            "#,
+        )
+        .bind(task_id)
+        .bind(attempt_no)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     async fn delete_task_lease(
@@ -5510,12 +5644,15 @@ impl TaskRepository {
         .await?;
 
         self.delete_task_lease(tx, task_id).await?;
+        let deliver_after = self
+            .terminal_state_callback_deliver_after(tx, task_id, now)
+            .await?;
         self.enqueue_task_completed_callback(
             tx,
             task_id,
             attempt_no,
             "terminal_state",
-            now + self.callback_settle_delay,
+            deliver_after,
         )
         .await?;
         Ok(())
@@ -5627,15 +5764,88 @@ impl TaskRepository {
         .await?;
 
         self.delete_task_lease(tx, task_id).await?;
+        let deliver_after = self
+            .terminal_state_callback_deliver_after(tx, task_id, now)
+            .await?;
         self.enqueue_task_completed_callback(
             tx,
             task_id,
             attempt_no,
             "terminal_state",
-            now + self.callback_settle_delay,
+            deliver_after,
         )
         .await?;
         Ok(())
+    }
+}
+
+impl TaskRepository {
+    async fn terminal_state_callback_deliver_after(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, RepoError> {
+        let delay = if self.task_expects_artifacts(tx, task_id).await?
+            && !self.task_already_has_artifacts(tx, task_id).await?
+        {
+            self.artifact_callback_wait_timeout
+        } else {
+            self.callback_settle_delay
+        };
+        Ok(now + delay)
+    }
+
+    async fn task_expects_artifacts(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+    ) -> Result<bool, RepoError> {
+        let row = sqlx::query(
+            r#"
+            select
+              type::text as task_type,
+              coalesce(resolved_spec, requested_spec) as task_spec
+              from tasks
+             where id = $1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let task_type: String = row.try_get("task_type")?;
+        let task_spec: Option<Value> = row.try_get("task_spec")?;
+        Ok(task_expects_artifacts_from_value(
+            task_type.as_str(),
+            task_spec.as_ref(),
+        ))
+    }
+
+    async fn task_already_has_artifacts(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+    ) -> Result<bool, RepoError> {
+        sqlx::query_scalar(
+            r#"
+            select exists (
+              select 1
+                from record_files
+               where task_id = $1
+              union all
+              select 1
+                from transcode_artifacts
+               where task_id = $1
+            )
+            "#,
+        )
+        .bind(task_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(Into::into)
     }
 }
 
@@ -5646,6 +5856,23 @@ fn retry_enabled_on_disconnect(spec: &TaskSpec) -> bool {
             .unwrap_or(RecoveryPolicy::default_for(spec.task_type)),
         RecoveryPolicy::Never
     )
+}
+
+fn task_expects_artifacts_from_value(task_type: &str, task_spec: Option<&Value>) -> bool {
+    match task_type {
+        "stream_ingest" => task_spec
+            .and_then(|value| value.get("record"))
+            .and_then(|value| value.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "stream_bridge" => task_spec
+            .and_then(|value| value.get("publish"))
+            .and_then(|value| value.get("kind"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "file"),
+        "file_transcode" => true,
+        _ => false,
+    }
 }
 
 fn start_rejected_retry_limit(spec: &TaskSpec) -> Option<u32> {
@@ -6364,6 +6591,15 @@ fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
         return None;
     }
     path.strip_prefix(root)?.strip_prefix('/')
+}
+
+fn task_id_from_managed_output_path(path: &str) -> Option<Uuid> {
+    let normalized = normalized_absolute_path(path).ok()?;
+    let relative = relative_path_under_root(&normalized, ZLM_OUTPUT_MP4_ROOT)
+        .or_else(|| relative_path_under_root(&normalized, ZLM_OUTPUT_HLS_ROOT))?;
+    let mut segments = relative.split('/').filter(|segment| !segment.is_empty());
+    let _node_dir = segments.next()?;
+    Uuid::parse_str(segments.next()?).ok()
 }
 
 fn normalized_absolute_path(path: &str) -> Result<String, RepoError> {
@@ -7099,6 +7335,8 @@ struct HookStreamBinding {
     attempt_id: Uuid,
     attempt_no: i32,
     resolved_spec: Option<Value>,
+    started_at: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7123,6 +7361,8 @@ impl HookStreamBinding {
             attempt_id: row.try_get("attempt_id")?,
             attempt_no: row.try_get("attempt_no")?,
             resolved_spec: row.try_get("resolved_spec")?,
+            started_at: row.try_get("started_at")?,
+            ended_at: row.try_get("ended_at")?,
         })
     }
 
@@ -7132,6 +7372,12 @@ impl HookStreamBinding {
             .map(serde_json::from_value::<TaskSpec>)
             .transpose()
             .map_err(RepoError::from)
+    }
+
+    fn matches_record_start(&self, start_time: DateTime<Utc>) -> bool {
+        self.started_at.is_some_and(|started_at| {
+            started_at <= start_time && self.ended_at.unwrap_or(start_time) >= start_time
+        })
     }
 }
 

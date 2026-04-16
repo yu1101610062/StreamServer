@@ -855,6 +855,28 @@ async fn stop_task(
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
     let _principal =
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
+    let current = state.repository.get_task_summary(task_id).await?;
+    if current.status == media_domain::TaskStatus::Stopping {
+        let stop_intent_persisted = if current.current_attempt_no > 0 {
+            state
+                .repository
+                .attempt_has_stop_intent(task_id, current.current_attempt_no)
+                .await?
+        } else {
+            true
+        };
+        if stop_intent_persisted {
+            return Ok((StatusCode::ACCEPTED, Json(current)));
+        }
+
+        state
+            .control_plane
+            .request_stop(task_id, "user_requested", 30, 5)
+            .await?;
+        let task = state.repository.get_task_summary(task_id).await?;
+        return Ok((StatusCode::ACCEPTED, Json(task)));
+    }
+
     let task = state
         .repository
         .transition_task(task_id, TaskOperation::Stop)
