@@ -2240,19 +2240,6 @@ fn build_process_plan(
     }
 }
 
-fn build_stream_ingest_plan(
-    settings: &AgentSettings,
-    request: &StartTaskRequest,
-    spec: &TaskSpec,
-) -> Result<ProcessPlan, ExecutorError> {
-    build_stream_ingest_plan_with_capability_hints(
-        settings,
-        request,
-        spec,
-        RuntimeCapabilityHints::default(),
-    )
-}
-
 fn build_stream_ingest_plan_with_capability_hints(
     settings: &AgentSettings,
     request: &StartTaskRequest,
@@ -2659,23 +2646,6 @@ fn build_stream_ingest_realtime_plan(
         companion_recording: None,
         internal_ingress_protocol: Some(ingress_protocol.metadata_value().to_string()),
     })
-}
-
-fn build_file_to_live_plan(
-    settings: &AgentSettings,
-    request: &StartTaskRequest,
-    spec: &TaskSpec,
-) -> Result<ProcessPlan, ExecutorError> {
-    build_stream_ingest_realtime_plan(settings, request, spec, RuntimeCapabilityHints::default())
-}
-
-fn build_file_to_live_plan_with_capability_hints(
-    settings: &AgentSettings,
-    request: &StartTaskRequest,
-    spec: &TaskSpec,
-    capability_hints: RuntimeCapabilityHints,
-) -> Result<ProcessPlan, ExecutorError> {
-    build_stream_ingest_realtime_plan(settings, request, spec, capability_hints)
 }
 
 fn build_stream_ingest_fast_record_plan(
@@ -4714,6 +4684,16 @@ fn live_relay_recording_from_handle(handle: &RuntimeHandle) -> Option<LiveRelayR
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+fn zlm_proxy_key_from_handle(handle: &RuntimeHandle) -> Option<String> {
+    handle
+        .metadata
+        .get("zlm_proxy_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn should_start_live_relay_recording(recording: &LiveRelayRecording) -> bool {
     !recording.started && !recording.failed
 }
@@ -6166,13 +6146,7 @@ fn spawn_live_relay_monitor(
                         app: startup_probe.app.clone(),
                         stream: startup_probe.stream.clone(),
                     });
-                    let _ = call_zlm_api(
-                        &http_client,
-                        &settings,
-                        "/index/api/close_streams",
-                        &build_close_stream_params(&binding, true),
-                    )
-                    .await;
+                    cleanup_live_relay_runtime(&http_client, &settings, &handle, &binding).await;
                     let failed_handle = registry
                         .update(runtime_id, |runtime| {
                             runtime.state = RuntimeState::Exited;
@@ -6374,11 +6348,11 @@ fn spawn_live_relay_monitor(
                                         &recording,
                                     )
                                     .await;
-                                    let _ = call_zlm_api(
+                                    cleanup_live_relay_runtime(
                                         &http_client,
                                         &settings,
-                                        "/index/api/close_streams",
-                                        &build_close_stream_params(&binding, true),
+                                        &degraded_handle,
+                                        &binding,
                                     )
                                     .await;
                                     let failed_handle = registry
@@ -6566,13 +6540,7 @@ fn spawn_live_relay_monitor(
                         app: startup_probe.app.clone(),
                         stream: startup_probe.stream.clone(),
                     });
-                    let _ = call_zlm_api(
-                        &http_client,
-                        &settings,
-                        "/index/api/close_streams",
-                        &build_close_stream_params(&binding, true),
-                    )
-                    .await;
+                    cleanup_live_relay_runtime(&http_client, &settings, &handle, &binding).await;
                     let failed_handle = registry
                         .update(runtime_id, |runtime| {
                             runtime.state = RuntimeState::Exited;
@@ -6933,6 +6901,30 @@ async fn stop_live_relay_recording(
         .await?;
     }
     Ok(())
+}
+
+async fn cleanup_live_relay_runtime(
+    client: &Client,
+    settings: &AgentSettings,
+    handle: &RuntimeHandle,
+    binding: &StreamBinding,
+) {
+    if let Some(proxy_key) = zlm_proxy_key_from_handle(handle) {
+        let _ = call_zlm_api(
+            client,
+            settings,
+            "/index/api/delStreamProxy",
+            &[("key".to_string(), proxy_key)],
+        )
+        .await;
+    }
+    let _ = call_zlm_api(
+        client,
+        settings,
+        "/index/api/close_streams",
+        &build_close_stream_params(binding, true),
+    )
+    .await;
 }
 
 async fn zlm_stream_online(

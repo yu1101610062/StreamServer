@@ -3543,43 +3543,91 @@ impl TaskRepository {
                     )
                     .await?;
                 } else {
-                    sqlx::query(
-                        r#"
-                        update tasks
-                           set status = 'QUEUED'::task_status,
-                               assigned_node_id = null,
-                               updated_at = $1
-                         where id = $2
-                           and current_attempt_no = $3
-                        "#,
-                    )
-                    .bind(now)
-                    .bind(event.task_id)
-                    .bind(event.attempt_no)
-                    .execute(&mut *tx)
-                    .await?;
+                    let consecutive_failures = self
+                        .consecutive_failed_attempts_before(
+                            &mut tx,
+                            event.task_id,
+                            event.attempt_no - 1,
+                        )
+                        .await?
+                        + 1;
+                    let resolved_spec = ownership
+                        .resolved_spec
+                        .clone()
+                        .map(serde_json::from_value::<TaskSpec>)
+                        .transpose()?;
+                    let retry_limit = resolved_spec
+                        .as_ref()
+                        .and_then(start_rejected_retry_limit)
+                        .unwrap_or(DEFAULT_MAX_CONSECUTIVE_FAILURES);
+                    let should_retry = resolved_spec
+                        .as_ref()
+                        .is_none_or(retry_enabled_on_disconnect)
+                        && retry_limit > 0
+                        && consecutive_failures < retry_limit;
 
-                    sqlx::query(
-                        r#"
-                        update task_attempts
-                           set status = 'FAILED'::attempt_status,
-                               node_id = $1,
-                               failure_code = 'agent_start_rejected',
-                               failure_reason = $2,
-                               ended_at = $3
-                         where task_id = $4
-                           and attempt_no = $5
-                        "#,
-                    )
-                    .bind(node_id)
-                    .bind(&event.message)
-                    .bind(now)
-                    .bind(event.task_id)
-                    .bind(event.attempt_no)
-                    .execute(&mut *tx)
-                    .await?;
+                    if should_retry {
+                        sqlx::query(
+                            r#"
+                            update tasks
+                               set status = 'QUEUED'::task_status,
+                                   assigned_node_id = null,
+                                   updated_at = $1
+                             where id = $2
+                               and current_attempt_no = $3
+                            "#,
+                        )
+                        .bind(now)
+                        .bind(event.task_id)
+                        .bind(event.attempt_no)
+                        .execute(&mut *tx)
+                        .await?;
 
-                    self.delete_task_lease(&mut tx, event.task_id).await?;
+                        sqlx::query(
+                            r#"
+                            update task_attempts
+                               set status = 'FAILED'::attempt_status,
+                                   node_id = $1,
+                                   failure_code = 'agent_start_rejected',
+                                   failure_reason = $2,
+                                   ended_at = $3
+                             where task_id = $4
+                               and attempt_no = $5
+                            "#,
+                        )
+                        .bind(node_id)
+                        .bind(&event.message)
+                        .bind(now)
+                        .bind(event.task_id)
+                        .bind(event.attempt_no)
+                        .execute(&mut *tx)
+                        .await?;
+
+                        self.delete_task_lease(&mut tx, event.task_id).await?;
+                    } else {
+                        let failure_reason = if retry_limit == 0 {
+                            format!("{} (automatic retry disabled for this task)", event.message)
+                        } else {
+                            format!(
+                                "{} (consecutive start_rejected failures reached {}/{})",
+                                event.message, consecutive_failures, retry_limit
+                            )
+                        };
+                        self.delete_stream_bindings_for_task(&mut tx, event.task_id)
+                            .await?;
+                        self.complete_task_attempt(
+                            &mut tx,
+                            event.task_id,
+                            event.attempt_no,
+                            node_id,
+                            TaskStatus::Failed,
+                            AttemptStatus::Failed,
+                            Some("agent_start_rejected"),
+                            Some(&failure_reason),
+                            now,
+                        )
+                        .await?;
+                    }
                 }
             }
             "stop_rejected" => {
@@ -5040,6 +5088,18 @@ impl TaskRepository {
         Ok(())
     }
 
+    async fn delete_stream_bindings_for_task(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+    ) -> Result<(), RepoError> {
+        sqlx::query("delete from stream_bindings where task_id = $1")
+            .bind(task_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     async fn validate_attempt_ownership(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -5055,7 +5115,8 @@ impl TaskRepository {
             select
               t.status::text as task_status,
               t.current_attempt_no,
-              t.assigned_node_id
+              t.assigned_node_id,
+              t.resolved_spec
             from tasks t
             where t.id = $1
             for update
@@ -5091,6 +5152,7 @@ impl TaskRepository {
         let task_status = TaskStatus::from_str(&task_row.try_get::<String, _>("task_status")?)?;
         let current_attempt_no: i32 = task_row.try_get("current_attempt_no")?;
         let assigned_node_id: Option<Uuid> = task_row.try_get("assigned_node_id")?;
+        let resolved_spec: Option<Value> = task_row.try_get("resolved_spec")?;
         let attempt_id = attempt_row
             .as_ref()
             .and_then(|row| row.try_get::<Option<Uuid>, _>("attempt_id").ok())
@@ -5131,6 +5193,7 @@ impl TaskRepository {
             return Ok(Some(AttemptOwnership {
                 attempt_id,
                 task_status,
+                resolved_spec,
                 stop_requested_at,
                 desired_terminal_status,
             }));
@@ -5231,6 +5294,14 @@ impl TaskRepository {
             })
             .unwrap_or("runtime exited without a terminal task event");
 
+        if metadata
+            .get("startup_timeout")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            self.delete_stream_bindings_for_task(tx, task_id).await?;
+        }
+
         self.complete_task_attempt(
             tx,
             task_id,
@@ -5243,6 +5314,41 @@ impl TaskRepository {
             now,
         )
         .await
+    }
+
+    async fn consecutive_failed_attempts_before(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        task_id: Uuid,
+        max_attempt_no: i32,
+    ) -> Result<u32, RepoError> {
+        if max_attempt_no <= 0 {
+            return Ok(0);
+        }
+
+        let statuses = sqlx::query_scalar::<_, String>(
+            r#"
+            select status::text
+              from task_attempts
+             where task_id = $1
+               and attempt_no <= $2
+             order by attempt_no desc
+            "#,
+        )
+        .bind(task_id)
+        .bind(max_attempt_no)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        let mut consecutive = 0_u32;
+        for status in statuses {
+            if AttemptStatus::from_str(&status)? == AttemptStatus::Failed {
+                consecutive += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(consecutive)
     }
 
     async fn callback_target_for_attempt(
@@ -5541,6 +5647,19 @@ fn retry_enabled_on_disconnect(spec: &TaskSpec) -> bool {
         RecoveryPolicy::Never
     )
 }
+
+fn start_rejected_retry_limit(spec: &TaskSpec) -> Option<u32> {
+    if !retry_enabled_on_disconnect(spec) {
+        return Some(0);
+    }
+    Some(
+        spec.recovery
+            .max_consecutive_failures
+            .unwrap_or(DEFAULT_MAX_CONSECUTIVE_FAILURES),
+    )
+}
+
+const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CreateTaskResult {
@@ -6986,6 +7105,7 @@ struct HookStreamBinding {
 struct AttemptOwnership {
     attempt_id: Option<Uuid>,
     task_status: TaskStatus,
+    resolved_spec: Option<Value>,
     stop_requested_at: Option<DateTime<Utc>>,
     desired_terminal_status: Option<TaskStatus>,
 }

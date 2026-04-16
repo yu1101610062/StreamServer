@@ -35,6 +35,36 @@ fn test_settings(work_root: &str) -> AgentSettings {
     }
 }
 
+fn build_stream_ingest_plan(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+) -> Result<ProcessPlan, ExecutorError> {
+    build_stream_ingest_plan_with_capability_hints(
+        settings,
+        request,
+        spec,
+        RuntimeCapabilityHints::default(),
+    )
+}
+
+fn build_file_to_live_plan(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+) -> Result<ProcessPlan, ExecutorError> {
+    build_stream_ingest_realtime_plan(settings, request, spec, RuntimeCapabilityHints::default())
+}
+
+fn build_file_to_live_plan_with_capability_hints(
+    settings: &AgentSettings,
+    request: &StartTaskRequest,
+    spec: &TaskSpec,
+    capability_hints: RuntimeCapabilityHints,
+) -> Result<ProcessPlan, ExecutorError> {
+    build_stream_ingest_realtime_plan(settings, request, spec, capability_hints)
+}
+
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("script should write");
     let mut permissions = fs::metadata(path)
@@ -3611,6 +3641,105 @@ fn zlm_stream_online_in_body_allows_any_schema_when_probe_schema_is_absent() {
     };
 
     assert!(zlm_stream_online_in_body(&body, &target));
+}
+
+#[tokio::test]
+async fn cleanup_live_relay_runtime_deletes_proxy_before_closing_stream() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn del_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("delStreamProxy".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    async fn close_streams(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("close_streams".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/delStreamProxy", get(del_stream_proxy))
+        .route("/index/api/close_streams", get(close_streams))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let mut settings = test_settings("/tmp/work");
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+    let handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::ZlmProxy,
+        pid: None,
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Starting,
+        command_line: Some("zlm addStreamProxy".to_string()),
+        outputs: Vec::new(),
+        metadata: json!({
+            "zlm_proxy_key": "proxy-1"
+        }),
+    };
+    let binding = StreamBinding {
+        schema: Some("rtsp".to_string()),
+        vhost: "__defaultVhost__".to_string(),
+        app: "live".to_string(),
+        stream: "camera01".to_string(),
+    };
+
+    cleanup_live_relay_runtime(&Client::new(), &settings, &handle, &binding).await;
+
+    let captured = calls.lock().await.clone();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(captured[0].0, "delStreamProxy");
+    assert_eq!(
+        captured[0].1.get("key").map(String::as_str),
+        Some("proxy-1")
+    );
+    assert_eq!(captured[1].0, "close_streams");
+    assert_eq!(
+        captured[1].1.get("stream").map(String::as_str),
+        Some("camera01")
+    );
+
+    server.abort();
 }
 
 #[test]
