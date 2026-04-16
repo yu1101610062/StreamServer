@@ -2266,14 +2266,29 @@ fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
         TaskType::StreamIngest => match (spec.input.kind, spec.input.source_mode) {
             (Some(InputKind::GbRtp), _) => TaskRuntimeMode::ZlmRtpServer,
             (Some(InputKind::Rtsp | InputKind::Rtmp | InputKind::HttpFlv), _) => {
-                TaskRuntimeMode::ZlmProxy
+                if should_use_managed_process_for_record_only_live_ingest(spec) {
+                    TaskRuntimeMode::ManagedProcess
+                } else {
+                    TaskRuntimeMode::ZlmProxy
+                }
             }
             (Some(InputKind::Hls | InputKind::HttpTs), Some(SourceMode::Live)) => {
-                TaskRuntimeMode::ZlmProxy
+                if should_use_managed_process_for_record_only_live_ingest(spec) {
+                    TaskRuntimeMode::ManagedProcess
+                } else {
+                    TaskRuntimeMode::ZlmProxy
+                }
             }
             _ => TaskRuntimeMode::ManagedProcess,
         },
     }
+}
+
+fn should_use_managed_process_for_record_only_live_ingest(spec: &TaskSpec) -> bool {
+    spec.task_type == TaskType::StreamIngest
+        && spec.input.source_mode == Some(SourceMode::Live)
+        && spec.record.enabled.unwrap_or(false)
+        && !spec.expose.any_playback_enabled()
 }
 
 const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";

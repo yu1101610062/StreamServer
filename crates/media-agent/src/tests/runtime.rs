@@ -3215,6 +3215,90 @@ fn build_live_relay_plan_omits_playback_probe_schema_for_record_only_recording()
 }
 
 #[test]
+fn task_runtime_mode_uses_managed_process_for_record_only_live_http_ts() {
+    let request = StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "relay-record-only-http-ts",
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "http_ts",
+                "source_mode": "live",
+                "url": "http://camera.example/live.ts"
+            },
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "record": {"enabled": true, "format": "mp4"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+
+    assert_eq!(task_runtime_mode(&spec), TaskRuntimeMode::ManagedProcess);
+}
+
+#[test]
+fn build_process_plan_uses_internal_startup_schema_for_record_only_live_http_ts() {
+    let settings = test_settings("/tmp/work");
+    let request = StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "relay-record-only-http-ts",
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "http_ts",
+                "source_mode": "live",
+                "url": "http://camera.example/live.ts"
+            },
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "record": {"enabled": true, "format": "mp4"},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let plan = build_process_plan(&settings, &request, RuntimeCapabilityHints::default())
+        .expect("plan should build");
+    let startup_probe = plan
+        .startup_probe
+        .as_ref()
+        .expect("managed process plan should include startup probe");
+
+    assert_eq!(task_runtime_mode(&parse_task_spec(&request).expect("spec should parse")), TaskRuntimeMode::ManagedProcess);
+    assert!(startup_probe.schema.is_some());
+    assert!(plan.recording.is_some());
+}
+
+#[test]
 fn recording_duration_reached_uses_recording_start_time() {
     let started_at = Utc::now();
     let recording = LiveRelayRecording {
