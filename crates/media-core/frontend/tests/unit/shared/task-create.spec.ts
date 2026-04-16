@@ -1,0 +1,194 @@
+import { describe, expect, it } from "vitest";
+
+import {
+  buildDraftPayload,
+  createDefaultDraft,
+  defaultSourceModeForInputKind,
+  deriveStreamIngestRecordMode,
+  normalizeDraftForTaskType,
+} from "@/shared/task-create";
+
+describe("buildDraftPayload", () => {
+  it("omits ingest-only sections for stream_bridge tasks", () => {
+    const draft = createDefaultDraft();
+    draft.name = "bridge";
+    draft.common.created_by = "alice";
+    normalizeDraftForTaskType(draft, "stream_bridge");
+    draft.publish.kind = "file";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload).not.toHaveProperty("stream");
+    expect(payload).not.toHaveProperty("expose");
+    expect(payload).not.toHaveProperty("record");
+  });
+
+  it("normalizes managed file input paths for file_transcode tasks", () => {
+    const draft = createDefaultDraft();
+    draft.name = "transcode";
+    draft.common.created_by = "alice";
+    normalizeDraftForTaskType(draft, "file_transcode");
+    draft.input.kind = "file";
+    draft.input.source_mode = "vod";
+    draft.input.url = "/vod/demo.ts";
+    draft.publish.kind = "file";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.input).toMatchObject({ kind: "file", source_mode: "vod", url: "vod/demo.ts" });
+    expect(payload).not.toHaveProperty("stream");
+    expect(payload).not.toHaveProperty("expose");
+    expect(payload).not.toHaveProperty("record");
+  });
+
+  it("keeps record extras out of stream_ingest payloads when recording is disabled", () => {
+    const draft = createDefaultDraft();
+    draft.name = "ingest";
+    draft.common.created_by = "alice";
+    draft.record.enabled = false;
+    draft.record.duration_sec = "300";
+    draft.record.as_player = true;
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.record).toEqual({ enabled: false });
+  });
+
+  it("includes loop_enabled for stream_ingest vod inputs", () => {
+    const draft = createDefaultDraft();
+    draft.name = "vod-loop";
+    draft.common.created_by = "alice";
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.loop_enabled = true;
+    draft.input.url = "http://vod.example.com/archive.mp4";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.input).toMatchObject({
+      kind: "http_mp4",
+      source_mode: "vod",
+      loop_enabled: true,
+      url: "http://vod.example.com/archive.mp4",
+    });
+  });
+
+  it("defaults ftp input to vod mode", () => {
+    expect(defaultSourceModeForInputKind("ftp")).toBe("vod");
+  });
+
+  it("keeps ftp input when normalizing file_transcode drafts", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "ftp";
+    draft.input.url = "ftp://vod.example.com/archive/demo.mp4";
+
+    normalizeDraftForTaskType(draft, "file_transcode");
+
+    expect(draft.input.kind).toBe("ftp");
+    expect(draft.input.source_mode).toBe("vod");
+  });
+
+  it("preserves ftp input urls in task payloads", () => {
+    const draft = createDefaultDraft();
+    draft.name = "ftp-vod";
+    draft.common.created_by = "alice";
+    normalizeDraftForTaskType(draft, "file_transcode");
+    draft.input.kind = "ftp";
+    draft.input.source_mode = "vod";
+    draft.input.url = "ftp://user:pass@example.com/archive/demo.mp4";
+    draft.publish.kind = "file";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.input).toMatchObject({
+      kind: "ftp",
+      source_mode: "vod",
+      url: "ftp://user:pass@example.com/archive/demo.mp4",
+    });
+  });
+
+  it("keeps required_labels and strips preferred_labels from advanced json overrides", () => {
+    const draft = createDefaultDraft();
+    draft.name = "labels";
+    draft.common.created_by = "alice";
+    draft.resource.required_labels_text = "gpu, beijing-idc";
+    draft.advanced_json = JSON.stringify({
+      resource: {
+        preferred_labels: ["archive"],
+      },
+    });
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.resource).toEqual({
+      required_labels: ["gpu", "beijing-idc"],
+    });
+  });
+
+  it("does not turn empty numeric fields into zero-valued publish settings", () => {
+    const draft = createDefaultDraft();
+    draft.name = "ingest-http-ts";
+    draft.common.created_by = "admin";
+    draft.input.kind = "http_ts";
+    draft.input.source_mode = "vod";
+    draft.input.url = "http://172.17.28.109:28081/source.ts";
+    draft.stream.name = "tdsy";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload).not.toHaveProperty("publish");
+    expect(payload.input).toMatchObject({
+      kind: "http_ts",
+      source_mode: "vod",
+      url: "http://172.17.28.109:28081/source.ts",
+      probe_timeout_ms: 7000,
+      reuse: false,
+    });
+    expect(payload.input).not.toMatchObject({
+      port: 0,
+      ttl: 0,
+      tcp_mode: 0,
+      ssrc: 0,
+    });
+    expect(payload.process).toEqual({ mode: "copy_or_transcode" });
+    expect(payload.recovery).toEqual({ policy: "auto" });
+  });
+
+  it("clears loop_enabled when draft switches away from stream_ingest", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "file";
+    draft.input.source_mode = "vod";
+    draft.input.loop_enabled = true;
+
+    normalizeDraftForTaskType(draft, "stream_bridge");
+
+    expect(draft.input.loop_enabled).toBe(false);
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+    expect(payload.input).not.toHaveProperty("loop_enabled");
+  });
+
+  it("derives realtime record mode when vod recording keeps playback exposed", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.url = "http://vod.example.com/archive.mp4";
+    draft.record.enabled = true;
+
+    expect(deriveStreamIngestRecordMode(draft)).toBe("realtime");
+  });
+
+  it("derives fast record mode when vod recording disables all playback exposes", () => {
+    const draft = createDefaultDraft();
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.url = "http://vod.example.com/archive.mp4";
+    draft.record.enabled = true;
+    draft.expose.enable_rtsp = false;
+    draft.expose.enable_rtmp = false;
+    draft.expose.enable_http_ts = false;
+    draft.expose.enable_http_fmp4 = false;
+    draft.expose.enable_hls = false;
+
+    expect(deriveStreamIngestRecordMode(draft)).toBe("fast");
+  });
+});
