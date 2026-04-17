@@ -80,6 +80,8 @@ export interface TaskDetail {
   current_attempt?: AttemptSummary | null;
   recent_events: TaskEventSummary[];
   callback_delivery?: CallbackDeliverySummary | null;
+  records: RecordFileSummary[];
+  file_artifacts: FileArtifactSummary[];
 }
 
 export interface TaskPreview {
@@ -124,6 +126,7 @@ export interface StreamSummary {
 export interface RecordFileSummary {
   id: string;
   task_id: string;
+  task_name: string;
   attempt_id?: string | null;
   vhost?: string | null;
   app?: string | null;
@@ -141,6 +144,7 @@ export interface FileArtifactSummary {
   id: string;
   artifact_kind: "transcode_output" | "bridge_output" | "stream_ingest_record";
   task_id: string;
+  task_name: string;
   attempt_id?: string | null;
   node_id: string;
   file_name: string;

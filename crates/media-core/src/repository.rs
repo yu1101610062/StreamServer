@@ -745,6 +745,9 @@ impl TaskRepository {
         .map(|row| CallbackDeliverySummary::from_row(&row))
         .transpose()?;
 
+        let records = self.list_task_record_files(task_id).await?;
+        let file_artifacts = self.list_task_file_artifacts(task_id).await?;
+
         Ok(TaskDetail {
             task,
             requested_spec,
@@ -752,6 +755,8 @@ impl TaskRepository {
             current_attempt,
             recent_events,
             callback_delivery,
+            records,
+            file_artifacts,
         })
     }
 
@@ -1118,6 +1123,7 @@ impl TaskRepository {
             select
               rf.id,
               rf.task_id,
+              t.name as task_name,
               rf.attempt_id,
               rf.vhost,
               rf.app,
@@ -1165,6 +1171,7 @@ impl TaskRepository {
             select
               rf.id,
               rf.task_id,
+              t.name as task_name,
               rf.attempt_id,
               rf.vhost,
               rf.app,
@@ -1181,6 +1188,7 @@ impl TaskRepository {
             from record_files rf
             join task_attempts ta on ta.id = rf.attempt_id
             join media_nodes n on n.id = ta.node_id
+            join tasks t on t.id = rf.task_id
             where rf.task_id = $1
               and rf.file_path like '/data/zlm/www/output/%'
             order by coalesce(rf.start_time, rf.created_at) desc, rf.id desc
@@ -1208,6 +1216,7 @@ impl TaskRepository {
               ta.id,
               t.type::text as task_type,
               ta.task_id,
+              t.name as task_name,
               ta.attempt_id,
               ta.node_id,
               ta.file_name,
@@ -1251,6 +1260,7 @@ impl TaskRepository {
               ta.id,
               t.type::text as task_type,
               ta.task_id,
+              t.name as task_name,
               ta.attempt_id,
               ta.node_id,
               ta.file_name,
@@ -6097,6 +6107,7 @@ pub struct RecordListFilter {
 pub struct RecordFileSummary {
     pub id: Uuid,
     pub task_id: Uuid,
+    pub task_name: String,
     pub attempt_id: Option<Uuid>,
     pub vhost: Option<String>,
     pub app: Option<String>,
@@ -6116,6 +6127,7 @@ impl RecordFileSummary {
         Ok(Self {
             id: row.try_get("id")?,
             task_id: row.try_get("task_id")?,
+            task_name: row.try_get("task_name")?,
             attempt_id: row.try_get("attempt_id")?,
             vhost: row.try_get("vhost")?,
             app: row.try_get("app")?,
@@ -6180,6 +6192,7 @@ pub struct FileArtifactSummary {
     pub id: Uuid,
     pub artifact_kind: FileArtifactKind,
     pub task_id: Uuid,
+    pub task_name: String,
     pub attempt_id: Option<Uuid>,
     pub node_id: Uuid,
     pub file_name: String,
@@ -6196,6 +6209,7 @@ impl FileArtifactSummary {
             id: row.try_get("id")?,
             artifact_kind: FileArtifactKind::from_task_type(row.try_get::<&str, _>("task_type")?)?,
             task_id: row.try_get("task_id")?,
+            task_name: row.try_get("task_name")?,
             attempt_id: row.try_get("attempt_id")?,
             node_id: row.try_get("node_id")?,
             file_name: row.try_get("file_name")?,
@@ -7586,6 +7600,8 @@ pub struct TaskDetail {
     pub current_attempt: Option<AttemptSummary>,
     pub recent_events: Vec<TaskEventSummary>,
     pub callback_delivery: Option<CallbackDeliverySummary>,
+    pub records: Vec<RecordFileSummary>,
+    pub file_artifacts: Vec<FileArtifactSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]

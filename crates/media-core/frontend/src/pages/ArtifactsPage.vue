@@ -130,9 +130,12 @@ async function resetFilters() {
         <el-table-column label="产物类型" min-width="120">
           <template #default="{ row }">{{ artifactKindLabel(row.artifact_kind) }}</template>
         </el-table-column>
-        <el-table-column label="任务" min-width="140">
+        <el-table-column label="任务" min-width="220">
           <template #default="{ row }">
-            <el-link type="primary" @click="router.push(`/tasks/${row.task_id}`)">{{ shortId(row.task_id) }}</el-link>
+            <div>
+              <el-link type="primary" @click="router.push(`/tasks/${row.task_id}`)">{{ row.task_name || shortId(row.task_id) }}</el-link>
+            </div>
+            <div class="subtle">{{ shortId(row.task_id) }}</div>
           </template>
         </el-table-column>
         <el-table-column prop="node_id" label="节点" min-width="180" />

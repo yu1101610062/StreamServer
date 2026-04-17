@@ -93,9 +93,12 @@ const rows = computed<MulticastRow[]>(() => {
 
       <div class="table-scroll">
         <el-table :data="rows" v-loading="tasksQuery.isLoading.value || detailsQuery.isLoading.value">
-        <el-table-column label="任务" min-width="140">
+        <el-table-column label="任务" min-width="220">
           <template #default="{ row }">
-            <el-link type="primary" :href="`/tasks/${row.task.id}`">{{ shortId(row.task.id) }}</el-link>
+            <div>
+              <el-link type="primary" :href="`/tasks/${row.task.id}`">{{ row.task.name || shortId(row.task.id) }}</el-link>
+            </div>
+            <div class="subtle">{{ shortId(row.task.id) }}</div>
           </template>
         </el-table-column>
         <el-table-column prop="mode" label="模式" min-width="220" />
