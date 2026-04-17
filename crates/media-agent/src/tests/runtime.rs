@@ -213,6 +213,64 @@ fi
     path.to_string_lossy().to_string()
 }
 
+fn create_recording_mock_ffprobe_binary_with_profile(
+    root: &Path,
+    recorded_args_path: &Path,
+    format_name: &str,
+    video_codec_name: &str,
+    audio_codec_name: Option<&str>,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<u32>,
+    video_extradata_size: Option<u64>,
+    audio_extradata_size: Option<u64>,
+) -> String {
+    let path = root.join("mock-ffprobe-recording.sh");
+    let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
+        let sample_rate = audio_sample_rate
+            .map(|value| format!(",\"sample_rate\":\"{value}\""))
+            .unwrap_or_default();
+        let channels = audio_channels
+            .map(|value| format!(",\"channels\":{value}"))
+            .unwrap_or_default();
+        let extradata_size = audio_extradata_size
+            .map(|value| format!(",\"extradata_size\":{value}"))
+            .unwrap_or_default();
+        format!(
+            ",\n    {{\"codec_type\":\"audio\",\"codec_name\":\"{codec}\"{sample_rate}{channels}{extradata_size}}}"
+        )
+    });
+    let video_extradata_size = video_extradata_size
+        .map(|value| format!(",\"extradata_size\":{value}"))
+        .unwrap_or_default();
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > "{}"
+want_json=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
+    want_json=1
+    break
+  fi
+  prev="$arg"
+done
+if [ "$want_json" = "1" ]; then
+  cat <<'EOF'
+{{"streams":[
+    {{"codec_type":"video","codec_name":"{video_codec_name}"{video_extradata_size}}}{audio_stream}
+],"format":{{"format_name":"{format_name}"}}}}
+EOF
+else
+  echo "{video_codec_name}"
+fi
+"#,
+        recorded_args_path.display()
+    );
+    write_executable(&path, &body);
+    path.to_string_lossy().to_string()
+}
+
 fn create_slow_mock_ffprobe_binary(
     root: &Path,
     sleep_ms: u64,
@@ -2163,6 +2221,16 @@ fn build_stream_ingest_fast_record_plan_copies_mpegts_aac_for_both_output_with_m
             .count(),
         1
     );
+    let input_index = plan
+        .args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("ffmpeg input should exist");
+    assert!(
+        plan.args[..input_index]
+            .windows(2)
+            .any(|window| window == ["-probesize", "8000000"])
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -2226,6 +2294,16 @@ fn build_file_to_live_plan_copy_or_transcode_routes_mpegts_aac_to_internal_rtmp(
     );
     assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
     assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtmp"));
+    let input_index = plan
+        .args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("ffmpeg input should exist");
+    assert!(
+        plan.args[..input_index]
+            .windows(2)
+            .any(|window| window == ["-probesize", "8000000"])
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -2276,6 +2354,16 @@ fn build_file_to_live_plan_copy_or_transcode_copies_mp4_h264_aac_into_internal_r
             .any(|window| window == ["-c:a", "copy"])
     );
     assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+    let input_index = plan
+        .args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("ffmpeg input should exist");
+    assert!(
+        !plan.args[..input_index]
+            .windows(2)
+            .any(|window| window == ["-probesize", "8000000"])
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -2464,6 +2552,128 @@ fn build_file_to_live_plan_copy_or_transcode_copies_mp3_audio_when_flv_allows_it
     );
     assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
     assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+    let input_index = plan
+        .args
+        .iter()
+        .position(|arg| arg == "-i")
+        .expect("ffmpeg input should exist");
+    assert!(
+        !plan.args[..input_index]
+            .windows(2)
+            .any(|window| window == ["-probesize", "8000000"])
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn build_file_to_live_plan_uses_larger_probe_for_ts_ffprobe_preflight() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-file-live-probe-preflight-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let recorded_args_path = temp_root.join("ffprobe-args.txt");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_recording_mock_ffprobe_binary_with_profile(
+        &temp_root,
+        &recorded_args_path,
+        "mpegts",
+        "h264",
+        Some("aac"),
+        Some(48_000),
+        Some(2),
+        Some(32),
+        Some(2),
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "file-live-probe-preflight",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.ts"},
+            "stream": {"app": "live", "name": "stream"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let _plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+    let recorded_args =
+        fs::read_to_string(&recorded_args_path).expect("ffprobe args should be recorded");
+
+    assert!(recorded_args.lines().any(|line| line == "-probesize"));
+    assert!(recorded_args.lines().any(|line| line == "8000000"));
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn build_file_to_live_plan_rejects_ts_aac_copy_when_audio_params_remain_missing() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-file-live-bad-ts-aac-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_profile(
+        &temp_root,
+        "mpegts",
+        "h264",
+        Some("aac"),
+        None,
+        None,
+        Some(32),
+        Some(2),
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "file-live-bad-ts-aac",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.ts"},
+            "stream": {"app": "live", "name": "stream"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let error =
+        build_file_to_live_plan(&settings, &request, &spec).expect_err("plan should reject");
+
+    match error {
+        ExecutorError::InvalidRequest(message) => {
+            assert!(message.contains("sample_rate/channels remain unavailable"));
+            assert!(message.contains("refusing audio copy"));
+        }
+        other => panic!("expected invalid request, got {other:?}"),
+    }
 
     let _ = fs::remove_dir_all(temp_root);
 }

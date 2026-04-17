@@ -436,6 +436,7 @@ const RECORD_DURATION_FORCE_KILL_DELAY: Duration = Duration::from_millis(250);
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_BATCH_LINES: usize = 64;
 const DEFAULT_INPUT_PROBE_TIMEOUT_MS: u64 = 7000;
+const STREAM_INGEST_TS_AAC_COPY_PROBE_SIZE: u64 = 8_000_000;
 const FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ZLM_RUNTIME_VHOST: &str = "__defaultVhost__";
 const LIVE_STREAM_OFFLINE_GRACE_POLLS: u32 = 3;
@@ -2599,7 +2600,13 @@ fn build_stream_ingest_realtime_plan(
 ) -> Result<ProcessPlan, ExecutorError> {
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
-    let profile = probe_input_media_profile(settings, spec, input_url.as_str());
+    let probe_input_args = stream_ingest_probe_input_args(spec, input_url.as_str());
+    let profile = probe_input_media_profile_with_input_args(
+        settings,
+        spec,
+        input_url.as_str(),
+        &probe_input_args,
+    );
     let ingress_protocol = select_internal_ingress_protocol(settings, &profile, capability_hints);
     let startup_probe =
         build_managed_stream_ingest_startup_probe(request.task_id, spec, ingress_protocol)?;
@@ -2614,6 +2621,15 @@ fn build_stream_ingest_realtime_plan(
         input_url.clone(),
         spec.stream_ingest_requires_realtime_pacing(),
     );
+    let stream_ingest_audio_copy_probe_args = resolve_stream_ingest_audio_copy_probe_input_args(
+        spec,
+        process_output_format,
+        &profile,
+        AudioOutputPolicy::CopyWhitelistedElseAac,
+    )?;
+    if !stream_ingest_audio_copy_probe_args.is_empty() {
+        insert_ffmpeg_input_args(&mut args, stream_ingest_audio_copy_probe_args);
+    }
     if should_loop_file_to_live_input(spec) {
         insert_ffmpeg_input_args(
             &mut args,
@@ -2699,13 +2715,29 @@ fn build_stream_ingest_fast_record_plan(
         media_domain::RecordFormat::Mp4 | media_domain::RecordFormat::Both => "mp4",
         media_domain::RecordFormat::Hls => "hls",
     };
+    let probe_input_args = stream_ingest_probe_input_args(spec, input_url.as_str());
+    let profile = probe_input_media_profile_with_input_args(
+        settings,
+        spec,
+        input_url.as_str(),
+        &probe_input_args,
+    );
+    let stream_ingest_audio_copy_probe_args = resolve_stream_ingest_audio_copy_probe_input_args(
+        spec,
+        preferred_output_format,
+        &profile,
+        AudioOutputPolicy::CopyWhitelistedElseAac,
+    )?;
+    if !stream_ingest_audio_copy_probe_args.is_empty() {
+        insert_ffmpeg_input_args(&mut args, stream_ingest_audio_copy_probe_args);
+    }
     if should_loop_file_to_live_input(spec) {
         insert_ffmpeg_input_args(
             &mut args,
             vec!["-stream_loop".to_string(), "-1".to_string()],
         );
     }
-    let audio_copy_decoration = append_process_args(
+    let audio_copy_decoration = append_process_args_with_profile(
         &mut args,
         settings,
         spec,
@@ -2714,6 +2746,7 @@ fn build_stream_ingest_fast_record_plan(
         preferred_output_format,
         VideoOutputPolicy::CopyWhitelistedElseH264,
         AudioOutputPolicy::CopyWhitelistedElseAac,
+        Some(&profile),
     )?;
     args.extend(["-threads".to_string(), "0".to_string()]);
     if let Some(duration_sec) = spec.record.duration_sec {
@@ -3103,6 +3136,24 @@ fn insert_ffmpeg_input_args(args: &mut Vec<String>, extra_args: Vec<String>) {
         .position(|arg| arg == "-i")
         .expect("ffmpeg args should always include an input marker");
     args.splice(input_index..input_index, extra_args);
+}
+
+fn stream_ingest_probe_input_args(spec: &TaskSpec, input_url: &str) -> Vec<String> {
+    if matches!(
+        infer_input_source_family(spec, input_url, None),
+        InputSourceFamily::MpegTs | InputSourceFamily::Hls
+    ) {
+        stream_ingest_ts_aac_copy_probe_input_args()
+    } else {
+        Vec::new()
+    }
+}
+
+fn stream_ingest_ts_aac_copy_probe_input_args() -> Vec<String> {
+    vec![
+        "-probesize".to_string(),
+        STREAM_INGEST_TS_AAC_COPY_PROBE_SIZE.to_string(),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3568,6 +3619,32 @@ fn resolve_audio_copy_selection(
     }
 }
 
+fn resolve_stream_ingest_audio_copy_probe_input_args(
+    spec: &TaskSpec,
+    output_format: &str,
+    profile: &InputMediaProfile,
+    audio_policy: AudioOutputPolicy,
+) -> Result<Vec<String>, ExecutorError> {
+    let audio_copy = resolve_audio_copy_selection(spec, output_format, profile, audio_policy);
+    if !audio_copy.copy
+        || !matches!(
+            profile.source_family,
+            InputSourceFamily::MpegTs | InputSourceFamily::Hls
+        )
+        || profile.audio_codec_name.as_deref() != Some("aac")
+    {
+        return Ok(Vec::new());
+    }
+
+    if !audio_stream_parameters_available(profile) {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "input audio stream is AAC in a TS-family source, but sample_rate/channels remain unavailable after probing; refusing audio copy for {output_format} output"
+        )));
+    }
+
+    Ok(stream_ingest_ts_aac_copy_probe_input_args())
+}
+
 fn resolve_passthrough_audio_copy_decoration(
     settings: &AgentSettings,
     spec: &TaskSpec,
@@ -3605,6 +3682,11 @@ fn resolve_audio_copy_decoration(
 
 fn process_requires_video_transcode(spec: &TaskSpec) -> bool {
     spec.process.bitrate.is_some() || spec.process.fps.is_some() || spec.process.gop.is_some()
+}
+
+fn audio_stream_parameters_available(profile: &InputMediaProfile) -> bool {
+    matches!(profile.audio_sample_rate, Some(value) if value > 0)
+        && matches!(profile.audio_channels, Some(value) if value > 0)
 }
 
 fn process_requires_audio_transcode(spec: &TaskSpec) -> bool {
@@ -3911,22 +3993,33 @@ fn probe_input_media_profile(
     spec: &TaskSpec,
     input_url: &str,
 ) -> InputMediaProfile {
+    probe_input_media_profile_with_input_args(settings, spec, input_url, &[])
+}
+
+fn probe_input_media_profile_with_input_args(
+    settings: &AgentSettings,
+    spec: &TaskSpec,
+    input_url: &str,
+    extra_input_args: &[String],
+) -> InputMediaProfile {
     let default_profile = InputMediaProfile {
         source_family: infer_input_source_family(spec, input_url, None),
         ..InputMediaProfile::default()
     };
-    let args = [
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=codec_type,codec_name,sample_rate,channels,extradata_size:format=format_name",
-        "-of",
-        "json",
-        input_url,
-    ];
+    let mut args = vec!["-v".to_string(), "error".to_string()];
+    args.extend(extra_input_args.iter().cloned());
+    args.extend([
+        "-show_entries".to_string(),
+        "stream=codec_type,codec_name,sample_rate,channels,extradata_size:format=format_name"
+            .to_string(),
+        "-of".to_string(),
+        "json".to_string(),
+        input_url.to_string(),
+    ]);
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     let output = run_ffprobe_with_timeout(
         &settings.ffprobe_bin,
-        &args,
+        &arg_refs,
         input_probe_timeout_duration(spec.input.probe_timeout_ms),
     );
 
