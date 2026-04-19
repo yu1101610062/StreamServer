@@ -518,26 +518,21 @@ impl AgentController {
                 return;
             }
 
-            let _ = send_task_event(
-                &sender,
-                request.task_id,
-                request.attempt_no,
-                request.lease_token.clone(),
-                "accepted",
-                "info",
-                "task accepted by local executor",
-                json!({
-                    "worker_kind": request.task_type.default_worker_kind(),
-                }),
-            )
-            .await;
-
-            if session_guard.load(Ordering::SeqCst) != request.session_epoch {
-                return;
-            }
-
             match executor.start_task(&request) {
                 Ok(handle) => {
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        request.lease_token.clone(),
+                        "accepted",
+                        "info",
+                        "task accepted by local executor",
+                        json!({
+                            "worker_kind": request.task_type.default_worker_kind(),
+                        }),
+                    )
+                    .await;
                     if session_guard.load(Ordering::SeqCst) != request.session_epoch {
                         let _ = executor.stop_task(&StopTaskRequest {
                             task_id: request.task_id,

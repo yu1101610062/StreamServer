@@ -161,6 +161,22 @@ async fn require_test_database(run_migrations: bool) -> anyhow::Result<Option<Te
     TestDatabase::maybe_new(run_migrations).await
 }
 
+async fn current_attempt_lease_token(pool: &PgPool, task_id: Uuid) -> anyhow::Result<String> {
+    Ok(sqlx::query_scalar::<_, String>(
+        r#"
+        select lease_token
+          from task_attempts
+         where task_id = $1
+           and ended_at is null
+         order by attempt_no desc
+         limit 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?)
+}
+
 fn sample_immediate_task_spec() -> TaskSpec {
     let mut spec = sample_spec(InputKind::Rtsp, Some("rtsp://192.168.20.15/live"), None);
     spec.schedule.start_mode = Some(media_domain::StartMode::Immediate);
@@ -197,6 +213,29 @@ fn sample_heartbeat(running_tasks: u32, slot_usage: f64) -> HeartbeatSnapshot {
         starting_tasks: 0,
         stopping_tasks: 0,
         orphaned_tasks: 0,
+        slot_usage,
+        zlm_alive: true,
+        ffmpeg_alive: true,
+        gpu_runtime: Vec::new(),
+    }
+}
+
+fn sample_heartbeat_with_states(
+    running_tasks: u32,
+    starting_tasks: u32,
+    stopping_tasks: u32,
+    orphaned_tasks: u32,
+    slot_usage: f64,
+) -> HeartbeatSnapshot {
+    HeartbeatSnapshot {
+        node_time: Utc::now(),
+        cpu_percent: 0.0,
+        mem_percent: 0.0,
+        disk_percent: 0.0,
+        running_tasks,
+        starting_tasks,
+        stopping_tasks,
+        orphaned_tasks,
         slot_usage,
         zlm_alive: true,
         ffmpeg_alive: true,
@@ -276,14 +315,14 @@ fn compare_dispatch_score_prefers_same_subnet_then_lower_load() {
         same_subnet: true,
         gpu_headroom: None,
         slot_usage: 0.9,
-        running_tasks: 8,
+        occupied_tasks: 8,
         node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
     };
     let worse = DispatchScore {
         same_subnet: false,
         gpu_headroom: None,
         slot_usage: 0.1,
-        running_tasks: 1,
+        occupied_tasks: 1,
         node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
     };
 
@@ -293,7 +332,7 @@ fn compare_dispatch_score_prefers_same_subnet_then_lower_load() {
         same_subnet: true,
         gpu_headroom: None,
         slot_usage: 0.2,
-        running_tasks: 5,
+        occupied_tasks: 5,
         node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
     };
 
@@ -301,26 +340,26 @@ fn compare_dispatch_score_prefers_same_subnet_then_lower_load() {
 }
 
 #[test]
-fn compare_dispatch_score_falls_back_to_load_and_running_tasks() {
+fn compare_dispatch_score_falls_back_to_load_and_occupied_tasks() {
     let lighter = DispatchScore {
         same_subnet: false,
         gpu_headroom: None,
         slot_usage: 0.2,
-        running_tasks: 3,
+        occupied_tasks: 3,
         node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
     };
     let heavier = DispatchScore {
         same_subnet: false,
         gpu_headroom: None,
         slot_usage: 0.8,
-        running_tasks: 1,
+        occupied_tasks: 1,
         node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap(),
     };
     let same_load_more_tasks = DispatchScore {
         same_subnet: false,
         gpu_headroom: None,
         slot_usage: 0.2,
-        running_tasks: 6,
+        occupied_tasks: 6,
         node_id: Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap(),
     };
 
@@ -329,6 +368,72 @@ fn compare_dispatch_score_falls_back_to_load_and_running_tasks() {
         compare_dispatch_score(lighter, same_load_more_tasks),
         CmpOrdering::Less
     );
+}
+
+#[test]
+fn dispatch_reservation_waits_for_active_counts_instead_of_start_events() {
+    assert!(!event_releases_dispatch_reservation("accepted"));
+    assert!(!event_releases_dispatch_reservation("starting"));
+    assert!(!event_releases_dispatch_reservation("recovering"));
+    assert!(!event_releases_dispatch_reservation("running"));
+    assert!(event_releases_dispatch_reservation("start_rejected"));
+    assert!(event_releases_dispatch_reservation("failed"));
+}
+
+#[test]
+fn effective_slot_usage_counts_starting_tasks_and_reservations() {
+    let load = SessionLoad {
+        slot_usage: 0.5,
+        running_tasks: 1,
+        starting_tasks: 1,
+        ..SessionLoad::default()
+    };
+
+    assert_eq!(estimated_max_slots(&load), Some(4));
+    assert_eq!(effective_occupied_tasks(&load, 0), 2);
+    assert_eq!(effective_slot_usage(&load, 2), 1.0);
+    assert!(session_is_saturated(&load, 2));
+}
+
+#[test]
+fn update_session_load_uses_starting_tasks_to_release_reservations() {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+    runtime.block_on(async {
+        let service = ControlPlaneService::new(Arc::new(TaskRepository::new(
+            PgPoolOptions::new()
+                .connect_lazy("postgresql://postgres@127.0.0.1/postgres")
+                .expect("lazy pool should build"),
+        )));
+        let node_id = Uuid::now_v7();
+        service.sessions.lock().await.insert(
+            node_id,
+            SessionHandle {
+                session_id: 1,
+                sender: mpsc::channel(CONTROL_STREAM_BUFFER).0,
+                registration: sample_registration(node_id),
+                capabilities: SessionCapabilities::default(),
+                load: SessionLoad::default(),
+                reservations: VecDeque::from([
+                    DispatchReservation {
+                        task_id: Uuid::now_v7(),
+                    },
+                    DispatchReservation {
+                        task_id: Uuid::now_v7(),
+                    },
+                ]),
+            },
+        );
+
+        service
+            .update_session_load(node_id, &sample_heartbeat_with_states(0, 2, 0, 0, 0.5))
+            .await
+            .expect("load update should succeed");
+
+        let sessions = service.sessions.lock().await;
+        let handle = sessions.get(&node_id).expect("session should exist");
+        assert!(handle.reservations.is_empty());
+        assert_eq!(handle.load.starting_tasks, 2);
+    });
 }
 
 #[tokio::test]
@@ -866,6 +971,7 @@ async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Resu
 
     service.dispatch_task(task.id).await?;
     let dispatched = repository.get_task_summary(task.id).await?;
+    let lease_token = current_attempt_lease_token(&db.pool, task.id).await?;
     assert_eq!(dispatched.assigned_node_id, Some(original_node));
     assert_eq!(dispatched.current_attempt_no, 1);
 
@@ -881,21 +987,24 @@ async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Resu
         .close_session(original_node, original_session_id)
         .await;
 
-    let retried = repository.get_task_summary(task.id).await?;
-    assert_eq!(retried.status, TaskStatus::Queued);
-    assert_eq!(retried.assigned_node_id, None);
-    assert_eq!(retried.current_attempt_no, 2);
+    let reclaiming = repository.get_task_summary(task.id).await?;
+    assert_eq!(reclaiming.status, TaskStatus::Reclaiming);
+    assert_eq!(reclaiming.assigned_node_id, Some(original_node));
+    assert_eq!(reclaiming.current_attempt_no, 1);
 
     let error = service
         .dispatch_task(task.id)
         .await
-        .expect_err("stream retry should wait for the original node");
-    assert!(matches!(error, ControlPlaneError::NoConnectedNode));
+        .expect_err("reclaiming task should not redispatch");
+    assert!(matches!(
+        error,
+        ControlPlaneError::Repository(RepoError::TaskNotDispatchable(TaskStatus::Reclaiming))
+    ));
 
     let waiting = repository.get_task_summary(task.id).await?;
-    assert_eq!(waiting.status, TaskStatus::Queued);
-    assert_eq!(waiting.assigned_node_id, None);
-    assert_eq!(waiting.current_attempt_no, 2);
+    assert_eq!(waiting.status, TaskStatus::Reclaiming);
+    assert_eq!(waiting.assigned_node_id, Some(original_node));
+    assert_eq!(waiting.current_attempt_no, 1);
 
     let (reconnected_sender, _reconnected_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
     let _reconnected_session_id = service
@@ -905,11 +1014,43 @@ async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Resu
         .update_session_load(original_node, &sample_heartbeat(0, 0.0))
         .await?;
 
-    service.dispatch_task(task.id).await?;
-    let redispatched = repository.get_task_summary(task.id).await?;
-    assert_eq!(redispatched.status, TaskStatus::Dispatching);
-    assert_eq!(redispatched.assigned_node_id, Some(original_node));
-    assert_eq!(redispatched.current_attempt_no, 2);
+    repository
+        .record_agent_task_event(
+            original_node,
+            AgentTaskEventRecord {
+                task_id: task.id,
+                attempt_no: 1,
+                lease_token: lease_token.clone(),
+                event_type: "adopted".to_string(),
+                event_level: "info".to_string(),
+                message: "runtime reattached".to_string(),
+                payload: Value::Null,
+            },
+        )
+        .await?;
+    let recovering = repository.get_task_summary(task.id).await?;
+    assert_eq!(recovering.status, TaskStatus::Recovering);
+    assert_eq!(recovering.assigned_node_id, Some(original_node));
+    assert_eq!(recovering.current_attempt_no, 1);
+
+    repository
+        .record_agent_task_event(
+            original_node,
+            AgentTaskEventRecord {
+                task_id: task.id,
+                attempt_no: 1,
+                lease_token,
+                event_type: "running".to_string(),
+                event_level: "info".to_string(),
+                message: "runtime resumed".to_string(),
+                payload: Value::Null,
+            },
+        )
+        .await?;
+    let resumed = repository.get_task_summary(task.id).await?;
+    assert_eq!(resumed.status, TaskStatus::Running);
+    assert_eq!(resumed.assigned_node_id, Some(original_node));
+    assert_eq!(resumed.current_attempt_no, 1);
 
     db.cleanup().await?;
     Ok(())
@@ -1186,7 +1327,7 @@ async fn dispatch_task_reserves_slots_to_reduce_burst_skew() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn close_session_requeues_dispatching_task() -> anyhow::Result<()> {
+async fn close_session_marks_dispatching_task_reclaiming_before_retry() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -1215,8 +1356,9 @@ async fn close_session_requeues_dispatching_task() -> anyhow::Result<()> {
     service.close_session(node_id, session_id).await;
 
     let summary = repository.get_task_summary(task.id).await?;
-    assert_eq!(summary.status, TaskStatus::Queued);
-    assert_eq!(summary.assigned_node_id, None);
+    assert_eq!(summary.status, TaskStatus::Reclaiming);
+    assert_eq!(summary.assigned_node_id, Some(node_id));
+    assert_eq!(summary.current_attempt_no, 1);
 
     let attempt = sqlx::query(
         r#"
@@ -1229,18 +1371,28 @@ async fn close_session_requeues_dispatching_task() -> anyhow::Result<()> {
     .bind(task.id)
     .fetch_one(&db.pool)
     .await?;
-    assert_eq!(attempt.try_get::<String, _>("status")?, "FAILED");
-    assert_eq!(
-        attempt.try_get::<Option<String>, _>("failure_code")?,
-        Some("node_disconnected".to_string())
-    );
+    assert_eq!(attempt.try_get::<String, _>("status")?, "PENDING");
+    assert_eq!(attempt.try_get::<Option<String>, _>("failure_code")?, None);
+
+    let candidate = repository
+        .list_reclaiming_tasks()
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.task_id == task.id)
+        .expect("dispatching task should enter reclaiming");
+    repository.finalize_reclaim_timeout(&candidate).await?;
+
+    let retried = repository.get_task_summary(task.id).await?;
+    assert_eq!(retried.status, TaskStatus::Queued);
+    assert_eq!(retried.assigned_node_id, None);
+    assert_eq!(retried.current_attempt_no, 2);
 
     db.cleanup().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn close_session_retries_running_task_when_recovery_is_enabled() -> anyhow::Result<()> {
+async fn close_session_marks_running_task_reclaiming_until_timeout_retry() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -1266,13 +1418,14 @@ async fn close_session_retries_running_task_when_recovery_is_enabled() -> anyhow
         .await?;
 
     service.dispatch_task(task.id).await?;
+    let lease_token = current_attempt_lease_token(&db.pool, task.id).await?;
     repository
         .record_agent_task_event(
             node_id,
             AgentTaskEventRecord {
                 task_id: task.id,
                 attempt_no: 1,
-                lease_token: "lease-1".to_string(),
+                lease_token,
                 event_type: "running".to_string(),
                 event_level: "info".to_string(),
                 message: "task is running".to_string(),
@@ -1284,9 +1437,41 @@ async fn close_session_retries_running_task_when_recovery_is_enabled() -> anyhow
     service.close_session(node_id, session_id).await;
 
     let summary = repository.get_task_summary(task.id).await?;
-    assert_eq!(summary.status, TaskStatus::Queued);
-    assert_eq!(summary.current_attempt_no, 2);
-    assert_eq!(summary.assigned_node_id, None);
+    assert_eq!(summary.status, TaskStatus::Reclaiming);
+    assert_eq!(summary.current_attempt_no, 1);
+    assert_eq!(summary.assigned_node_id, Some(node_id));
+
+    let before_retry = sqlx::query(
+        r#"
+        select attempt_no, status::text as status, failure_code, node_id
+          from task_attempts
+         where task_id = $1
+         order by attempt_no asc
+        "#,
+    )
+    .bind(task.id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(before_retry.len(), 1);
+    assert_eq!(before_retry[0].try_get::<i32, _>("attempt_no")?, 1);
+    assert_eq!(before_retry[0].try_get::<String, _>("status")?, "RUNNING");
+    assert_eq!(
+        before_retry[0].try_get::<Option<String>, _>("failure_code")?,
+        None
+    );
+
+    let candidate = repository
+        .list_reclaiming_tasks()
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.task_id == task.id)
+        .expect("running task should enter reclaiming");
+    repository.finalize_reclaim_timeout(&candidate).await?;
+
+    let retried = repository.get_task_summary(task.id).await?;
+    assert_eq!(retried.status, TaskStatus::Queued);
+    assert_eq!(retried.current_attempt_no, 2);
+    assert_eq!(retried.assigned_node_id, None);
 
     let attempts = sqlx::query(
         r#"

@@ -348,16 +348,16 @@ fn should_persist_record_file_hook_only_keeps_hls_record_playlists() {
         vhost: "__defaultVhost__".to_string(),
         app: "live".to_string(),
         stream: "camera01".to_string(),
-        file_path: "/data/zlm/www/record/live/camera01/index.m3u8".to_string(),
+        file_path: "/data/zlm/www/output/hls/live/camera01/index.m3u8".to_string(),
         file_size: 1024,
         time_len_sec: Some(30),
         start_time: None,
         file_name: Some("index.m3u8".to_string()),
-        folder: Some("/data/zlm/www/record/live/camera01".to_string()),
-        url: Some("http://stream.example/record/live/camera01/index.m3u8".to_string()),
+        folder: Some("/data/zlm/www/output/hls/live/camera01".to_string()),
+        url: Some("http://stream.example/output/hls/live/camera01/index.m3u8".to_string()),
     };
     let segment = ZlmRecordFileRecord {
-        file_path: "/data/zlm/www/record/live/camera01/index-00001.ts".to_string(),
+        file_path: "/data/zlm/www/output/hls/live/camera01/index-00001.ts".to_string(),
         file_name: Some("index-00001.ts".to_string()),
         ..playlist.clone()
     };

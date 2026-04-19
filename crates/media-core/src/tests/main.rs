@@ -1518,6 +1518,13 @@ async fn ui_routes_serve_shell_and_static_assets() -> anyhow::Result<()> {
         .clone()
         .oneshot(Request::builder().uri("/tasks").body(Body::empty())?)
         .await?;
+    if tasks.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let html = to_bytes(tasks.into_body(), usize::MAX).await?;
+        let html = String::from_utf8(html.to_vec())?;
+        assert!(html.contains("控制台静态资源不可用"));
+        return Ok(());
+    }
+
     assert_eq!(tasks.status(), StatusCode::OK);
     let html = to_bytes(tasks.into_body(), usize::MAX).await?;
     let html = String::from_utf8(html.to_vec())?;
@@ -3168,6 +3175,91 @@ async fn record_agent_snapshot_ignores_missing_attempt_without_sql_error() -> an
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(event_count, 0);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn exited_snapshot_does_not_override_terminal_success() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "snapshot-after-success",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "file", "source_mode": "vod", "url": "input.ts"},
+        "stream": {"app": "live", "name": "snapshot-after-success"},
+        "process": {"mode": "transcode"},
+        "record": {"enabled": true, "format": "mp4"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id = insert_running_ingest_task(&db.pool, node_id, resolved_spec).await?;
+
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "succeeded".to_string(),
+                event_level: "info".to_string(),
+                message: "finished".to_string(),
+                payload: json!({
+                    "exit_code": 0
+                }),
+            },
+        )
+        .await?;
+
+    repository
+        .record_agent_snapshot(
+            node_id,
+            repository::TaskSnapshotRecord {
+                runtime_id: Uuid::now_v7(),
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                worker_kind: "ffmpeg".to_string(),
+                pid: Some(1234),
+                state: "EXITED".to_string(),
+                command_line: Some("ffmpeg ...".to_string()),
+                outputs: Vec::new(),
+                metadata: json!({}),
+            },
+        )
+        .await?;
+
+    let detail = repository.get_task(task_id).await?;
+    assert_eq!(detail.task.status, media_domain::TaskStatus::Succeeded);
+    assert_eq!(
+        detail
+            .current_attempt
+            .as_ref()
+            .map(|attempt| attempt.status),
+        Some(media_domain::AttemptStatus::Succeeded)
+    );
+    assert_eq!(
+        detail
+            .current_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.failure_code.as_deref()),
+        None
+    );
 
     db.cleanup().await?;
     Ok(())

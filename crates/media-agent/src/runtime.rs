@@ -15,7 +15,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -109,6 +109,7 @@ impl LocalRuntimeRegistry {
         runtimes.by_runtime_id.get(runtime_id).cloned()
     }
 
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
         runtimes.by_runtime_id.len()
@@ -229,6 +230,7 @@ pub struct ManagedProcessExecutor {
     registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    slot_limiter: Arc<RuntimeSlotLimiter>,
     stop_intents: Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
     http_client: Client,
     zlm_server_id: Arc<RwLock<Option<String>>>,
@@ -239,8 +241,105 @@ pub struct ManagedProcessExecutor {
 struct ManagedRuntime {
     pid: Option<i32>,
     companion_pids: Vec<i32>,
+    _slot_permit: Arc<RuntimeSlotPermit>,
     stop_requested: Arc<AtomicBool>,
     suppress_companion_events: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct RuntimeSlotLimiter {
+    limit: u32,
+    occupied: AtomicU32,
+}
+
+#[derive(Debug)]
+struct RuntimeSlotPermit {
+    limiter: Option<Arc<RuntimeSlotLimiter>>,
+    released: AtomicBool,
+}
+
+impl RuntimeSlotLimiter {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            occupied: AtomicU32::new(0),
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
+        if self.limit == 0 {
+            return Ok(RuntimeSlotPermit::unbounded());
+        }
+
+        let mut current = self.occupied.load(Ordering::Acquire);
+        loop {
+            if current >= self.limit {
+                return Err(ExecutorError::InvalidRequest(format!(
+                    "max_runtime_slots exhausted: {current}/{}",
+                    self.limit
+                )));
+            }
+            match self.occupied.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(RuntimeSlotPermit::tracked(self.clone())),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn attach_existing(self: &Arc<Self>) -> Arc<RuntimeSlotPermit> {
+        if self.limit == 0 {
+            return RuntimeSlotPermit::unbounded();
+        }
+
+        self.occupied.fetch_add(1, Ordering::AcqRel);
+        RuntimeSlotPermit::tracked(self.clone())
+    }
+}
+
+impl RuntimeSlotPermit {
+    fn tracked(limiter: Arc<RuntimeSlotLimiter>) -> Arc<Self> {
+        Arc::new(Self {
+            limiter: Some(limiter),
+            released: AtomicBool::new(false),
+        })
+    }
+
+    fn unbounded() -> Arc<Self> {
+        Arc::new(Self {
+            limiter: None,
+            released: AtomicBool::new(false),
+        })
+    }
+
+    fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(limiter) = &self.limiter {
+            limiter.occupied.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for RuntimeSlotPermit {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+fn remove_managed_runtime(
+    runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    runtime_id: Uuid,
+) -> Option<ManagedRuntime> {
+    runtimes
+        .write()
+        .expect("runtime map lock poisoned")
+        .remove(&runtime_id)
 }
 
 #[derive(Debug, Clone)]
@@ -573,11 +672,13 @@ impl ManagedProcessExecutor {
         registry: LocalRuntimeRegistry,
         events: RuntimeEventSink,
     ) -> Self {
+        let max_runtime_slots = settings.max_runtime_slots;
         Self {
             settings,
             registry,
             events,
             runtimes: Arc::new(RwLock::new(HashMap::new())),
+            slot_limiter: Arc::new(RuntimeSlotLimiter::new(max_runtime_slots)),
             stop_intents: Arc::new(RwLock::new(HashMap::new())),
             http_client: Client::builder()
                 .timeout(Duration::from_secs(3))
@@ -639,21 +740,12 @@ impl LocalExecutor for ManagedProcessExecutor {
             )));
         }
 
-        if self.settings.max_runtime_slots > 0 {
-            let active_runtimes = u32::try_from(self.registry.count()).unwrap_or(u32::MAX);
-            if active_runtimes >= self.settings.max_runtime_slots {
-                return Err(ExecutorError::InvalidRequest(format!(
-                    "max_runtime_slots exhausted: {active_runtimes}/{}",
-                    self.settings.max_runtime_slots
-                )));
-            }
-        }
-
+        let slot_permit = self.slot_limiter.try_acquire()?;
         let spec = parse_task_spec(request)?;
         match task_runtime_mode(&spec) {
-            TaskRuntimeMode::ZlmProxy => self.start_live_relay_task(request),
-            TaskRuntimeMode::ZlmRtpServer => self.start_rtp_receive_task(request),
-            TaskRuntimeMode::ManagedProcess => self.start_process_task(request),
+            TaskRuntimeMode::ZlmProxy => self.start_live_relay_task(request, slot_permit),
+            TaskRuntimeMode::ZlmRtpServer => self.start_rtp_receive_task(request, slot_permit),
+            TaskRuntimeMode::ManagedProcess => self.start_process_task(request, slot_permit),
         }
     }
 
@@ -747,10 +839,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                 &success_check_from_handle(&stopping_handle),
             );
             self.close_rtp_receive(&stopping_handle)?;
-            self.runtimes
-                .write()
-                .expect("runtime map lock poisoned")
-                .remove(&runtime_id);
+            let _ = remove_managed_runtime(&self.runtimes, runtime_id);
             let exited_handle = self
                 .registry
                 .update(runtime_id, |runtime| {
@@ -772,9 +861,6 @@ impl LocalExecutor for ManagedProcessExecutor {
             );
             let _ = self
                 .events
-                .send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
-            let _ = self
-                .events
                 .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                     task_id: exited_handle.task_id,
                     attempt_no: exited_handle.attempt_no,
@@ -789,6 +875,9 @@ impl LocalExecutor for ManagedProcessExecutor {
                         "reason": request.reason,
                     }),
                 }));
+            let _ = self
+                .events
+                .send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
             let _ = self.registry.remove(runtime_id);
             return Ok(());
         }
@@ -867,6 +956,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                     .collect::<Vec<_>>();
 
                 self.registry.track(handle.clone());
+                let slot_permit = self.slot_limiter.attach_existing();
                 self.runtimes
                     .write()
                     .expect("runtime map lock poisoned")
@@ -875,6 +965,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                         ManagedRuntime {
                             pid: Some(pid),
                             companion_pids: companion_pids.clone(),
+                            _slot_permit: slot_permit,
                             stop_requested: Arc::new(AtomicBool::new(false)),
                             suppress_companion_events: Arc::new(AtomicBool::new(false)),
                         },
@@ -952,6 +1043,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                         });
 
                         self.registry.track(handle.clone());
+                        let slot_permit = self.slot_limiter.attach_existing();
                         self.runtimes
                             .write()
                             .expect("runtime map lock poisoned")
@@ -960,6 +1052,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                                 ManagedRuntime {
                                     pid: None,
                                     companion_pids: Vec::new(),
+                                    _slot_permit: slot_permit,
                                     stop_requested: Arc::new(AtomicBool::new(false)),
                                     suppress_companion_events: Arc::new(AtomicBool::new(false)),
                                 },
@@ -1007,7 +1100,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                     let Ok(request) = restart_request_from_handle(&persisted.handle) else {
                         continue;
                     };
-                    let Ok(handle) = self.start_rtp_receive_task(&request) else {
+                    let Ok(handle) = self.start_task(&request) else {
                         continue;
                     };
                     snapshots.push(handle);
@@ -1040,6 +1133,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                 });
 
                 self.registry.track(handle.clone());
+                let slot_permit = self.slot_limiter.attach_existing();
                 self.runtimes
                     .write()
                     .expect("runtime map lock poisoned")
@@ -1048,6 +1142,7 @@ impl LocalExecutor for ManagedProcessExecutor {
                         ManagedRuntime {
                             pid: None,
                             companion_pids: Vec::new(),
+                            _slot_permit: slot_permit,
                             stop_requested: Arc::new(AtomicBool::new(false)),
                             suppress_companion_events: Arc::new(AtomicBool::new(false)),
                         },
@@ -1090,7 +1185,7 @@ impl LocalExecutor for ManagedProcessExecutor {
             let Ok(request) = restart_request_from_handle(&persisted.handle) else {
                 continue;
             };
-            let Ok(handle) = self.start_live_relay_task(&request) else {
+            let Ok(handle) = self.start_task(&request) else {
                 continue;
             };
             snapshots.push(handle);
@@ -1126,6 +1221,7 @@ impl ManagedProcessExecutor {
     fn start_process_task(
         &self,
         request: &StartTaskRequest,
+        slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeHandle, ExecutorError> {
         let plan = build_process_plan(
             &self.settings,
@@ -1212,6 +1308,7 @@ impl ManagedProcessExecutor {
                 ManagedRuntime {
                     pid: Some(pid),
                     companion_pids: Vec::new(),
+                    _slot_permit: slot_permit,
                     stop_requested: stop_requested.clone(),
                     suppress_companion_events: Arc::new(AtomicBool::new(false)),
                 },
@@ -1442,10 +1539,7 @@ impl ManagedProcessExecutor {
                     }
                 }
             }
-            runtimes
-                .write()
-                .expect("runtime map lock poisoned")
-                .remove(&runtime_id);
+            let _ = remove_managed_runtime(&runtimes, runtime_id);
 
             let mut exited_handle = registry
                 .update(runtime_id, |runtime| {
@@ -1668,8 +1762,6 @@ impl ManagedProcessExecutor {
                 ),
             };
 
-            let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
-            let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: exited_handle.task_id,
                 attempt_no: exited_handle.attempt_no,
@@ -1680,6 +1772,8 @@ impl ManagedProcessExecutor {
                 message,
                 payload,
             }));
+            let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
+            let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
 
             let _ = registry.remove(runtime_id);
         });
@@ -1699,7 +1793,7 @@ impl ManagedProcessExecutor {
         .await;
 
         let request = restart_request_from_handle(exited_handle)?;
-        let restarted = self.start_process_task(&request)?;
+        let restarted = self.start_process_task(&request, self.slot_limiter.try_acquire()?)?;
         let _ = self
             .events
             .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
@@ -1725,6 +1819,7 @@ impl ManagedProcessExecutor {
     fn start_live_relay_task(
         &self,
         request: &StartTaskRequest,
+        slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeHandle, ExecutorError> {
         let spec = parse_task_spec(request)?;
         let plan = build_live_relay_plan(&self.settings, request, &spec)?;
@@ -1788,6 +1883,7 @@ impl ManagedProcessExecutor {
                 ManagedRuntime {
                     pid: None,
                     companion_pids: Vec::new(),
+                    _slot_permit: slot_permit,
                     stop_requested,
                     suppress_companion_events: Arc::new(AtomicBool::new(false)),
                 },
@@ -1826,6 +1922,7 @@ impl ManagedProcessExecutor {
     fn start_rtp_receive_task(
         &self,
         request: &StartTaskRequest,
+        slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeHandle, ExecutorError> {
         let spec = parse_task_spec(request)?;
         let plan = build_rtp_receive_plan(&self.settings, request, &spec)?;
@@ -1884,6 +1981,7 @@ impl ManagedProcessExecutor {
                 ManagedRuntime {
                     pid: None,
                     companion_pids: Vec::new(),
+                    _slot_permit: slot_permit,
                     stop_requested,
                     suppress_companion_events: Arc::new(AtomicBool::new(false)),
                 },
@@ -3439,6 +3537,14 @@ fn append_process_args_with_profile(
             Ok(audio_copy_decoration)
         }
         "copy_or_transcode" | "force_transcode" => {
+            let probed_profile;
+            let selection_profile = match input_profile {
+                Some(profile) => Some(profile),
+                None => {
+                    probed_profile = probe_input_media_profile(settings, spec, input_url);
+                    Some(&probed_profile)
+                }
+            };
             let selection = resolve_process_selection(
                 settings,
                 spec,
@@ -3447,7 +3553,7 @@ fn append_process_args_with_profile(
                 output_format,
                 video_policy,
                 audio_policy,
-                input_profile,
+                selection_profile,
             );
             if !selection.input_args.is_empty() {
                 insert_ffmpeg_input_args(args, selection.input_args);
@@ -3458,6 +3564,16 @@ fn append_process_args_with_profile(
                 "-c:a".to_string(),
                 selection.audio_encoder,
             ]);
+            if selection_profile
+                .is_some_and(|profile| should_force_h264_nvenc_to_yuv420p(profile, args))
+            {
+                args.extend([
+                    "-vf".to_string(),
+                    "format=yuv420p".to_string(),
+                    "-pix_fmt".to_string(),
+                    "yuv420p".to_string(),
+                ]);
+            }
             if let Some(bitrate) = spec.process.bitrate {
                 args.extend(["-b:v".to_string(), format!("{bitrate}k")]);
             }
@@ -3486,6 +3602,14 @@ fn resolve_process_selection(
     input_profile: Option<&InputMediaProfile>,
 ) -> TranscodeSelection {
     if mode == "force_transcode" {
+        if let Some(profile) = input_profile {
+            return resolve_transcode_selection_for_input_family(
+                settings,
+                profile.video_family,
+                video_policy,
+                audio_policy,
+            );
+        }
         return resolve_transcode_selection(settings, spec, input_url, video_policy, audio_policy);
     }
 
@@ -3564,6 +3688,60 @@ fn should_copy_video_stream(
         VideoOutputPolicy::KeepSourceFamily | VideoOutputPolicy::CopyWhitelistedElseH264 => true,
         VideoOutputPolicy::ForceH264 => profile.video_family == VideoCodecFamily::H264,
     }
+}
+
+fn should_force_h264_nvenc_to_yuv420p(
+    profile: &InputMediaProfile,
+    process_args: &[String],
+) -> bool {
+    if !process_args
+        .windows(2)
+        .any(|window| window == ["-c:v", "h264_nvenc"])
+    {
+        return false;
+    }
+
+    profile
+        .video_pixel_format
+        .as_deref()
+        .is_some_and(video_pixel_format_requires_h264_nvenc_8bit_compatibility)
+}
+
+fn video_pixel_format_requires_h264_nvenc_8bit_compatibility(pix_fmt: &str) -> bool {
+    let pix_fmt = pix_fmt.trim().to_ascii_lowercase();
+    if pix_fmt.is_empty() {
+        return false;
+    }
+
+    matches!(
+        pix_fmt.as_str(),
+        "p010le"
+            | "p012le"
+            | "p016le"
+            | "yuv420p9le"
+            | "yuv420p10le"
+            | "yuv420p12le"
+            | "yuv420p14le"
+            | "yuv420p16le"
+            | "yuv422p10le"
+            | "yuv422p12le"
+            | "yuv422p14le"
+            | "yuv422p16le"
+            | "yuv444p10le"
+            | "yuv444p12le"
+            | "yuv444p14le"
+            | "yuv444p16le"
+            | "gbrp10le"
+            | "gbrp12le"
+            | "gbrp14le"
+            | "gbrp16le"
+            | "yuva420p10le"
+            | "yuva420p12le"
+            | "yuva420p16le"
+            | "yuva444p10le"
+            | "yuva444p12le"
+            | "yuva444p16le"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3941,6 +4119,7 @@ struct InputMediaProfile {
     has_video: bool,
     video_family: VideoCodecFamily,
     video_codec_name: Option<String>,
+    video_pixel_format: Option<String>,
     video_extradata_present: bool,
     has_audio: bool,
     audio_codec_name: Option<String>,
@@ -3956,6 +4135,7 @@ impl Default for InputMediaProfile {
             has_video: false,
             video_family: VideoCodecFamily::Unknown,
             video_codec_name: None,
+            video_pixel_format: None,
             video_extradata_present: false,
             has_audio: false,
             audio_codec_name: None,
@@ -3983,6 +4163,7 @@ struct FfprobeFormat {
 struct FfprobeStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    pix_fmt: Option<String>,
     sample_rate: Option<String>,
     channels: Option<u32>,
     extradata_size: Option<u64>,
@@ -4010,7 +4191,7 @@ fn probe_input_media_profile_with_input_args(
     args.extend(extra_input_args.iter().cloned());
     args.extend([
         "-show_entries".to_string(),
-        "stream=codec_type,codec_name,sample_rate,channels,extradata_size:format=format_name"
+        "stream=codec_type,codec_name,pix_fmt,sample_rate,channels,extradata_size:format=format_name"
             .to_string(),
         "-of".to_string(),
         "json".to_string(),
@@ -4051,6 +4232,12 @@ fn probe_input_media_profile_with_input_args(
                 profile.has_video = true;
                 profile.video_codec_name = stream
                     .codec_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_ascii_lowercase);
+                profile.video_pixel_format = stream
+                    .pix_fmt
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
@@ -5608,10 +5795,7 @@ fn spawn_adopted_runtime_monitor(
                 continue;
             }
 
-            runtimes
-                .write()
-                .expect("runtime map lock poisoned")
-                .remove(&runtime_id);
+            let _ = remove_managed_runtime(&runtimes, runtime_id);
 
             let mut exited_handle = registry
                 .update(runtime_id, |runtime| {
@@ -5628,8 +5812,6 @@ fn spawn_adopted_runtime_monitor(
 
             let (event_type, event_level, message, payload) =
                 classify_adopted_exit(&exited_handle, &success_check, stop_requested);
-            let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
-            let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: exited_handle.task_id,
                 attempt_no: exited_handle.attempt_no,
@@ -5640,6 +5822,8 @@ fn spawn_adopted_runtime_monitor(
                 message,
                 payload,
             }));
+            let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
+            let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
             let _ = registry.remove(runtime_id);
             return;
         }
@@ -6069,10 +6253,7 @@ fn spawn_live_relay_monitor(
             let stop_requested = runtime.stop_requested.load(Ordering::Relaxed);
             let handle = registry.get(runtime_id);
             let Some(handle) = handle else {
-                runtimes
-                    .write()
-                    .expect("runtime map lock poisoned")
-                    .remove(&runtime_id);
+                let _ = remove_managed_runtime(&runtimes, runtime_id);
                 return;
             };
 
@@ -6330,10 +6511,7 @@ fn spawn_live_relay_monitor(
                         &failed_handle,
                         &SuccessCheck::ProcessExit,
                     );
-                    runtimes
-                        .write()
-                        .expect("runtime map lock poisoned")
-                        .remove(&runtime_id);
+                    let _ = remove_managed_runtime(&runtimes, runtime_id);
                     let _ = registry.remove(runtime_id);
                     return;
                 }
@@ -6519,10 +6697,7 @@ fn spawn_live_relay_monitor(
                                             }),
                                         },
                                     ));
-                                    runtimes
-                                        .write()
-                                        .expect("runtime map lock poisoned")
-                                        .remove(&runtime_id);
+                                    let _ = remove_managed_runtime(&runtimes, runtime_id);
                                     let _ = registry.remove(runtime_id);
                                     return;
                                 }
@@ -6724,10 +6899,7 @@ fn spawn_live_relay_monitor(
                         &failed_handle,
                         &SuccessCheck::ProcessExit,
                     );
-                    runtimes
-                        .write()
-                        .expect("runtime map lock poisoned")
-                        .remove(&runtime_id);
+                    let _ = remove_managed_runtime(&runtimes, runtime_id);
                     let _ = registry.remove(runtime_id);
                     return;
                 }
@@ -6782,12 +6954,6 @@ fn spawn_live_relay_monitor(
                                 "unexpected_offline",
                             )
                         };
-                    let _ = persist_runtime_state(
-                        &work_dir,
-                        &exited_handle,
-                        &SuccessCheck::ProcessExit,
-                    );
-                    let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
                     let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: exited_handle.task_id,
                         attempt_no: exited_handle.attempt_no,
@@ -6805,10 +6971,13 @@ fn spawn_live_relay_monitor(
                             "orphaned": exited_handle.metadata.get("orphaned").and_then(Value::as_bool).unwrap_or(false),
                         }),
                     }));
-                    runtimes
-                        .write()
-                        .expect("runtime map lock poisoned")
-                        .remove(&runtime_id);
+                    let _ = persist_runtime_state(
+                        &work_dir,
+                        &exited_handle,
+                        &SuccessCheck::ProcessExit,
+                    );
+                    let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
+                    let _ = remove_managed_runtime(&runtimes, runtime_id);
                     let _ = registry.remove(runtime_id);
                     return;
                 }
@@ -6848,10 +7017,7 @@ fn spawn_rtp_receive_monitor(
             let stop_requested = runtime.stop_requested.load(Ordering::Relaxed);
             let handle = registry.get(runtime_id);
             let Some(handle) = handle else {
-                runtimes
-                    .write()
-                    .expect("runtime map lock poisoned")
-                    .remove(&runtime_id);
+                let _ = remove_managed_runtime(&runtimes, runtime_id);
                 return;
             };
 
@@ -6931,10 +7097,7 @@ fn spawn_rtp_receive_monitor(
                         sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                         continue;
                     }
-                    runtimes
-                        .write()
-                        .expect("runtime map lock poisoned")
-                        .remove(&runtime_id);
+                    let _ = remove_managed_runtime(&runtimes, runtime_id);
                     let exited_handle = registry
                         .update(runtime_id, |runtime| {
                             runtime.state = RuntimeState::Exited;
@@ -6955,8 +7118,6 @@ fn spawn_rtp_receive_monitor(
                     );
                     if !stop_requested {
                         let _ =
-                            events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
-                        let _ =
                             events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: exited_handle.task_id,
                                 attempt_no: exited_handle.attempt_no,
@@ -6970,6 +7131,8 @@ fn spawn_rtp_receive_monitor(
                                     "orphaned": exited_handle.metadata.get("orphaned").and_then(Value::as_bool).unwrap_or(false),
                                 }),
                             }));
+                        let _ =
+                            events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
                     }
                     let _ = registry.remove(runtime_id);
                     return;

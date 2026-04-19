@@ -72,7 +72,7 @@ struct SessionTarget {
     using_gpu_path: bool,
     gpu_headroom: Option<f64>,
     slot_usage: f64,
-    running_tasks: u32,
+    occupied_tasks: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -126,7 +126,7 @@ struct DispatchScore {
     same_subnet: bool,
     gpu_headroom: Option<f64>,
     slot_usage: f64,
-    running_tasks: u32,
+    occupied_tasks: u32,
     node_id: Uuid,
 }
 
@@ -261,7 +261,7 @@ impl ControlPlaneService {
             same_subnet = target.same_subnet,
             gpu_headroom = target.gpu_headroom,
             slot_usage = target.slot_usage,
-            running_tasks = target.running_tasks,
+            occupied_tasks = target.occupied_tasks,
             "start_task dispatched to agent"
         );
 
@@ -284,7 +284,13 @@ impl ControlPlaneService {
         };
 
         let Some(target) = self.session_for_node(command.node_id).await else {
-            return Err(ControlPlaneError::NodeDisconnected(command.node_id));
+            info!(
+                task_id = %task_id,
+                node_id = %command.node_id,
+                attempt_no = command.attempt_no,
+                "stop intent persisted while node session is disconnected"
+            );
+            return Ok(());
         };
 
         let envelope = CoreEnvelope {
@@ -302,7 +308,13 @@ impl ControlPlaneService {
 
         if send_core_message(&target.sender, envelope).await.is_err() {
             self.close_session(target.node_id, target.session_id).await;
-            return Err(ControlPlaneError::NodeDisconnected(target.node_id));
+            info!(
+                task_id = %task_id,
+                node_id = %target.node_id,
+                attempt_no = command.attempt_no,
+                "stop intent persisted but stop_task delivery raced with session close"
+            );
+            return Ok(());
         }
 
         info!(
@@ -476,6 +488,9 @@ impl ControlPlaneService {
                 debug!(
                     node_id = %node_id,
                     running_tasks = snapshot.running_tasks,
+                    starting_tasks = snapshot.starting_tasks,
+                    stopping_tasks = snapshot.stopping_tasks,
+                    orphaned_tasks = snapshot.orphaned_tasks,
                     slot_usage = snapshot.slot_usage,
                     zlm_alive = snapshot.zlm_alive,
                     ffmpeg_alive = snapshot.ffmpeg_alive,
@@ -609,7 +624,7 @@ impl ControlPlaneService {
 
         if let Err(error) = self
             .repository
-            .recover_tasks_for_disconnected_node(node_id)
+            .mark_tasks_reclaiming_for_disconnected_node(node_id)
             .await
         {
             warn!(node_id = %node_id, error = %error, "failed to recover tasks after session close");
@@ -754,7 +769,7 @@ impl ControlPlaneService {
             using_gpu_path: target.using_gpu_path,
             gpu_headroom: score.gpu_headroom,
             slot_usage: score.slot_usage,
-            running_tasks: score.running_tasks,
+            occupied_tasks: score.occupied_tasks,
         })
     }
 
@@ -804,7 +819,7 @@ impl ControlPlaneService {
             using_gpu_path: false,
             gpu_headroom: score.gpu_headroom,
             slot_usage: score.slot_usage,
-            running_tasks: score.running_tasks,
+            occupied_tasks: score.occupied_tasks,
         })
     }
 
@@ -841,7 +856,7 @@ impl ControlPlaneService {
             using_gpu_path: false,
             gpu_headroom: None,
             slot_usage: handle.load.slot_usage,
-            running_tasks: handle.load.running_tasks,
+            occupied_tasks: effective_occupied_tasks(&handle.load, reservation_count(handle)),
         })
     }
 
@@ -1167,22 +1182,30 @@ fn task_execution_preference(spec: &TaskSpec) -> ExecutionPreference {
     ExecutionPreference::CpuOnly
 }
 
-fn effective_running_tasks(load: &SessionLoad, reserved_dispatches: u32) -> u32 {
-    load.running_tasks.saturating_add(reserved_dispatches)
+fn occupied_tasks(load: &SessionLoad) -> u32 {
+    load.running_tasks
+        .saturating_add(load.starting_tasks)
+        .saturating_add(load.stopping_tasks)
+        .saturating_add(load.orphaned_tasks)
+}
+
+fn effective_occupied_tasks(load: &SessionLoad, reserved_dispatches: u32) -> u32 {
+    occupied_tasks(load).saturating_add(reserved_dispatches)
 }
 
 fn estimated_max_slots(load: &SessionLoad) -> Option<u32> {
     let slot_usage = normalized_slot_usage(load.slot_usage);
-    if !slot_usage.is_finite() || slot_usage <= 0.0 || load.running_tasks == 0 {
+    let occupied = occupied_tasks(load);
+    if !slot_usage.is_finite() || slot_usage <= 0.0 || occupied == 0 {
         return None;
     }
 
-    let estimate = (load.running_tasks as f64 / slot_usage).ceil();
+    let estimate = (occupied as f64 / slot_usage).ceil();
     if !estimate.is_finite() || estimate <= 0.0 {
         return None;
     }
 
-    Some((estimate as u32).max(load.running_tasks))
+    Some((estimate as u32).max(occupied))
 }
 
 fn effective_slot_usage(load: &SessionLoad, reserved_dispatches: u32) -> f64 {
@@ -1193,7 +1216,7 @@ fn effective_slot_usage(load: &SessionLoad, reserved_dispatches: u32) -> f64 {
 
     match estimated_max_slots(load) {
         Some(max_slots) if max_slots > 0 => {
-            (effective_running_tasks(load, reserved_dispatches) as f64 / max_slots as f64)
+            (effective_occupied_tasks(load, reserved_dispatches) as f64 / max_slots as f64)
                 .clamp(0.0, 1.0)
         }
         _ => base_usage,
@@ -1281,14 +1304,7 @@ fn gpu_runtime_headroom(runtime: &GpuRuntimeStats) -> Option<f64> {
 fn event_releases_dispatch_reservation(event_type: &str) -> bool {
     matches!(
         event_type,
-        "accepted"
-            | "starting"
-            | "recovering"
-            | "running"
-            | "start_rejected"
-            | "succeeded"
-            | "failed"
-            | "canceled"
+        "start_rejected" | "succeeded" | "failed" | "canceled"
     )
 }
 
@@ -1356,7 +1372,7 @@ fn pick_best_session_target(
                     using_gpu_path: gpu_only,
                     gpu_headroom: score.gpu_headroom,
                     slot_usage: score.slot_usage,
-                    running_tasks: score.running_tasks,
+                    occupied_tasks: score.occupied_tasks,
                 }
             })
     };
@@ -1382,7 +1398,7 @@ fn dispatch_score(
             .then(|| best_gpu_headroom(&load.gpu_runtime))
             .flatten(),
         slot_usage: effective_slot_usage(load, reserved_dispatches),
-        running_tasks: effective_running_tasks(load, reserved_dispatches),
+        occupied_tasks: effective_occupied_tasks(load, reserved_dispatches),
         node_id,
     }
 }
@@ -1393,7 +1409,7 @@ fn compare_dispatch_score(left: DispatchScore, right: DispatchScore) -> CmpOrder
         .cmp(&left.same_subnet)
         .then_with(|| compare_gpu_headroom(left.gpu_headroom, right.gpu_headroom))
         .then_with(|| compare_slot_usage(left.slot_usage, right.slot_usage))
-        .then_with(|| left.running_tasks.cmp(&right.running_tasks))
+        .then_with(|| left.occupied_tasks.cmp(&right.occupied_tasks))
         .then_with(|| left.node_id.cmp(&right.node_id))
 }
 

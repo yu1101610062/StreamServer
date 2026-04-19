@@ -1058,7 +1058,7 @@ impl TaskRepository {
             where 1 = 1
               and t.current_attempt_no > 0
               and ta.attempt_no = t.current_attempt_no
-              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING')
+              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING', 'RECLAIMING')
             "#,
         );
         if let Some(schema) = filter
@@ -2074,13 +2074,13 @@ impl TaskRepository {
         Ok(row.and_then(|row| row.try_get::<Option<Uuid>, _>("node_id").ok().flatten()))
     }
 
-    pub async fn recover_tasks_for_disconnected_node(
+    pub async fn mark_tasks_reclaiming_for_disconnected_node(
         &self,
         node_id: Uuid,
     ) -> Result<(), RepoError> {
         let rows = sqlx::query(
             r#"
-            select id, status::text as status, current_attempt_no, resolved_spec
+            select id, status::text as status, current_attempt_no
              from tasks
              where assigned_node_id = $1
                and current_attempt_no > 0
@@ -2092,135 +2092,60 @@ impl TaskRepository {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut retry_candidates = Vec::new();
-
         for row in rows {
             let task_id: Uuid = row.try_get("id")?;
             let attempt_no: i32 = row.try_get("current_attempt_no")?;
             let status = TaskStatus::from_str(&row.try_get::<String, _>("status")?)?;
-            let resolved_spec: Option<Value> = row.try_get("resolved_spec")?;
-
-            match status {
-                TaskStatus::Dispatching => {
-                    let mut tx = self.pool.begin().await?;
-                    let now = Utc::now();
-                    sqlx::query(
-                        r#"
-                        update tasks
-                           set status = 'QUEUED'::task_status,
-                               assigned_node_id = null,
-                               updated_at = $1
-                         where id = $2
-                           and current_attempt_no = $3
-                           and status = 'DISPATCHING'::task_status
-                        "#,
-                    )
-                    .bind(now)
-                    .bind(task_id)
-                    .bind(attempt_no)
-                    .execute(&mut *tx)
-                    .await?;
-
-                    sqlx::query(
-                        r#"
-                        update task_attempts
-                           set status = 'FAILED'::attempt_status,
-                               node_id = $1,
-                               failure_code = 'node_disconnected',
-                               failure_reason = $2,
-                               ended_at = $3
-                         where task_id = $4
-                           and attempt_no = $5
-                           and status = 'PENDING'::attempt_status
-                        "#,
-                    )
-                    .bind(node_id)
-                    .bind("control-plane session closed before dispatch was acknowledged")
-                    .bind(now)
-                    .bind(task_id)
-                    .bind(attempt_no)
-                    .execute(&mut *tx)
-                    .await?;
-
-                    self.delete_task_lease(&mut tx, task_id).await?;
-                    self.insert_event(
-                        &mut tx,
-                        task_id,
-                        None,
-                        Some(attempt_no),
-                        EventSource::Core,
-                        "task_requeued_after_node_disconnect",
-                        "warn",
-                        json!({
-                            "node_id": node_id,
-                            "attempt_no": attempt_no,
-                            "requeued": true,
-                        }),
-                    )
-                    .await?;
-                    tx.commit().await?;
-                }
-                TaskStatus::Starting
-                | TaskStatus::Running
-                | TaskStatus::Stopping
-                | TaskStatus::Recovering => {
-                    let should_retry = resolved_spec
-                        .as_ref()
-                        .and_then(|value| serde_json::from_value::<TaskSpec>(value.clone()).ok())
-                        .is_some_and(|spec| {
-                            status != TaskStatus::Stopping && retry_enabled_on_disconnect(&spec)
-                        });
-                    let mut tx = self.pool.begin().await?;
-                    let now = Utc::now();
-                    self.mark_task_lost(
-                        &mut tx,
-                        task_id,
-                        attempt_no,
-                        node_id,
-                        "node_disconnected",
-                        "control-plane session closed before task completed",
-                        now,
-                    )
-                    .await?;
-                    self.insert_event(
-                        &mut tx,
-                        task_id,
-                        None,
-                        Some(attempt_no),
-                        EventSource::Core,
-                        "task_lost_after_node_disconnect",
-                        "warn",
-                        json!({
-                            "node_id": node_id,
-                            "attempt_no": attempt_no,
-                            "auto_retry": should_retry,
-                        }),
-                    )
-                    .await?;
-                    tx.commit().await?;
-
-                    if should_retry {
-                        retry_candidates.push(task_id);
-                    }
-                }
-                _ => {}
+            let now = Utc::now();
+            let reclaim_deadline_at = now
+                + if status == TaskStatus::Dispatching {
+                    chrono::Duration::seconds(DISPATCH_RECLAIM_GRACE_SECS)
+                } else {
+                    chrono::Duration::seconds(RUNTIME_RECLAIM_GRACE_SECS)
+                };
+            let mut tx = self.pool.begin().await?;
+            let updated = sqlx::query(
+                r#"
+                update tasks
+                   set status = 'RECLAIMING'::task_status,
+                       reclaim_deadline_at = $1,
+                       updated_at = $2,
+                       finished_at = null
+                 where id = $3
+                   and current_attempt_no = $4
+                   and status = $5::task_status
+                "#,
+            )
+            .bind(reclaim_deadline_at)
+            .bind(now)
+            .bind(task_id)
+            .bind(attempt_no)
+            .bind(status.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if updated.rows_affected() == 0 {
+                tx.commit().await?;
+                continue;
             }
-        }
 
-        for task_id in retry_candidates {
-            let current = self.fetch_task_summary(task_id).await?;
-            if current.status == TaskStatus::Lost {
-                self.enqueue_retry(
-                    current,
-                    EventSource::Core,
-                    "task_retry_after_node_disconnect",
-                    json!({
-                        "reason": "node_disconnected",
-                        "auto_retry": true,
-                    }),
-                )
-                .await?;
-            }
+            self.insert_event(
+                &mut tx,
+                task_id,
+                None,
+                Some(attempt_no),
+                EventSource::Core,
+                "task_reclaiming_after_node_disconnect",
+                "warn",
+                json!({
+                    "node_id": node_id,
+                    "attempt_no": attempt_no,
+                    "from": status,
+                    "to": TaskStatus::Reclaiming,
+                    "reclaim_deadline_at": reclaim_deadline_at,
+                }),
+            )
+            .await?;
+            tx.commit().await?;
         }
 
         Ok(())
@@ -2850,6 +2775,7 @@ impl TaskRepository {
             r#"
             update tasks
                set status = 'STOPPING'::task_status,
+                   reclaim_deadline_at = null,
                    updated_at = $1
              where id = $2
                and current_attempt_no = $3
@@ -2914,6 +2840,7 @@ impl TaskRepository {
                 'RUNNING'::task_status,
                 'STOPPING'::task_status,
                 'RECOVERING'::task_status,
+                'RECLAIMING'::task_status,
                 'LOST'::task_status
               )
               and coalesce(ta.lease_token, '') <> ''
@@ -2933,6 +2860,70 @@ impl TaskRepository {
             })
         })
         .collect()
+    }
+
+    pub async fn list_reclaiming_tasks(&self) -> Result<Vec<ReclaimingTaskReconcile>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              t.id as task_id,
+              t.current_attempt_no as attempt_no,
+              ta.node_id,
+              ta.status::text as attempt_status,
+              t.reclaim_deadline_at
+            from tasks t
+            join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = t.current_attempt_no
+            where t.status = 'RECLAIMING'::task_status
+              and t.reclaim_deadline_at is not null
+              and ta.node_id is not null
+            order by t.reclaim_deadline_at asc, t.updated_at asc
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(ReclaimingTaskReconcile {
+                task_id: row.try_get("task_id")?,
+                attempt_no: row.try_get("attempt_no")?,
+                node_id: row.try_get("node_id")?,
+                attempt_status: AttemptStatus::from_str(
+                    &row.try_get::<String, _>("attempt_status")?,
+                )?,
+                reclaim_deadline_at: row.try_get("reclaim_deadline_at")?,
+            })
+        })
+        .collect()
+    }
+
+    pub async fn finalize_reclaim_timeout(
+        &self,
+        candidate: &ReclaimingTaskReconcile,
+    ) -> Result<bool, RepoError> {
+        self.finalize_reclaiming_task(
+            candidate,
+            "node_disconnected",
+            "control-plane session did not recover before reclaim deadline",
+            "task_lost_after_reclaim_timeout",
+            "reclaim_timeout",
+        )
+        .await
+    }
+
+    pub async fn finalize_reclaim_orphaned(
+        &self,
+        candidate: &ReclaimingTaskReconcile,
+    ) -> Result<bool, RepoError> {
+        self.finalize_reclaiming_task(
+            candidate,
+            "runtime_not_found",
+            "reclaimed runtime was reported missing by the agent",
+            "task_lost_after_reclaim_orphaned",
+            "runtime_not_found",
+        )
+        .await
     }
 
     pub async fn attempt_has_stop_intent(
@@ -3077,6 +3068,99 @@ impl TaskRepository {
         )
         .await?;
         tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn finalize_reclaiming_task(
+        &self,
+        candidate: &ReclaimingTaskReconcile,
+        failure_code: &str,
+        failure_reason: &str,
+        event_type: &str,
+        reason: &str,
+    ) -> Result<bool, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select
+              t.status::text as task_status,
+              t.current_attempt_no,
+              t.resolved_spec,
+              ta.stop_requested_at
+            from tasks t
+            join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = t.current_attempt_no
+            where t.id = $1
+            for update
+            "#,
+        )
+        .bind(candidate.task_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let task_status = TaskStatus::from_str(&row.try_get::<String, _>("task_status")?)?;
+        let current_attempt_no: i32 = row.try_get("current_attempt_no")?;
+        if current_attempt_no != candidate.attempt_no || task_status != TaskStatus::Reclaiming {
+            return Ok(false);
+        }
+
+        let resolved_spec: Option<Value> = row.try_get("resolved_spec")?;
+        let stop_requested_at: Option<DateTime<Utc>> = row.try_get("stop_requested_at")?;
+        let should_retry = stop_requested_at.is_none()
+            && candidate.attempt_status != AttemptStatus::Stopping
+            && resolved_spec
+                .as_ref()
+                .and_then(|value| serde_json::from_value::<TaskSpec>(value.clone()).ok())
+                .is_some_and(|spec| retry_enabled_on_disconnect(&spec));
+        let now = Utc::now();
+
+        self.mark_task_lost(
+            &mut tx,
+            candidate.task_id,
+            candidate.attempt_no,
+            candidate.node_id,
+            failure_code,
+            failure_reason,
+            now,
+        )
+        .await?;
+        self.insert_event(
+            &mut tx,
+            candidate.task_id,
+            None,
+            Some(candidate.attempt_no),
+            EventSource::Core,
+            event_type,
+            "warn",
+            json!({
+                "node_id": candidate.node_id,
+                "attempt_no": candidate.attempt_no,
+                "reason": reason,
+                "auto_retry": should_retry,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+
+        if should_retry {
+            let current = self.fetch_task_summary(candidate.task_id).await?;
+            if current.status == TaskStatus::Lost {
+                self.enqueue_retry(
+                    current,
+                    EventSource::Core,
+                    "task_retry_after_node_disconnect",
+                    json!({
+                        "reason": reason,
+                        "auto_retry": true,
+                    }),
+                )
+                .await?;
+            }
+        }
+
         Ok(true)
     }
 
@@ -3395,6 +3479,7 @@ impl TaskRepository {
                     update tasks
                        set status = 'STARTING'::task_status,
                            assigned_node_id = $1,
+                           reclaim_deadline_at = null,
                            updated_at = $2
                      where id = $3
                     "#,
@@ -3428,6 +3513,7 @@ impl TaskRepository {
                     update tasks
                        set status = 'RECOVERING'::task_status,
                            assigned_node_id = $1,
+                           reclaim_deadline_at = null,
                            updated_at = $2
                      where id = $3
                     "#,
@@ -3461,6 +3547,7 @@ impl TaskRepository {
                     update tasks
                        set status = 'RECOVERING'::task_status,
                            assigned_node_id = $1,
+                           reclaim_deadline_at = null,
                            updated_at = $2
                      where id = $3
                        and current_attempt_no = $4
@@ -3497,10 +3584,15 @@ impl TaskRepository {
                         update tasks
                            set status = 'STOPPING'::task_status,
                                assigned_node_id = null,
+                               reclaim_deadline_at = null,
                                updated_at = $1
                          where id = $2
                            and current_attempt_no = $3
-                           and status in ('STOPPING'::task_status, 'LOST'::task_status)
+                           and status in (
+                             'STOPPING'::task_status,
+                             'LOST'::task_status,
+                             'RECLAIMING'::task_status
+                           )
                         "#,
                     )
                     .bind(now)
@@ -3533,6 +3625,7 @@ impl TaskRepository {
                     r#"
                     update tasks
                        set status = 'STOPPING'::task_status,
+                           reclaim_deadline_at = null,
                            updated_at = $1
                      where id = $2
                     "#,
@@ -3662,6 +3755,7 @@ impl TaskRepository {
                     r#"
                     update tasks
                        set status = 'STOPPING'::task_status,
+                           reclaim_deadline_at = null,
                            updated_at = $1
                      where id = $2
                        and current_attempt_no = $3
@@ -4557,7 +4651,7 @@ impl TaskRepository {
              and ta.attempt_no = t.current_attempt_no
             where t.assigned_node_id = $1
               and t.current_attempt_no > 0
-              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
+              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING', 'RECLAIMING')
             order by t.updated_at desc
             "#,
         )
@@ -4653,7 +4747,7 @@ impl TaskRepository {
              and ta.attempt_no = t.current_attempt_no
             where t.assigned_node_id = $1
               and t.current_attempt_no > 0
-              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
+              and t.status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING', 'RECLAIMING')
             order by t.updated_at desc
             "#,
         )
@@ -5381,6 +5475,13 @@ impl TaskRepository {
         metadata: &Value,
         now: DateTime<Utc>,
     ) -> Result<(), RepoError> {
+        if matches!(
+            ownership.task_status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Canceled | TaskStatus::Lost
+        ) {
+            return Ok(());
+        }
+
         let explicit_success = metadata
             .get("completion_reason")
             .and_then(Value::as_str)
@@ -5617,6 +5718,7 @@ impl TaskRepository {
             update tasks
                set status = $1::task_status,
                    assigned_node_id = null,
+                   reclaim_deadline_at = null,
                    updated_at = $2,
                    finished_at = $3
              where id = $4
@@ -5681,11 +5783,18 @@ impl TaskRepository {
             update tasks
                set status = 'RUNNING'::task_status,
                    assigned_node_id = $1,
+                   reclaim_deadline_at = null,
                    started_at = coalesce(started_at, $2),
                    updated_at = $2
              where id = $3
                and current_attempt_no = $4
-               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING')
+               and status in (
+                 'DISPATCHING',
+                 'STARTING',
+                 'RUNNING',
+                 'RECOVERING',
+                 'RECLAIMING'
+               )
             "#,
         )
         .bind(node_id)
@@ -5734,11 +5843,19 @@ impl TaskRepository {
             update tasks
                set status = 'LOST'::task_status,
                    assigned_node_id = null,
+                   reclaim_deadline_at = null,
                    updated_at = $1,
                    finished_at = $1
              where id = $2
                and current_attempt_no = $3
-               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING')
+               and status in (
+                 'DISPATCHING',
+                 'STARTING',
+                 'RUNNING',
+                 'STOPPING',
+                 'RECOVERING',
+                 'RECLAIMING'
+               )
             "#,
         )
         .bind(now)
@@ -5897,6 +6014,8 @@ fn start_rejected_retry_limit(spec: &TaskSpec) -> Option<u32> {
 }
 
 const DEFAULT_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const DISPATCH_RECLAIM_GRACE_SECS: i64 = 10;
+const RUNTIME_RECLAIM_GRACE_SECS: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CreateTaskResult {
@@ -5955,6 +6074,15 @@ pub struct ReclaimRuntimeCommand {
     pub attempt_no: i32,
     pub lease_token: String,
     pub worker_kind: WorkerKind,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReclaimingTaskReconcile {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub node_id: Uuid,
+    pub attempt_status: AttemptStatus,
+    pub reclaim_deadline_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]

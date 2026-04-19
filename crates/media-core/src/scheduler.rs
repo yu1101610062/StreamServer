@@ -58,6 +58,7 @@ async fn run_once(
     }
 
     reconcile_stopping_tasks(repository, control_plane, now).await?;
+    reconcile_reclaiming_tasks(repository, now).await?;
 
     Ok(())
 }
@@ -144,6 +145,23 @@ async fn reconcile_stopping_tasks(
                 ) => {}
                 Err(error) => return Err(anyhow::Error::new(error)),
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn reconcile_reclaiming_tasks(
+    repository: &TaskRepository,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    for candidate in repository.list_reclaiming_tasks().await? {
+        if candidate.attempt_status == media_domain::AttemptStatus::Orphaned {
+            let _ = repository.finalize_reclaim_orphaned(&candidate).await?;
+            continue;
+        }
+        if now >= candidate.reclaim_deadline_at {
+            let _ = repository.finalize_reclaim_timeout(&candidate).await?;
         }
     }
 

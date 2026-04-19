@@ -61,6 +61,22 @@ fn stop_operation_rejects_lost_task() {
 }
 
 #[test]
+fn reclaiming_transition_allows_runtime_recovery() {
+    assert!(TaskStatus::Running.can_transition_to(TaskStatus::Reclaiming));
+    assert!(TaskStatus::Reclaiming.can_transition_to(TaskStatus::Recovering));
+    assert!(TaskStatus::Reclaiming.can_transition_to(TaskStatus::Running));
+}
+
+#[test]
+fn stop_operation_allows_reclaiming_task() {
+    let next = TaskStatus::Reclaiming
+        .apply_operation(TaskOperation::Stop)
+        .expect("stop should be allowed while reclaiming");
+
+    assert_eq!(next, TaskStatus::Stopping);
+}
+
+#[test]
 fn cancel_operation_moves_running_task_to_stopping() {
     let next = TaskStatus::Running
         .apply_operation(TaskOperation::Cancel)

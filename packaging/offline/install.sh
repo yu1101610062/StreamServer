@@ -908,7 +908,9 @@ prepare_worker_layout() {
   mkdir -p \
     "${install_dir}/data/media/work" \
     "${install_dir}/data/media/logs" \
-    "${install_dir}/data/zlm/www"
+    "${install_dir}/data/zlm/www" \
+    "${install_dir}/data/zlm/www/output/mp4" \
+    "${install_dir}/data/zlm/www/output/hls"
 }
 
 emit_manual_start_hint() {

@@ -8,17 +8,101 @@ GPU_SUPPORT=""
 HOST_BINARY_TARGET_TRIPLE="x86_64-unknown-linux-musl"
 BUILD_MUSL_BIN_SCRIPT="${ROOT_DIR}/scripts/build_musl_bin_by_docker.sh"
 
-APT_MIRROR="${APT_MIRROR:-}"
-UBUNTU_APT_MIRROR="${UBUNTU_APT_MIRROR:-}"
-CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR:-}"
-NPM_REGISTRY_MIRROR="${NPM_REGISTRY_MIRROR:-}"
-FRONTEND_BUILDER_IMAGE="${FRONTEND_BUILDER_IMAGE:-node:22-bookworm}"
-RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE:-rust:1.85-bookworm}"
-MEDIA_CORE_RUNTIME_BASE_IMAGE="${MEDIA_CORE_RUNTIME_BASE_IMAGE:-debian:bookworm-slim}"
-MEDIA_AGENT_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_RUNTIME_BASE_IMAGE:-jrottenberg/ffmpeg:7.1-ubuntu2404}"
-MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE:-jrottenberg/ffmpeg:7.1-nvidia2204}"
-POSTGRES_SOURCE_IMAGE="${POSTGRES_SOURCE_IMAGE:-postgres:18.3}"
-ZLM_SOURCE_IMAGE="${ZLM_SOURCE_IMAGE:-zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f}"
+DEFAULT_APT_MIRROR="http://mirrors.aliyun.com"
+DEFAULT_UBUNTU_APT_MIRROR="${DEFAULT_APT_MIRROR}"
+DEFAULT_CARGO_REGISTRY_MIRROR="sparse+https://rsproxy.cn/index/"
+DEFAULT_NPM_REGISTRY_MIRROR="https://registry.npmmirror.com"
+DOCKERHUB_MIRROR_HOST="m.daocloud.io"
+
+image_ref_has_registry() {
+  local image_ref="$1"
+  local first_segment="${image_ref%%/*}"
+  [[ "${image_ref}" == */* ]] && {
+    [[ "${first_segment}" == *.* ]] || [[ "${first_segment}" == *:* ]] || [[ "${first_segment}" == "localhost" ]]
+  }
+}
+
+dockerhub_mirror_ref() {
+  local image_ref="$1"
+
+  if [[ "${image_ref}" == "${DOCKERHUB_MIRROR_HOST}/docker.io/"* ]]; then
+    printf '%s\n' "${image_ref}"
+  elif [[ "${image_ref}" == docker.io/* ]]; then
+    printf '%s/%s\n' "${DOCKERHUB_MIRROR_HOST}" "${image_ref}"
+  elif image_ref_has_registry "${image_ref}"; then
+    printf '%s\n' "${image_ref}"
+  elif [[ "${image_ref}" == */* ]]; then
+    printf '%s/docker.io/%s\n' "${DOCKERHUB_MIRROR_HOST}" "${image_ref}"
+  else
+    printf '%s/docker.io/library/%s\n' "${DOCKERHUB_MIRROR_HOST}" "${image_ref}"
+  fi
+}
+
+dockerhub_library_mirror_ref() {
+  local image_ref="$1"
+
+  if image_ref_has_registry "${image_ref}"; then
+    printf '%s\n' "${image_ref}"
+  elif [[ "${image_ref}" == */* ]]; then
+    printf '%s\n' "${image_ref}"
+  else
+    dockerhub_mirror_ref "${image_ref}"
+  fi
+}
+
+dockerhub_upstream_ref() {
+  local image_ref="$1"
+
+  if [[ "${image_ref}" == "${DOCKERHUB_MIRROR_HOST}/docker.io/"* ]]; then
+    printf '%s\n' "${image_ref#${DOCKERHUB_MIRROR_HOST}/}"
+  elif [[ "${image_ref}" == docker.io/* ]]; then
+    printf '%s\n' "${image_ref}"
+  elif image_ref_has_registry "${image_ref}"; then
+    printf '%s\n' "${image_ref}"
+  elif [[ "${image_ref}" == */* ]]; then
+    printf 'docker.io/%s\n' "${image_ref}"
+  else
+    printf 'docker.io/library/%s\n' "${image_ref}"
+  fi
+}
+
+dockerhub_short_ref() {
+  local upstream_ref="$1"
+
+  upstream_ref="$(dockerhub_upstream_ref "${upstream_ref}")"
+  if [[ "${upstream_ref}" == docker.io/library/* ]]; then
+    printf '%s\n' "${upstream_ref#docker.io/library/}"
+    return 0
+  fi
+  if [[ "${upstream_ref}" == docker.io/* ]]; then
+    printf '%s\n' "${upstream_ref#docker.io/}"
+    return 0
+  fi
+  return 1
+}
+
+resolve_env_or_default() {
+  local var_name="$1"
+  local default_value="$2"
+
+  if [ "${!var_name+x}" = x ]; then
+    printf '%s\n' "${!var_name}"
+  else
+    printf '%s\n' "${default_value}"
+  fi
+}
+
+APT_MIRROR="$(resolve_env_or_default APT_MIRROR "${DEFAULT_APT_MIRROR}")"
+UBUNTU_APT_MIRROR="$(resolve_env_or_default UBUNTU_APT_MIRROR "${DEFAULT_UBUNTU_APT_MIRROR}")"
+CARGO_REGISTRY_MIRROR="$(resolve_env_or_default CARGO_REGISTRY_MIRROR "${DEFAULT_CARGO_REGISTRY_MIRROR}")"
+NPM_REGISTRY_MIRROR="$(resolve_env_or_default NPM_REGISTRY_MIRROR "${DEFAULT_NPM_REGISTRY_MIRROR}")"
+FRONTEND_BUILDER_IMAGE="$(resolve_env_or_default FRONTEND_BUILDER_IMAGE "$(dockerhub_library_mirror_ref 'node:22-bookworm')")"
+RUST_BUILDER_IMAGE="$(resolve_env_or_default RUST_BUILDER_IMAGE "$(dockerhub_library_mirror_ref 'rust:1.85-bookworm')")"
+MEDIA_CORE_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_CORE_RUNTIME_BASE_IMAGE "$(dockerhub_library_mirror_ref 'debian:bookworm-slim')")"
+MEDIA_AGENT_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:7.1-ubuntu2404')"
+MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:7.1-nvidia2204')"
+POSTGRES_SOURCE_IMAGE="$(resolve_env_or_default POSTGRES_SOURCE_IMAGE "$(dockerhub_library_mirror_ref 'postgres:18.3')")"
+ZLM_SOURCE_IMAGE="$(resolve_env_or_default ZLM_SOURCE_IMAGE 'zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f')"
 
 log() {
   printf '[offline-package] %s\n' "$*"
@@ -43,15 +127,15 @@ usage() {
   默认输出到 ./dist。
 
 环境变量:
-  APT_MIRROR             默认留空，使用 Debian 官方源；如设置则用于 Debian 构建阶段，也会作为 media-agent Ubuntu 运行时的默认镜像源。
-  UBUNTU_APT_MIRROR      默认留空，使用 Ubuntu 官方源；如设置则覆盖 media-agent CPU/GPU 运行时的 Ubuntu 源。
-  CARGO_REGISTRY_MIRROR  默认留空，使用 crates.io 官方源；如设置则覆盖 Cargo registry。
-  NPM_REGISTRY_MIRROR    默认留空，使用 npm 官方源；如设置则覆盖前端构建 registry。
-  FRONTEND_BUILDER_IMAGE 默认 node:22-bookworm；可覆写前端构建基础镜像。
-  RUST_BUILDER_IMAGE     默认 rust:1.85-bookworm；可覆写 Rust 构建基础镜像。
+  APT_MIRROR             默认 http://mirrors.aliyun.com；如显式置空则回退 Debian 官方源，也会作为 media-agent Ubuntu 运行时的默认镜像源。
+  UBUNTU_APT_MIRROR      默认 http://mirrors.aliyun.com；如显式置空则回退 Ubuntu 官方源；如设置则覆盖 media-agent CPU/GPU 运行时的 Ubuntu 源。
+  CARGO_REGISTRY_MIRROR  默认 sparse+https://rsproxy.cn/index/；如显式置空则回退 crates.io 官方源。
+  NPM_REGISTRY_MIRROR    默认 https://registry.npmmirror.com；如显式置空则回退 npm 官方源。
+  FRONTEND_BUILDER_IMAGE 默认 m.daocloud.io/docker.io/library/node:22-bookworm；可覆写前端构建基础镜像。
+  RUST_BUILDER_IMAGE     默认 m.daocloud.io/docker.io/library/rust:1.85-bookworm；可覆写 Rust 构建基础镜像。
   MUSL_CARGO_HOME_DIR    默认 ./.build-cache/musl/cargo-home；可覆写 musl 构建的 Cargo 缓存目录。
   MUSL_CARGO_TARGET_DIR  默认 ./target/docker-musl；可覆写 musl 构建的 target 缓存目录。
-  MEDIA_CORE_RUNTIME_BASE_IMAGE      默认 debian:bookworm-slim；可覆写 media-core 运行时基础镜像。
+  MEDIA_CORE_RUNTIME_BASE_IMAGE      默认 m.daocloud.io/docker.io/library/debian:bookworm-slim；可覆写 media-core 运行时基础镜像。
   MEDIA_AGENT_RUNTIME_BASE_IMAGE     默认 jrottenberg/ffmpeg:7.1-ubuntu2404；可覆写 media-agent CPU 运行时基础镜像。
   MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 默认 jrottenberg/ffmpeg:7.1-nvidia2204；可覆写 media-agent GPU 运行时基础镜像。
   POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
@@ -296,17 +380,31 @@ smoke_test_media_agent_image() {
 
 local_source_candidate() {
   local image_ref="$1"
-  if docker image inspect "${image_ref}" >/dev/null 2>&1; then
-    printf '%s\n' "${image_ref}"
-    return 0
+  local upstream_ref=""
+  local short_ref=""
+  local candidate=""
+
+  upstream_ref="$(dockerhub_upstream_ref "${image_ref}")"
+  if short_ref="$(dockerhub_short_ref "${image_ref}")"; then
+    :
+  else
+    short_ref=""
   fi
-  if [[ "${image_ref}" == *"@"* ]]; then
-    local tag_ref="${image_ref%@*}"
-    if docker image inspect "${tag_ref}" >/dev/null 2>&1; then
-      printf '%s\n' "${tag_ref}"
+
+  while IFS= read -r candidate; do
+    [ -n "${candidate}" ] || continue
+    if docker image inspect "${candidate}" >/dev/null 2>&1; then
+      printf '%s\n' "${candidate}"
       return 0
     fi
-  fi
+  done <<EOF
+${image_ref}
+${image_ref%@*}
+${upstream_ref}
+${upstream_ref%@*}
+${short_ref}
+${short_ref%@*}
+EOF
   return 1
 }
 
@@ -711,6 +809,18 @@ main() {
   else
     log "Cargo 使用 crates.io 官方源"
   fi
+  if [ -n "${NPM_REGISTRY_MIRROR}" ]; then
+    log "使用 npm 镜像: ${NPM_REGISTRY_MIRROR}"
+  else
+    log "npm 使用官方 registry"
+  fi
+  log "前端构建基础镜像: ${FRONTEND_BUILDER_IMAGE}"
+  log "Rust 构建基础镜像: ${RUST_BUILDER_IMAGE}"
+  log "media-core 运行时基础镜像: ${MEDIA_CORE_RUNTIME_BASE_IMAGE}"
+  log "media-agent CPU 运行时基础镜像: ${MEDIA_AGENT_RUNTIME_BASE_IMAGE}"
+  log "media-agent GPU 运行时基础镜像: ${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}"
+  log "PostgreSQL 拉取源: ${POSTGRES_SOURCE_IMAGE}"
+  log "ZLMediaKit 拉取源: ${ZLM_SOURCE_IMAGE}"
 
   version="$(workspace_version)"
   [ -n "${version}" ] || fail "无法从 Cargo.toml 解析版本号"

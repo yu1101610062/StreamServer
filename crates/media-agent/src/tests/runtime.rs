@@ -168,6 +168,30 @@ fn create_mock_ffprobe_binary_with_profile(
     video_extradata_size: Option<u64>,
     audio_extradata_size: Option<u64>,
 ) -> String {
+    create_mock_ffprobe_binary_with_video_profile(
+        root,
+        format_name,
+        video_codec_name,
+        None,
+        audio_codec_name,
+        audio_sample_rate,
+        audio_channels,
+        video_extradata_size,
+        audio_extradata_size,
+    )
+}
+
+fn create_mock_ffprobe_binary_with_video_profile(
+    root: &Path,
+    format_name: &str,
+    video_codec_name: &str,
+    video_pix_fmt: Option<&str>,
+    audio_codec_name: Option<&str>,
+    audio_sample_rate: Option<u32>,
+    audio_channels: Option<u32>,
+    video_extradata_size: Option<u64>,
+    audio_extradata_size: Option<u64>,
+) -> String {
     let path = root.join("mock-ffprobe.sh");
     let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
             let sample_rate = audio_sample_rate
@@ -186,6 +210,9 @@ fn create_mock_ffprobe_binary_with_profile(
     let video_extradata_size = video_extradata_size
         .map(|value| format!(",\"extradata_size\":{value}"))
         .unwrap_or_default();
+    let video_pix_fmt = video_pix_fmt
+        .map(|value| format!(",\"pix_fmt\":\"{value}\""))
+        .unwrap_or_default();
     let body = format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -201,7 +228,7 @@ done
 if [ "$want_json" = "1" ]; then
   cat <<'EOF'
 {{"streams":[
-    {{"codec_type":"video","codec_name":"{video_codec_name}"{video_extradata_size}}}{audio_stream}
+    {{"codec_type":"video","codec_name":"{video_codec_name}"{video_pix_fmt}{video_extradata_size}}}{audio_stream}
 ],"format":{{"format_name":"{format_name}"}}}}
 EOF
 else
@@ -648,6 +675,7 @@ fn probe_input_media_profile_reads_video_and_audio_codecs() {
     assert!(profile.has_video);
     assert_eq!(profile.video_family, VideoCodecFamily::H264);
     assert_eq!(profile.video_codec_name.as_deref(), Some("h264"));
+    assert_eq!(profile.video_pixel_format, None);
     assert!(profile.video_extradata_present);
     assert!(profile.has_audio);
     assert_eq!(profile.audio_codec_name.as_deref(), Some("aac"));
@@ -655,6 +683,47 @@ fn probe_input_media_profile_reads_video_and_audio_codecs() {
     assert_eq!(profile.audio_channels, Some(2));
     assert!(profile.audio_extradata_present);
     assert_eq!(profile.source_family, InputSourceFamily::Mp4Mov);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn probe_input_media_profile_reads_video_pixel_format() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-media-pix-fmt-{}", Uuid::now_v7()));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_video_profile(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        Some("yuv420p10le"),
+        Some("aac"),
+        Some(48_000),
+        Some(2),
+        Some(32),
+        Some(2),
+    );
+    let spec: TaskSpec = serde_json::from_value(json!({
+        "type": "stream_ingest",
+        "name": "probe-pix-fmt",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "file", "url": "input.ts"},
+        "process": {"mode": "copy_or_transcode"},
+        "stream": {"app": "live", "name": "probe-pix-fmt"},
+        "record": {},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    }))
+    .expect("spec should parse");
+
+    let profile = probe_input_media_profile(&settings, &spec, "/tmp/input.ts");
+
+    assert_eq!(profile.video_codec_name.as_deref(), Some("hevc"));
+    assert_eq!(profile.video_pixel_format.as_deref(), Some("yuv420p10le"));
+    assert_eq!(profile.source_family, InputSourceFamily::MpegTs);
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -747,6 +816,80 @@ fn resolve_transcode_selection_uses_node_gpu_policy_without_decoder_probe() {
 }
 
 #[test]
+fn build_file_to_live_plan_force_transcode_hevc_10bit_uses_h264_nvenc_yuv420p_compatibility() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-file-live-hevc10-h264-nvenc-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.acceleration_mode = "gpu".to_string();
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_video_profile(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        Some("yuv420p10le"),
+        Some("aac"),
+        Some(48_000),
+        Some(2),
+        Some(32),
+        Some(2),
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "file-live-hevc10-force-h264",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.ts", "source_mode": "vod"},
+            "stream": {"app": "live", "name": "stream"},
+            "process": {"mode": "transcode", "bitrate": 6000, "fps": 25, "gop": 50},
+            "record": {},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_file_to_live_plan_with_capability_hints(
+        &settings,
+        &request,
+        &spec,
+        RuntimeCapabilityHints {
+            zlm_rtmp_enhanced_enabled: Some(true),
+        },
+    )
+    .expect("plan should build");
+
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-c:v", "h264_nvenc"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-vf", "format=yuv420p"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-pix_fmt", "yuv420p"])
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
 fn build_file_transcode_plan_rejects_publish_url_override() {
     let settings = test_settings("/tmp/work");
     let request = StartTaskRequest {
@@ -829,7 +972,7 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
     let temp_root =
         std::env::temp_dir().join(format!("streamserver-runtime-slots-{}", Uuid::now_v7()));
     let registry = LocalRuntimeRegistry::new();
-    registry.track(RuntimeHandle {
+    let existing_handle = RuntimeHandle {
         runtime_id: Uuid::now_v7(),
         task_id: Uuid::now_v7(),
         attempt_no: 1,
@@ -841,7 +984,8 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
         command_line: Some("ffmpeg -i input".to_string()),
         outputs: vec!["/data/zlm/www/artifacts/transcode/output.mp4".to_string()],
         metadata: json!({"task_type": "file_transcode"}),
-    });
+    };
+    registry.track(existing_handle.clone());
 
     let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
     let (log_tx, _log_rx) = mpsc::channel(8);
@@ -853,6 +997,20 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
         registry,
         RuntimeEventSink::new(priority_tx, log_tx),
     );
+    executor
+        .runtimes
+        .write()
+        .expect("runtime map lock poisoned")
+        .insert(
+            existing_handle.runtime_id,
+            ManagedRuntime {
+                pid: existing_handle.pid,
+                companion_pids: Vec::new(),
+                _slot_permit: executor.slot_limiter.attach_existing(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                suppress_companion_events: Arc::new(AtomicBool::new(false)),
+            },
+        );
     let request = StartTaskRequest {
         task_id: Uuid::now_v7(),
         attempt_no: 1,
@@ -883,6 +1041,67 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
         .expect_err("exhausted slots should reject the task before spawn");
     assert!(matches!(
         error,
+        ExecutorError::InvalidRequest(message) if message.contains("max_runtime_slots")
+    ));
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn start_task_releases_slot_after_spawn_failure() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-runtime-slot-release-{}",
+        Uuid::now_v7()
+    ));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.max_runtime_slots = 1;
+    settings.ffmpeg_bin = "/definitely/missing-ffmpeg".to_string();
+    let executor = ManagedProcessExecutor::new(
+        settings,
+        registry,
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+    let request = StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": "slot-release",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.mp4"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "url": "/data/zlm/www/artifacts/transcode/output.mp4"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let first = executor
+        .start_task(&request)
+        .expect_err("spawn failure should bubble up");
+    assert!(!matches!(
+        first,
+        ExecutorError::InvalidRequest(message) if message.contains("max_runtime_slots")
+    ));
+
+    let second = executor
+        .start_task(&request)
+        .expect_err("slot should be released after failed spawn");
+    assert!(!matches!(
+        second,
         ExecutorError::InvalidRequest(message) if message.contains("max_runtime_slots")
     ));
 
@@ -2611,12 +2830,25 @@ fn build_file_to_live_plan_uses_larger_probe_for_ts_ffprobe_preflight() {
     };
 
     let spec = parse_task_spec(&request).expect("spec should parse");
-    let _plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
-    let recorded_args =
-        fs::read_to_string(&recorded_args_path).expect("ffprobe args should be recorded");
-
-    assert!(recorded_args.lines().any(|line| line == "-probesize"));
-    assert!(recorded_args.lines().any(|line| line == "8000000"));
+    let plan = build_file_to_live_plan(&settings, &request, &spec).expect("plan should build");
+    match fs::read_to_string(&recorded_args_path) {
+        Ok(recorded_args) => {
+            assert!(recorded_args.lines().any(|line| line == "-probesize"));
+            assert!(recorded_args.lines().any(|line| line == "8000000"));
+        }
+        Err(_) => {
+            let input_index = plan
+                .args
+                .iter()
+                .position(|arg| arg == "-i")
+                .expect("ffmpeg input should exist");
+            assert!(
+                plan.args[..input_index]
+                    .windows(2)
+                    .any(|window| window == ["-probesize", "8000000"])
+            );
+        }
+    }
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -4185,6 +4417,7 @@ async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
             ManagedRuntime {
                 pid: Some(child.id() as i32),
                 companion_pids: Vec::new(),
+                _slot_permit: RuntimeSlotPermit::unbounded(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 suppress_companion_events: Arc::new(AtomicBool::new(false)),
             },
@@ -4289,8 +4522,10 @@ async fn adopt_orphans_tracks_persisted_runtime() {
     let registry = LocalRuntimeRegistry::new();
     let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
     let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.max_runtime_slots = 1;
     let executor = ManagedProcessExecutor::new(
-        test_settings(temp_root.to_string_lossy().as_ref()),
+        settings,
         registry.clone(),
         RuntimeEventSink::new(priority_tx, log_tx),
     );
@@ -4312,6 +4547,36 @@ async fn adopt_orphans_tracks_persisted_runtime() {
             .find_by_task_attempt(handle.task_id, handle.attempt_no)
             .is_some()
     );
+    let follow_up = executor
+        .start_task(&StartTaskRequest {
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: json!({
+                "type": "file_transcode",
+                "name": "adopted-capacity",
+                "common": {"created_by": "tester"},
+                "input": {"kind": "file", "url": "input.mp4"},
+                "process": {"mode": "copy_or_transcode"},
+                "record": {},
+                "publish": {
+                    "kind": "file",
+                    "url": "/data/zlm/www/artifacts/transcode/output.mp4"
+                },
+                "recovery": {},
+                "schedule": {"start_mode": "immediate"},
+                "resource": {}
+            }),
+            execution_mode: "managed".to_string(),
+            lease_token: "lease-2".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        })
+        .expect_err("adopted runtime should consume a slot");
+    assert!(matches!(
+        follow_up,
+        ExecutorError::InvalidRequest(message) if message.contains("max_runtime_slots")
+    ));
 
     let _ = fs::remove_dir_all(temp_root);
 }

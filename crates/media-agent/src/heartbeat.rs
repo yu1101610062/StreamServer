@@ -55,10 +55,14 @@ impl HeartbeatSampler {
             .and_then(ArtifactCleanupManager::current_disk_percent)
             .or_else(|| sample_disk_percent(&self.work_root))
             .unwrap_or(0.0);
+        let occupied_tasks = running_tasks
+            .saturating_add(starting_tasks)
+            .saturating_add(stopping_tasks)
+            .saturating_add(orphaned_tasks);
         let slot_usage = if self.max_runtime_slots == 0 {
             0.0
         } else {
-            (running_tasks as f64 / self.max_runtime_slots as f64).clamp(0.0, 1.0)
+            (occupied_tasks as f64 / self.max_runtime_slots as f64).clamp(0.0, 1.0)
         };
 
         HeartbeatSnapshot {

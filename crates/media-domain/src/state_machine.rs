@@ -27,18 +27,28 @@ impl TaskStatus {
                 | (Queued, Failed)
                 | (Dispatching, Queued)
                 | (Dispatching, Starting)
+                | (Dispatching, Reclaiming)
                 | (Starting, Running)
                 | (Starting, Failed)
+                | (Starting, Reclaiming)
                 | (Running, Stopping)
                 | (Running, Failed)
                 | (Running, Lost)
+                | (Running, Reclaiming)
                 | (Stopping, Succeeded)
                 | (Stopping, Canceled)
                 | (Stopping, Failed)
+                | (Stopping, Reclaiming)
                 | (Lost, Recovering)
                 | (Lost, Queued)
                 | (Recovering, Running)
                 | (Recovering, Failed)
+                | (Recovering, Reclaiming)
+                | (Reclaiming, Starting)
+                | (Reclaiming, Running)
+                | (Reclaiming, Stopping)
+                | (Reclaiming, Recovering)
+                | (Reclaiming, Lost)
                 | (Failed, Queued)
                 | (Failed, Validating)
                 | (Canceled, Validating)
@@ -62,9 +72,9 @@ impl TaskStatus {
 
         let next = match (operation, self) {
             (Start, Created | Failed | Canceled) => Validating,
-            (Stop, Dispatching | Starting | Running | Recovering) => Stopping,
+            (Stop, Dispatching | Starting | Running | Recovering | Reclaiming) => Stopping,
             (Cancel, Created | Validating | Queued) => Canceled,
-            (Cancel, Dispatching | Starting | Running | Recovering) => Stopping,
+            (Cancel, Dispatching | Starting | Running | Recovering | Reclaiming) => Stopping,
             (Retry, Failed | Lost) => Queued,
             (Clone, Succeeded | Failed | Canceled | Lost) => Created,
             _ => {
