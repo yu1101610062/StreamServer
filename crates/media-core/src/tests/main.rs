@@ -2193,7 +2193,7 @@ async fn list_streams_collapses_duplicate_bindings_for_same_logical_stream() -> 
 }
 
 #[tokio::test]
-async fn list_streams_omits_entries_when_runtime_lookup_fails() -> anyhow::Result<()> {
+async fn list_streams_returns_fallback_entries_when_runtime_lookup_fails() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -2231,7 +2231,14 @@ async fn list_streams_omits_entries_when_runtime_lookup_fails() -> anyhow::Resul
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     let items = body.as_array().expect("streams should be a list");
-    assert!(items.is_empty());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["stream"], json!("camera01"));
+    assert!(items[0].get("viewer_count").is_none());
+    assert_eq!(items[0]["has_viewer"], Value::Null);
+    assert_eq!(
+        items[0]["play_urls"],
+        json!(["rtsp://stream.example/live/camera01"])
+    );
 
     db.cleanup().await?;
     Ok(())

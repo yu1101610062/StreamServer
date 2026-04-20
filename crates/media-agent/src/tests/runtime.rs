@@ -2350,6 +2350,9 @@ fn prepare_plan_paths_creates_live_relay_recording_root_dirs() {
             auto_stop_requested: false,
             completion_reason: None,
             started: false,
+            keyframe_wait_started_at: None,
+            keyframe_baseline: None,
+            keyframe_gate_satisfied: false,
             failed: false,
         }),
         managed_file_output_kind: None,
@@ -3758,6 +3761,9 @@ fn recording_duration_reached_uses_recording_start_time() {
         auto_stop_requested: false,
         completion_reason: None,
         started: true,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
         failed: false,
     };
 
@@ -3785,6 +3791,9 @@ fn should_auto_stop_live_relay_recording_requires_started_and_not_already_reques
         auto_stop_requested: false,
         completion_reason: None,
         started: true,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
         failed: false,
     };
 
@@ -3954,6 +3963,9 @@ fn build_record_api_params_uses_expected_zlm_shape() {
         auto_stop_requested: false,
         completion_reason: None,
         started: false,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
         failed: false,
     };
 
@@ -3989,6 +4001,9 @@ fn build_record_api_params_defaults_mp4_to_task_duration() {
         auto_stop_requested: false,
         completion_reason: None,
         started: false,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
         failed: false,
     };
 
@@ -4018,6 +4033,9 @@ fn build_record_api_params_uses_long_default_for_unbounded_mp4() {
         auto_stop_requested: false,
         completion_reason: None,
         started: false,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
         failed: false,
     };
 
@@ -4171,6 +4189,150 @@ fn zlm_stream_online_in_body_allows_any_schema_when_probe_schema_is_absent() {
     };
 
     assert!(zlm_stream_online_in_body(&body, &target));
+}
+
+#[test]
+fn zlm_stream_status_in_body_extracts_video_track_keyframe_fields() {
+    let body = json!({
+        "code": 0,
+        "data": [
+            {
+                "schema": "rtmp",
+                "vhost": "__defaultVhost__",
+                "app": "relay",
+                "stream": "stream-1",
+                "tracks": [
+                    {
+                        "codec_type": 1,
+                        "ready": true,
+                        "key_frames": 99
+                    },
+                    {
+                        "codec_type": 0,
+                        "ready": true,
+                        "key_frames": 12,
+                        "gop_interval_ms": 1600
+                    }
+                ]
+            }
+        ]
+    });
+    let target = StartupProbe {
+        schema: Some("rtmp".to_string()),
+        vhost: "__defaultVhost__".to_string(),
+        app: "relay".to_string(),
+        stream: "stream-1".to_string(),
+    };
+
+    let status = zlm_stream_status_in_body(&body, &target).expect("stream should match");
+
+    assert_eq!(status.binding.schema.as_deref(), Some("rtmp"));
+    assert_eq!(status.binding.app, "relay");
+    assert!(status.video_track_ready());
+    assert_eq!(status.video_key_frames(), 12);
+    assert_eq!(status.video_gop_interval_ms(), Some(1600));
+}
+
+fn test_live_relay_recording_for_keyframe_gate() -> LiveRelayRecording {
+    LiveRelayRecording {
+        formats: vec![ZlmRecordKind::Mp4],
+        root_path_mp4: Some("/var/media/archive".to_string()),
+        root_path_hls: None,
+        duration_sec: None,
+        segment_sec: None,
+        as_player: false,
+        recording_started_at: None,
+        auto_stop_requested: false,
+        completion_reason: None,
+        started: false,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
+        failed: false,
+    }
+}
+
+fn test_zlm_media_status(key_frames: u64) -> ZlmMediaStatus {
+    ZlmMediaStatus {
+        binding: StreamBinding {
+            schema: Some("rtmp".to_string()),
+            vhost: "__defaultVhost__".to_string(),
+            app: "relay".to_string(),
+            stream: "stream-1".to_string(),
+        },
+        video_track: Some(ZlmVideoTrackStatus {
+            ready: true,
+            key_frames,
+            gop_interval_ms: Some(1600),
+        }),
+    }
+}
+
+#[test]
+fn evaluate_live_relay_recording_gate_waits_for_next_keyframe() {
+    let recording = test_live_relay_recording_for_keyframe_gate();
+    let now = Utc::now();
+
+    let decision = evaluate_live_relay_recording_gate(&recording, &test_zlm_media_status(10), now);
+
+    match decision {
+        LiveRelayRecordingGateDecision::Wait { recording, event } => {
+            assert_eq!(recording.keyframe_baseline, Some(10));
+            assert_eq!(recording.keyframe_wait_started_at, Some(now));
+            assert!(!recording.keyframe_gate_satisfied);
+            let event = event.expect("waiting event should be emitted");
+            assert_eq!(event.kind, RecordingKeyframeGateEventKind::Waiting);
+            assert_eq!(event.baseline, 10);
+            assert_eq!(event.current_key_frames, 10);
+            assert_eq!(event.gop_interval_ms, Some(1600));
+        }
+        other => panic!("expected wait decision, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluate_live_relay_recording_gate_starts_after_keyframe_increment() {
+    let now = Utc::now();
+    let mut recording = test_live_relay_recording_for_keyframe_gate();
+    recording.keyframe_wait_started_at = Some(now - chrono::Duration::seconds(1));
+    recording.keyframe_baseline = Some(10);
+
+    let decision = evaluate_live_relay_recording_gate(&recording, &test_zlm_media_status(11), now);
+
+    match decision {
+        LiveRelayRecordingGateDecision::Start { recording, event } => {
+            assert!(recording.keyframe_gate_satisfied);
+            let event = event.expect("detected event should be emitted");
+            assert_eq!(event.kind, RecordingKeyframeGateEventKind::Detected);
+            assert_eq!(event.baseline, 10);
+            assert_eq!(event.current_key_frames, 11);
+            assert!(event.waited_ms.is_some());
+        }
+        other => panic!("expected start decision, got {other:?}"),
+    }
+}
+
+#[test]
+fn evaluate_live_relay_recording_gate_times_out_to_existing_behavior() {
+    let now = Utc::now();
+    let mut recording = test_live_relay_recording_for_keyframe_gate();
+    recording.keyframe_wait_started_at =
+        Some(now - chrono::Duration::milliseconds(STARTUP_PROBE_TIMEOUT.as_millis() as i64 + 1));
+    recording.keyframe_baseline = Some(10);
+
+    let decision = evaluate_live_relay_recording_gate(&recording, &test_zlm_media_status(10), now);
+
+    match decision {
+        LiveRelayRecordingGateDecision::Start { recording, event } => {
+            assert!(recording.keyframe_gate_satisfied);
+            let event = event.expect("timeout event should be emitted");
+            assert_eq!(event.kind, RecordingKeyframeGateEventKind::Timeout);
+            assert_eq!(event.baseline, 10);
+            assert_eq!(event.current_key_frames, 10);
+            assert!(event.waited_ms.is_some());
+        }
+        other => panic!("expected timeout start decision, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -4403,6 +4565,9 @@ async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
                 auto_stop_requested: false,
                 completion_reason: None,
                 started: true,
+                keyframe_wait_started_at: None,
+                keyframe_baseline: None,
+                keyframe_gate_satisfied: false,
                 failed: false,
             }
         }),
@@ -4464,6 +4629,9 @@ fn failed_live_relay_recording_is_not_retried() {
         auto_stop_requested: false,
         completion_reason: None,
         started: false,
+        keyframe_wait_started_at: None,
+        keyframe_baseline: None,
+        keyframe_gate_satisfied: false,
         failed: true,
     }));
 }

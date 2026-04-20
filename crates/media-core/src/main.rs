@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{net::TcpListener, sync::watch, time::timeout};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -989,6 +989,7 @@ async fn list_streams(
         .into_iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
+    apply_stream_runtime_fallbacks(&mut streams, &node_lookup);
     let stale_indexes = enrich_streams_with_runtime(&state, &mut streams, &node_lookup).await;
     if !stale_indexes.is_empty() {
         streams = streams
@@ -1278,6 +1279,30 @@ struct StreamRuntimeInfo {
     schemas: BTreeSet<String>,
 }
 
+const STREAM_RUNTIME_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn apply_stream_runtime_fallbacks(
+    streams: &mut [repository::StreamSummary],
+    nodes: &HashMap<Uuid, NodeSummary>,
+) {
+    for stream in streams {
+        let Some(node_id) = stream.node_id else {
+            continue;
+        };
+        let Some(node) = nodes.get(&node_id) else {
+            continue;
+        };
+        if stream.play_urls.is_empty() {
+            stream.play_urls = build_fallback_play_urls(
+                &node.agent_stream_addr,
+                &stream.schema,
+                &stream.app,
+                &stream.stream,
+            );
+        }
+    }
+}
+
 async fn enrich_streams_with_runtime(
     state: &AppState,
     streams: &mut [repository::StreamSummary],
@@ -1298,8 +1323,8 @@ async fn enrich_streams_with_runtime(
         let Some(node) = nodes.get(&node_id) else {
             continue;
         };
-        match load_zlm_media_index(state, node_id).await {
-            Ok(index) => {
+        match timeout(STREAM_RUNTIME_LOOKUP_TIMEOUT, load_zlm_media_index(state, node_id)).await {
+            Ok(Ok(index)) => {
                 for stream_index in indexes {
                     let stream = &mut streams[stream_index];
                     let key = (
@@ -1324,15 +1349,20 @@ async fn enrich_streams_with_runtime(
                     }
                 }
             }
-            Err(error) => {
+            Ok(index) => {
+                let error = index.expect_err("ok result handled above");
                 warn!(
                     node_id = %node_id,
                     error = %error,
-                    "failed to enrich stream runtime from ZLM; omitting unverified streams"
+                    "failed to enrich stream runtime from ZLM; returning fallback stream data"
                 );
-                for stream_index in indexes {
-                    stale_indexes.insert(stream_index);
-                }
+            }
+            Err(_) => {
+                warn!(
+                    node_id = %node_id,
+                    timeout_ms = STREAM_RUNTIME_LOOKUP_TIMEOUT.as_millis(),
+                    "timed out enriching stream runtime from ZLM; returning fallback stream data"
+                );
             }
         }
     }
