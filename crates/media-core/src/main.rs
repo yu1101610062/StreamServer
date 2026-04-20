@@ -1323,7 +1323,12 @@ async fn enrich_streams_with_runtime(
         let Some(node) = nodes.get(&node_id) else {
             continue;
         };
-        match timeout(STREAM_RUNTIME_LOOKUP_TIMEOUT, load_zlm_media_index(state, node_id)).await {
+        match timeout(
+            STREAM_RUNTIME_LOOKUP_TIMEOUT,
+            load_zlm_media_index(state, node_id),
+        )
+        .await
+        {
             Ok(Ok(index)) => {
                 for stream_index in indexes {
                     let stream = &mut streams[stream_index];
