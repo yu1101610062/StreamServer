@@ -592,6 +592,7 @@ const RUNTIME_STATE_FILE: &str = "runtime.json";
 const RUNTIME_PID_FILE: &str = "runtime.pid";
 const RUNTIME_COMMAND_FILE: &str = "runtime.cmd";
 const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+const RECORDING_KEYFRAME_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_PROBE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -5105,7 +5106,7 @@ fn recording_keyframe_wait_elapsed_ms(
 
 fn recording_keyframe_wait_timed_out(recording: &LiveRelayRecording, now: DateTime<Utc>) -> bool {
     recording_keyframe_wait_elapsed_ms(recording, now)
-        .is_some_and(|elapsed_ms| elapsed_ms >= STARTUP_PROBE_TIMEOUT.as_millis() as u64)
+        .is_some_and(|elapsed_ms| elapsed_ms >= RECORDING_KEYFRAME_WAIT_TIMEOUT.as_millis() as u64)
 }
 
 fn mark_recording_waiting_for_keyframe(
@@ -6371,11 +6372,15 @@ fn spawn_startup_probe_monitor(
                 }
 
                 let startup_ready = live_relay_startup_ready(&handle);
-                let should_emit_running = startup_ready
-                    && (!startup_completed
-                        || handle.state != RuntimeState::Running
-                        || !stream_online(&handle)
-                        || recording_started);
+                if !startup_ready {
+                    sleep(STARTUP_PROBE_POLL_INTERVAL).await;
+                    continue;
+                }
+
+                let should_emit_running = !startup_completed
+                    || handle.state != RuntimeState::Running
+                    || !stream_online(&handle)
+                    || recording_started;
                 let running_handle = if should_emit_running {
                     let running_handle = registry
                         .update(runtime_id, |runtime| {

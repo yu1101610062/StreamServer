@@ -4317,7 +4317,11 @@ fn evaluate_live_relay_recording_gate_times_out_to_existing_behavior() {
     let now = Utc::now();
     let mut recording = test_live_relay_recording_for_keyframe_gate();
     recording.keyframe_wait_started_at =
-        Some(now - chrono::Duration::milliseconds(STARTUP_PROBE_TIMEOUT.as_millis() as i64 + 1));
+        Some(
+            now - chrono::Duration::milliseconds(
+                RECORDING_KEYFRAME_WAIT_TIMEOUT.as_millis() as i64 + 1,
+            ),
+        );
     recording.keyframe_baseline = Some(10);
 
     let decision = evaluate_live_relay_recording_gate(&recording, &test_zlm_media_status(10), now);
@@ -4333,6 +4337,233 @@ fn evaluate_live_relay_recording_gate_times_out_to_existing_behavior() {
         }
         other => panic!("expected timeout start decision, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_probe_monitor_times_out_keyframe_wait_for_managed_live_recording() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{
+        net::TcpListener,
+        sync::Mutex,
+        time::{Duration, timeout},
+    };
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn get_media_list(Query(_params): Query<HashMap<String, String>>) -> Json<Value> {
+        Json(json!({
+            "code": 0,
+            "data": [{
+                "schema": "rtmp",
+                "vhost": "__defaultVhost__",
+                "app": "objective",
+                "stream": "objective-1",
+                "tracks": [{
+                    "codec_type": 0,
+                    "ready": true,
+                    "key_frames": 2,
+                    "gop_interval_ms": 1500
+                }]
+            }]
+        }))
+    }
+
+    async fn start_record(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("startRecord".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/getMediaList", get(get_media_list))
+        .route("/index/api/startRecord", get(start_record))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-keyframe-startup-timeout-{}",
+        Uuid::now_v7()
+    ));
+    let work_dir = temp_root.join("task").join("attempt-1");
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep should spawn");
+    let task_id = Uuid::now_v7();
+    let runtime_id = Uuid::now_v7();
+    let startup_probe = StartupProbe {
+        schema: Some("rtmp".to_string()),
+        vhost: "__defaultVhost__".to_string(),
+        app: "objective".to_string(),
+        stream: "objective-1".to_string(),
+    };
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-record-only-http-ts",
+        "common": {"created_by": "tester"},
+        "input": {
+            "kind": "http_ts",
+            "source_mode": "live",
+            "url": "http://camera.example/live.ts"
+        },
+        "stream": {"app": "objective", "name": "objective-1"},
+        "expose": {
+            "enable_rtsp": false,
+            "enable_rtmp": false,
+            "enable_http_ts": false,
+            "enable_http_fmp4": false,
+            "enable_hls": false
+        },
+        "record": {"enabled": true, "format": "mp4"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let handle = RuntimeHandle {
+        runtime_id,
+        task_id,
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(child.id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Starting,
+        command_line: Some("ffmpeg -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1:1935/objective/objective-1".to_string()],
+        metadata: json!({
+            "task_type": "stream_ingest",
+            "execution_mode": "managed",
+            "lease_token": "lease",
+            "resolved_spec": resolved_spec,
+            "startup_probe": startup_probe,
+            "recording": test_live_relay_recording_for_keyframe_gate(),
+        }),
+    };
+    registry.track(handle);
+    let runtimes = Arc::new(RwLock::new(HashMap::new()));
+    runtimes
+        .write()
+        .expect("runtime map lock poisoned")
+        .insert(
+            runtime_id,
+            ManagedRuntime {
+                pid: Some(child.id() as i32),
+                companion_pids: Vec::new(),
+                _slot_permit: RuntimeSlotPermit::unbounded(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                suppress_companion_events: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+    spawn_startup_probe_monitor(
+        runtime_id,
+        work_dir.clone(),
+        SuccessCheck::ProcessExit,
+        StartupProbe {
+            schema: Some("rtmp".to_string()),
+            vhost: "__defaultVhost__".to_string(),
+            app: "objective".to_string(),
+            stream: "objective-1".to_string(),
+        },
+        settings,
+        Client::new(),
+        registry.clone(),
+        runtimes,
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+
+    let mut seen_events = Vec::new();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let notification = priority_rx.recv().await.expect("event stream should stay open");
+            if let RuntimeNotification::TaskEvent(event) = notification {
+                if event.task_id != task_id {
+                    continue;
+                }
+                seen_events.push(event.event_type.clone());
+                if seen_events.contains(&"recording_waiting_for_keyframe".to_string())
+                    && seen_events.contains(&"recording_keyframe_wait_timeout".to_string())
+                    && seen_events.contains(&"recording_started".to_string())
+                    && seen_events.contains(&"running".to_string())
+                {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("startup probe should fall back to start recording");
+
+    let waiting_index = seen_events
+        .iter()
+        .position(|event| event == "recording_waiting_for_keyframe")
+        .expect("waiting event should exist");
+    let timeout_index = seen_events
+        .iter()
+        .position(|event| event == "recording_keyframe_wait_timeout")
+        .expect("timeout event should exist");
+    let started_index = seen_events
+        .iter()
+        .position(|event| event == "recording_started")
+        .expect("recording_started event should exist");
+    let running_index = seen_events
+        .iter()
+        .position(|event| event == "running")
+        .expect("running event should exist");
+    assert!(waiting_index < timeout_index);
+    assert!(timeout_index < started_index);
+    assert!(started_index < running_index);
+
+    let captured = calls.lock().await.clone();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0, "startRecord");
+
+    let updated_handle = registry
+        .get(runtime_id)
+        .expect("runtime handle should still exist");
+    let recording = live_relay_recording_from_handle(&updated_handle)
+        .expect("recording metadata should remain present");
+    assert!(recording.started);
+    assert!(recording.keyframe_gate_satisfied);
+    assert!(recording.recording_started_at.is_some());
+    assert_eq!(updated_handle.state, RuntimeState::Running);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    server.abort();
+    let _ = fs::remove_dir_all(temp_root);
 }
 
 #[tokio::test]
