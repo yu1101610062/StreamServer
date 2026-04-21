@@ -63,6 +63,8 @@ pub struct AgentRegistration {
     pub zlm_api_base: String,
     pub zlm_api_secret: String,
     pub agent_stream_addr: String,
+    pub zlm_rtmp_port: u16,
+    pub zlm_rtsp_port: u16,
     pub network_mode: NetworkMode,
     pub ffmpeg_bin: String,
     pub ffprobe_bin: String,

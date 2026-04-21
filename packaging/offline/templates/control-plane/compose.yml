@@ -5,12 +5,13 @@ services:
     image: ${POSTGRES_IMAGE}
     restart: unless-stopped
     network_mode: host
+    command: ["postgres", "-p", "${POSTGRES_PORT}"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p ${POSTGRES_PORT} -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -30,7 +31,7 @@ services:
       STREAMSERVER_UI_DIR: /opt/streamserver/ui
       CORE_HTTP_ADDR: 0.0.0.0:${CORE_HTTP_PORT}
       CORE_GRPC_ADDR: 0.0.0.0:${CORE_GRPC_PORT}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}
       HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
       HOOK_SOURCE_ALLOWLIST: ${HOOK_SOURCE_ALLOWLIST}
       STORAGE_ALLOWLIST: ${STORAGE_ALLOWLIST}

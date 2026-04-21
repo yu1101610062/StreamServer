@@ -169,6 +169,8 @@ export interface NodeSummary {
   labels: string[];
   zlm_api_base: string;
   agent_stream_addr: string;
+  zlm_rtmp_port: number;
+  zlm_rtsp_port: number;
   network_mode: string;
   interfaces: string[];
   healthy: boolean;

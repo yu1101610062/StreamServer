@@ -5915,11 +5915,8 @@ fn spawn_startup_probe_monitor(
                                     handle.metadata["recording_error"] = Value::Null;
                                     handle
                                 });
-                            let _ = persist_runtime_state(
-                                &work_dir,
-                                &updated_handle,
-                                &success_check,
-                            );
+                            let _ =
+                                persist_runtime_state(&work_dir, &updated_handle, &success_check);
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: updated_handle.task_id,
                                 attempt_no: updated_handle.attempt_no,
@@ -5954,10 +5951,8 @@ fn spawn_startup_probe_monitor(
                                         "app": binding.app,
                                         "stream": binding.stream,
                                     });
-                                    runtime.metadata["recording_error"] =
-                                        json!(error.to_string());
-                                    runtime.metadata["recording"] =
-                                        json!(failed_recording.clone());
+                                    runtime.metadata["recording_error"] = json!(error.to_string());
+                                    runtime.metadata["recording"] = json!(failed_recording.clone());
                                     if fatal {
                                         runtime.metadata["recording_fatal_error"] =
                                             json!(error.to_string());
@@ -5973,8 +5968,7 @@ fn spawn_startup_probe_monitor(
                                         "app": binding.app,
                                         "stream": binding.stream,
                                     });
-                                    handle.metadata["recording_error"] =
-                                        json!(error.to_string());
+                                    handle.metadata["recording_error"] = json!(error.to_string());
                                     handle.metadata["recording"] = json!(failed_recording);
                                     if fatal {
                                         handle.metadata["recording_fatal_error"] =
@@ -6004,8 +5998,8 @@ fn spawn_startup_probe_monitor(
                                 }),
                             }));
                             if fatal {
-                                let _ = events
-                                    .send(RuntimeNotification::TaskSnapshot(updated_handle));
+                                let _ =
+                                    events.send(RuntimeNotification::TaskSnapshot(updated_handle));
                                 if signal_pid(pid, libc::SIGTERM).is_ok() {
                                     schedule_force_kill_if_running(
                                         runtime_id,
@@ -6618,8 +6612,8 @@ fn spawn_live_relay_monitor(
                                         handle.metadata["recording_error"] = Value::Null;
                                         handle
                                     });
-                                let _ = events.send(RuntimeNotification::TaskEvent(
-                                    RuntimeTaskEvent {
+                                let _ =
+                                    events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                         task_id: updated_handle.task_id,
                                         attempt_no: updated_handle.attempt_no,
                                         lease_token: runtime_lease_token(&updated_handle)
@@ -6636,8 +6630,7 @@ fn spawn_live_relay_monitor(
                                             "segment_sec": updated_recording.segment_sec,
                                             "as_player": updated_recording.as_player,
                                         }),
-                                    },
-                                ));
+                                    }));
                                 let _ = persist_runtime_state(
                                     &work_dir,
                                     &updated_handle,
@@ -6675,8 +6668,8 @@ fn spawn_live_relay_monitor(
                                         }
                                         handle
                                     });
-                                let _ = events.send(RuntimeNotification::TaskEvent(
-                                    RuntimeTaskEvent {
+                                let _ =
+                                    events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                         task_id: degraded_handle.task_id,
                                         attempt_no: degraded_handle.attempt_no,
                                         lease_token: runtime_lease_token(&degraded_handle)
@@ -6696,8 +6689,7 @@ fn spawn_live_relay_monitor(
                                             "record_roots": recording.root_paths_payload(),
                                             "duration_sec": recording.duration_sec,
                                         }),
-                                    },
-                                ));
+                                    }));
                                 let _ = persist_runtime_state(
                                     &work_dir,
                                     &degraded_handle,
@@ -6735,8 +6727,8 @@ fn spawn_live_relay_monitor(
                                     let _ = events.send(RuntimeNotification::TaskSnapshot(
                                         failed_handle.clone(),
                                     ));
-                                    let _ =
-                                        events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                                    let _ = events.send(RuntimeNotification::TaskEvent(
+                                        RuntimeTaskEvent {
                                             task_id: failed_handle.task_id,
                                             attempt_no: failed_handle.attempt_no,
                                             lease_token: runtime_lease_token(&failed_handle)
@@ -6755,7 +6747,8 @@ fn spawn_live_relay_monitor(
                                                 "record_roots": recording.root_paths_payload(),
                                                 "reason": "recording_start_failed",
                                             }),
-                                        }));
+                                        },
+                                    ));
                                     let _ = remove_managed_runtime(&runtimes, runtime_id);
                                     let _ = registry.remove(runtime_id);
                                     return;

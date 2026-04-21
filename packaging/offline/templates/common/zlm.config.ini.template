@@ -58,6 +58,7 @@ retry_delay=1.0
 
 [http]
 port=__ZLM_HTTP_PORT__
+sslport=__ZLM_HTTPS_PORT__
 rootPath=/data/zlm/www
 allow_cross_domains=1
 allow_ip_range=__ZLM_API_ALLOW_IP_RANGE__
@@ -67,7 +68,32 @@ appName=record
 
 [rtmp]
 port=__ZLM_RTMP_PORT__
+sslport=__ZLM_RTMPS_PORT__
 enhanced=1
 
 [rtsp]
 port=__ZLM_RTSP_PORT__
+sslport=__ZLM_RTSPS_PORT__
+
+[rtp_proxy]
+port=__ZLM_RTP_PROXY_PORT__
+timeoutSec=15
+port_range=__ZLM_RTP_PROXY_PORT_RANGE__
+
+[rtc]
+signalingPort=__ZLM_RTC_SIGNALING_PORT__
+signalingSslPort=__ZLM_RTC_SIGNALING_SSL_PORT__
+icePort=__ZLM_RTC_ICE_PORT__
+iceTcpPort=__ZLM_RTC_ICE_TCP_PORT__
+port=__ZLM_RTC_PORT__
+tcpPort=__ZLM_RTC_TCP_PORT__
+port_range=__ZLM_RTC_PORT_RANGE__
+
+[srt]
+port=__ZLM_SRT_PORT__
+
+[shell]
+port=__ZLM_SHELL_PORT__
+
+[onvif]
+port=__ZLM_ONVIF_PORT__

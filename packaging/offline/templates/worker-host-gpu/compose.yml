@@ -5,7 +5,34 @@ services:
     image: ${ZLM_IMAGE}
     restart: unless-stopped
     network_mode: host
-    command: ["./MediaServer", "-s", "default.pem", "-c", "../conf/config.ini", "-l", "0"]
+    command:
+      - /bin/sh
+      - -ec
+      - /opt/media/conf/render-config.sh /opt/media/conf/config.ini.template /tmp/streamserver-zlm-config.ini && exec ./MediaServer -s default.pem -c /tmp/streamserver-zlm-config.ini -l 0
+    environment:
+      ZLM_API_SECRET: ${HOOK_SHARED_SECRET}
+      ZLM_HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
+      ZLM_SERVER_ID: ${NODE_ID}
+      ZLM_HOOK_BASE: http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}
+      ZLM_API_ALLOW_IP_RANGE: ::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255
+      ZLM_HTTP_PORT: ${ZLM_HTTP_PORT}
+      ZLM_HTTPS_PORT: ${ZLM_HTTPS_PORT}
+      ZLM_RTMP_PORT: ${ZLM_RTMP_PORT}
+      ZLM_RTMPS_PORT: ${ZLM_RTMPS_PORT}
+      ZLM_RTSP_PORT: ${ZLM_RTSP_PORT}
+      ZLM_RTSPS_PORT: ${ZLM_RTSPS_PORT}
+      ZLM_RTP_PROXY_PORT: ${ZLM_RTP_PROXY_PORT}
+      ZLM_RTP_PROXY_PORT_RANGE: ${ZLM_RTP_PROXY_PORT_RANGE}
+      ZLM_RTC_SIGNALING_PORT: ${ZLM_RTC_SIGNALING_PORT}
+      ZLM_RTC_SIGNALING_SSL_PORT: ${ZLM_RTC_SIGNALING_SSL_PORT}
+      ZLM_RTC_ICE_PORT: ${ZLM_RTC_ICE_PORT}
+      ZLM_RTC_ICE_TCP_PORT: ${ZLM_RTC_ICE_TCP_PORT}
+      ZLM_RTC_PORT: ${ZLM_RTC_PORT}
+      ZLM_RTC_TCP_PORT: ${ZLM_RTC_TCP_PORT}
+      ZLM_RTC_PORT_RANGE: ${ZLM_RTC_PORT_RANGE}
+      ZLM_SRT_PORT: ${ZLM_SRT_PORT}
+      ZLM_SHELL_PORT: ${ZLM_SHELL_PORT}
+      ZLM_ONVIF_PORT: ${ZLM_ONVIF_PORT}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:${ZLM_HTTP_PORT}/index/api/getStatistic?secret=${HOOK_SHARED_SECRET}' >/dev/null"]
       interval: 5s
@@ -14,7 +41,8 @@ services:
     volumes:
       - ./data/media/work:/data/media/work
       - ./data/zlm/www:/data/zlm/www
-      - ./zlm/config.ini:/opt/media/conf/config.ini:ro
+      - ./zlm/config.ini.template:/opt/media/conf/config.ini.template:ro
+      - ./zlm/render-config.sh:/opt/media/conf/render-config.sh:ro
 
   media-agent:
     image: ${MEDIA_AGENT_IMAGE}
@@ -31,7 +59,7 @@ services:
       AGENT_NODE_ID: ${NODE_ID}
       AGENT_NODE_NAME: ${AGENT_NODE_NAME}
       AGENT_CORE_ENDPOINT: http://${CORE_GRPC_HOST}:${CORE_GRPC_PORT}
-      AGENT_STREAM_ADDR: http://${PUBLIC_HOST}
+      AGENT_STREAM_ADDR: http://${PUBLIC_HOST}:${ZLM_HTTP_PORT}
       AGENT_PRIMARY_INTERFACE_NAME: ${AGENT_PRIMARY_INTERFACE_NAME}
       AGENT_PRIMARY_INTERFACE_IP: ${AGENT_PRIMARY_INTERFACE_IP}
       OUTPUT_MOUNT_RELATIVE_PREFIX_MP4: ${OUTPUT_MOUNT_RELATIVE_PREFIX_MP4}

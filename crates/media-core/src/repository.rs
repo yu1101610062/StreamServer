@@ -1135,6 +1135,7 @@ impl TaskRepository {
               rf.start_time,
               rf.source,
               rf.created_at,
+              n.agent_stream_addr,
               n.output_mount_relative_prefix_mp4,
               n.output_mount_relative_prefix_hls
             from record_files rf
@@ -1183,6 +1184,7 @@ impl TaskRepository {
               rf.start_time,
               rf.source,
               rf.created_at,
+              n.agent_stream_addr,
               n.output_mount_relative_prefix_mp4,
               n.output_mount_relative_prefix_hls
             from record_files rf
@@ -1224,6 +1226,7 @@ impl TaskRepository {
               ta.http_url,
               ta.file_size,
               ta.created_at,
+              n.agent_stream_addr,
               n.output_mount_relative_prefix_mp4,
               n.output_mount_relative_prefix_hls
             from transcode_artifacts ta
@@ -1268,6 +1271,7 @@ impl TaskRepository {
               ta.http_url,
               ta.file_size,
               ta.created_at,
+              n.agent_stream_addr,
               n.output_mount_relative_prefix_mp4,
               n.output_mount_relative_prefix_hls
             from transcode_artifacts ta
@@ -1296,6 +1300,8 @@ impl TaskRepository {
               n.labels,
               n.zlm_api_base,
               n.agent_stream_addr,
+              n.zlm_rtmp_port,
+              n.zlm_rtsp_port,
               n.network_mode,
               n.interfaces,
               n.healthy,
@@ -3174,12 +3180,13 @@ impl TaskRepository {
             r#"
             insert into media_nodes (
               id, node_name, hostname, labels, zlm_api_base, zlm_api_secret, agent_stream_addr,
+              zlm_rtmp_port, zlm_rtsp_port,
               output_mount_relative_prefix_mp4, output_mount_relative_prefix_hls,
               network_mode, interfaces, healthy, control_connected, last_seen_at,
               control_last_seen_at, created_at, updated_at
             ) values (
               $1, $2, $3, $4, $5, $6, $7,
-              $8, $9, $10, $11, true, true, $12, $12, $13, $13
+              $8, $9, $10, $11, $12, $13, true, true, $14, $14, $15, $15
             )
             on conflict (id) do update
                set node_name = excluded.node_name,
@@ -3188,6 +3195,8 @@ impl TaskRepository {
                    zlm_api_base = excluded.zlm_api_base,
                    zlm_api_secret = excluded.zlm_api_secret,
                    agent_stream_addr = excluded.agent_stream_addr,
+                   zlm_rtmp_port = excluded.zlm_rtmp_port,
+                   zlm_rtsp_port = excluded.zlm_rtsp_port,
                    output_mount_relative_prefix_mp4 =
                      excluded.output_mount_relative_prefix_mp4,
                    output_mount_relative_prefix_hls =
@@ -3208,6 +3217,8 @@ impl TaskRepository {
         .bind(&registration.zlm_api_base)
         .bind(&registration.zlm_api_secret)
         .bind(&registration.agent_stream_addr)
+        .bind(i32::from(registration.zlm_rtmp_port))
+        .bind(i32::from(registration.zlm_rtsp_port))
         .bind(&registration.output_mount_relative_prefix_mp4)
         .bind(&registration.output_mount_relative_prefix_hls)
         .bind(registration.network_mode.as_str())
@@ -4128,35 +4139,14 @@ impl TaskRepository {
             return Ok(());
         };
 
-        let Some(agent_stream_addr) = sqlx::query_scalar::<_, String>(
-            r#"
-            select agent_stream_addr
-              from media_nodes
-             where id = $1
-            "#,
-        )
-        .bind(node_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        else {
-            return Ok(());
-        };
-
         if let Some(metadata) = snapshot
             .metadata
             .get("transcode_artifact")
             .cloned()
             .and_then(|value| serde_json::from_value::<FileArtifactMetadata>(value).ok())
         {
-            self.upsert_file_artifact_row(
-                tx,
-                snapshot.task_id,
-                attempt_id,
-                node_id,
-                &agent_stream_addr,
-                metadata,
-            )
-            .await?;
+            self.upsert_file_artifact_row(tx, snapshot.task_id, attempt_id, node_id, metadata)
+                .await?;
             self.enqueue_artifact_update_callback_if_needed(
                 tx,
                 snapshot.task_id,
@@ -4171,15 +4161,8 @@ impl TaskRepository {
             .cloned()
             .and_then(|value| serde_json::from_value::<FileArtifactMetadata>(value).ok())
         {
-            self.upsert_file_artifact_row(
-                tx,
-                snapshot.task_id,
-                attempt_id,
-                node_id,
-                &agent_stream_addr,
-                metadata,
-            )
-            .await?;
+            self.upsert_file_artifact_row(tx, snapshot.task_id, attempt_id, node_id, metadata)
+                .await?;
             self.enqueue_artifact_update_callback_if_needed(
                 tx,
                 snapshot.task_id,
@@ -4195,15 +4178,8 @@ impl TaskRepository {
             .and_then(|value| serde_json::from_value::<Vec<FileArtifactMetadata>>(value).ok())
         {
             for metadata in records {
-                self.upsert_file_artifact_row(
-                    tx,
-                    snapshot.task_id,
-                    attempt_id,
-                    node_id,
-                    &agent_stream_addr,
-                    metadata,
-                )
-                .await?;
+                self.upsert_file_artifact_row(tx, snapshot.task_id, attempt_id, node_id, metadata)
+                    .await?;
             }
             self.enqueue_artifact_update_callback_if_needed(
                 tx,
@@ -4222,10 +4198,9 @@ impl TaskRepository {
         task_id: Uuid,
         attempt_id: Uuid,
         node_id: Uuid,
-        agent_stream_addr: &str,
         metadata: FileArtifactMetadata,
     ) -> Result<(), RepoError> {
-        let http_url = artifact_http_url_from_path(agent_stream_addr, metadata.file_path.as_str())?;
+        let http_url = relative_http_url_from_path(metadata.file_path.as_str())?;
 
         sqlx::query(
             r#"
@@ -4312,7 +4287,9 @@ impl TaskRepository {
             .await?
         {
             if should_persist_record_file_hook(hook_name, &binding, &record)? {
-                let http_url = resolve_record_http_url(&mut tx, server_id, &record).await?;
+                let stored_http_url = relative_record_http_url_from_hook(&record);
+                let callback_http_url =
+                    resolve_record_callback_http_url(&mut tx, server_id, &record).await?;
                 sqlx::query(
                     r#"
                     insert into record_files (
@@ -4342,7 +4319,7 @@ impl TaskRepository {
                 .bind(&record.app)
                 .bind(&record.stream)
                 .bind(&record.file_path)
-                .bind(http_url.as_deref())
+                .bind(stored_http_url.as_deref())
                 .bind(record.file_size)
                 .bind(record.time_len_sec)
                 .bind(record.start_time)
@@ -4369,8 +4346,8 @@ impl TaskRepository {
                         "file_path": record.file_path,
                         "file_name": record.file_name,
                         "folder": record.folder,
-                        "url": http_url.clone().or(record.url.clone()),
-                        "http_url": http_url,
+                        "url": callback_http_url.clone().or(record.url.clone()),
+                        "http_url": callback_http_url,
                         "file_size": record.file_size,
                         "time_len": record.time_len_sec,
                         "start_time": record.start_time,
@@ -6252,6 +6229,8 @@ pub struct RecordFileSummary {
 impl RecordFileSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
         let prefixes = OutputMountPrefixes::from_row(row)?;
+        let agent_stream_addr = row.try_get::<&str, _>("agent_stream_addr")?;
+        let raw_file_path = row.try_get::<&str, _>("file_path")?;
         Ok(Self {
             id: row.try_get("id")?,
             task_id: row.try_get("task_id")?,
@@ -6260,12 +6239,8 @@ impl RecordFileSummary {
             vhost: row.try_get("vhost")?,
             app: row.try_get("app")?,
             stream: row.try_get("stream")?,
-            file_path: externalize_managed_path(
-                row.try_get::<&str, _>("file_path")?,
-                "file_path",
-                &prefixes,
-            )?,
-            http_url: row.try_get("http_url")?,
+            file_path: externalize_managed_path(raw_file_path, "file_path", &prefixes)?,
+            http_url: absolute_http_url_from_file_path(agent_stream_addr, raw_file_path),
             file_size: row.try_get("file_size")?,
             time_len: row.try_get("time_len")?,
             start_time: row.try_get("start_time")?,
@@ -6333,6 +6308,8 @@ pub struct FileArtifactSummary {
 impl FileArtifactSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
         let prefixes = OutputMountPrefixes::from_row(row)?;
+        let agent_stream_addr = row.try_get::<&str, _>("agent_stream_addr")?;
+        let raw_file_path = row.try_get::<&str, _>("file_path")?;
         Ok(Self {
             id: row.try_get("id")?,
             artifact_kind: FileArtifactKind::from_task_type(row.try_get::<&str, _>("task_type")?)?,
@@ -6341,12 +6318,14 @@ impl FileArtifactSummary {
             attempt_id: row.try_get("attempt_id")?,
             node_id: row.try_get("node_id")?,
             file_name: row.try_get("file_name")?,
-            file_path: externalize_managed_path(
-                row.try_get::<&str, _>("file_path")?,
-                "file_path",
-                &prefixes,
-            )?,
-            http_url: row.try_get("http_url")?,
+            file_path: externalize_managed_path(raw_file_path, "file_path", &prefixes)?,
+            http_url: absolute_http_url_from_file_path(agent_stream_addr, raw_file_path)
+                .ok_or_else(|| {
+                    validation_error(
+                        "http_url",
+                        format!("failed to build artifact URL from {raw_file_path}"),
+                    )
+                })?,
             file_size: row.try_get("file_size")?,
             created_at: row.try_get("created_at")?,
         })
@@ -6361,6 +6340,8 @@ pub struct NodeSummary {
     pub labels: Vec<String>,
     pub zlm_api_base: String,
     pub agent_stream_addr: String,
+    pub zlm_rtmp_port: u16,
+    pub zlm_rtsp_port: u16,
     pub network_mode: String,
     pub interfaces: Vec<String>,
     pub healthy: bool,
@@ -6409,6 +6390,10 @@ pub struct NodeSummary {
 impl NodeSummary {
     fn from_row(row: &PgRow) -> Result<Self, RepoError> {
         let media_last_seen_at: Option<DateTime<Utc>> = row.try_get("media_last_seen_at")?;
+        let zlm_rtmp_port = u16::try_from(row.try_get::<i32, _>("zlm_rtmp_port")?)
+            .map_err(|_| validation_error("zlm_rtmp_port", "stored value is out of range"))?;
+        let zlm_rtsp_port = u16::try_from(row.try_get::<i32, _>("zlm_rtsp_port")?)
+            .map_err(|_| validation_error("zlm_rtsp_port", "stored value is out of range"))?;
         let media_alive = media_last_seen_at
             .map(|seen_at| seen_at >= Utc::now() - chrono::Duration::seconds(30))
             .unwrap_or(false);
@@ -6419,6 +6404,8 @@ impl NodeSummary {
             labels: serde_json::from_value(row.try_get("labels")?)?,
             zlm_api_base: row.try_get("zlm_api_base")?,
             agent_stream_addr: row.try_get("agent_stream_addr")?,
+            zlm_rtmp_port,
+            zlm_rtsp_port,
             network_mode: row.try_get("network_mode")?,
             interfaces: serde_json::from_value(row.try_get("interfaces")?)?,
             healthy: row.try_get("healthy")?,
@@ -6823,20 +6810,12 @@ fn validate_task_callback_url(spec: &TaskSpec) -> Result<(), RepoError> {
     Ok(())
 }
 
-fn artifact_http_url_from_path(
-    agent_stream_addr: &str,
-    file_path: &str,
-) -> Result<String, RepoError> {
+fn relative_http_url_from_path(file_path: &str) -> Result<String, RepoError> {
     let normalized = normalized_absolute_path(file_path)?;
     let relative = relative_path_under_root(&normalized, ZLM_HTTP_ROOT).ok_or_else(|| {
         validation_error("publish.url", "output path must be under /data/zlm/www")
     })?;
-    absolute_http_url_from_relative(agent_stream_addr, relative).ok_or_else(|| {
-        validation_error(
-            "publish.url",
-            format!("failed to build artifact URL from {file_path}"),
-        )
-    })
+    Ok(format!("/{}", relative.trim_start_matches('/')))
 }
 
 fn managed_output_bucket_from_path(path: &str) -> Option<ManagedOutputBucket> {
@@ -6960,24 +6939,13 @@ fn absolute_http_url_from_relative(agent_stream_addr: &str, relative: &str) -> O
     base.join(relative).ok().map(|value| value.to_string())
 }
 
-fn record_http_url_from_path(agent_stream_addr: &str, file_path: &str) -> Option<String> {
-    let normalized = normalized_absolute_path(file_path).ok()?;
-    let relative = relative_path_under_root(&normalized, ZLM_HTTP_ROOT)?;
-    absolute_http_url_from_relative(agent_stream_addr, relative)
+fn absolute_http_url_from_file_path(agent_stream_addr: &str, file_path: &str) -> Option<String> {
+    let relative = relative_http_url_from_path(file_path).ok()?;
+    absolute_http_url_from_relative(agent_stream_addr, &relative)
 }
 
-fn resolve_absolute_http_url(agent_stream_addr: &str, value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if Url::parse(trimmed).is_ok() {
-        return Some(trimmed.to_string());
-    }
-    let Ok(base) = Url::parse(agent_stream_addr) else {
-        return None;
-    };
-    base.join(trimmed).ok().map(|value| value.to_string())
+fn relative_record_http_url_from_hook(record: &ZlmRecordFileRecord) -> Option<String> {
+    relative_http_url_from_path(&record.file_path).ok()
 }
 
 fn should_persist_record_file_hook(
@@ -7015,7 +6983,7 @@ fn is_hls_playlist_record_path(file_path: &str) -> bool {
             .is_some_and(|value| value.eq_ignore_ascii_case("m3u8"))
 }
 
-async fn resolve_record_http_url(
+async fn resolve_record_callback_http_url(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     server_id: &str,
     record: &ZlmRecordFileRecord,
@@ -7034,22 +7002,13 @@ async fn resolve_record_http_url(
     .fetch_optional(&mut **tx)
     .await?
     else {
-        return Ok(record.url.as_deref().and_then(|raw_url| {
-            Url::parse(raw_url.trim())
-                .ok()
-                .map(|value| value.to_string())
-        }));
+        return Ok(None);
     };
 
-    if let Some(http_url) = record_http_url_from_path(agent_stream_addr.as_str(), &record.file_path)
-    {
-        return Ok(Some(http_url));
-    }
-
-    Ok(record
-        .url
-        .as_deref()
-        .and_then(|raw_url| resolve_absolute_http_url(agent_stream_addr.as_str(), raw_url)))
+    Ok(absolute_http_url_from_file_path(
+        agent_stream_addr.as_str(),
+        &record.file_path,
+    ))
 }
 
 fn build_resolved_task_json(

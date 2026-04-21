@@ -1293,12 +1293,8 @@ fn apply_stream_runtime_fallbacks(
             continue;
         };
         if stream.play_urls.is_empty() {
-            stream.play_urls = build_fallback_play_urls(
-                &node.agent_stream_addr,
-                &stream.schema,
-                &stream.app,
-                &stream.stream,
-            );
+            stream.play_urls =
+                build_fallback_play_urls(node, &stream.schema, &stream.app, &stream.stream);
         }
     }
 }
@@ -1343,12 +1339,8 @@ async fn enrich_streams_with_runtime(
                         if runtime.bitrate_kbps > 0.0 {
                             stream.bitrate_kbps = Some(runtime.bitrate_kbps);
                         }
-                        stream.play_urls = build_play_urls(
-                            &node.agent_stream_addr,
-                            &runtime.schemas,
-                            &stream.app,
-                            &stream.stream,
-                        );
+                        stream.play_urls =
+                            build_play_urls(node, &runtime.schemas, &stream.app, &stream.stream);
                     } else {
                         stale_indexes.insert(stream_index);
                     }
@@ -1490,23 +1482,23 @@ fn build_stream_runtime_index(
 }
 
 pub(crate) fn build_fallback_play_urls(
-    agent_stream_addr: &str,
+    node: &repository::NodeSummary,
     schema: &str,
     app: &str,
     stream: &str,
 ) -> Vec<String> {
     let mut schemas = BTreeSet::new();
     schemas.insert(schema.trim().to_string());
-    build_play_urls(agent_stream_addr, &schemas, app, stream)
+    build_play_urls(node, &schemas, app, stream)
 }
 
 pub(crate) fn build_play_urls(
-    agent_stream_addr: &str,
+    node: &repository::NodeSummary,
     schemas: &BTreeSet<String>,
     app: &str,
     stream: &str,
 ) -> Vec<String> {
-    let Ok(base) = Url::parse(agent_stream_addr) else {
+    let Ok(base) = Url::parse(node.agent_stream_addr.as_str()) else {
         return Vec::new();
     };
     let Some(host) = base.host_str() else {
@@ -1521,8 +1513,14 @@ pub(crate) fn build_play_urls(
 
     for schema in schemas {
         match schema.as_str() {
-            "rtsp" => urls.push(format!("rtsp://{host}/{app}/{stream}")),
-            "rtmp" => urls.push(format!("rtmp://{host}/{app}/{stream}")),
+            "rtsp" => urls.push(format!(
+                "rtsp://{}:{}/{app}/{stream}",
+                host, node.zlm_rtsp_port
+            )),
+            "rtmp" => urls.push(format!(
+                "rtmp://{}:{}/{app}/{stream}",
+                host, node.zlm_rtmp_port
+            )),
             "hls" => urls.push(format!("{http_base}/{app}/{stream}/hls.m3u8")),
             "ts" | "http_ts" => urls.push(format!("{http_base}/{app}/{stream}.live.ts")),
             "fmp4" | "http_fmp4" | "http_fmp4_ts" => {

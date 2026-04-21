@@ -43,6 +43,8 @@ message Register {
   string zlm_server_id = 13;
   string output_mount_relative_prefix_mp4 = 14;
   string output_mount_relative_prefix_hls = 15;
+  uint32 zlm_rtmp_port = 16;
+  uint32 zlm_rtsp_port = 17;
 }
 
 message Heartbeat {

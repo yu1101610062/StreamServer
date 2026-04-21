@@ -199,22 +199,18 @@ fn task_spec_overlay_preserves_input_loop_enabled() {
 }
 
 #[test]
-fn artifact_http_url_from_path_uses_node_stream_base() {
-    let url = artifact_http_url_from_path(
-        "http://192.168.1.10:8081",
+fn relative_http_url_from_path_uses_web_root_directly() {
+    let url = relative_http_url_from_path(
         "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
     )
-    .expect("artifact url should build");
+    .expect("relative url should build");
 
-    assert_eq!(
-        url,
-        "http://192.168.1.10:8081/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
-    );
+    assert_eq!(url, "/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4");
 }
 
 #[test]
-fn record_http_url_from_path_uses_web_root_directly() {
-    let url = record_http_url_from_path(
+fn absolute_http_url_from_file_path_uses_node_stream_base() {
+    let url = absolute_http_url_from_file_path(
         "http://192.168.1.10:8081",
         "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
     )
@@ -253,8 +249,8 @@ fn externalize_managed_path_strips_mount_roots() {
 }
 
 #[test]
-fn resolve_absolute_http_url_accepts_relative_paths() {
-    let url = resolve_absolute_http_url(
+fn absolute_http_url_from_relative_accepts_relative_paths() {
+    let url = absolute_http_url_from_relative(
         "http://worker.example:8081",
         "/output/hls/node-192_168_1_10-hls/task-1/index.m3u8",
     )

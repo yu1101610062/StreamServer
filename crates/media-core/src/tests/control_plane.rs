@@ -194,6 +194,8 @@ fn sample_registration(node_id: Uuid) -> AgentRegistration {
         zlm_api_base: "http://127.0.0.1:65535".to_string(),
         zlm_api_secret: "secret".to_string(),
         agent_stream_addr: "http://stream.example".to_string(),
+        zlm_rtmp_port: 1935,
+        zlm_rtsp_port: 554,
         network_mode: NetworkMode::Bridge,
         ffmpeg_bin: "ffmpeg".to_string(),
         ffprobe_bin: "ffprobe".to_string(),

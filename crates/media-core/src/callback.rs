@@ -552,7 +552,7 @@ impl TaskCallbackStream {
             .map(|node| {
                 if summary.play_urls.is_empty() {
                     crate::build_fallback_play_urls(
-                        &node.agent_stream_addr,
+                        node,
                         &summary.schema,
                         &summary.app,
                         &summary.stream,

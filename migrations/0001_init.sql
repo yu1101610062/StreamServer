@@ -55,6 +55,10 @@ create table media_nodes (
   zlm_api_base text not null,
   zlm_api_secret text not null default '',
   agent_stream_addr text not null,
+  zlm_rtmp_port integer not null default 1935
+    check (zlm_rtmp_port between 1 and 65535),
+  zlm_rtsp_port integer not null default 554
+    check (zlm_rtsp_port between 1 and 65535),
   network_mode text not null check (network_mode in ('bridge', 'host', 'macvlan')),
   interfaces jsonb not null default '[]'::jsonb,
   healthy boolean not null default false,

@@ -211,6 +211,25 @@ async fn upsert_test_node(
     zlm_api_base: &str,
     agent_stream_addr: &str,
 ) -> anyhow::Result<()> {
+    upsert_test_node_with_ports(
+        repository,
+        node_id,
+        zlm_api_base,
+        agent_stream_addr,
+        1935,
+        554,
+    )
+    .await
+}
+
+async fn upsert_test_node_with_ports(
+    repository: &TaskRepository,
+    node_id: Uuid,
+    zlm_api_base: &str,
+    agent_stream_addr: &str,
+    zlm_rtmp_port: u16,
+    zlm_rtsp_port: u16,
+) -> anyhow::Result<()> {
     repository
         .upsert_node_registration(
             &AgentRegistration {
@@ -223,6 +242,8 @@ async fn upsert_test_node(
                 zlm_api_base: zlm_api_base.to_string(),
                 zlm_api_secret: "secret".to_string(),
                 agent_stream_addr: agent_stream_addr.to_string(),
+                zlm_rtmp_port,
+                zlm_rtsp_port,
                 network_mode: NetworkMode::Bridge,
                 ffmpeg_bin: "ffmpeg".to_string(),
                 ffprobe_bin: "ffprobe".to_string(),
@@ -2094,17 +2115,90 @@ async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::
     assert!(
         play_urls
             .iter()
-            .any(|value| value == "rtsp://stream.example/live/camera01")
+            .any(|value| value == "rtsp://stream.example:554/live/camera01")
     );
     assert!(
         play_urls
             .iter()
-            .any(|value| value == "rtmp://stream.example/live/camera01")
+            .any(|value| value == "rtmp://stream.example:1935/live/camera01")
     );
     assert!(
         play_urls
             .iter()
             .any(|value| value == "http://stream.example/live/camera01/hls.m3u8")
+    );
+
+    zlm_handle.abort();
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_streams_uses_current_node_stream_ports() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let (zlm_base, zlm_handle) = spawn_zlm_stub().await?;
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node_with_ports(
+        &repository,
+        node_id,
+        &zlm_base,
+        "http://stream.example:18080",
+        2935,
+        9554,
+    )
+    .await?;
+    let resolved_spec = json!({
+        "type": "live_relay",
+        "name": "relay-camera-ports",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+        "publish": {
+            "enable_rtsp": true,
+            "enable_rtmp": true,
+            "enable_http_ts": true,
+            "enable_http_fmp4": true,
+            "enable_hls": true
+        },
+        "record": {"enabled": false},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+
+    let app = build_app(test_app_state(db.pool.clone()));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/streams")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let items = body.as_array().expect("streams should be a list");
+    assert_eq!(items.len(), 1);
+    let play_urls = items[0]["play_urls"]
+        .as_array()
+        .expect("play_urls should be a list");
+    assert!(
+        play_urls
+            .iter()
+            .any(|value| value == "rtsp://stream.example:9554/live/camera01")
+    );
+    assert!(
+        play_urls
+            .iter()
+            .any(|value| value == "rtmp://stream.example:2935/live/camera01")
+    );
+    assert!(
+        play_urls
+            .iter()
+            .any(|value| value == "http://stream.example:18080/live/camera01/hls.m3u8")
     );
 
     zlm_handle.abort();
@@ -2237,7 +2331,7 @@ async fn list_streams_returns_fallback_entries_when_runtime_lookup_fails() -> an
     assert_eq!(items[0]["has_viewer"], Value::Null);
     assert_eq!(
         items[0]["play_urls"],
-        json!(["rtsp://stream.example/live/camera01"])
+        json!(["rtsp://stream.example:554/live/camera01"])
     );
 
     db.cleanup().await?;
@@ -2407,7 +2501,7 @@ async fn callback_dispatcher_waits_for_record_artifact_before_first_terminal_cal
             .as_array()
             .unwrap_or(&Vec::new())
             .iter()
-            .any(|value| value == "rtsp://stream.example/live/camera01")
+            .any(|value| value == "rtsp://stream.example:554/live/camera01")
     );
     assert_eq!(
         delivered_calls[0]
@@ -2705,6 +2799,107 @@ async fn hls_record_hooks_only_persist_playlist_rows() -> anyhow::Result<()> {
         records[0].http_url.as_deref(),
         Some("http://stream.example/record/live/camera01/index.m3u8")
     );
+    let stored_http_url: Option<String> = sqlx::query_scalar(
+        "select http_url from record_files where task_id = $1 and file_path like '%index.m3u8'",
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        stored_http_url.as_deref(),
+        Some("/record/live/camera01/index.m3u8")
+    );
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn record_file_http_url_uses_latest_node_stream_addr() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node_with_ports(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example:18080",
+        1935,
+        554,
+    )
+    .await?;
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "record-mp4-current-node-url",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01"},
+        "process": {"mode": "copy_or_transcode"},
+        "record": {"enabled": true, "format": "mp4"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+
+    repository
+        .record_zlm_record_file_hook(
+            &format!("zlm-{node_id}"),
+            "on_record_mp4",
+            "record-http-url-rebind",
+            json!({}),
+            repository::ZlmRecordFileRecord {
+                record_format: Some("mp4".to_string()),
+                schema: Some("rtsp".to_string()),
+                vhost: "__defaultVhost__".to_string(),
+                app: "live".to_string(),
+                stream: "camera01".to_string(),
+                file_path: "/data/zlm/www/record/live/camera01/clip.mp4".to_string(),
+                file_size: 4096,
+                time_len_sec: Some(12),
+                start_time: Some(Utc::now()),
+                file_name: Some("clip.mp4".to_string()),
+                folder: Some("/data/zlm/www/record/live/camera01".to_string()),
+                url: None,
+            },
+        )
+        .await?;
+
+    let first_records = repository.list_task_record_files(task_id).await?;
+    assert_eq!(first_records.len(), 1);
+    assert_eq!(
+        first_records[0].http_url.as_deref(),
+        Some("http://stream.example:18080/record/live/camera01/clip.mp4")
+    );
+    let stored_http_url: Option<String> =
+        sqlx::query_scalar("select http_url from record_files where task_id = $1 limit 1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        stored_http_url.as_deref(),
+        Some("/record/live/camera01/clip.mp4")
+    );
+
+    upsert_test_node_with_ports(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream-new.example:19090",
+        1935,
+        554,
+    )
+    .await?;
+
+    let second_records = repository.list_task_record_files(task_id).await?;
+    assert_eq!(second_records.len(), 1);
+    assert_eq!(
+        second_records[0].http_url.as_deref(),
+        Some("http://stream-new.example:19090/record/live/camera01/clip.mp4")
+    );
 
     db.cleanup().await?;
     Ok(())
@@ -2995,6 +3190,12 @@ async fn callback_payload_includes_file_artifact_http_url_for_transcode_output()
         delivered[0].1["file_artifacts"][0]["artifact_kind"],
         json!("transcode_output")
     );
+    let stored_http_url: String =
+        sqlx::query_scalar("select http_url from transcode_artifacts where task_id = $1 limit 1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(stored_http_url, "/artifacts/transcode/verify/output.mp4");
 
     let _ = shutdown_tx.send(true);
     dispatcher.abort();

@@ -939,6 +939,14 @@ fn registration_from_rpc(register: RpcRegister) -> Result<AgentRegistration, Sta
         .network_mode
         .parse::<NetworkMode>()
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let zlm_rtmp_port = u16::try_from(register.zlm_rtmp_port)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Status::invalid_argument("invalid zlm_rtmp_port"))?;
+    let zlm_rtsp_port = u16::try_from(register.zlm_rtsp_port)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Status::invalid_argument("invalid zlm_rtsp_port"))?;
 
     Ok(AgentRegistration {
         node_id,
@@ -950,6 +958,8 @@ fn registration_from_rpc(register: RpcRegister) -> Result<AgentRegistration, Sta
         zlm_api_base: register.zlm_api_base.trim().to_string(),
         zlm_api_secret: register.zlm_api_secret.trim().to_string(),
         agent_stream_addr: require_field("agent_stream_addr", register.agent_stream_addr)?,
+        zlm_rtmp_port,
+        zlm_rtsp_port,
         network_mode,
         ffmpeg_bin: require_field("ffmpeg_bin", register.ffmpeg_bin)?,
         ffprobe_bin: require_field("ffprobe_bin", register.ffprobe_bin)?,

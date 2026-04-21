@@ -5,12 +5,13 @@ services:
     image: ${POSTGRES_IMAGE}
     restart: unless-stopped
     network_mode: host
+    command: ["postgres", "-p", "${POSTGRES_PORT}"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p ${POSTGRES_PORT} -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -30,7 +31,7 @@ services:
       STREAMSERVER_UI_DIR: /opt/streamserver/ui
       CORE_HTTP_ADDR: 0.0.0.0:${CORE_HTTP_PORT}
       CORE_GRPC_ADDR: 0.0.0.0:${CORE_GRPC_PORT}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}
       HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
       HOOK_SOURCE_ALLOWLIST: ${HOOK_SOURCE_ALLOWLIST}
       STORAGE_ALLOWLIST: ${STORAGE_ALLOWLIST}
@@ -58,7 +59,34 @@ services:
     depends_on:
       media-core:
         condition: service_healthy
-    command: ["./MediaServer", "-s", "default.pem", "-c", "../conf/config.ini", "-l", "0"]
+    command:
+      - /bin/sh
+      - -ec
+      - /opt/media/conf/render-config.sh /opt/media/conf/config.ini.template /tmp/streamserver-zlm-config.ini && exec ./MediaServer -s default.pem -c /tmp/streamserver-zlm-config.ini -l 0
+    environment:
+      ZLM_API_SECRET: ${HOOK_SHARED_SECRET}
+      ZLM_HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
+      ZLM_SERVER_ID: ${NODE_ID}
+      ZLM_HOOK_BASE: http://127.0.0.1:${CORE_HTTP_PORT}/internal/hooks/zlm/${NODE_ID}
+      ZLM_API_ALLOW_IP_RANGE: ::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255
+      ZLM_HTTP_PORT: ${ZLM_HTTP_PORT}
+      ZLM_HTTPS_PORT: ${ZLM_HTTPS_PORT}
+      ZLM_RTMP_PORT: ${ZLM_RTMP_PORT}
+      ZLM_RTMPS_PORT: ${ZLM_RTMPS_PORT}
+      ZLM_RTSP_PORT: ${ZLM_RTSP_PORT}
+      ZLM_RTSPS_PORT: ${ZLM_RTSPS_PORT}
+      ZLM_RTP_PROXY_PORT: ${ZLM_RTP_PROXY_PORT}
+      ZLM_RTP_PROXY_PORT_RANGE: ${ZLM_RTP_PROXY_PORT_RANGE}
+      ZLM_RTC_SIGNALING_PORT: ${ZLM_RTC_SIGNALING_PORT}
+      ZLM_RTC_SIGNALING_SSL_PORT: ${ZLM_RTC_SIGNALING_SSL_PORT}
+      ZLM_RTC_ICE_PORT: ${ZLM_RTC_ICE_PORT}
+      ZLM_RTC_ICE_TCP_PORT: ${ZLM_RTC_ICE_TCP_PORT}
+      ZLM_RTC_PORT: ${ZLM_RTC_PORT}
+      ZLM_RTC_TCP_PORT: ${ZLM_RTC_TCP_PORT}
+      ZLM_RTC_PORT_RANGE: ${ZLM_RTC_PORT_RANGE}
+      ZLM_SRT_PORT: ${ZLM_SRT_PORT}
+      ZLM_SHELL_PORT: ${ZLM_SHELL_PORT}
+      ZLM_ONVIF_PORT: ${ZLM_ONVIF_PORT}
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS 'http://127.0.0.1:${ZLM_HTTP_PORT}/index/api/getStatistic?secret=${HOOK_SHARED_SECRET}' >/dev/null"]
       interval: 5s
@@ -67,7 +95,8 @@ services:
     volumes:
       - ./data/media/work:/data/media/work
       - ./data/zlm/www:/data/zlm/www
-      - ./zlm/config.ini:/opt/media/conf/config.ini:ro
+      - ./zlm/config.ini.template:/opt/media/conf/config.ini.template:ro
+      - ./zlm/render-config.sh:/opt/media/conf/render-config.sh:ro
 
   media-agent:
     image: ${MEDIA_AGENT_IMAGE}
@@ -85,7 +114,7 @@ services:
       AGENT_NODE_ID: ${NODE_ID}
       AGENT_NODE_NAME: ${AGENT_NODE_NAME}
       AGENT_CORE_ENDPOINT: http://127.0.0.1:${CORE_GRPC_PORT}
-      AGENT_STREAM_ADDR: http://${PUBLIC_HOST}
+      AGENT_STREAM_ADDR: http://${PUBLIC_HOST}:${ZLM_HTTP_PORT}
       AGENT_PRIMARY_INTERFACE_NAME: ${AGENT_PRIMARY_INTERFACE_NAME}
       AGENT_PRIMARY_INTERFACE_IP: ${AGENT_PRIMARY_INTERFACE_IP}
       OUTPUT_MOUNT_RELATIVE_PREFIX_MP4: ${OUTPUT_MOUNT_RELATIVE_PREFIX_MP4}
@@ -100,7 +129,7 @@ services:
       AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT: ${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}
       AGENT_ARTIFACT_CLEANUP_STRATEGY: ${AGENT_ARTIFACT_CLEANUP_STRATEGY}
       AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC: ${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC}
-      WORK_ROOT: /data/media/work
+      WORK_ROOT: ${WORK_ROOT}
       FFMPEG_BIN: ffmpeg
       FFPROBE_BIN: ffprobe
       ZLM_API_BASE: http://${ZLM_API_HOST}:${ZLM_HTTP_PORT}
