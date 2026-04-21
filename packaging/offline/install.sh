@@ -23,6 +23,7 @@ COMPOSE_CMD=()
 COMPOSE_CMD_DISPLAY=""
 COMPOSE_FILE_NAME="compose.yml"
 STACK_SYSTEMD_UNIT_NAME=""
+SYSTEMD_SERVICE_USE_SUDO="false"
 IS_UPGRADE="false"
 INSTALL_ROLE=""
 EXISTING_INSTALL_ROLE=""
@@ -87,6 +88,38 @@ compose_systemd_unit_name() {
   safe_name="$(sanitize_systemd_fragment "${PROJECT_NAME:-streamserver}")"
   [ -n "${safe_name}" ] || safe_name="streamserver"
   printf '%s' "streamserver-compose-${safe_name}.service"
+}
+
+current_user_is_root() {
+  [ "$(id -u)" -eq 0 ]
+}
+
+systemd_use_sudo() {
+  [ "${SYSTEMD_SERVICE_USE_SUDO}" = "true" ]
+}
+
+systemctl_cmd_display() {
+  if systemd_use_sudo; then
+    printf '%s' "sudo systemctl"
+  else
+    printf '%s' "systemctl"
+  fi
+}
+
+journalctl_cmd_display() {
+  if systemd_use_sudo; then
+    printf '%s' "sudo journalctl"
+  else
+    printf '%s' "journalctl"
+  fi
+}
+
+run_systemctl() {
+  if systemd_use_sudo; then
+    sudo systemctl "$@"
+  else
+    systemctl "$@"
+  fi
 }
 
 ensure_docker_ready() {
@@ -499,8 +532,11 @@ install_compose_autostart_service() {
   local install_dir="$1"
   local wrapper_path
   local unit_path
+  local unit_tmp
+  local should_use_sudo="false"
 
   STACK_SYSTEMD_UNIT_NAME=""
+  SYSTEMD_SERVICE_USE_SUDO="false"
   write_compose_wrapper_script "${install_dir}"
 
   if ! systemd_available; then
@@ -508,11 +544,29 @@ install_compose_autostart_service() {
     return 0
   fi
 
+  if ! current_user_is_root; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      log "检测到 systemd，但当前用户不是 root 且缺少 sudo，跳过开机自启动服务安装。"
+      return 0
+    fi
+
+    if ! prompt_yes_no "检测到 systemd，是否使用 sudo 安装并启用开机自启动服务？" "N"; then
+      log "用户选择不安装 systemd 服务，将按无 systemd 模式继续。"
+      return 0
+    fi
+
+    sudo -v || fail "sudo 验证失败，无法安装 systemd 服务"
+    should_use_sudo="true"
+  fi
+
   wrapper_path="${install_dir}/bin/streamserver-compose"
   STACK_SYSTEMD_UNIT_NAME="$(compose_systemd_unit_name)"
   unit_path="/etc/systemd/system/${STACK_SYSTEMD_UNIT_NAME}"
+  require_cmd mktemp
+  require_cmd install
+  unit_tmp="$(mktemp "/tmp/${STACK_SYSTEMD_UNIT_NAME}.XXXXXX")"
 
-  cat >"${unit_path}" <<EOF
+  cat >"${unit_tmp}" <<EOF
 [Unit]
 Description=StreamServer Compose Stack (${PROJECT_NAME})
 Requires=docker.service
@@ -535,8 +589,16 @@ TimeoutStopSec=300
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable "${STACK_SYSTEMD_UNIT_NAME}" >/dev/null
+  if [ "${should_use_sudo}" = "true" ]; then
+    sudo install -m 644 "${unit_tmp}" "${unit_path}"
+    SYSTEMD_SERVICE_USE_SUDO="true"
+  else
+    install -m 644 "${unit_tmp}" "${unit_path}"
+  fi
+  rm -f "${unit_tmp}"
+
+  run_systemctl daemon-reload
+  run_systemctl enable "${STACK_SYSTEMD_UNIT_NAME}" >/dev/null
   log "已安装并启用开机自启动服务: ${STACK_SYSTEMD_UNIT_NAME}"
 }
 
@@ -798,8 +860,8 @@ ensure_runtime_support() {
 log_runtime_commands() {
   local install_dir="$1"
   if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
-    log "  systemctl status ${STACK_SYSTEMD_UNIT_NAME}"
-    log "  journalctl -u ${STACK_SYSTEMD_UNIT_NAME} -f"
+    log "  $(systemctl_cmd_display) status ${STACK_SYSTEMD_UNIT_NAME}"
+    log "  $(journalctl_cmd_display) -u ${STACK_SYSTEMD_UNIT_NAME} -f"
   fi
   log "  ${install_dir}/bin/streamserver-compose ps"
   log "  ${install_dir}/bin/streamserver-compose logs -f"
@@ -808,8 +870,8 @@ log_runtime_commands() {
 restart_existing_stack() {
   local install_dir="$1"
 
-  if systemd_available; then
-    systemctl restart "${STACK_SYSTEMD_UNIT_NAME}"
+  if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
+    run_systemctl restart "${STACK_SYSTEMD_UNIT_NAME}"
     return 0
   fi
 
@@ -1676,8 +1738,8 @@ emit_manual_start_hint() {
   log "已写入部署文件。"
   if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
     log "开机自启动已启用，可手动执行:"
-    log "  systemctl start ${STACK_SYSTEMD_UNIT_NAME}"
-    log "  systemctl status ${STACK_SYSTEMD_UNIT_NAME}"
+    log "  $(systemctl_cmd_display) start ${STACK_SYSTEMD_UNIT_NAME}"
+    log "  $(systemctl_cmd_display) status ${STACK_SYSTEMD_UNIT_NAME}"
   else
     log "稍后可手动执行:"
     log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} up -d"
@@ -1723,7 +1785,7 @@ start_stack_if_requested() {
   local install_dir="$1"
   if prompt_yes_no "是否立即启动该部署？" "Y"; then
     if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
-      systemctl start "${STACK_SYSTEMD_UNIT_NAME}"
+      run_systemctl start "${STACK_SYSTEMD_UNIT_NAME}"
     else
       (
         cd "${install_dir}"
@@ -1732,8 +1794,8 @@ start_stack_if_requested() {
     fi
     log "已启动，常用命令:"
     if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
-      log "  systemctl status ${STACK_SYSTEMD_UNIT_NAME}"
-      log "  journalctl -u ${STACK_SYSTEMD_UNIT_NAME} -f"
+      log "  $(systemctl_cmd_display) status ${STACK_SYSTEMD_UNIT_NAME}"
+      log "  $(journalctl_cmd_display) -u ${STACK_SYSTEMD_UNIT_NAME} -f"
     fi
     log "  ${install_dir}/bin/streamserver-compose ps"
     log "  ${install_dir}/bin/streamserver-compose logs -f"
