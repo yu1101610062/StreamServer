@@ -4,6 +4,7 @@ services:
   postgres:
     image: ${POSTGRES_IMAGE}
     restart: unless-stopped
+    network_mode: host
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
@@ -13,9 +14,6 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    networks:
-      streamserver-stack:
-        ipv4_address: ${POSTGRES_IP}
     volumes:
       - ./data/postgres:/var/lib/postgresql
 
@@ -32,7 +30,7 @@ services:
       STREAMSERVER_UI_DIR: /opt/streamserver/ui
       CORE_HTTP_ADDR: 0.0.0.0:${CORE_HTTP_PORT}
       CORE_GRPC_ADDR: 0.0.0.0:${CORE_GRPC_PORT}
-      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_IP}:5432/${POSTGRES_DB}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}
       HOOK_SHARED_SECRET: ${HOOK_SHARED_SECRET}
       HOOK_SOURCE_ALLOWLIST: ${HOOK_SOURCE_ALLOWLIST}
       STORAGE_ALLOWLIST: ${STORAGE_ALLOWLIST}
@@ -122,10 +120,3 @@ services:
       - ./data/media/logs:/data/media/logs
       - ./data/zlm/www:/data/zlm/www
       - ./certs:/certs:ro
-
-networks:
-  streamserver-stack:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: ${STACK_SUBNET}

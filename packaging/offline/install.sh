@@ -700,8 +700,6 @@ POSTGRES_USER=${POSTGRES_USER}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 CORE_HTTP_PORT=${CORE_HTTP_PORT}
 CORE_GRPC_PORT=${CORE_GRPC_PORT}
-STACK_SUBNET=${STACK_SUBNET}
-POSTGRES_IP=${POSTGRES_IP}
 HOOK_SHARED_SECRET=${HOOK_SHARED_SECRET}
 HOOK_SOURCE_ALLOWLIST=${HOOK_SOURCE_ALLOWLIST}
 STORAGE_ALLOWLIST=${STORAGE_ALLOWLIST}
@@ -817,9 +815,6 @@ AUTH_JWT_PRIVATE_KEY_PATH=${AUTH_JWT_PRIVATE_KEY_PATH}
 AUTH_JWT_PUBLIC_KEY_PATH=${AUTH_JWT_PUBLIC_KEY_PATH}
 AUTH_ACCESS_TOKEN_TTL=${AUTH_ACCESS_TOKEN_TTL}
 AUTH_REFRESH_TOKEN_TTL=${AUTH_REFRESH_TOKEN_TTL}
-STACK_SUBNET=${STACK_SUBNET}
-CORE_IP=${CORE_IP}
-POSTGRES_IP=${POSTGRES_IP}
 
 # HTTPS 默认关闭。
 # 当前应用不内置 HTTPS listener，如需 HTTPS，请在反向代理中终止 TLS 后转发到 media-core:8080。
@@ -991,7 +986,8 @@ select_role() {
     echo "  1) control-plane"
     echo "     用途: 只安装中心控制面，包含 media-core 和 PostgreSQL。"
     echo "     适合: 多工作节点部署中的中心节点，或你已经有独立媒体工作节点的情况。"
-    echo "     网络特性: media-core 使用 host；PostgreSQL 保持 bridge。"
+    echo "     网络特性: media-core 和 PostgreSQL 都使用 host。"
+    echo "     注意: 会直接占用宿主机 5432/8080/50051 端口。"
     echo
     echo "  2) worker-host-cpu"
     echo "     用途: 安装 CPU-only 媒体工作节点，包含 media-agent 和 ZLMediaKit。"
@@ -1008,10 +1004,9 @@ select_role() {
       echo "  4) all-in-one-host-cpu"
       echo "     用途: 单机安装完整系统（CPU-only 工作节点），但媒体面直连宿主机网络。"
       echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-      echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
-      echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
+      echo "     网络特性: media-core/media-agent/ZLMediaKit/PostgreSQL 全部使用 host。"
       echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
-      echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
+      echo "     注意: 会直接占用宿主机的 5432/8080/50051/8081/80/554/1935 等端口。"
       echo
       echo "  5) all-in-one-host-gpu"
       echo "     用途: 单机安装完整系统，并让工作节点部分支持 NVIDIA GPU。"
@@ -1023,10 +1018,9 @@ select_role() {
       echo "  3) all-in-one-host-cpu"
       echo "     用途: 单机安装完整系统（CPU-only 工作节点），但媒体面直连宿主机网络。"
       echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-      echo "     网络特性: media-core/media-agent/ZLMediaKit 使用 host；PostgreSQL 保持 bridge。"
-      echo "     优点: 比全量 host 更克制，不会把数据库和控制面也切到 host 网络。"
+      echo "     网络特性: media-core/media-agent/ZLMediaKit/PostgreSQL 全部使用 host。"
       echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
-      echo "     注意: 仍会直接占用宿主机的 8080/50051/8081/80/554/1935 等端口。"
+      echo "     注意: 会直接占用宿主机的 5432/8080/50051/8081/80/554/1935 等端口。"
       echo
       echo "当前离线包为 CPU-only，不包含 GPU 镜像和 GPU 模板。"
       echo "输入方式: 直接输入上面的角色编号 1-3 后回车。"
@@ -1077,8 +1071,6 @@ configure_control_plane() {
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
   CORE_HTTP_PORT="$(prompt_non_empty "media-core HTTP 暴露端口" "8080")"
   CORE_GRPC_PORT="$(prompt_non_empty "media-core gRPC 暴露端口" "50051")"
-  STACK_SUBNET="172.29.0.0/24"
-  POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "")"
   STORAGE_ALLOWLIST="/data/media/work,/data/zlm/www"
   prompt_local_auth_configuration
@@ -1213,9 +1205,6 @@ configure_all_in_one_host() {
   ZLM_HTTP_PORT="80"
   ZLM_RTMP_PORT="1935"
   ZLM_RTSP_PORT="554"
-  STACK_SUBNET="172.29.0.0/24"
-  CORE_IP="172.29.0.10"
-  POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST=""
   prompt_local_auth_configuration
   agent_labels="$(collect_agent_labels "cpu")"
@@ -1238,7 +1227,7 @@ configure_all_in_one_host() {
   write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "${agent_labels}"
   ensure_images_loaded postgres media-core media-agent zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
-  log "all-in-one-host-cpu 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  log "all-in-one-host-cpu 说明: PostgreSQL、media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 5432/${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
   log "如果这些端口已被宿主机其他服务占用，请先释放端口，或改用非 host 模式。"
   show_tls_notice "${INSTALL_DIR}" "127.0.0.1" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
@@ -1275,9 +1264,6 @@ configure_all_in_one_host_gpu() {
   ZLM_HTTP_PORT="80"
   ZLM_RTMP_PORT="1935"
   ZLM_RTSP_PORT="554"
-  STACK_SUBNET="172.29.0.0/24"
-  CORE_IP="172.29.0.10"
-  POSTGRES_IP="172.29.0.40"
   HOOK_SOURCE_ALLOWLIST=""
   prompt_local_auth_configuration
   agent_labels="$(collect_agent_labels "gpu")"
@@ -1300,7 +1286,7 @@ configure_all_in_one_host_gpu() {
   write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "${agent_labels}"
   ensure_images_loaded postgres media-core media-agent-gpu zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
-  log "all-in-one-host-gpu 说明: media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  log "all-in-one-host-gpu 说明: PostgreSQL、media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 5432/${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
   log "该模式要求宿主机 NVIDIA 驱动和 Docker nvidia runtime 均已就绪。"
   show_tls_notice "${INSTALL_DIR}" "127.0.0.1" "${CORE_GRPC_PORT}" || return 0
   start_stack_if_requested "${INSTALL_DIR}"
