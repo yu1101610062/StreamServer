@@ -30,6 +30,7 @@ EXISTING_INSTALL_ROLE=""
 EXISTING_PROJECT_NAME=""
 INSTALL_BACKUP_DIR=""
 PRESERVED_ENV_SOURCE=""
+RESERVED_LOCAL_TCP_PORTS=""
 
 log() {
   printf '[streamserver-install] %s\n' "$*"
@@ -463,6 +464,7 @@ install_host_binary() {
   local binary_rel
   local source_path
   local target_path
+  local temp_path
 
   binary_rel="$(binary_rel_for_key "${binary_key}")"
   [ -n "${binary_rel}" ] || fail "离线包未声明 ${binary_key} 二进制路径"
@@ -472,8 +474,12 @@ install_host_binary() {
 
   mkdir -p "${install_dir}/bin"
   target_path="${install_dir}/bin/${binary_key}"
-  cp "${source_path}" "${target_path}"
-  chmod 755 "${target_path}"
+  temp_path="$(mktemp "${install_dir}/bin/.${binary_key}.XXXXXX")"
+  cp "${source_path}" "${temp_path}"
+  chmod 755 "${temp_path}"
+  # Atomically replace the target so upgrades can swap binaries even while the
+  # previous inode is still being executed inside a running container.
+  mv -f "${temp_path}" "${target_path}"
   log "已写入宿主机挂载二进制: ${target_path}"
 }
 
@@ -615,6 +621,7 @@ reset_install_context() {
   EXISTING_PROJECT_NAME=""
   INSTALL_BACKUP_DIR=""
   PRESERVED_ENV_SOURCE=""
+  RESERVED_LOCAL_TCP_PORTS=""
 }
 
 is_managed_install_dir() {
@@ -1289,12 +1296,46 @@ describe_tcp_port_usage() {
   [ -n "${proc_output}" ] && printf '%s' "${proc_output}"
 }
 
+session_reserved_tcp_port_usage() {
+  local port="$1"
+  case " ${RESERVED_LOCAL_TCP_PORTS} " in
+    *" ${port} "*) printf '%s' "当前安装流程已为其他组件预留端口 ${port}" ;;
+  esac
+}
+
+describe_local_tcp_port_conflict() {
+  local port="$1"
+  local usage=""
+
+  usage="$(describe_tcp_port_usage "${port}")"
+  if [ -n "${usage}" ]; then
+    printf '%s' "${usage}"
+    return 0
+  fi
+
+  usage="$(session_reserved_tcp_port_usage "${port}")"
+  [ -n "${usage}" ] && printf '%s' "${usage}"
+}
+
+reserve_local_tcp_port() {
+  local port="$1"
+  validate_port_number "reserved_tcp_port" "${port}"
+  case " ${RESERVED_LOCAL_TCP_PORTS} " in
+    *" ${port} "*) return 0 ;;
+  esac
+  if [ -n "${RESERVED_LOCAL_TCP_PORTS}" ]; then
+    RESERVED_LOCAL_TCP_PORTS="${RESERVED_LOCAL_TCP_PORTS} ${port}"
+  else
+    RESERVED_LOCAL_TCP_PORTS="${port}"
+  fi
+}
+
 find_next_available_tcp_port() {
   local start_port="$1"
   local candidate=$((start_port + 1))
 
   while [ "${candidate}" -le 65535 ]; do
-    if [ -z "$(describe_tcp_port_usage "${candidate}")" ]; then
+    if [ -z "$(describe_local_tcp_port_conflict "${candidate}")" ]; then
       printf '%s' "${candidate}"
       return 0
     fi
@@ -1333,7 +1374,7 @@ prompt_available_local_tcp_port() {
   while true; do
     answer="$(prompt_non_empty "${label}（原默认端口 ${original_default} 已被占用；当前默认值 ${suggested_port} 是临时选出的空闲端口）" "${suggested_port}")"
     validate_port_number "${key}" "${answer}"
-    usage="$(describe_tcp_port_usage "${answer}")"
+    usage="$(describe_local_tcp_port_conflict "${answer}")"
     if [ -z "${usage}" ]; then
       printf '%s' "${answer}"
       return 0
@@ -1356,12 +1397,15 @@ resolve_default_local_tcp_port() {
   local suggested_port
 
   if current_value="$(existing_env_value "${env_file}" "${key}")"; then
+    validate_port_number "${key}" "${current_value}"
+    usage="$(describe_local_tcp_port_conflict "${current_value}")"
+    [ -z "${usage}" ] || fail "${label} ${current_value} 与当前安装流程中的其他端口冲突：${usage}"
     printf '%s' "${current_value}"
     return 0
   fi
 
   validate_port_number "${key}" "${built_in_default}"
-  usage="$(describe_tcp_port_usage "${built_in_default}")"
+  usage="$(describe_local_tcp_port_conflict "${built_in_default}")"
   if [ -z "${usage}" ]; then
     printf '%s' "${built_in_default}"
     return 0
@@ -1384,12 +1428,14 @@ prompt_local_tcp_port() {
   if answer="$(existing_env_value "${env_file}" "${key}")"; then
     answer="$(prompt_non_empty "${label}" "${answer}")"
     validate_port_number "${key}" "${answer}"
+    usage="$(describe_local_tcp_port_conflict "${answer}")"
+    [ -z "${usage}" ] || fail "${label} ${answer} 与当前安装流程中的其他端口冲突：${usage}"
     printf '%s' "${answer}"
     return 0
   fi
 
   validate_port_number "${key}" "${built_in_default}"
-  usage="$(describe_tcp_port_usage "${built_in_default}")"
+  usage="$(describe_local_tcp_port_conflict "${built_in_default}")"
   if [ -z "${usage}" ]; then
     suggested_port="${built_in_default}"
   else
@@ -1400,7 +1446,7 @@ prompt_local_tcp_port() {
   while true; do
     answer="$(prompt_non_empty "${label}" "${suggested_port}")"
     validate_port_number "${key}" "${answer}"
-    usage="$(describe_tcp_port_usage "${answer}")"
+    usage="$(describe_local_tcp_port_conflict "${answer}")"
     if [ -z "${usage}" ]; then
       printf '%s' "${answer}"
       return 0
@@ -1411,6 +1457,26 @@ prompt_local_tcp_port() {
     suggested_port="$(find_next_available_tcp_port "${answer}")"
     printf '已重新临时选中空闲端口 %s 作为当前默认值，请确认或改成其他端口。\n' "${suggested_port}" >&2
   done
+}
+
+assign_default_local_tcp_port() {
+  local target_var="$1"
+  shift
+  local selected_port
+
+  selected_port="$(resolve_default_local_tcp_port "$@")"
+  reserve_local_tcp_port "${selected_port}"
+  printf -v "${target_var}" '%s' "${selected_port}"
+}
+
+assign_prompt_local_tcp_port() {
+  local target_var="$1"
+  shift
+  local selected_port
+
+  selected_port="$(prompt_local_tcp_port "$@")"
+  reserve_local_tcp_port "${selected_port}"
+  printf -v "${target_var}" '%s' "${selected_port}"
 }
 
 write_env_reset() {
@@ -1480,11 +1546,11 @@ validate_port_range() {
 
 set_default_zlm_port_config() {
   local existing_env_file="$1"
-  ZLM_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "ZLM_HTTP_PORT" "ZLM HTTP 宿主机监听端口" "80")"
+  assign_default_local_tcp_port ZLM_HTTP_PORT "${existing_env_file}" "ZLM_HTTP_PORT" "ZLM HTTP 宿主机监听端口" "80"
   ZLM_HTTPS_PORT="$(env_value_or_default "${existing_env_file}" "ZLM_HTTPS_PORT" "0")"
-  ZLM_RTMP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "ZLM_RTMP_PORT" "ZLM RTMP 宿主机监听端口" "1935")"
+  assign_default_local_tcp_port ZLM_RTMP_PORT "${existing_env_file}" "ZLM_RTMP_PORT" "ZLM RTMP 宿主机监听端口" "1935"
   ZLM_RTMPS_PORT="$(env_value_or_default "${existing_env_file}" "ZLM_RTMPS_PORT" "0")"
-  ZLM_RTSP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "ZLM_RTSP_PORT" "ZLM RTSP 宿主机监听端口" "554")"
+  assign_default_local_tcp_port ZLM_RTSP_PORT "${existing_env_file}" "ZLM_RTSP_PORT" "ZLM RTSP 宿主机监听端口" "554"
   ZLM_RTSPS_PORT="$(env_value_or_default "${existing_env_file}" "ZLM_RTSPS_PORT" "0")"
   ZLM_RTP_PROXY_PORT="$(env_value_or_default "${existing_env_file}" "ZLM_RTP_PROXY_PORT" "0")"
   ZLM_RTP_PROXY_PORT_RANGE="$(env_value_or_default "${existing_env_file}" "ZLM_RTP_PROXY_PORT_RANGE" "0-0")"
@@ -1904,9 +1970,9 @@ configure_control_plane() {
   POSTGRES_PASSWORD="$(prompt "PostgreSQL 密码（留空自动生成）" "")"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
-  POSTGRES_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432")"
-  CORE_HTTP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 暴露端口" "8080")"
-  CORE_GRPC_PORT="$(prompt_local_tcp_port "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 暴露端口" "50051")"
+  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432"
+  assign_prompt_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 暴露端口" "8080"
+  assign_prompt_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 暴露端口" "50051"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")")"
   STORAGE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "/data/media/work,/data/zlm/www")"
   prompt_local_auth_configuration "${existing_env_file}"
@@ -1962,7 +2028,7 @@ configure_worker_host() {
   PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
-  AGENT_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081")"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
   OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
   OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "")"
@@ -2026,7 +2092,7 @@ configure_worker_host_gpu() {
   PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
-  AGENT_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081")"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
   OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
   OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "")"
@@ -2093,10 +2159,10 @@ configure_all_in_one_host() {
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
   PUBLIC_HOST="$(prompt_non_empty "当前主机对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
-  POSTGRES_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432")"
-  CORE_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 宿主机监听端口" "8080")"
-  CORE_GRPC_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 宿主机监听端口" "50051")"
-  AGENT_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081")"
+  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432"
+  assign_default_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 宿主机监听端口" "8080"
+  assign_default_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 宿主机监听端口" "50051"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
   HOOK_SOURCE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")"
   OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
@@ -2177,10 +2243,10 @@ configure_all_in_one_host_gpu() {
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
   PUBLIC_HOST="$(prompt_non_empty "当前主机对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
-  POSTGRES_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432")"
-  CORE_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 宿主机监听端口" "8080")"
-  CORE_GRPC_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 宿主机监听端口" "50051")"
-  AGENT_HTTP_PORT="$(resolve_default_local_tcp_port "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081")"
+  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432"
+  assign_default_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 宿主机监听端口" "8080"
+  assign_default_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 宿主机监听端口" "50051"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
   HOOK_SOURCE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")"
   OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
