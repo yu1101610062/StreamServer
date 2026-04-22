@@ -1296,6 +1296,13 @@ describe_tcp_port_usage() {
   [ -n "${proc_output}" ] && printf '%s' "${proc_output}"
 }
 
+upgrade_existing_tcp_port_key() {
+  local env_file="$1"
+  local key="$2"
+  [ "${IS_UPGRADE}" = "true" ] || return 1
+  env_key_exists "${env_file}" "${key}"
+}
+
 session_reserved_tcp_port_usage() {
   local port="$1"
   case " ${RESERVED_LOCAL_TCP_PORTS} " in
@@ -1305,12 +1312,15 @@ session_reserved_tcp_port_usage() {
 
 describe_local_tcp_port_conflict() {
   local port="$1"
+  local skip_host_check="${2:-false}"
   local usage=""
 
-  usage="$(describe_tcp_port_usage "${port}")"
-  if [ -n "${usage}" ]; then
-    printf '%s' "${usage}"
-    return 0
+  if [ "${skip_host_check}" != "true" ]; then
+    usage="$(describe_tcp_port_usage "${port}")"
+    if [ -n "${usage}" ]; then
+      printf '%s' "${usage}"
+      return 0
+    fi
   fi
 
   usage="$(session_reserved_tcp_port_usage "${port}")"
@@ -1332,10 +1342,11 @@ reserve_local_tcp_port() {
 
 find_next_available_tcp_port() {
   local start_port="$1"
+  local skip_host_check="${2:-false}"
   local candidate=$((start_port + 1))
 
   while [ "${candidate}" -le 65535 ]; do
-    if [ -z "$(describe_local_tcp_port_conflict "${candidate}")" ]; then
+    if [ -z "$(describe_local_tcp_port_conflict "${candidate}" "${skip_host_check}")" ]; then
       printf '%s' "${candidate}"
       return 0
     fi
@@ -1392,26 +1403,32 @@ resolve_default_local_tcp_port() {
   local key="$2"
   local label="$3"
   local built_in_default="$4"
+  local skip_host_check="false"
   local current_value
   local usage=""
   local suggested_port
 
+  # Upgrades only check host-level occupancy for newly introduced TCP port keys.
+  if upgrade_existing_tcp_port_key "${env_file}" "${key}"; then
+    skip_host_check="true"
+  fi
+
   if current_value="$(existing_env_value "${env_file}" "${key}")"; then
     validate_port_number "${key}" "${current_value}"
-    usage="$(describe_local_tcp_port_conflict "${current_value}")"
+    usage="$(describe_local_tcp_port_conflict "${current_value}" "${skip_host_check}")"
     [ -z "${usage}" ] || fail "${label} ${current_value} 与当前安装流程中的其他端口冲突：${usage}"
     printf '%s' "${current_value}"
     return 0
   fi
 
   validate_port_number "${key}" "${built_in_default}"
-  usage="$(describe_local_tcp_port_conflict "${built_in_default}")"
+  usage="$(describe_local_tcp_port_conflict "${built_in_default}" "${skip_host_check}")"
   if [ -z "${usage}" ]; then
     printf '%s' "${built_in_default}"
     return 0
   fi
 
-  suggested_port="$(find_next_available_tcp_port "${built_in_default}")"
+  suggested_port="$(find_next_available_tcp_port "${built_in_default}" "${skip_host_check}")"
   announce_default_local_tcp_port_conflict "${label}" "${built_in_default}" "${usage}" "${suggested_port}"
   prompt_available_local_tcp_port "${key}" "${label}" "${built_in_default}" "${suggested_port}"
 }
@@ -1421,32 +1438,37 @@ prompt_local_tcp_port() {
   local key="$2"
   local label="$3"
   local built_in_default="$4"
+  local skip_host_check="false"
   local answer
   local usage=""
   local suggested_port
 
+  if upgrade_existing_tcp_port_key "${env_file}" "${key}"; then
+    skip_host_check="true"
+  fi
+
   if answer="$(existing_env_value "${env_file}" "${key}")"; then
     answer="$(prompt_non_empty "${label}" "${answer}")"
     validate_port_number "${key}" "${answer}"
-    usage="$(describe_local_tcp_port_conflict "${answer}")"
+    usage="$(describe_local_tcp_port_conflict "${answer}" "${skip_host_check}")"
     [ -z "${usage}" ] || fail "${label} ${answer} 与当前安装流程中的其他端口冲突：${usage}"
     printf '%s' "${answer}"
     return 0
   fi
 
   validate_port_number "${key}" "${built_in_default}"
-  usage="$(describe_local_tcp_port_conflict "${built_in_default}")"
+  usage="$(describe_local_tcp_port_conflict "${built_in_default}" "${skip_host_check}")"
   if [ -z "${usage}" ]; then
     suggested_port="${built_in_default}"
   else
-    suggested_port="$(find_next_available_tcp_port "${built_in_default}")"
+    suggested_port="$(find_next_available_tcp_port "${built_in_default}" "${skip_host_check}")"
     announce_default_local_tcp_port_conflict "${label}" "${built_in_default}" "${usage}" "${suggested_port}"
   fi
 
   while true; do
     answer="$(prompt_non_empty "${label}" "${suggested_port}")"
     validate_port_number "${key}" "${answer}"
-    usage="$(describe_local_tcp_port_conflict "${answer}")"
+    usage="$(describe_local_tcp_port_conflict "${answer}" "${skip_host_check}")"
     if [ -z "${usage}" ]; then
       printf '%s' "${answer}"
       return 0
@@ -1454,7 +1476,7 @@ prompt_local_tcp_port() {
 
     printf '端口 %s 已被占用，不能直接使用。\n' "${answer}" >&2
     print_tcp_port_usage_details "${usage}"
-    suggested_port="$(find_next_available_tcp_port "${answer}")"
+    suggested_port="$(find_next_available_tcp_port "${answer}" "${skip_host_check}")"
     printf '已重新临时选中空闲端口 %s 作为当前默认值，请确认或改成其他端口。\n' "${suggested_port}" >&2
   done
 }
