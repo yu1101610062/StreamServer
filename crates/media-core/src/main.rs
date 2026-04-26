@@ -1870,6 +1870,7 @@ async fn process_zlm_hook(
                             task_id: target.task_id,
                             attempt_id: target.attempt_id,
                             attempt_no: Some(target.attempt_no),
+                            resolved_spec: target.resolved_spec.clone(),
                             event_type: "rtp_server_timeout".to_string(),
                             event_level: "warn".to_string(),
                             payload: json!({

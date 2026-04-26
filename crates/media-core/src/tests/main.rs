@@ -5154,7 +5154,7 @@ async fn startup_timeout_snapshot_cleans_stream_bindings() -> anyhow::Result<()>
         "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
         "stream": {"app": "live", "name": "camera01"},
         "record": {"enabled": false},
-        "recovery": {"policy": "auto"},
+        "recovery": {"policy": "never"},
         "schedule": {"start_mode": "immediate"},
         "resource": {}
     });
@@ -5242,6 +5242,191 @@ async fn startup_timeout_snapshot_cleans_stream_bindings() -> anyhow::Result<()>
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(binding_count, 0);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sticky_live_ingest_startup_timeout_snapshot_stays_starting() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    let server_id = format!("zlm-{node_id}");
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01"},
+        "record": {"enabled": false},
+        "recovery": {"policy": "auto"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_starting_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+    let attempt_id: Uuid = sqlx::query_scalar(
+        r#"
+        select id
+          from task_attempts
+         where task_id = $1
+           and attempt_no = 1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into stream_bindings (
+          id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+          zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+        ) values (
+          $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+          'proxy-sticky-startup-timeout', null, null, $6
+        )
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(task_id)
+    .bind(attempt_id)
+    .bind(&server_id)
+    .bind(node_id)
+    .bind(Utc::now())
+    .execute(&db.pool)
+    .await?;
+
+    repository
+        .record_agent_snapshot(
+            node_id,
+            repository::TaskSnapshotRecord {
+                runtime_id: Uuid::now_v7(),
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                worker_kind: "zlm_proxy".to_string(),
+                pid: None,
+                state: "exited".to_string(),
+                command_line: Some("zlm addStreamProxy ...".to_string()),
+                outputs: Vec::new(),
+                metadata: json!({
+                    "startup_timeout": true,
+                    "stream_binding": {
+                        "schema": "rtsp",
+                        "vhost": "__defaultVhost__",
+                        "app": "live",
+                        "stream": "camera01"
+                    },
+                    "zlm_server_id": server_id,
+                    "zlm_proxy_key": "proxy-sticky-startup-timeout"
+                }),
+            },
+        )
+        .await?;
+
+    let detail = repository.get_task(task_id).await?;
+    assert_eq!(detail.task.status, media_domain::TaskStatus::Starting);
+    assert_eq!(
+        detail
+            .current_attempt
+            .as_ref()
+            .map(|attempt| attempt.status),
+        Some(media_domain::AttemptStatus::Starting)
+    );
+
+    let binding_count: i64 =
+        sqlx::query_scalar("select count(*) from stream_bindings where task_id = $1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(binding_count, 1);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sticky_live_ingest_failed_event_keeps_running_status() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01"},
+        "record": {"enabled": false},
+        "recovery": {"policy": "auto"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+    sqlx::query(
+        r#"
+        update task_attempts
+           set lease_token = 'lease-1'
+         where task_id = $1
+           and attempt_no = 1
+        "#,
+    )
+    .bind(task_id)
+    .execute(&db.pool)
+    .await?;
+
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "failed".to_string(),
+                event_level: "error".to_string(),
+                message: "live_relay stream went offline unexpectedly".to_string(),
+                payload: json!({"reason": "unexpected_offline"}),
+            },
+        )
+        .await?;
+
+    let detail = repository.get_task(task_id).await?;
+    assert_eq!(detail.task.status, media_domain::TaskStatus::Running);
+    assert_eq!(
+        detail
+            .current_attempt
+            .as_ref()
+            .map(|attempt| attempt.status),
+        Some(media_domain::AttemptStatus::Running)
+    );
+    assert_eq!(
+        detail
+            .current_attempt
+            .as_ref()
+            .and_then(|attempt| attempt.failure_code.as_deref()),
+        None
+    );
 
     db.cleanup().await?;
     Ok(())

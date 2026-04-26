@@ -123,6 +123,48 @@ fn continuous_stream_ingest_handle() -> RuntimeHandle {
     }
 }
 
+fn sticky_live_ingest_handle(stream_online: bool) -> RuntimeHandle {
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "sticky-live-ingest",
+        "common": {"created_by": "tester"},
+        "input": {
+            "kind": "udp_mpegts_multicast",
+            "source_mode": "live",
+            "url": "udp://239.0.0.1:1234"
+        },
+        "stream": {"app": "live", "name": "sticky-live"},
+        "process": {"mode": "copy_or_transcode"},
+        "record": {"enabled": false},
+        "recovery": {"policy": "auto"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(1234),
+        started_at: Utc::now(),
+        last_progress_at: stream_online.then(Utc::now),
+        state: if stream_online {
+            RuntimeState::Running
+        } else {
+            RuntimeState::Starting
+        },
+        command_line: Some("ffmpeg -i input".to_string()),
+        outputs: vec!["rtsp://127.0.0.1:554/live/sticky-live".to_string()],
+        metadata: json!({
+            "task_type": "stream_ingest",
+            "execution_mode": "managed",
+            "lease_token": "lease",
+            "stream_online": stream_online,
+            "resolved_spec": resolved_spec,
+        }),
+    }
+}
+
 fn create_mock_ffprobe_binary(
     root: &Path,
     video_codec_name: &str,
@@ -3845,6 +3887,30 @@ fn should_auto_restart_process_restarts_continuous_stream_on_zero_exit() {
 }
 
 #[test]
+fn should_auto_restart_process_restarts_sticky_live_ingest_before_first_online() {
+    let handle = sticky_live_ingest_handle(false);
+
+    assert!(should_auto_restart_process(
+        &handle,
+        false,
+        &Ok(success_exit_status()),
+    ));
+}
+
+#[test]
+fn sticky_reconnect_respects_recovery_never() {
+    let mut handle = sticky_live_ingest_handle(false);
+    handle.metadata["resolved_spec"]["recovery"]["policy"] = json!("never");
+
+    assert!(!sticky_reconnect_stream_ingest_from_handle(&handle));
+    assert!(!should_auto_restart_process(
+        &handle,
+        false,
+        &Ok(success_exit_status()),
+    ));
+}
+
+#[test]
 fn classify_adopted_exit_marks_unstopped_continuous_stream_exit_as_failed() {
     let mut handle = continuous_stream_ingest_handle();
     handle.state = RuntimeState::Exited;
@@ -3874,6 +3940,51 @@ fn live_relay_monitor_requires_consecutive_offline_before_failure() {
     let (polls, should_fail) = next_live_relay_offline_polls(polls, true, Err(()));
     assert_eq!(polls, 0);
     assert!(!should_fail);
+}
+
+#[test]
+fn source_reconnecting_event_dedupes_by_reason() {
+    let mut handle = sticky_live_ingest_handle(true);
+    assert!(should_emit_source_reconnecting(
+        &handle,
+        "source_disconnected"
+    ));
+
+    mark_source_reconnecting(&mut handle, "source_disconnected");
+    assert!(!should_emit_source_reconnecting(
+        &handle,
+        "source_disconnected"
+    ));
+    assert!(should_emit_source_reconnecting(&handle, "startup_timeout"));
+
+    clear_source_reconnecting(&mut handle);
+    assert!(should_emit_source_reconnecting(
+        &handle,
+        "source_disconnected"
+    ));
+}
+
+#[test]
+fn open_rtp_server_params_can_be_rebuilt_from_runtime_metadata() {
+    let params = build_open_rtp_server_params_from_metadata(&RtpServerMetadata {
+        stream_id: "stream-1".to_string(),
+        local_port: 15000,
+        requested_port: 15000,
+        tcp_mode: 1,
+        reuse_port: Some(true),
+        ssrc: Some(42),
+    })
+    .into_iter()
+    .collect::<HashMap<_, _>>();
+
+    assert_eq!(params.get("port").map(String::as_str), Some("15000"));
+    assert_eq!(params.get("tcp_mode").map(String::as_str), Some("1"));
+    assert_eq!(
+        params.get("stream_id").map(String::as_str),
+        Some("stream-1")
+    );
+    assert_eq!(params.get("re_use_port").map(String::as_str), Some("1"));
+    assert_eq!(params.get("ssrc").map(String::as_str), Some("42"));
 }
 
 #[test]

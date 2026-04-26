@@ -3465,6 +3465,7 @@ impl TaskRepository {
             tx.commit().await?;
             return Ok(());
         };
+        let sticky_reconnect_active = sticky_reconnect_active(&ownership)?;
 
         self.insert_event(
             &mut tx,
@@ -3484,6 +3485,8 @@ impl TaskRepository {
         .await?;
 
         match event.event_type.as_str() {
+            "accepted" | "starting"
+                if sticky_reconnect_active && ownership.task_status == TaskStatus::Running => {}
             "accepted" | "starting" => {
                 sqlx::query(
                     r#"
@@ -3518,6 +3521,7 @@ impl TaskRepository {
                 .execute(&mut *tx)
                 .await?;
             }
+            "recovering" if sticky_reconnect_active => {}
             "recovering" => {
                 sqlx::query(
                     r#"
@@ -3778,6 +3782,7 @@ impl TaskRepository {
                 .execute(&mut *tx)
                 .await?;
             }
+            "succeeded" if sticky_reconnect_active => {}
             "succeeded" => {
                 self.complete_task_attempt(
                     &mut tx,
@@ -3792,6 +3797,7 @@ impl TaskRepository {
                 )
                 .await?;
             }
+            "failed" if sticky_reconnect_active => {}
             "failed" => {
                 self.complete_task_attempt(
                     &mut tx,
@@ -4539,16 +4545,19 @@ impl TaskRepository {
         .await?;
 
         if let Some(attempt_no) = record.attempt_no {
-            self.mark_task_lost(
-                &mut tx,
-                record.task_id,
-                attempt_no,
-                node_id,
-                failure_code,
-                failure_reason,
-                Utc::now(),
-            )
-            .await?;
+            let sticky_reconnect = sticky_reconnect_from_spec_value(Some(&record.resolved_spec))?;
+            if !sticky_reconnect {
+                self.mark_task_lost(
+                    &mut tx,
+                    record.task_id,
+                    attempt_no,
+                    node_id,
+                    failure_code,
+                    failure_reason,
+                    Utc::now(),
+                )
+                .await?;
+            }
         }
 
         self.mark_hook_event_processed(&mut tx, dedup_key).await?;
@@ -5504,6 +5513,10 @@ impl TaskRepository {
             return Ok(());
         }
 
+        if sticky_reconnect_active(ownership)? {
+            return Ok(());
+        }
+
         let failure_reason = metadata
             .get("recording_fatal_error")
             .and_then(Value::as_str)
@@ -5959,6 +5972,22 @@ fn retry_enabled_on_disconnect(spec: &TaskSpec) -> bool {
             .policy
             .unwrap_or(RecoveryPolicy::default_for(spec.task_type)),
         RecoveryPolicy::Never
+    )
+}
+
+fn sticky_reconnect_from_spec_value(value: Option<&Value>) -> Result<bool, RepoError> {
+    Ok(value
+        .cloned()
+        .map(serde_json::from_value::<TaskSpec>)
+        .transpose()?
+        .is_some_and(|spec| spec.stream_ingest_uses_sticky_reconnect()))
+}
+
+fn sticky_reconnect_active(ownership: &AttemptOwnership) -> Result<bool, RepoError> {
+    Ok(
+        sticky_reconnect_from_spec_value(ownership.resolved_spec.as_ref())?
+            && ownership.task_status != TaskStatus::Stopping
+            && ownership.stop_requested_at.is_none(),
     )
 }
 
@@ -7387,6 +7416,7 @@ pub struct ZlmTaskEventHookRecord {
     pub task_id: Uuid,
     pub attempt_id: Option<Uuid>,
     pub attempt_no: Option<i32>,
+    pub resolved_spec: Value,
     pub event_type: String,
     pub event_level: String,
     pub payload: Value,

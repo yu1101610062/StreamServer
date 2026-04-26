@@ -128,6 +128,32 @@ fn file_transcode_defaults_to_auto_recovery() {
 }
 
 #[test]
+fn live_stream_ingest_without_recording_uses_sticky_reconnect_by_default() {
+    let resolved = sample_task(TaskType::StreamIngest).resolved();
+
+    assert!(resolved.stream_ingest_uses_sticky_reconnect());
+}
+
+#[test]
+fn sticky_reconnect_respects_recording_and_recovery_opt_out() {
+    let mut recording_task = sample_task(TaskType::StreamIngest);
+    recording_task.record.enabled = Some(true);
+    assert!(
+        !recording_task
+            .resolved()
+            .stream_ingest_uses_sticky_reconnect()
+    );
+
+    let mut opt_out_task = sample_task(TaskType::StreamIngest);
+    opt_out_task.recovery.policy = Some(RecoveryPolicy::Never);
+    assert!(
+        !opt_out_task
+            .resolved()
+            .stream_ingest_uses_sticky_reconnect()
+    );
+}
+
+#[test]
 fn recovery_policy_deserializes_legacy_aliases() {
     let on_failure: RecoveryPolicy = serde_json::from_str("\"on_failure\"").unwrap();
     let always: RecoveryPolicy = serde_json::from_str("\"always\"").unwrap();
