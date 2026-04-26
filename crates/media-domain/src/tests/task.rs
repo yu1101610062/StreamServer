@@ -135,15 +135,25 @@ fn live_stream_ingest_without_recording_uses_sticky_reconnect_by_default() {
 }
 
 #[test]
-fn sticky_reconnect_respects_recording_and_recovery_opt_out() {
+fn sticky_reconnect_allows_unbounded_live_recording() {
     let mut recording_task = sample_task(TaskType::StreamIngest);
     recording_task.record.enabled = Some(true);
+    assert!(
+        recording_task
+            .resolved()
+            .stream_ingest_uses_sticky_reconnect()
+    );
+
+    recording_task.record.duration_sec = Some(60);
     assert!(
         !recording_task
             .resolved()
             .stream_ingest_uses_sticky_reconnect()
     );
+}
 
+#[test]
+fn sticky_reconnect_respects_recovery_opt_out() {
     let mut opt_out_task = sample_task(TaskType::StreamIngest);
     opt_out_task.recovery.policy = Some(RecoveryPolicy::Never);
     assert!(
@@ -151,6 +161,29 @@ fn sticky_reconnect_respects_recording_and_recovery_opt_out() {
             .resolved()
             .stream_ingest_uses_sticky_reconnect()
     );
+}
+
+#[test]
+fn vod_loop_playback_ingest_uses_sticky_reconnect_until_duration() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.input.kind = Some(InputKind::HttpMp4);
+    task.input.source_mode = Some(SourceMode::Vod);
+    task.input.loop_enabled = Some(true);
+    task.record.enabled = Some(true);
+    task.expose.enable_rtsp = Some(true);
+
+    assert!(task.resolved().stream_ingest_uses_sticky_reconnect());
+
+    task.record.duration_sec = Some(60);
+    assert!(!task.resolved().stream_ingest_uses_sticky_reconnect());
+
+    task.record.duration_sec = None;
+    task.expose.enable_rtsp = Some(false);
+    task.expose.enable_rtmp = Some(false);
+    task.expose.enable_http_ts = Some(false);
+    task.expose.enable_http_fmp4 = Some(false);
+    task.expose.enable_hls = Some(false);
+    assert!(!task.resolved().stream_ingest_uses_sticky_reconnect());
 }
 
 #[test]

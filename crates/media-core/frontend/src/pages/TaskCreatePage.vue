@@ -671,7 +671,7 @@ function previewTask() {
           </el-col>
           <el-col v-if="draft.record.enabled" :md="6" :span="24">
             <el-form-item label="分段时长（秒，可选，仅 HLS 或需要切片 MP4 时填写）">
-              <el-input v-model="draft.record.segment_sec" placeholder="例如 60" />
+              <el-input v-model="draft.record.segment_sec" placeholder="例如 300；实时 MP4 默认 7200" />
             </el-form-item>
           </el-col>
           <el-col v-if="draft.record.enabled" :md="6" :span="24">
@@ -705,12 +705,12 @@ function previewTask() {
           </el-col>
           <el-col :md="8" :span="24">
             <el-form-item label="最大连续失败次数（可选）">
-              <el-input v-model="draft.recovery.max_consecutive_failures" placeholder="为空表示按系统默认处理" />
+              <el-input v-model="draft.recovery.max_consecutive_failures" placeholder="为空表示按系统默认处理，仅限制启动失败" />
             </el-form-item>
           </el-col>
           <el-col :md="8" :span="24">
             <el-form-item label="恢复模式（高级，可选）">
-              <el-input v-model="draft.recovery.resume_mode" placeholder="仅在专家模式或明确约定时填写" />
+              <el-input v-model="draft.recovery.resume_mode" placeholder="保留字段，通常留空" />
             </el-form-item>
           </el-col>
         </el-row>

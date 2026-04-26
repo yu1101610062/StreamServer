@@ -5377,7 +5377,7 @@ async fn sticky_live_ingest_failed_event_keeps_running_status() -> anyhow::Resul
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
         "stream": {"app": "live", "name": "camera01"},
-        "record": {"enabled": false},
+        "record": {"enabled": true},
         "recovery": {"policy": "auto"},
         "schedule": {"start_mode": "immediate"},
         "resource": {}

@@ -596,14 +596,24 @@ impl TaskSpec {
     }
 
     pub fn stream_ingest_uses_sticky_reconnect(&self) -> bool {
-        self.task_type == TaskType::StreamIngest
-            && self.input.source_mode == Some(SourceMode::Live)
-            && !self.record.enabled.unwrap_or(false)
-            && self
+        if self.task_type != TaskType::StreamIngest
+            || self.record.duration_sec.is_some()
+            || self
                 .recovery
                 .policy
                 .unwrap_or(RecoveryPolicy::default_for(self.task_type))
-                == RecoveryPolicy::Auto
+                != RecoveryPolicy::Auto
+        {
+            return false;
+        }
+
+        match self.input.source_mode {
+            Some(SourceMode::Live) => true,
+            Some(SourceMode::Vod) => {
+                self.input.loop_enabled.unwrap_or(false) && self.expose.any_playback_enabled()
+            }
+            None => false,
+        }
     }
 
     pub fn stream_ingest_uses_wall_clock_record_duration(&self) -> bool {

@@ -336,7 +336,7 @@ function fieldMeta(path: string): FieldMeta | null {
       meta: { description: "录制输出格式。", enumValues: RECORD_FORMAT_ENUM },
     },
     { test: (value) => value === "record.duration_sec", meta: { description: "录制时长上限，单位秒。VOD 快录分支下如果同时开启 `input.loop_enabled=true`，这里必须填写。" } },
-    { test: (value) => value === "record.segment_sec", meta: { description: "录制分段时长，单位秒。HLS 会按此切片；MP4 只有在显式填写时才会分段，不填时默认输出单个文件。" } },
+    { test: (value) => value === "record.segment_sec", meta: { description: "录制分段时长，单位秒。实时 MP4 不填时默认 7200 秒分段；VOD 快录 HLS 不填时默认 6 秒切片。" } },
     {
       test: (value) => value === "record.save_path",
       meta: { description: "已忽略。stream_ingest 录制目录由系统托管生成，仅为兼容旧请求保留。" },
@@ -345,10 +345,10 @@ function fieldMeta(path: string): FieldMeta | null {
     { test: (value) => value === "recovery", meta: { description: "失败恢复策略。" } },
     {
       test: (value) => value === "recovery.policy",
-      meta: { description: "失败恢复策略。", enumValues: RECOVERY_POLICY_ENUM },
+      meta: { description: "失败恢复策略。auto 会让连续型流接入在断源后持续等待恢复；never 会禁用自动恢复。", enumValues: RECOVERY_POLICY_ENUM },
     },
-    { test: (value) => value === "recovery.resume_mode", meta: { description: "恢复时的高级恢复模式。" } },
-    { test: (value) => value === "recovery.max_consecutive_failures", meta: { description: "最大连续失败次数。" } },
+    { test: (value) => value === "recovery.resume_mode", meta: { description: "恢复时的高级恢复模式，当前为保留字段。" } },
+    { test: (value) => value === "recovery.max_consecutive_failures", meta: { description: "最大连续启动失败次数；不限制连续型流接入的断链等待。" } },
     { test: (value) => value === "schedule", meta: { description: "任务首次启动方式。" } },
     {
       test: (value) => value === "schedule.start_mode",

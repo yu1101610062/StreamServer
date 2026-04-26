@@ -1574,6 +1574,10 @@ impl ManagedProcessExecutor {
                 } else {
                     "source_unavailable"
                 };
+                let emit_gap_started = should_emit_recording_gap_started(&exited_handle);
+                if sticky_reconnect {
+                    mark_source_reconnecting(&mut exited_handle, restart_reason);
+                }
                 let _ = persist_runtime_state(&work_dir, &exited_handle, &success_check);
                 if sticky_reconnect {
                     emit_source_reconnecting_event(
@@ -1588,6 +1592,19 @@ impl ManagedProcessExecutor {
                             "reason": restart_reason,
                         }),
                     );
+                    if emit_gap_started {
+                        emit_recording_gap_started_event(
+                            &events,
+                            &exited_handle,
+                            restart_reason,
+                            json!({
+                                "runtime_id": exited_handle.runtime_id,
+                                "exit_code": status.as_ref().ok().and_then(|value| value.code()),
+                                "output_target": output_target,
+                                "task_type": task_type_from_handle(&exited_handle),
+                            }),
+                        );
+                    }
                 } else {
                     let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                         task_id: exited_handle.task_id,
@@ -1820,7 +1837,50 @@ impl ManagedProcessExecutor {
         .await;
 
         let request = restart_request_from_handle(exited_handle)?;
-        let restarted = self.start_process_task(&request, self.slot_limiter.try_acquire()?)?;
+        let mut restarted = self.start_process_task(&request, self.slot_limiter.try_acquire()?)?;
+        if exited_handle
+            .metadata
+            .get("source_reconnecting")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let source_reconnecting = exited_handle
+                .metadata
+                .get("source_reconnecting")
+                .cloned()
+                .unwrap_or(json!(true));
+            let source_reconnect_reason = exited_handle
+                .metadata
+                .get("source_reconnect_reason")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let recording_gap_active = exited_handle
+                .metadata
+                .get("recording_gap_active")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let recording_gap_reason = exited_handle
+                .metadata
+                .get("recording_gap_reason")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let recording_gap_started_at = exited_handle
+                .metadata
+                .get("recording_gap_started_at")
+                .cloned()
+                .unwrap_or(Value::Null);
+            restarted = self
+                .registry
+                .update(restarted.runtime_id, |runtime| {
+                    runtime.metadata["source_reconnecting"] = source_reconnecting;
+                    runtime.metadata["source_reconnect_reason"] = source_reconnect_reason;
+                    runtime.metadata["recording_gap_active"] = recording_gap_active;
+                    runtime.metadata["recording_gap_reason"] = recording_gap_reason;
+                    runtime.metadata["recording_gap_started_at"] = recording_gap_started_at;
+                    runtime.metadata["recording_gap_ended_at"] = Value::Null;
+                })
+                .unwrap_or(restarted);
+        }
         if emit_starting_event {
             let _ = self
                 .events
@@ -2441,9 +2501,7 @@ fn should_use_managed_process_for_record_only_live_ingest(spec: &TaskSpec) -> bo
 
 const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
 const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
-// ZLMediaKit falls back to a time-sliced mp4 recorder and does not expose a true
-// unlimited mode, so use a long horizon to approximate "single file" recording.
-const ZLM_SINGLE_FILE_MP4_MAX_SECOND: u32 = 31_536_000;
+const DEFAULT_REALTIME_MP4_RECORD_SEGMENT_SEC: u32 = 7_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -5164,6 +5222,24 @@ fn sticky_reconnect_stream_ingest_from_handle(handle: &RuntimeHandle) -> bool {
     resolved_spec_from_handle(handle).is_some_and(|spec| spec.stream_ingest_uses_sticky_reconnect())
 }
 
+fn stream_ingest_recording_enabled_from_handle(handle: &RuntimeHandle) -> bool {
+    resolved_spec_from_handle(handle).is_some_and(|spec| {
+        spec.task_type == TaskType::StreamIngest && spec.record.enabled.unwrap_or(false)
+    })
+}
+
+fn recording_gap_active(handle: &RuntimeHandle) -> bool {
+    handle
+        .metadata
+        .get("recording_gap_active")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn should_emit_recording_gap_started(handle: &RuntimeHandle) -> bool {
+    stream_ingest_recording_enabled_from_handle(handle) && !recording_gap_active(handle)
+}
+
 fn should_emit_source_reconnecting(handle: &RuntimeHandle, reason: &str) -> bool {
     !handle
         .metadata
@@ -5182,12 +5258,22 @@ fn mark_source_reconnecting(runtime: &mut RuntimeHandle, reason: &str) {
     runtime.metadata["stream_online"] = json!(false);
     runtime.metadata["source_reconnecting"] = json!(true);
     runtime.metadata["source_reconnect_reason"] = json!(reason);
+    if stream_ingest_recording_enabled_from_handle(runtime) && !recording_gap_active(runtime) {
+        runtime.metadata["recording_gap_active"] = json!(true);
+        runtime.metadata["recording_gap_reason"] = json!(reason);
+        runtime.metadata["recording_gap_started_at"] = json!(Utc::now().to_rfc3339());
+        runtime.metadata["recording_gap_ended_at"] = Value::Null;
+    }
 }
 
 fn clear_source_reconnecting(runtime: &mut RuntimeHandle) {
     runtime.metadata["source_reconnecting"] = json!(false);
     runtime.metadata["source_reconnect_reason"] = Value::Null;
     runtime.metadata["startup_timeout"] = Value::Null;
+    if recording_gap_active(runtime) {
+        runtime.metadata["recording_gap_active"] = json!(false);
+        runtime.metadata["recording_gap_ended_at"] = json!(Utc::now().to_rfc3339());
+    }
 }
 
 fn emit_source_reconnecting_event(
@@ -5206,6 +5292,67 @@ fn emit_source_reconnecting_event(
         message: message.into(),
         payload,
     }));
+}
+
+fn emit_recording_gap_started_event(
+    events: &RuntimeEventSink,
+    handle: &RuntimeHandle,
+    reason: &str,
+    payload: Value,
+) {
+    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+        task_id: handle.task_id,
+        attempt_no: handle.attempt_no,
+        lease_token: runtime_lease_token(handle).unwrap_or_default(),
+        session_epoch: runtime_session_epoch(handle),
+        event_type: "recording_gap_started".to_string(),
+        event_level: "warn".to_string(),
+        message: "stream recording gap started while source reconnects".to_string(),
+        payload: merge_event_payload(
+            payload,
+            json!({
+                "reason": reason,
+                "recording_gap_started_at": handle.metadata.get("recording_gap_started_at").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+    }));
+}
+
+fn emit_recording_gap_ended_event(
+    events: &RuntimeEventSink,
+    handle: &RuntimeHandle,
+    reason: &str,
+    payload: Value,
+) {
+    if !recording_gap_active(handle) {
+        return;
+    }
+
+    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+        task_id: handle.task_id,
+        attempt_no: handle.attempt_no,
+        lease_token: runtime_lease_token(handle).unwrap_or_default(),
+        session_epoch: runtime_session_epoch(handle),
+        event_type: "recording_gap_ended".to_string(),
+        event_level: "info".to_string(),
+        message: "stream recording gap ended after source reconnected".to_string(),
+        payload: merge_event_payload(
+            payload,
+            json!({
+                "reason": reason,
+                "recording_gap_started_at": handle.metadata.get("recording_gap_started_at").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+    }));
+}
+
+fn merge_event_payload(mut base: Value, extra: Value) -> Value {
+    if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+    base
 }
 
 fn should_auto_restart_process(
@@ -5980,6 +6127,17 @@ fn spawn_startup_probe_monitor(
                     .await
                     {
                         Ok(updated_recording) => {
+                            emit_recording_gap_ended_event(
+                                &events,
+                                &handle,
+                                "source_reconnected",
+                                json!({
+                                    "schema": binding.schema,
+                                    "vhost": binding.vhost,
+                                    "app": binding.app,
+                                    "stream": binding.stream,
+                                }),
+                            );
                             let updated_handle = registry
                                 .update(runtime_id, |runtime| {
                                     runtime.last_progress_at = Some(Utc::now());
@@ -6036,6 +6194,17 @@ fn spawn_startup_probe_monitor(
                         Err(error) => {
                             let failed_recording = mark_recording_failed(&recording);
                             let fatal = should_fail_on_recording_start_error(&recording);
+                            emit_recording_gap_ended_event(
+                                &events,
+                                &handle,
+                                "source_reconnected",
+                                json!({
+                                    "schema": binding.schema,
+                                    "vhost": binding.vhost,
+                                    "app": binding.app,
+                                    "stream": binding.stream,
+                                }),
+                            );
                             let updated_handle = registry
                                 .update(runtime_id, |runtime| {
                                     runtime.last_progress_at = Some(Utc::now());
@@ -6258,6 +6427,17 @@ fn spawn_startup_probe_monitor(
                     || !stream_online(&handle)
                     || recording_started;
                 let running_handle = if should_emit_running {
+                    emit_recording_gap_ended_event(
+                        &events,
+                        &handle,
+                        "source_reconnected",
+                        json!({
+                            "schema": startup_probe.schema,
+                            "vhost": startup_probe.vhost,
+                            "app": startup_probe.app,
+                            "stream": startup_probe.stream,
+                        }),
+                    );
                     let running_handle = registry
                         .update(runtime_id, |runtime| {
                             runtime.state = RuntimeState::Running;
@@ -6305,6 +6485,7 @@ fn spawn_startup_probe_monitor(
             } else if !startup_completed && started_at.elapsed() >= STARTUP_PROBE_TIMEOUT {
                 if sticky_reconnect_stream_ingest_from_handle(&handle) {
                     let emit_event = should_emit_source_reconnecting(&handle, "startup_timeout");
+                    let emit_gap_started = should_emit_recording_gap_started(&handle);
                     let updated = registry.update(runtime_id, |runtime| {
                         runtime.metadata["startup_timeout"] = json!(true);
                         mark_source_reconnecting(runtime, "startup_timeout");
@@ -6328,7 +6509,21 @@ fn spawn_startup_probe_monitor(
                                     "reason": "startup_timeout",
                                 }),
                             );
-                            let _ = events.send(RuntimeNotification::TaskSnapshot(handle));
+                            let _ = events.send(RuntimeNotification::TaskSnapshot(handle.clone()));
+                        }
+                        if emit_gap_started {
+                            emit_recording_gap_started_event(
+                                &events,
+                                &handle,
+                                "startup_timeout",
+                                json!({
+                                    "runtime_id": handle.runtime_id,
+                                    "schema": startup_probe.schema,
+                                    "vhost": startup_probe.vhost,
+                                    "app": startup_probe.app,
+                                    "stream": startup_probe.stream,
+                                }),
+                            );
                         }
                     }
                     sleep(STARTUP_PROBE_POLL_INTERVAL).await;
@@ -6586,11 +6781,23 @@ fn spawn_live_relay_monitor(
                             || !stream_online(&handle)
                             || recording_started);
                     if should_emit_running {
+                        emit_recording_gap_ended_event(
+                            &events,
+                            &handle,
+                            "source_reconnected",
+                            json!({
+                                "schema": startup_probe.schema,
+                                "vhost": startup_probe.vhost,
+                                "app": startup_probe.app,
+                                "stream": startup_probe.stream,
+                            }),
+                        );
                         let running_handle = registry
                             .update(runtime_id, |runtime| {
                                 runtime.state = RuntimeState::Running;
                                 runtime.last_progress_at = Some(Utc::now());
                                 runtime.metadata["stream_online"] = json!(true);
+                                clear_source_reconnecting(runtime);
                                 runtime.metadata["stream_binding"] = json!({
                                     "schema": startup_probe.schema,
                                     "vhost": startup_probe.vhost,
@@ -6627,6 +6834,64 @@ fn spawn_live_relay_monitor(
                 }
 
                 if started_at.elapsed() >= STARTUP_PROBE_TIMEOUT {
+                    if sticky_reconnect_stream_ingest_from_handle(&handle) {
+                        let emit_event =
+                            should_emit_source_reconnecting(&handle, "startup_timeout");
+                        let emit_gap_started = should_emit_recording_gap_started(&handle);
+                        let reconnecting_handle = registry
+                            .update(runtime_id, |runtime| {
+                                runtime.metadata["startup_timeout"] = json!(true);
+                                mark_source_reconnecting(runtime, "startup_timeout");
+                            })
+                            .unwrap_or_else(|| {
+                                let mut handle = handle.clone();
+                                handle.metadata["startup_timeout"] = json!(true);
+                                mark_source_reconnecting(&mut handle, "startup_timeout");
+                                handle
+                            });
+                        let _ = persist_runtime_state(
+                            &work_dir,
+                            &reconnecting_handle,
+                            &SuccessCheck::ProcessExit,
+                        );
+                        if emit_event {
+                            emit_source_reconnecting_event(
+                                &events,
+                                &reconnecting_handle,
+                                format!(
+                                    "live_relay recording for {}/{}/{} is not active yet; continuing to retry",
+                                    startup_probe.vhost, startup_probe.app, startup_probe.stream
+                                ),
+                                json!({
+                                    "runtime_id": reconnecting_handle.runtime_id,
+                                    "schema": startup_probe.schema,
+                                    "vhost": startup_probe.vhost,
+                                    "app": startup_probe.app,
+                                    "stream": startup_probe.stream,
+                                    "reason": "startup_timeout",
+                                }),
+                            );
+                            let _ = events.send(RuntimeNotification::TaskSnapshot(
+                                reconnecting_handle.clone(),
+                            ));
+                        }
+                        if emit_gap_started {
+                            emit_recording_gap_started_event(
+                                &events,
+                                &reconnecting_handle,
+                                "startup_timeout",
+                                json!({
+                                    "runtime_id": reconnecting_handle.runtime_id,
+                                    "schema": startup_probe.schema,
+                                    "vhost": startup_probe.vhost,
+                                    "app": startup_probe.app,
+                                    "stream": startup_probe.stream,
+                                }),
+                            );
+                        }
+                        sleep(STARTUP_PROBE_POLL_INTERVAL).await;
+                        continue;
+                    }
                     let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
                         schema: startup_probe.schema.clone(),
                         vhost: startup_probe.vhost.clone(),
@@ -6725,6 +6990,17 @@ fn spawn_live_relay_monitor(
                         .await
                         {
                             Ok(updated_recording) => {
+                                emit_recording_gap_ended_event(
+                                    &events,
+                                    &handle,
+                                    "source_reconnected",
+                                    json!({
+                                        "schema": binding.schema,
+                                        "vhost": binding.vhost,
+                                        "app": binding.app,
+                                        "stream": binding.stream,
+                                    }),
+                                );
                                 let updated_handle = registry
                                     .update(runtime_id, |runtime| {
                                         runtime.last_progress_at = Some(Utc::now());
@@ -6773,6 +7049,17 @@ fn spawn_live_relay_monitor(
                             Err(error) => {
                                 let failed_recording = mark_recording_failed(&recording);
                                 let fatal = should_fail_on_recording_start_error(&recording);
+                                emit_recording_gap_ended_event(
+                                    &events,
+                                    &handle,
+                                    "source_reconnected",
+                                    json!({
+                                        "schema": binding.schema,
+                                        "vhost": binding.vhost,
+                                        "app": binding.app,
+                                        "stream": binding.stream,
+                                    }),
+                                );
                                 let degraded_handle = registry
                                     .update(runtime_id, |runtime| {
                                         runtime.last_progress_at = Some(Utc::now());
@@ -6988,6 +7275,17 @@ fn spawn_live_relay_monitor(
                             || !stream_online(&handle)
                             || recording_started);
                     if should_emit_running {
+                        emit_recording_gap_ended_event(
+                            &events,
+                            &handle,
+                            "source_reconnected",
+                            json!({
+                                "schema": startup_probe.schema,
+                                "vhost": startup_probe.vhost,
+                                "app": startup_probe.app,
+                                "stream": startup_probe.stream,
+                            }),
+                        );
                         let running_handle = registry
                             .update(runtime_id, |runtime| {
                                 runtime.state = RuntimeState::Running;
@@ -7032,6 +7330,7 @@ fn spawn_live_relay_monitor(
                     if sticky_reconnect_stream_ingest_from_handle(&handle) {
                         let emit_event =
                             should_emit_source_reconnecting(&handle, "startup_timeout");
+                        let emit_gap_started = should_emit_recording_gap_started(&handle);
                         let reconnecting_handle = registry
                             .update(runtime_id, |runtime| {
                                 runtime.metadata["startup_timeout"] = json!(true);
@@ -7065,8 +7364,23 @@ fn spawn_live_relay_monitor(
                                     "reason": "startup_timeout",
                                 }),
                             );
-                            let _ =
-                                events.send(RuntimeNotification::TaskSnapshot(reconnecting_handle));
+                            let _ = events.send(RuntimeNotification::TaskSnapshot(
+                                reconnecting_handle.clone(),
+                            ));
+                        }
+                        if emit_gap_started {
+                            emit_recording_gap_started_event(
+                                &events,
+                                &reconnecting_handle,
+                                "startup_timeout",
+                                json!({
+                                    "runtime_id": reconnecting_handle.runtime_id,
+                                    "schema": startup_probe.schema,
+                                    "vhost": startup_probe.vhost,
+                                    "app": startup_probe.app,
+                                    "stream": startup_probe.stream,
+                                }),
+                            );
                         }
                         sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                         continue;
@@ -7146,6 +7460,7 @@ fn spawn_live_relay_monitor(
                     if sticky_reconnect_stream_ingest_from_handle(&handle) {
                         let emit_event =
                             should_emit_source_reconnecting(&handle, "source_disconnected");
+                        let emit_gap_started = should_emit_recording_gap_started(&handle);
                         let reconnecting_handle = registry
                             .update(runtime_id, |runtime| {
                                 mark_source_reconnecting(runtime, "source_disconnected");
@@ -7175,8 +7490,24 @@ fn spawn_live_relay_monitor(
                                     "orphaned": reconnecting_handle.metadata.get("orphaned").and_then(Value::as_bool).unwrap_or(false),
                                 }),
                             );
-                            let _ =
-                                events.send(RuntimeNotification::TaskSnapshot(reconnecting_handle));
+                            let _ = events.send(RuntimeNotification::TaskSnapshot(
+                                reconnecting_handle.clone(),
+                            ));
+                        }
+                        if emit_gap_started {
+                            emit_recording_gap_started_event(
+                                &events,
+                                &reconnecting_handle,
+                                "source_disconnected",
+                                json!({
+                                    "runtime_id": reconnecting_handle.runtime_id,
+                                    "schema": startup_probe.schema,
+                                    "vhost": startup_probe.vhost,
+                                    "app": startup_probe.app,
+                                    "stream": startup_probe.stream,
+                                    "orphaned": reconnecting_handle.metadata.get("orphaned").and_then(Value::as_bool).unwrap_or(false),
+                                }),
+                            );
                         }
                         sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                         continue;
@@ -7311,6 +7642,19 @@ fn spawn_rtp_receive_monitor(
                             zlm_stream_binding_by_stream_id(&http_client, &settings, &stream_id)
                                 .await
                         {
+                            emit_recording_gap_ended_event(
+                                &events,
+                                &handle,
+                                "source_reconnected",
+                                json!({
+                                    "rtp_stream_id": stream_id.clone(),
+                                    "local_port": local_port,
+                                    "schema": binding.schema,
+                                    "vhost": binding.vhost,
+                                    "app": binding.app,
+                                    "stream": binding.stream,
+                                }),
+                            );
                             let running_handle = registry
                                 .update(runtime_id, |runtime| {
                                     runtime.state = RuntimeState::Running;
@@ -7373,6 +7717,7 @@ fn spawn_rtp_receive_monitor(
                     if sticky_reconnect_stream_ingest_from_handle(&handle) {
                         let emit_event =
                             should_emit_source_reconnecting(&handle, "rtp_server_missing");
+                        let emit_gap_started = should_emit_recording_gap_started(&handle);
                         let Some(mut rtp_server) = rtp_server_from_handle(&handle) else {
                             sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                             continue;
@@ -7425,8 +7770,26 @@ fn spawn_rtp_receive_monitor(
                                     "orphaned": reconnecting_handle.metadata.get("orphaned").and_then(Value::as_bool).unwrap_or(false),
                                 }),
                             );
-                            let _ =
-                                events.send(RuntimeNotification::TaskSnapshot(reconnecting_handle));
+                            let _ = events.send(RuntimeNotification::TaskSnapshot(
+                                reconnecting_handle.clone(),
+                            ));
+                        }
+                        if emit_gap_started {
+                            emit_recording_gap_started_event(
+                                &events,
+                                &reconnecting_handle,
+                                "rtp_server_missing",
+                                json!({
+                                    "runtime_id": reconnecting_handle.runtime_id,
+                                    "rtp_stream_id": stream_id.clone(),
+                                    "local_port": rtp_server.local_port,
+                                    "requested_port": rtp_server.requested_port,
+                                    "re_use_port": rtp_server.reuse_port,
+                                    "ssrc": rtp_server.ssrc,
+                                    "reopen_error": reopen_error,
+                                    "orphaned": reconnecting_handle.metadata.get("orphaned").and_then(Value::as_bool).unwrap_or(false),
+                                }),
+                            );
                         }
                         missing_polls = 0;
                         sleep(STARTUP_PROBE_POLL_INTERVAL).await;
@@ -7793,7 +8156,7 @@ fn mp4_record_max_second(recording: &LiveRelayRecording) -> u32 {
         .segment_sec
         .filter(|value| *value > 0)
         .or(recording.duration_sec.filter(|value| *value > 0))
-        .unwrap_or(ZLM_SINGLE_FILE_MP4_MAX_SECOND)
+        .unwrap_or(DEFAULT_REALTIME_MP4_RECORD_SEGMENT_SEC)
 }
 
 fn build_close_stream_params(binding: &StreamBinding, force: bool) -> Vec<(String, String)> {

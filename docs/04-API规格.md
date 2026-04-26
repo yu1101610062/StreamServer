@@ -132,6 +132,9 @@
 - `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。对 `stream_ingest + source_mode=vod + record.enabled=true`，只要任一播放协议开启，任务就保持实时录制；全部关闭则切到快录且不再提供实时播放地址。
 - `publish.kind` 表示任务直接写出的外部目标类型；当前支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`、`rtmp_push`。
 - `record.duration_sec` 表示总录制时长：`stream_ingest + source_mode=vod` 在实时分支按媒体时间截取、在快录分支作为离线处理的终点；`stream_ingest + source_mode=live` 按现实时间计时；到点后任务整体成功结束。
+- `record.segment_sec` 表示录像分段时长：实时 MP4 录制未填写时默认 7200 秒（2 小时）分段；VOD 快录 HLS 未填写时默认 6 秒切片。
+- `recovery.policy=auto` 对连续型 `stream_ingest` 表示断源后持续等待恢复：`source_mode=live` 且未设置 `record.duration_sec`，或 `source_mode=vod + input.loop_enabled=true + expose` 任一播放协议开启且未设置 `record.duration_sec`，都会在断链时进入 `source_reconnecting` 而不是直接失败。开启录制但未指定时长也适用；录制系统自身错误仍按失败/降级处理。
+- `recovery.max_consecutive_failures` 只限制启动拒绝类自动重试次数，不限制连续型流接入的断链等待；`recovery.resume_mode` 与 `recovery.backoff` 为保留字段，当前运行时不消费。
 
 当前能力矩阵：
 

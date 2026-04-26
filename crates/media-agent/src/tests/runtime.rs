@@ -165,6 +165,12 @@ fn sticky_live_ingest_handle(stream_online: bool) -> RuntimeHandle {
     }
 }
 
+fn sticky_live_recording_ingest_handle(stream_online: bool) -> RuntimeHandle {
+    let mut handle = sticky_live_ingest_handle(stream_online);
+    handle.metadata["resolved_spec"]["record"] = json!({"enabled": true});
+    handle
+}
+
 fn create_mock_ffprobe_binary(
     root: &Path,
     video_codec_name: &str,
@@ -3898,6 +3904,37 @@ fn should_auto_restart_process_restarts_sticky_live_ingest_before_first_online()
 }
 
 #[test]
+fn sticky_reconnect_allows_unbounded_live_recording() {
+    let mut handle = sticky_live_recording_ingest_handle(false);
+
+    assert!(sticky_reconnect_stream_ingest_from_handle(&handle));
+    assert!(should_auto_restart_process(
+        &handle,
+        false,
+        &Ok(success_exit_status()),
+    ));
+
+    handle.metadata["resolved_spec"]["record"]["duration_sec"] = json!(60);
+    assert!(!sticky_reconnect_stream_ingest_from_handle(&handle));
+    assert!(!should_auto_restart_process(
+        &handle,
+        false,
+        &Ok(success_exit_status()),
+    ));
+}
+
+#[test]
+fn sticky_reconnect_allows_looped_vod_recording_without_duration() {
+    let mut handle = continuous_stream_ingest_handle();
+    handle.metadata["resolved_spec"]["record"] = json!({"enabled": true});
+
+    assert!(sticky_reconnect_stream_ingest_from_handle(&handle));
+
+    handle.metadata["resolved_spec"]["record"]["duration_sec"] = json!(60);
+    assert!(!sticky_reconnect_stream_ingest_from_handle(&handle));
+}
+
+#[test]
 fn sticky_reconnect_respects_recovery_never() {
     let mut handle = sticky_live_ingest_handle(false);
     handle.metadata["resolved_spec"]["recovery"]["policy"] = json!("never");
@@ -3962,6 +3999,33 @@ fn source_reconnecting_event_dedupes_by_reason() {
         &handle,
         "source_disconnected"
     ));
+}
+
+#[test]
+fn recording_gap_tracks_recorded_sticky_reconnect_window() {
+    let mut handle = sticky_live_recording_ingest_handle(true);
+    assert!(should_emit_recording_gap_started(&handle));
+
+    mark_source_reconnecting(&mut handle, "source_disconnected");
+    assert!(recording_gap_active(&handle));
+    assert!(!should_emit_recording_gap_started(&handle));
+    assert_eq!(
+        handle
+            .metadata
+            .get("recording_gap_reason")
+            .and_then(Value::as_str),
+        Some("source_disconnected")
+    );
+
+    clear_source_reconnecting(&mut handle);
+    assert!(!recording_gap_active(&handle));
+    assert!(
+        handle
+            .metadata
+            .get("recording_gap_ended_at")
+            .and_then(Value::as_str)
+            .is_some()
+    );
 }
 
 #[test]
@@ -4111,7 +4175,7 @@ fn build_record_api_params_defaults_mp4_to_task_duration() {
 }
 
 #[test]
-fn build_record_api_params_uses_long_default_for_unbounded_mp4() {
+fn build_record_api_params_defaults_unbounded_mp4_to_two_hours() {
     let binding = StreamBinding {
         schema: None,
         vhost: "__defaultVhost__".to_string(),
@@ -4136,10 +4200,7 @@ fn build_record_api_params_uses_long_default_for_unbounded_mp4() {
         .into_iter()
         .collect::<HashMap<_, _>>();
 
-    assert_eq!(
-        params.get("max_second").map(String::as_str),
-        Some("31536000")
-    );
+    assert_eq!(params.get("max_second").map(String::as_str), Some("7200"));
 }
 
 #[test]
