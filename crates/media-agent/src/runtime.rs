@@ -7083,6 +7083,69 @@ fn spawn_live_relay_monitor(
                 let _ = remove_managed_runtime(&runtimes, runtime_id);
                 return;
             };
+            if stop_requested {
+                let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
+                    schema: startup_probe.schema.clone(),
+                    vhost: startup_probe.vhost.clone(),
+                    app: startup_probe.app.clone(),
+                    stream: startup_probe.stream.clone(),
+                });
+                cleanup_live_relay_runtime(&http_client, &settings, &handle, &binding).await;
+                let exited_handle = registry
+                    .update(runtime_id, |runtime| {
+                        runtime.state = RuntimeState::Exited;
+                        runtime.last_progress_at = Some(Utc::now());
+                        runtime.metadata["stream_online"] = json!(false);
+                        clear_source_reconnecting(runtime);
+                    })
+                    .unwrap_or_else(|| {
+                        let mut handle = handle.clone();
+                        handle.state = RuntimeState::Exited;
+                        handle.last_progress_at = Some(Utc::now());
+                        handle.metadata["stream_online"] = json!(false);
+                        clear_source_reconnecting(&mut handle);
+                        handle
+                    });
+                let completion_reason = completion_reason_from_handle(&exited_handle);
+                let (event_type, event_level, message, reason) =
+                    if completion_reason.as_deref() == Some("record_duration_reached") {
+                        (
+                            "succeeded",
+                            "info",
+                            "live_relay completed after recording duration reached",
+                            "record_duration_reached",
+                        )
+                    } else {
+                        (
+                            "canceled",
+                            "info",
+                            "live_relay stream stopped",
+                            "stop_requested",
+                        )
+                    };
+                let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                    task_id: exited_handle.task_id,
+                    attempt_no: exited_handle.attempt_no,
+                    lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&exited_handle),
+                    event_type: event_type.to_string(),
+                    event_level: event_level.to_string(),
+                    message: message.to_string(),
+                    payload: json!({
+                        "schema": binding.schema,
+                        "vhost": binding.vhost,
+                        "app": binding.app,
+                        "stream": binding.stream,
+                        "reason": reason,
+                    }),
+                }));
+                let _ =
+                    persist_runtime_state(&work_dir, &exited_handle, &SuccessCheck::ProcessExit);
+                let _ = events.send(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
+                let _ = remove_managed_runtime(&runtimes, runtime_id);
+                let _ = registry.remove(runtime_id);
+                return;
+            }
             let stream_status = zlm_stream_status(&http_client, &settings, &startup_probe).await;
 
             if live_relay_uses_recording_startup(&startup_probe, &handle) {
