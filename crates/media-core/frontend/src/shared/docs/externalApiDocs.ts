@@ -1411,6 +1411,66 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
   {
     category: "任务管理",
     method: "POST",
+    path: "/api/v1/tasks/{id}/recording/start",
+    title: "运行中开启录制",
+    summary: "对正在运行且已有实时流绑定的流接入任务单独开启录制。",
+    description:
+      "仅支持实时源 stream_ingest，或已开启播放暴露并已有 ZLM 流绑定的离线流分支。这里的 duration_sec 表示本次录制会话时长，到点只停止录制，不停止任务。",
+    successStatus: "202 Accepted",
+    params: [authHeaderParam(), taskIdPathParam()],
+    requestExample: {
+      headers: {
+        Authorization: authHeaderParam().example,
+      },
+      path: {
+        id: taskIdPathParam().example,
+      },
+      body: {
+        format: "mp4",
+        segment_sec: 7200,
+        duration_sec: 3600,
+        as_player: false,
+      },
+    },
+    responseExample: {
+      task_id: "019d77d3-a942-7c91-8e82-ff963ccf1222",
+      attempt_no: 1,
+      desired_enabled: true,
+      recording_state: "requested",
+      message: "recording control accepted",
+    },
+  },
+  {
+    category: "任务管理",
+    method: "POST",
+    path: "/api/v1/tasks/{id}/recording/stop",
+    title: "运行中关闭录制",
+    summary: "对正在运行且已有实时流绑定的流接入任务单独关闭录制，任务继续运行。",
+    description: "手动关闭后，断源重连不会自动恢复录制；再次开启需要调用 recording/start。",
+    successStatus: "202 Accepted",
+    params: [authHeaderParam(), taskIdPathParam()],
+    requestExample: {
+      headers: {
+        Authorization: authHeaderParam().example,
+      },
+      path: {
+        id: taskIdPathParam().example,
+      },
+      body: {
+        reason: "user_requested",
+      },
+    },
+    responseExample: {
+      task_id: "019d77d3-a942-7c91-8e82-ff963ccf1222",
+      attempt_no: 1,
+      desired_enabled: false,
+      recording_state: "requested",
+      message: "recording control accepted",
+    },
+  },
+  {
+    category: "任务管理",
+    method: "POST",
     path: "/api/v1/tasks/{id}/clone",
     title: "克隆任务",
     summary: "基于历史任务复制出新任务。",

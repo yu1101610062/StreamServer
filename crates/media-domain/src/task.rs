@@ -451,6 +451,18 @@ pub enum StreamIngestRecordMode {
     Fast,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingControlSpec {
+    #[serde(default)]
+    pub format: Option<RecordFormat>,
+    #[serde(default)]
+    pub duration_sec: Option<u32>,
+    #[serde(default)]
+    pub segment_sec: Option<u32>,
+    #[serde(default)]
+    pub as_player: Option<bool>,
+}
+
 impl StreamIngestRecordMode {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -612,6 +624,18 @@ impl TaskSpec {
             Some(SourceMode::Vod) => {
                 self.input.loop_enabled.unwrap_or(false) && self.expose.any_playback_enabled()
             }
+            None => false,
+        }
+    }
+
+    pub fn supports_runtime_recording_control(&self) -> bool {
+        if self.task_type != TaskType::StreamIngest {
+            return false;
+        }
+
+        match self.input.source_mode {
+            Some(SourceMode::Live) => true,
+            Some(SourceMode::Vod) => self.expose.any_playback_enabled(),
             None => false,
         }
     }

@@ -393,7 +393,22 @@
 - 创建新 Attempt，Task ID 不变
 - 返回新 Attempt 摘要
 
-### 3.11 `POST /tasks/{id}/clone`
+### 3.11 `POST /tasks/{id}/recording/start`
+
+- 允许状态：`RUNNING`
+- 仅支持实时源 `stream_ingest`，或已开启播放暴露的离线流分支，且当前 Attempt 已有 ZLM 流绑定
+- 请求体可选字段：`format`(`mp4|hls|both`)、`duration_sec`、`segment_sec`、`as_player`
+- `duration_sec` 表示本次手动录制会话时长，到点只停止录制，不停止任务
+- 成功返回 `202 ACCEPTED`
+
+### 3.12 `POST /tasks/{id}/recording/stop`
+
+- 允许状态：`RUNNING`
+- 仅关闭当前 Attempt 的运行中录制，流接入任务继续运行
+- 手动关闭后，断源重连不会自动恢复录制
+- 成功返回 `202 ACCEPTED`
+
+### 3.13 `POST /tasks/{id}/clone`
 
 - 允许状态：`SUCCEEDED`, `FAILED`, `CANCELED`, `LOST`
 - 生成新 Task

@@ -2287,6 +2287,50 @@ async fn list_streams_collapses_duplicate_bindings_for_same_logical_stream() -> 
 }
 
 #[tokio::test]
+async fn recording_control_command_allows_running_realtime_stream_ingest() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:8081",
+        "http://stream.example",
+    )
+    .await?;
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01", "vhost": "__defaultVhost__"},
+        "expose": {"enable_rtsp": true},
+        "record": {"enabled": false},
+        "recovery": {"policy": "auto"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+    sqlx::query("update task_attempts set lease_token = 'lease-recording' where task_id = $1")
+        .bind(task_id)
+        .execute(&db.pool)
+        .await?;
+
+    let command = repository.build_recording_control_command(task_id).await?;
+
+    assert_eq!(command.task_id, task_id);
+    assert_eq!(command.attempt_no, 1);
+    assert_eq!(command.node_id, node_id);
+    assert_eq!(command.lease_token, "lease-recording");
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_streams_returns_fallback_entries_when_runtime_lookup_fails() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());

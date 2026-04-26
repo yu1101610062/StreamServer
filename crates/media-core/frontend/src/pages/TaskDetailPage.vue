@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
 import { taskApi } from "@/shared/api/resources";
+import type { RecordingControlRequest } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
 import { copyText } from "@/shared/utils/clipboard";
@@ -14,6 +15,14 @@ const route = useRoute();
 const router = useRouter();
 const taskId = computed(() => String(route.params.id));
 const activeTab = ref("overview");
+const recordingDialogOpen = ref(false);
+const recordingControlLoading = ref(false);
+const recordingForm = ref({
+  format: "mp4" as "mp4" | "hls" | "both",
+  duration_sec: "",
+  segment_sec: "7200",
+  as_player: false,
+});
 
 const detailQuery = useQuery({
   queryKey: computed(() => ["task-detail", taskId.value]),
@@ -35,11 +44,90 @@ const resolvedSpecQuery = useQuery({
   queryFn: () => taskApi.resolvedSpec(taskId.value),
 });
 
+const resolvedSpec = computed(() => detailQuery.data.value?.resolved_spec ?? null);
+const exposeAnyPlayback = computed(() => {
+  const expose = resolvedSpec.value?.expose as Record<string, unknown> | undefined;
+  return Boolean(
+    expose?.enable_rtsp ||
+      expose?.enable_rtmp ||
+      expose?.enable_http_ts ||
+      expose?.enable_http_fmp4 ||
+      expose?.enable_hls,
+  );
+});
+const supportsRecordingControl = computed(() => {
+  const spec = resolvedSpec.value;
+  const input = spec?.input as Record<string, unknown> | undefined;
+  return (
+    detailQuery.data.value?.task.status === "RUNNING" &&
+    detailQuery.data.value?.task.type === "stream_ingest" &&
+    (input?.source_mode === "live" || (input?.source_mode === "vod" && exposeAnyPlayback.value))
+  );
+});
+const recordingControlDisabledReason = computed(() => {
+  if (detailQuery.data.value?.task.status !== "RUNNING") return "任务运行后可用";
+  if (detailQuery.data.value?.task.type !== "stream_ingest") return "仅支持流接入任务";
+  if (!supportsRecordingControl.value) return "仅支持实时源或已开启播放暴露的离线流分支";
+  return "";
+});
+const latestRecordingEvent = computed(() =>
+  (eventsQuery.data.value?.items ?? []).find((event) =>
+    ["recording_started", "recording_stopped", "recording_start_pending", "recording_control_failed"].includes(event.event_type),
+  ),
+);
+const recordingStateLabel = computed(() => {
+  const event = latestRecordingEvent.value?.event_type;
+  if (event === "recording_started") return "录制中";
+  if (event === "recording_start_pending") return "等待源恢复";
+  if (event === "recording_control_failed") return "操作失败";
+  return "未录制";
+});
+
 function artifactKindLabel(value: string) {
   if (value === "bridge_output") return "桥接输出";
   if (value === "transcode_output") return "转码输出";
   if (value === "stream_ingest_record") return "流接入快录";
   return "—";
+}
+
+function numericField(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined;
+}
+
+async function refreshTaskViews() {
+  await Promise.all([detailQuery.refetch(), eventsQuery.refetch()]);
+}
+
+async function submitStartRecording() {
+  const payload: RecordingControlRequest = {
+    format: recordingForm.value.format,
+    duration_sec: numericField(recordingForm.value.duration_sec),
+    segment_sec: numericField(recordingForm.value.segment_sec),
+    as_player: recordingForm.value.as_player,
+  };
+  recordingControlLoading.value = true;
+  try {
+    await taskApi.startRecording(taskId.value, payload);
+    ElMessage.success("录制开启请求已提交");
+    recordingDialogOpen.value = false;
+    await refreshTaskViews();
+  } finally {
+    recordingControlLoading.value = false;
+  }
+}
+
+async function stopRecording() {
+  recordingControlLoading.value = true;
+  try {
+    await taskApi.stopRecording(taskId.value);
+    ElMessage.success("录制停止请求已提交");
+    await refreshTaskViews();
+  } finally {
+    recordingControlLoading.value = false;
+  }
 }
 </script>
 
@@ -52,6 +140,20 @@ function artifactKindLabel(value: string) {
       <el-button @click="router.push('/tasks')">返回任务中心</el-button>
       <el-button @click="router.push(`/records?task_id=${taskId}`)">录像中心</el-button>
       <el-button @click="router.push(`/file-artifacts?task_id=${taskId}`)">文件产物</el-button>
+      <el-tooltip :disabled="supportsRecordingControl" :content="recordingControlDisabledReason">
+        <span>
+          <el-button :disabled="!supportsRecordingControl" :loading="recordingControlLoading" @click="recordingDialogOpen = true">
+            开启录制
+          </el-button>
+        </span>
+      </el-tooltip>
+      <el-tooltip :disabled="supportsRecordingControl" :content="recordingControlDisabledReason">
+        <span>
+          <el-button :disabled="!supportsRecordingControl" :loading="recordingControlLoading" @click="stopRecording">
+            关闭录制
+          </el-button>
+        </span>
+      </el-tooltip>
     </PageHeader>
 
     <div v-if="detailQuery.data.value" class="metric-grid">
@@ -70,6 +172,10 @@ function artifactKindLabel(value: string) {
       <div class="surface-card metric-card">
         <div class="subtle">最近回调</div>
         <strong>{{ detailQuery.data.value.callback_delivery?.event_type ?? "未配置" }}</strong>
+      </div>
+      <div class="surface-card metric-card">
+        <div class="subtle">录制状态</div>
+        <strong>{{ recordingStateLabel }}</strong>
       </div>
     </div>
 
@@ -202,5 +308,30 @@ function artifactKindLabel(value: string) {
         </el-tab-pane>
       </el-tabs>
     </div>
+
+    <el-dialog v-model="recordingDialogOpen" title="开启录制" width="520px">
+      <el-form label-width="110px">
+        <el-form-item label="格式">
+          <el-select v-model="recordingForm.format" style="width: 100%">
+            <el-option label="MP4" value="mp4" />
+            <el-option label="HLS" value="hls" />
+            <el-option label="MP4 + HLS" value="both" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="分段秒数">
+          <el-input v-model="recordingForm.segment_sec" placeholder="实时 MP4 默认 7200" />
+        </el-form-item>
+        <el-form-item label="本次时长">
+          <el-input v-model="recordingForm.duration_sec" placeholder="留空表示持续录制" />
+        </el-form-item>
+        <el-form-item label="播放器保活">
+          <el-switch v-model="recordingForm.as_player" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="recordingDialogOpen = false">取消</el-button>
+        <el-button type="primary" :loading="recordingControlLoading" @click="submitStartRecording">开启</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>

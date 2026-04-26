@@ -24,6 +24,7 @@ message CoreEnvelope {
     StopTask stop_task = 2;
     ProbeCapabilities probe_capabilities = 3;
     AdoptOrphans adopt_orphans = 4;
+    TaskRecordingControl task_recording_control = 5;
   }
 }
 
@@ -150,6 +151,16 @@ message StopTask {
   uint32 grace_period_sec = 4;
   uint32 force_after_sec = 5;
   string lease_token = 6;
+}
+
+message TaskRecordingControl {
+  string task_id = 1;
+  int32 attempt_no = 2;
+  string lease_token = 3;
+  string action = 4;
+  string record_config_json = 5;
+  string reason = 6;
+  string command_id = 7;
 }
 
 message ProbeCapabilities {}

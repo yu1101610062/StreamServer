@@ -2394,6 +2394,10 @@ fn prepare_plan_paths_creates_live_relay_recording_root_dirs() {
             duration_sec: None,
             segment_sec: None,
             as_player: false,
+            desired_enabled: true,
+            manual_control: false,
+            stop_task_on_duration: true,
+            control_command_id: None,
             recording_started_at: None,
             auto_stop_requested: false,
             completion_reason: None,
@@ -3802,6 +3806,10 @@ fn recording_duration_reached_uses_recording_start_time() {
         duration_sec: Some(300),
         segment_sec: None,
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: Some(started_at),
         auto_stop_requested: false,
         completion_reason: None,
@@ -3829,6 +3837,10 @@ fn should_auto_stop_live_relay_recording_requires_started_and_not_already_reques
         duration_sec: Some(60),
         segment_sec: None,
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: Some(started_at),
         auto_stop_requested: false,
         completion_reason: None,
@@ -3852,6 +3864,26 @@ fn should_auto_stop_live_relay_recording_requires_started_and_not_already_reques
     not_started.started = false;
     assert!(!should_auto_stop_live_relay_recording(
         &not_started,
+        started_at + chrono::Duration::seconds(60)
+    ));
+}
+
+#[test]
+fn manual_recording_duration_does_not_stop_task() {
+    let started_at = Utc::now();
+    let mut recording = test_live_relay_recording();
+    recording.duration_sec = Some(60);
+    recording.recording_started_at = Some(started_at);
+    recording.started = true;
+    recording.manual_control = true;
+    recording.stop_task_on_duration = false;
+
+    assert!(recording_duration_reached(
+        &recording,
+        started_at + chrono::Duration::seconds(60)
+    ));
+    assert!(!should_auto_stop_live_relay_recording(
+        &recording,
         started_at + chrono::Duration::seconds(60)
     ));
 }
@@ -4125,6 +4157,10 @@ fn build_record_api_params_uses_expected_zlm_shape() {
         duration_sec: None,
         segment_sec: Some(90),
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: None,
         auto_stop_requested: false,
         completion_reason: None,
@@ -4160,6 +4196,10 @@ fn build_record_api_params_defaults_mp4_to_task_duration() {
         duration_sec: Some(300),
         segment_sec: None,
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: None,
         auto_stop_requested: false,
         completion_reason: None,
@@ -4189,6 +4229,10 @@ fn build_record_api_params_defaults_unbounded_mp4_to_two_hours() {
         duration_sec: None,
         segment_sec: None,
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: None,
         auto_stop_requested: false,
         completion_reason: None,
@@ -4356,6 +4400,10 @@ fn test_live_relay_recording() -> LiveRelayRecording {
         duration_sec: None,
         segment_sec: None,
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: None,
         auto_stop_requested: false,
         completion_reason: None,
@@ -4804,6 +4852,10 @@ async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
                 duration_sec: None,
                 segment_sec: None,
                 as_player: false,
+                desired_enabled: true,
+                manual_control: false,
+                stop_task_on_duration: true,
+                control_command_id: None,
                 recording_started_at: Some(started_at),
                 auto_stop_requested: false,
                 completion_reason: None,
@@ -4865,12 +4917,25 @@ fn failed_live_relay_recording_is_not_retried() {
         duration_sec: None,
         segment_sec: None,
         as_player: false,
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: None,
         auto_stop_requested: false,
         completion_reason: None,
         started: false,
         failed: true,
     }));
+}
+
+#[test]
+fn manually_disabled_recording_is_not_restarted() {
+    let mut recording = test_live_relay_recording();
+    recording.desired_enabled = false;
+    recording.manual_control = true;
+
+    assert!(!should_start_live_relay_recording(&recording));
 }
 
 #[test]

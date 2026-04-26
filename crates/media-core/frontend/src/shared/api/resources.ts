@@ -13,6 +13,8 @@ import type {
   NodeSummary,
   PageResult,
   RecordFileSummary,
+  RecordingControlRequest,
+  RecordingControlResponse,
   StreamSummary,
   TaskDetail,
   TaskEventSummary,
@@ -106,6 +108,16 @@ export const taskApi = {
   cancel: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/cancel`, { method: "POST" }),
   delete: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}`, { method: "DELETE" }),
   retry: (taskId: string) => apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/retry`, { method: "POST" }),
+  startRecording: (taskId: string, payload: RecordingControlRequest) =>
+    apiRequest<RecordingControlResponse>(`/api/v1/tasks/${taskId}/recording/start`, {
+      method: "POST",
+      body: payload,
+    }),
+  stopRecording: (taskId: string, reason = "user_requested") =>
+    apiRequest<RecordingControlResponse>(`/api/v1/tasks/${taskId}/recording/stop`, {
+      method: "POST",
+      body: { reason },
+    }),
   clone: (taskId: string, payload: UnknownJson) =>
     apiRequest<TaskSummary>(`/api/v1/tasks/${taskId}/clone`, {
       method: "POST",

@@ -22,7 +22,7 @@ use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
     GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
     ProbeCapabilities, ReclaimRuntime, Register as RpcRegister, TaskEvent, TaskLogBatch,
-    TaskProgress, TaskSnapshot,
+    TaskProgress, TaskRecordingControl, TaskSnapshot,
     control_plane_server::{ControlPlane, ControlPlaneServer},
 };
 use reqwest::Url;
@@ -38,8 +38,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::repository::{
-    AgentTaskEventRecord, RepoError, TaskLogBatchRecord, TaskProgressRecord, TaskRepository,
-    TaskSnapshotRecord,
+    AgentTaskEventRecord, RecordingControlCommand, RepoError, TaskLogBatchRecord,
+    TaskProgressRecord, TaskRepository, TaskSnapshotRecord,
 };
 
 const CONTROL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -325,6 +325,56 @@ impl ControlPlaneService {
         );
 
         Ok(())
+    }
+
+    pub async fn request_recording_control(
+        &self,
+        task_id: Uuid,
+        action: &'static str,
+        record_config: Option<Value>,
+        reason: impl Into<String>,
+        command_id: String,
+    ) -> Result<RecordingControlCommand, ControlPlaneError> {
+        let command = self
+            .repository
+            .build_recording_control_command(task_id)
+            .await?;
+        let Some(target) = self.session_for_node(command.node_id).await else {
+            return Err(ControlPlaneError::NodeDisconnected(command.node_id));
+        };
+        let envelope = CoreEnvelope {
+            payload: Some(
+                media_rpc::control_plane::core_envelope::Payload::TaskRecordingControl(
+                    TaskRecordingControl {
+                        task_id: command.task_id.to_string(),
+                        attempt_no: command.attempt_no,
+                        lease_token: command.lease_token.clone(),
+                        action: action.to_string(),
+                        record_config_json: record_config
+                            .map(|value| serde_json::to_string(&value))
+                            .transpose()?
+                            .unwrap_or_default(),
+                        reason: reason.into(),
+                        command_id,
+                    },
+                ),
+            ),
+        };
+
+        if send_core_message(&target.sender, envelope).await.is_err() {
+            self.close_session(target.node_id, target.session_id).await;
+            return Err(ControlPlaneError::NodeDisconnected(target.node_id));
+        }
+
+        info!(
+            task_id = %task_id,
+            node_id = %command.node_id,
+            attempt_no = command.attempt_no,
+            action,
+            "task recording control sent to agent"
+        );
+
+        Ok(command)
     }
 
     async fn bootstrap_session(

@@ -14,7 +14,7 @@ use std::{
     ptr,
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
@@ -22,9 +22,9 @@ use std::{
 
 use chrono::{DateTime, Local, Utc};
 use media_domain::{
-    ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecoveryPolicy,
-    RuntimeHandle, RuntimeState, SourceMode, StreamIngestRecordMode, TaskSpec, TaskType,
-    WorkerKind, normalize_relative_file_input_path,
+    ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecordingControlSpec,
+    RecoveryPolicy, RuntimeHandle, RuntimeState, SourceMode, StreamIngestRecordMode, TaskSpec,
+    TaskType, WorkerKind, normalize_relative_file_input_path,
 };
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
@@ -187,6 +187,23 @@ pub struct StopTaskRequest {
     pub force_after_sec: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingControlAction {
+    Start,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskRecordingControlRequest {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub lease_token: String,
+    pub action: RecordingControlAction,
+    pub record: Option<RecordingControlSpec>,
+    pub reason: String,
+    pub command_id: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AdoptFilter {
     pub session_epoch: u64,
@@ -219,6 +236,10 @@ impl AdoptFilter {
 pub trait LocalExecutor: Send + Sync {
     fn start_task(&self, request: &StartTaskRequest) -> Result<RuntimeHandle, ExecutorError>;
     fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError>;
+    fn set_task_recording(
+        &self,
+        request: &TaskRecordingControlRequest,
+    ) -> Result<RuntimeHandle, ExecutorError>;
     fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle>;
     fn set_zlm_server_id(&self, _server_id: String) {}
     fn set_zlm_rtmp_enhanced_enabled(&self, _enabled: Option<bool>) {}
@@ -232,6 +253,7 @@ pub struct ManagedProcessExecutor {
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     slot_limiter: Arc<RuntimeSlotLimiter>,
     stop_intents: Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
+    recording_controls: Arc<StdMutex<HashSet<Uuid>>>,
     http_client: Client,
     zlm_server_id: Arc<RwLock<Option<String>>>,
     zlm_rtmp_enhanced_enabled: Arc<RwLock<Option<bool>>>,
@@ -342,6 +364,36 @@ fn remove_managed_runtime(
         .remove(&runtime_id)
 }
 
+struct RecordingControlGuard {
+    active: Arc<StdMutex<HashSet<Uuid>>>,
+    runtime_id: Uuid,
+}
+
+impl RecordingControlGuard {
+    fn acquire(
+        active: Arc<StdMutex<HashSet<Uuid>>>,
+        runtime_id: Uuid,
+    ) -> Result<Self, ExecutorError> {
+        let mut active_controls = active.lock().expect("recording controls lock poisoned");
+        if !active_controls.insert(runtime_id) {
+            return Err(ExecutorError::InvalidRequest(
+                "recording control is already in progress for this runtime".to_string(),
+            ));
+        }
+        drop(active_controls);
+        Ok(Self { active, runtime_id })
+    }
+}
+
+impl Drop for RecordingControlGuard {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .expect("recording controls lock poisoned")
+            .remove(&self.runtime_id);
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ProcessPlan {
     executable: String,
@@ -439,6 +491,14 @@ struct LiveRelayRecording {
     duration_sec: Option<u32>,
     segment_sec: Option<u32>,
     as_player: bool,
+    #[serde(default = "default_true")]
+    desired_enabled: bool,
+    #[serde(default)]
+    manual_control: bool,
+    #[serde(default = "default_true")]
+    stop_task_on_duration: bool,
+    #[serde(default)]
+    control_command_id: Option<String>,
     #[serde(default)]
     recording_started_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -449,6 +509,10 @@ struct LiveRelayRecording {
     started: bool,
     #[serde(default)]
     failed: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl LiveRelayRecording {
@@ -685,6 +749,7 @@ impl ManagedProcessExecutor {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             slot_limiter: Arc::new(RuntimeSlotLimiter::new(max_runtime_slots)),
             stop_intents: Arc::new(RwLock::new(HashMap::new())),
+            recording_controls: Arc::new(StdMutex::new(HashSet::new())),
             http_client: Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -905,6 +970,72 @@ impl LocalExecutor for ManagedProcessExecutor {
         }
 
         Ok(())
+    }
+
+    fn set_task_recording(
+        &self,
+        request: &TaskRecordingControlRequest,
+    ) -> Result<RuntimeHandle, ExecutorError> {
+        if request.lease_token.trim().is_empty() {
+            return Err(ExecutorError::InvalidRequest(
+                "lease_token must not be empty".to_string(),
+            ));
+        }
+
+        let handle = self
+            .registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .ok_or(ExecutorError::RuntimeNotFound {
+                task_id: request.task_id,
+                attempt_no: request.attempt_no,
+            })?;
+        let handle_lease_token = runtime_lease_token(&handle).unwrap_or_default();
+        if handle_lease_token != request.lease_token {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "stale recording control for {}/{}: lease_token mismatch",
+                request.task_id, request.attempt_no
+            )));
+        }
+        if handle.state != RuntimeState::Running && handle.state != RuntimeState::Starting {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "recording control requires an active runtime, current state is {:?}",
+                handle.state
+            )));
+        }
+
+        let _guard =
+            RecordingControlGuard::acquire(self.recording_controls.clone(), handle.runtime_id)?;
+        let spec = resolved_spec_from_handle(&handle).ok_or_else(|| {
+            ExecutorError::InvalidRequest(
+                "runtime is missing resolved stream_ingest spec".to_string(),
+            )
+        })?;
+        if !spec.supports_runtime_recording_control() {
+            return Err(ExecutorError::InvalidRequest(
+                "recording control only supports realtime stream_ingest runtimes".to_string(),
+            ));
+        }
+        let binding = stream_binding_from_handle(&handle).ok_or_else(|| {
+            ExecutorError::InvalidRequest(
+                "recording control requires a ZLM stream binding".to_string(),
+            )
+        })?;
+
+        match request.action {
+            RecordingControlAction::Start => {
+                let requested = build_manual_live_relay_recording(
+                    &self.settings,
+                    request.task_id,
+                    &spec,
+                    request.record.as_ref(),
+                    &request.command_id,
+                );
+                self.start_manual_recording(request, &handle, &binding, requested)
+            }
+            RecordingControlAction::Stop => {
+                self.stop_manual_recording(request, &handle, &binding, &spec)
+            }
+        }
     }
 
     fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
@@ -2139,6 +2270,219 @@ impl ManagedProcessExecutor {
             &binding,
             &recording,
         ))
+    }
+
+    fn start_manual_recording(
+        &self,
+        request: &TaskRecordingControlRequest,
+        handle: &RuntimeHandle,
+        binding: &StreamBinding,
+        recording: LiveRelayRecording,
+    ) -> Result<RuntimeHandle, ExecutorError> {
+        if let Some(existing) = live_relay_recording_from_handle(handle) {
+            if existing.started && !recording_config_matches(&existing, &recording) {
+                return Err(ExecutorError::InvalidRequest(
+                    "recording is already running with different parameters; stop it first"
+                        .to_string(),
+                ));
+            }
+            if existing.started {
+                return Ok(handle.clone());
+            }
+        }
+
+        emit_recording_control_event(
+            &self.events,
+            handle,
+            "recording_start_requested",
+            "info",
+            "manual stream recording start requested",
+            &recording,
+            request,
+            json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+            }),
+        );
+
+        let work_dir = attempt_work_dir(&self.settings, request.task_id, request.attempt_no);
+        let success_check = success_check_from_handle(handle);
+        if !stream_online(handle) {
+            let pending_handle = self
+                .registry
+                .update(handle.runtime_id, |runtime| {
+                    runtime.last_progress_at = Some(Utc::now());
+                    runtime.metadata["recording"] = json!(recording.clone());
+                    runtime.metadata["recording_error"] = Value::Null;
+                })
+                .unwrap_or_else(|| {
+                    let mut updated = handle.clone();
+                    updated.last_progress_at = Some(Utc::now());
+                    updated.metadata["recording"] = json!(recording.clone());
+                    updated.metadata["recording_error"] = Value::Null;
+                    updated
+                });
+            let _ = persist_runtime_state(&work_dir, &pending_handle, &success_check);
+            emit_recording_control_event(
+                &self.events,
+                &pending_handle,
+                "recording_start_pending",
+                "info",
+                "manual stream recording will start after source reconnects",
+                &recording,
+                request,
+                json!({
+                    "schema": binding.schema,
+                    "vhost": binding.vhost,
+                    "app": binding.app,
+                    "stream": binding.stream,
+                }),
+            );
+            let _ = self
+                .events
+                .send(RuntimeNotification::TaskSnapshot(pending_handle.clone()));
+            return Ok(pending_handle);
+        }
+
+        let updated_recording = self.run_sync(start_stream_recording(
+            &self.http_client,
+            &self.settings,
+            binding,
+            &recording,
+            Utc::now(),
+        ))?;
+        let updated_handle = self
+            .registry
+            .update(handle.runtime_id, |runtime| {
+                runtime.last_progress_at = Some(Utc::now());
+                runtime.metadata["recording"] = json!(updated_recording.clone());
+                runtime.metadata["recording_error"] = Value::Null;
+            })
+            .unwrap_or_else(|| {
+                let mut updated = handle.clone();
+                updated.last_progress_at = Some(Utc::now());
+                updated.metadata["recording"] = json!(updated_recording.clone());
+                updated.metadata["recording_error"] = Value::Null;
+                updated
+            });
+        let _ = persist_runtime_state(&work_dir, &updated_handle, &success_check);
+        emit_recording_control_event(
+            &self.events,
+            &updated_handle,
+            "recording_started",
+            "info",
+            "manual stream recording started",
+            &updated_recording,
+            request,
+            json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+            }),
+        );
+        maybe_spawn_manual_recording_duration_timer(
+            updated_handle.runtime_id,
+            work_dir,
+            success_check,
+            binding.clone(),
+            self.settings.clone(),
+            self.http_client.clone(),
+            self.registry.clone(),
+            self.runtimes.clone(),
+            self.events.clone(),
+            updated_recording,
+        );
+        let _ = self
+            .events
+            .send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
+        Ok(updated_handle)
+    }
+
+    fn stop_manual_recording(
+        &self,
+        request: &TaskRecordingControlRequest,
+        handle: &RuntimeHandle,
+        binding: &StreamBinding,
+        spec: &TaskSpec,
+    ) -> Result<RuntimeHandle, ExecutorError> {
+        let mut recording = live_relay_recording_from_handle(handle).unwrap_or_else(|| {
+            build_manual_live_relay_recording(
+                &self.settings,
+                request.task_id,
+                spec,
+                request.record.as_ref(),
+                &request.command_id,
+            )
+        });
+        recording.manual_control = true;
+        recording.desired_enabled = false;
+        recording.control_command_id = Some(request.command_id.clone());
+
+        emit_recording_control_event(
+            &self.events,
+            handle,
+            "recording_stop_requested",
+            "info",
+            "manual stream recording stop requested",
+            &recording,
+            request,
+            json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+            }),
+        );
+
+        if recording.started && stream_online(handle) {
+            self.run_sync(stop_live_relay_recording(
+                &self.http_client,
+                &self.settings,
+                binding,
+                &recording,
+            ))?;
+        }
+
+        let stopped = mark_recording_completion(&recording, request.reason.clone());
+        let work_dir = attempt_work_dir(&self.settings, request.task_id, request.attempt_no);
+        let success_check = success_check_from_handle(handle);
+        let updated_handle = self
+            .registry
+            .update(handle.runtime_id, |runtime| {
+                runtime.last_progress_at = Some(Utc::now());
+                runtime.metadata["recording"] = json!(stopped.clone());
+                runtime.metadata["recording_error"] = Value::Null;
+            })
+            .unwrap_or_else(|| {
+                let mut updated = handle.clone();
+                updated.last_progress_at = Some(Utc::now());
+                updated.metadata["recording"] = json!(stopped.clone());
+                updated.metadata["recording_error"] = Value::Null;
+                updated
+            });
+        let _ = persist_runtime_state(&work_dir, &updated_handle, &success_check);
+        emit_recording_control_event(
+            &self.events,
+            &updated_handle,
+            "recording_stopped",
+            "info",
+            "manual stream recording stopped",
+            &stopped,
+            request,
+            json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+            }),
+        );
+        let _ = self
+            .events
+            .send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
+        Ok(updated_handle)
     }
 
     fn close_rtp_receive(&self, handle: &RuntimeHandle) -> Result<(), ExecutorError> {
@@ -4860,12 +5204,84 @@ fn build_live_relay_recording(
         duration_sec: spec.record.duration_sec,
         segment_sec: spec.record.segment_sec,
         as_player: spec.record.as_player.unwrap_or(false),
+        desired_enabled: true,
+        manual_control: false,
+        stop_task_on_duration: true,
+        control_command_id: None,
         recording_started_at: None,
         auto_stop_requested: false,
         completion_reason: None,
         started: false,
         failed: false,
     }))
+}
+
+fn build_manual_live_relay_recording(
+    settings: &AgentSettings,
+    task_id: Uuid,
+    spec: &TaskSpec,
+    control: Option<&RecordingControlSpec>,
+    command_id: &str,
+) -> LiveRelayRecording {
+    let format = control
+        .and_then(|control| control.format)
+        .or(spec.record.format)
+        .unwrap_or(media_domain::RecordFormat::Mp4);
+    let formats = record_kinds_from_format(format);
+    let root_path_mp4 = formats
+        .iter()
+        .any(|kind| matches!(kind, ZlmRecordKind::Mp4))
+        .then(|| {
+            managed_output_dir(settings, task_id, "mp4")
+                .to_string_lossy()
+                .to_string()
+        });
+    let root_path_hls = formats
+        .iter()
+        .any(|kind| matches!(kind, ZlmRecordKind::Hls))
+        .then(|| {
+            managed_output_dir(settings, task_id, "hls")
+                .to_string_lossy()
+                .to_string()
+        });
+
+    LiveRelayRecording {
+        formats,
+        root_path_mp4,
+        root_path_hls,
+        duration_sec: control.and_then(|control| control.duration_sec),
+        segment_sec: control
+            .and_then(|control| control.segment_sec)
+            .or(spec.record.segment_sec),
+        as_player: control
+            .and_then(|control| control.as_player)
+            .or(spec.record.as_player)
+            .unwrap_or(false),
+        desired_enabled: true,
+        manual_control: true,
+        stop_task_on_duration: false,
+        control_command_id: Some(command_id.to_string()),
+        recording_started_at: None,
+        auto_stop_requested: false,
+        completion_reason: None,
+        started: false,
+        failed: false,
+    }
+}
+
+fn record_kinds_from_format(format: media_domain::RecordFormat) -> Vec<ZlmRecordKind> {
+    match format {
+        media_domain::RecordFormat::Mp4 => vec![ZlmRecordKind::Mp4],
+        media_domain::RecordFormat::Hls => vec![ZlmRecordKind::Hls],
+        media_domain::RecordFormat::Both => vec![ZlmRecordKind::Mp4, ZlmRecordKind::Hls],
+    }
+}
+
+fn recording_config_matches(existing: &LiveRelayRecording, requested: &LiveRelayRecording) -> bool {
+    existing.formats == requested.formats
+        && existing.duration_sec == requested.duration_sec
+        && existing.segment_sec == requested.segment_sec
+        && existing.as_player == requested.as_player
 }
 
 fn build_startup_probe(task_id: Uuid, spec: &TaskSpec) -> Result<StartupProbe, ExecutorError> {
@@ -5117,7 +5533,7 @@ fn zlm_proxy_key_from_handle(handle: &RuntimeHandle) -> Option<String> {
 }
 
 fn should_start_live_relay_recording(recording: &LiveRelayRecording) -> bool {
-    !recording.started && !recording.failed
+    recording.desired_enabled && !recording.started && !recording.failed
 }
 
 fn live_relay_startup_ready(handle: &RuntimeHandle) -> bool {
@@ -5154,6 +5570,7 @@ fn mark_recording_started(
     now: DateTime<Utc>,
 ) -> LiveRelayRecording {
     let mut updated = recording.clone();
+    updated.desired_enabled = true;
     updated.started = true;
     updated.failed = false;
     updated.recording_started_at = Some(now);
@@ -5174,6 +5591,8 @@ fn mark_recording_completion(
     reason: impl Into<String>,
 ) -> LiveRelayRecording {
     let mut updated = recording.clone();
+    updated.desired_enabled = false;
+    updated.started = false;
     updated.auto_stop_requested = true;
     updated.completion_reason = Some(reason.into());
     updated
@@ -5184,6 +5603,7 @@ fn should_auto_stop_live_relay_recording(
     now: DateTime<Utc>,
 ) -> bool {
     recording.started
+        && recording.stop_task_on_duration
         && !recording.auto_stop_requested
         && recording_duration_reached(recording, now)
 }
@@ -5223,9 +5643,12 @@ fn sticky_reconnect_stream_ingest_from_handle(handle: &RuntimeHandle) -> bool {
 }
 
 fn stream_ingest_recording_enabled_from_handle(handle: &RuntimeHandle) -> bool {
-    resolved_spec_from_handle(handle).is_some_and(|spec| {
+    let spec_enabled = resolved_spec_from_handle(handle).is_some_and(|spec| {
         spec.task_type == TaskType::StreamIngest && spec.record.enabled.unwrap_or(false)
-    })
+    });
+    spec_enabled
+        || live_relay_recording_from_handle(handle)
+            .is_some_and(|recording| recording.desired_enabled || recording.started)
 }
 
 fn recording_gap_active(handle: &RuntimeHandle) -> bool {
@@ -5341,6 +5764,43 @@ fn emit_recording_gap_ended_event(
             json!({
                 "reason": reason,
                 "recording_gap_started_at": handle.metadata.get("recording_gap_started_at").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+    }));
+}
+
+fn emit_recording_control_event(
+    events: &RuntimeEventSink,
+    handle: &RuntimeHandle,
+    event_type: &str,
+    event_level: &str,
+    message: impl Into<String>,
+    recording: &LiveRelayRecording,
+    request: &TaskRecordingControlRequest,
+    payload: Value,
+) {
+    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+        task_id: handle.task_id,
+        attempt_no: handle.attempt_no,
+        lease_token: runtime_lease_token(handle).unwrap_or_default(),
+        session_epoch: runtime_session_epoch(handle),
+        event_type: event_type.to_string(),
+        event_level: event_level.to_string(),
+        message: message.into(),
+        payload: merge_event_payload(
+            payload,
+            json!({
+                "command_id": request.command_id,
+                "manual_control": recording.manual_control,
+                "desired_enabled": recording.desired_enabled,
+                "formats": recording.formats,
+                "root_path": recording.primary_root_path(),
+                "root_paths": recording.root_paths_payload(),
+                "duration_sec": recording.duration_sec,
+                "segment_sec": recording.segment_sec,
+                "as_player": recording.as_player,
+                "stop_task_on_duration": recording.stop_task_on_duration,
+                "reason": request.reason,
             }),
         ),
     }));
@@ -6170,6 +6630,18 @@ fn spawn_startup_probe_monitor(
                                 });
                             let _ =
                                 persist_runtime_state(&work_dir, &updated_handle, &success_check);
+                            maybe_spawn_manual_recording_duration_timer(
+                                runtime_id,
+                                work_dir.clone(),
+                                success_check.clone(),
+                                binding.clone(),
+                                settings.clone(),
+                                http_client.clone(),
+                                registry.clone(),
+                                runtimes.clone(),
+                                events.clone(),
+                                updated_recording.clone(),
+                            );
                             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                                 task_id: updated_handle.task_id,
                                 attempt_no: updated_handle.attempt_no,
@@ -6684,6 +7156,18 @@ fn spawn_live_relay_monitor(
                                 &updated_handle,
                                 &SuccessCheck::ProcessExit,
                             );
+                            maybe_spawn_manual_recording_duration_timer(
+                                runtime_id,
+                                work_dir.clone(),
+                                SuccessCheck::ProcessExit,
+                                binding.clone(),
+                                settings.clone(),
+                                http_client.clone(),
+                                registry.clone(),
+                                runtimes.clone(),
+                                events.clone(),
+                                updated_recording.clone(),
+                            );
                             recording_started = true;
                             active_handle = updated_handle;
                         }
@@ -7042,6 +7526,18 @@ fn spawn_live_relay_monitor(
                                     &work_dir,
                                     &updated_handle,
                                     &SuccessCheck::ProcessExit,
+                                );
+                                maybe_spawn_manual_recording_duration_timer(
+                                    runtime_id,
+                                    work_dir.clone(),
+                                    SuccessCheck::ProcessExit,
+                                    binding.clone(),
+                                    settings.clone(),
+                                    http_client.clone(),
+                                    registry.clone(),
+                                    runtimes.clone(),
+                                    events.clone(),
+                                    updated_recording.clone(),
                                 );
                                 recording_started = true;
                                 active_handle = updated_handle;
@@ -7890,6 +8386,95 @@ async fn stop_live_relay_recording(
         .await?;
     }
     Ok(())
+}
+
+fn maybe_spawn_manual_recording_duration_timer(
+    runtime_id: Uuid,
+    work_dir: PathBuf,
+    success_check: SuccessCheck,
+    binding: StreamBinding,
+    settings: AgentSettings,
+    http_client: Client,
+    registry: LocalRuntimeRegistry,
+    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    events: RuntimeEventSink,
+    recording: LiveRelayRecording,
+) {
+    if recording.stop_task_on_duration || !recording.started || !recording.manual_control {
+        return;
+    }
+    let Some(duration_sec) = recording.duration_sec.filter(|value| *value > 0) else {
+        return;
+    };
+    let command_id = recording.control_command_id.clone();
+
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(u64::from(duration_sec))).await;
+        let Some(handle) = registry.get(runtime_id) else {
+            return;
+        };
+        if !runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .contains_key(&runtime_id)
+        {
+            return;
+        }
+        let Some(current) = live_relay_recording_from_handle(&handle) else {
+            return;
+        };
+        if current.stop_task_on_duration
+            || !current.manual_control
+            || !current.started
+            || !current.desired_enabled
+            || current.duration_sec != Some(duration_sec)
+            || current.control_command_id != command_id
+        {
+            return;
+        }
+
+        let _ = stop_live_relay_recording(&http_client, &settings, &binding, &current).await;
+        let stopped = mark_recording_completion(&current, "manual_duration_reached");
+        let updated = registry
+            .update(runtime_id, |runtime| {
+                runtime.last_progress_at = Some(Utc::now());
+                runtime.metadata["recording"] = json!(stopped.clone());
+                runtime.metadata["recording_error"] = Value::Null;
+            })
+            .unwrap_or_else(|| {
+                let mut updated = handle.clone();
+                updated.last_progress_at = Some(Utc::now());
+                updated.metadata["recording"] = json!(stopped.clone());
+                updated.metadata["recording_error"] = Value::Null;
+                updated
+            });
+        let _ = persist_runtime_state(&work_dir, &updated, &success_check);
+        let request = TaskRecordingControlRequest {
+            task_id: updated.task_id,
+            attempt_no: updated.attempt_no,
+            lease_token: runtime_lease_token(&updated).unwrap_or_default(),
+            action: RecordingControlAction::Stop,
+            record: None,
+            reason: "manual_duration_reached".to_string(),
+            command_id: command_id.unwrap_or_else(|| Uuid::now_v7().to_string()),
+        };
+        emit_recording_control_event(
+            &events,
+            &updated,
+            "recording_stopped",
+            "info",
+            "manual stream recording duration reached",
+            &stopped,
+            &request,
+            json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+            }),
+        );
+        let _ = events.send(RuntimeNotification::TaskSnapshot(updated));
+    });
 }
 
 async fn cleanup_live_relay_runtime(

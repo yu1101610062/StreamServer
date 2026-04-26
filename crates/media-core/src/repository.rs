@@ -2824,6 +2824,84 @@ impl TaskRepository {
         }))
     }
 
+    pub async fn build_recording_control_command(
+        &self,
+        task_id: Uuid,
+    ) -> Result<RecordingControlCommand, RepoError> {
+        let row = sqlx::query(
+            r#"
+            select
+              t.status::text as task_status,
+              t.assigned_node_id,
+              t.current_attempt_no,
+              t.resolved_spec,
+              nullif(ta.lease_token, '') as lease_token,
+              sb.id as stream_binding_id
+            from tasks t
+            left join task_attempts ta
+              on ta.task_id = t.id
+             and ta.attempt_no = t.current_attempt_no
+            left join stream_bindings sb
+              on sb.attempt_id = ta.id
+            where t.id = $1
+            order by sb.created_at desc
+            limit 1
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(RepoError::TaskNotFound(task_id))?;
+
+        let status = TaskStatus::from_str(&row.try_get::<String, _>("task_status")?)?;
+        if status != TaskStatus::Running {
+            return Err(RepoError::RecordingControlUnsupported(format!(
+                "task must be RUNNING to control recording, current status is {status}"
+            )));
+        }
+        let node_id: Option<Uuid> = row.try_get("assigned_node_id")?;
+        let Some(node_id) = node_id else {
+            return Err(RepoError::RecordingControlUnsupported(
+                "task has no assigned media node".to_string(),
+            ));
+        };
+        let attempt_no: i32 = row.try_get("current_attempt_no")?;
+        if attempt_no <= 0 {
+            return Err(RepoError::RecordingControlUnsupported(
+                "task has no active attempt".to_string(),
+            ));
+        }
+        let lease_token: Option<String> = row.try_get("lease_token")?;
+        let Some(lease_token) = lease_token else {
+            return Err(validation_error(
+                "lease_token",
+                "current attempt is missing lease_token",
+            ));
+        };
+        let resolved_spec: Value = row
+            .try_get::<Option<Value>, _>("resolved_spec")?
+            .ok_or(RepoError::TaskMissingResolvedSpec(task_id))?;
+        let spec = serde_json::from_value::<TaskSpec>(resolved_spec.clone())?;
+        if !spec.supports_runtime_recording_control() {
+            return Err(RepoError::RecordingControlUnsupported(
+                "only realtime stream_ingest tasks support runtime recording control".to_string(),
+            ));
+        }
+        let stream_binding_id: Option<Uuid> = row.try_get("stream_binding_id")?;
+        if stream_binding_id.is_none() {
+            return Err(RepoError::RecordingControlUnsupported(
+                "current attempt has no ZLM stream binding".to_string(),
+            ));
+        }
+
+        Ok(RecordingControlCommand {
+            task_id,
+            attempt_no,
+            node_id,
+            lease_token,
+        })
+    }
+
     pub async fn list_reclaim_runtimes(
         &self,
         node_id: Uuid,
@@ -6075,6 +6153,14 @@ pub struct StopCommand {
 }
 
 #[derive(Debug, Clone)]
+pub struct RecordingControlCommand {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub node_id: Uuid,
+    pub lease_token: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReclaimRuntimeCommand {
     pub task_id: Uuid,
     pub attempt_no: i32,
@@ -7962,6 +8048,8 @@ pub enum RepoError {
     TaskNotDispatchable(TaskStatus),
     #[error("task cannot be deleted from status {0}")]
     TaskDeleteForbidden(TaskStatus),
+    #[error("recording control is not supported: {0}")]
+    RecordingControlUnsupported(String),
     #[error("idempotency key already exists with different request body")]
     IdempotencyConflict,
     #[error("operation with the same idempotency key is still in progress")]

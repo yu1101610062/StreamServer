@@ -105,6 +105,12 @@ impl IntoResponse for AppError {
                     format!("task cannot be deleted from status {status}"),
                     Value::Null,
                 ),
+                RepoError::RecordingControlUnsupported(message) => (
+                    StatusCode::CONFLICT,
+                    "RECORDING_CONTROL_UNSUPPORTED",
+                    message,
+                    Value::Null,
+                ),
                 RepoError::IdempotencyConflict => (
                     StatusCode::CONFLICT,
                     "CONFLICT_IDEMPOTENCY_KEY",

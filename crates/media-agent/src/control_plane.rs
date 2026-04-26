@@ -14,14 +14,14 @@ use std::{
 
 use anyhow::Context;
 use media_domain::{
-    AgentRegistration, NetworkMode, RuntimeHandle, TaskType, WorkerKind,
+    AgentRegistration, NetworkMode, RecordingControlSpec, RuntimeHandle, TaskType, WorkerKind,
     normalize_output_mount_relative_prefix,
 };
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
     GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
-    ProbeCapabilities, Register as RpcRegister, StartTask, StopTask, TaskEvent, TaskSnapshot,
-    control_plane_client::ControlPlaneClient,
+    ProbeCapabilities, Register as RpcRegister, StartTask, StopTask, TaskEvent,
+    TaskRecordingControl, TaskSnapshot, control_plane_client::ControlPlaneClient,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -40,9 +40,10 @@ use crate::{
     heartbeat::HeartbeatSampler,
     runtime::{
         AdoptFilter, AdoptRuntimeFilter, LocalExecutor, LocalRuntimeRegistry,
-        ManagedProcessExecutor, RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent,
-        RuntimeTaskLogBatch, RuntimeTaskProgress, StartTaskRequest, StopTaskRequest,
-        TerminalRuntimeReplay, cleanup_persisted_runtime_state, collect_terminal_runtime_replays,
+        ManagedProcessExecutor, RecordingControlAction, RuntimeEventSink, RuntimeNotification,
+        RuntimeTaskEvent, RuntimeTaskLogBatch, RuntimeTaskProgress, StartTaskRequest,
+        StopTaskRequest, TaskRecordingControlRequest, TerminalRuntimeReplay,
+        cleanup_persisted_runtime_state, collect_terminal_runtime_replays,
         is_terminal_runtime_event, rejected_runtime_handle, runtime_session_epoch,
     },
 };
@@ -310,6 +311,9 @@ impl AgentController {
             }
             media_rpc::control_plane::core_envelope::Payload::StopTask(command) => {
                 self.handle_stop_task(sender, command).await?;
+            }
+            media_rpc::control_plane::core_envelope::Payload::TaskRecordingControl(command) => {
+                self.handle_task_recording_control(sender, command).await?;
             }
         }
 
@@ -634,6 +638,38 @@ impl AgentController {
         Ok(())
     }
 
+    async fn handle_task_recording_control(
+        &self,
+        sender: &mpsc::Sender<AgentEnvelope>,
+        command: TaskRecordingControl,
+    ) -> anyhow::Result<()> {
+        let request = parse_task_recording_control(command)?;
+        match self.executor.set_task_recording(&request) {
+            Ok(handle) => {
+                send_task_snapshot(sender, &handle).await?;
+            }
+            Err(error) => {
+                send_task_event(
+                    sender,
+                    request.task_id,
+                    request.attempt_no,
+                    request.lease_token.clone(),
+                    "recording_control_failed",
+                    "error",
+                    error.to_string(),
+                    json!({
+                        "command_id": request.command_id,
+                        "action": recording_control_action_name(request.action),
+                        "reason": request.reason,
+                    }),
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn build_registration(&self) -> anyhow::Result<AgentRegistration> {
         let hostname = detect_hostname().unwrap_or_else(|| self.settings.agent.node_name.clone());
         let interfaces = discover_interfaces();
@@ -938,6 +974,39 @@ fn parse_stop_task(command: StopTask) -> anyhow::Result<StopTaskRequest> {
         grace_period_sec: command.grace_period_sec,
         force_after_sec: command.force_after_sec,
     })
+}
+
+fn parse_task_recording_control(
+    command: TaskRecordingControl,
+) -> anyhow::Result<TaskRecordingControlRequest> {
+    let action = match command.action.trim() {
+        "start" => RecordingControlAction::Start,
+        "stop" => RecordingControlAction::Stop,
+        other => anyhow::bail!("unsupported recording control action {other}"),
+    };
+    let record = if command.record_config_json.trim().is_empty() {
+        None
+    } else {
+        Some(serde_json::from_str::<RecordingControlSpec>(
+            &command.record_config_json,
+        )?)
+    };
+    Ok(TaskRecordingControlRequest {
+        task_id: Uuid::parse_str(command.task_id.trim())?,
+        attempt_no: command.attempt_no,
+        lease_token: command.lease_token.trim().to_string(),
+        action,
+        record,
+        reason: command.reason.trim().to_string(),
+        command_id: command.command_id.trim().to_string(),
+    })
+}
+
+fn recording_control_action_name(action: RecordingControlAction) -> &'static str {
+    match action {
+        RecordingControlAction::Start => "start",
+        RecordingControlAction::Stop => "stop",
+    }
 }
 
 fn parse_json_field(value: &str) -> anyhow::Result<Value> {

@@ -101,6 +101,21 @@ export interface TaskLogResponse {
   lines: TaskLogLine[];
 }
 
+export interface RecordingControlRequest {
+  format?: "mp4" | "hls" | "both";
+  duration_sec?: number;
+  segment_sec?: number;
+  as_player?: boolean;
+}
+
+export interface RecordingControlResponse {
+  task_id: string;
+  attempt_no: number;
+  desired_enabled: boolean;
+  recording_state: string;
+  message: string;
+}
+
 export interface StreamSummary {
   id: string;
   task_id: string;

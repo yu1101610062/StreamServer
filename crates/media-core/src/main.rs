@@ -36,6 +36,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use control_plane::{ControlPlaneService, NodeLiveLoad};
 use error::AppError;
+use media_domain::RecordingControlSpec;
 use repository::{
     AuthUser, CreateTaskResult, HookEventListFilter, MachineAllowlistEntry, MachineAllowlistWrite,
     NewRefreshSession, NodeSummary, RecordListFilter, SecurityAuditEventRecord, StreamListFilter,
@@ -230,6 +231,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/tasks/{id}/stop", post(stop_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
         .route("/tasks/{id}/retry", post(retry_task))
+        .route("/tasks/{id}/recording/start", post(start_task_recording))
+        .route("/tasks/{id}/recording/stop", post(stop_task_recording))
         .route("/tasks/{id}/clone", post(clone_task))
         .route("/streams", get(list_streams))
         .route("/records", get(list_records))
@@ -919,6 +922,103 @@ async fn retry_task(
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let attempt = state.repository.retry_task(task_id).await?;
     Ok((StatusCode::ACCEPTED, Json(attempt)))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RecordingControlResponse {
+    task_id: Uuid,
+    attempt_no: i32,
+    desired_enabled: bool,
+    recording_state: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RecordingStopRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn start_task_recording(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Path(task_id): Path<Uuid>,
+    Json(payload): Json<RecordingControlSpec>,
+) -> Result<(StatusCode, Json<RecordingControlResponse>), AppError> {
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
+    validate_recording_control_spec(&payload)?;
+    let command_id = Uuid::now_v7().to_string();
+    let command = state
+        .control_plane
+        .request_recording_control(
+            task_id,
+            "start",
+            Some(
+                serde_json::to_value(&payload)
+                    .map_err(|error| AppError::Internal(error.to_string()))?,
+            ),
+            "user_requested",
+            command_id,
+        )
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RecordingControlResponse {
+            task_id,
+            attempt_no: command.attempt_no,
+            desired_enabled: true,
+            recording_state: "requested".to_string(),
+            message: "recording control accepted".to_string(),
+        }),
+    ))
+}
+
+async fn stop_task_recording(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Path(task_id): Path<Uuid>,
+    body: Option<Json<RecordingStopRequest>>,
+) -> Result<(StatusCode, Json<RecordingControlResponse>), AppError> {
+    let _principal =
+        authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
+    let reason = body
+        .map(|Json(payload)| payload.reason)
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "user_requested".to_string());
+    let command_id = Uuid::now_v7().to_string();
+    let command = state
+        .control_plane
+        .request_recording_control(task_id, "stop", None, reason, command_id)
+        .await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(RecordingControlResponse {
+            task_id,
+            attempt_no: command.attempt_no,
+            desired_enabled: false,
+            recording_state: "requested".to_string(),
+            message: "recording control accepted".to_string(),
+        }),
+    ))
+}
+
+fn validate_recording_control_spec(spec: &RecordingControlSpec) -> Result<(), AppError> {
+    if spec.duration_sec == Some(0) {
+        return Err(AppError::BadRequest(
+            "duration_sec must be greater than zero".to_string(),
+        ));
+    }
+    if spec.segment_sec == Some(0) {
+        return Err(AppError::BadRequest(
+            "segment_sec must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 async fn clone_task(
