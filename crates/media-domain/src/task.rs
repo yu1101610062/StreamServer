@@ -1283,10 +1283,6 @@ pub struct RecordSpec {
     pub save_path: Option<String>,
     #[serde(default)]
     pub as_player: Option<bool>,
-    #[serde(default)]
-    pub archive_policy: Option<String>,
-    #[serde(default)]
-    pub retention_days: Option<u16>,
 }
 
 impl RecordSpec {
@@ -1313,8 +1309,6 @@ impl RecordSpec {
             || self.segment_sec.is_some()
             || self.save_path.is_some()
             || self.as_player.is_some()
-            || self.archive_policy.is_some()
-            || self.retention_days.is_some()
     }
 }
 

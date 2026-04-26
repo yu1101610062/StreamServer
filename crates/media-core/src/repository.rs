@@ -7330,17 +7330,6 @@ fn task_spec_overlay(spec: &TaskSpec) -> Value {
             spec.record.save_path.as_ref().map(|value| json!(value)),
         ),
         ("as_player", spec.record.as_player.map(|value| json!(value))),
-        (
-            "archive_policy",
-            spec.record
-                .archive_policy
-                .as_ref()
-                .map(|value| json!(value)),
-        ),
-        (
-            "retention_days",
-            spec.record.retention_days.map(|value| json!(value)),
-        ),
     ]);
     if let Some(record) = record {
         overlay.insert("record".to_string(), record);
