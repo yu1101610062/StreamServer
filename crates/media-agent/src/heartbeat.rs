@@ -55,6 +55,11 @@ impl HeartbeatSampler {
             .and_then(ArtifactCleanupManager::current_disk_percent)
             .or_else(|| sample_disk_percent(&self.work_root))
             .unwrap_or(0.0);
+        let artifact_cleanup_block_reason = self
+            .artifact_cleanup
+            .as_ref()
+            .and_then(ArtifactCleanupManager::control_plane_block_reason);
+        let artifact_cleanup_blocked = artifact_cleanup_block_reason.is_some();
         let occupied_tasks = running_tasks
             .saturating_add(starting_tasks)
             .saturating_add(stopping_tasks)
@@ -77,6 +82,8 @@ impl HeartbeatSampler {
             slot_usage,
             zlm_alive,
             ffmpeg_alive,
+            artifact_cleanup_blocked,
+            artifact_cleanup_block_reason,
             gpu_runtime,
         }
     }

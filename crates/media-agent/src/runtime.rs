@@ -148,13 +148,13 @@ impl LocalRuntimeRegistry {
             .collect()
     }
 
-    pub fn tracked_task_ids(&self) -> HashSet<Uuid> {
+    pub fn active_handles(&self) -> Vec<RuntimeHandle> {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
         runtimes
             .by_runtime_id
             .values()
             .filter(|handle| handle.state != RuntimeState::Exited)
-            .map(|handle| handle.task_id)
+            .cloned()
             .collect()
     }
 }
@@ -929,6 +929,16 @@ impl LocalExecutor for ManagedProcessExecutor {
                 &exited_handle,
                 &success_check_from_handle(&exited_handle),
             );
+            let (event_type, event_level, message) = if request.reason == "disk_threshold_exceeded"
+            {
+                (
+                    "failed",
+                    "error",
+                    "stream_ingest rtp server stopped after disk threshold was exceeded",
+                )
+            } else {
+                ("canceled", "info", "stream_ingest rtp server stopped")
+            };
             let _ = self
                 .events
                 .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
@@ -936,9 +946,9 @@ impl LocalExecutor for ManagedProcessExecutor {
                     attempt_no: exited_handle.attempt_no,
                     lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
                     session_epoch: runtime_session_epoch(&exited_handle),
-                    event_type: "canceled".to_string(),
-                    event_level: "info".to_string(),
-                    message: "stream_ingest rtp server stopped".to_string(),
+                    event_type: event_type.to_string(),
+                    event_level: event_level.to_string(),
+                    message: message.to_string(),
                     payload: json!({
                         "runtime_id": exited_handle.runtime_id,
                         "rtp_stream_id": rtp_stream_id_from_handle(&exited_handle),
@@ -1766,6 +1776,7 @@ impl ManagedProcessExecutor {
             }
 
             let completion_reason = completion_reason_from_handle(&exited_handle);
+            let stop_reason = stop_reason_from_handle(&exited_handle);
             let fatal_recording_error = fatal_recording_error_from_handle(&exited_handle);
             let (event_type, event_level, message, payload) = match status {
                 Ok(status)
@@ -1783,6 +1794,20 @@ impl ManagedProcessExecutor {
                         }),
                     )
                 }
+                Ok(status)
+                    if was_stopped && stop_reason.as_deref() == Some("disk_threshold_exceeded") =>
+                {
+                    (
+                        "failed",
+                        "error",
+                        "child process stopped after disk threshold was exceeded".to_string(),
+                        json!({
+                            "exit_code": status.code(),
+                            "output_target": output_target,
+                            "reason": "disk_threshold_exceeded",
+                        }),
+                    )
+                }
                 Ok(status) if was_stopped => (
                     "canceled",
                     "info",
@@ -1790,6 +1815,7 @@ impl ManagedProcessExecutor {
                     json!({
                         "exit_code": status.code(),
                         "output_target": output_target,
+                        "reason": stop_reason,
                     }),
                 ),
                 Ok(status) if fatal_recording_error.is_some() => (
@@ -1926,6 +1952,20 @@ impl ManagedProcessExecutor {
                         "wait_error": error.to_string(),
                     }),
                 ),
+                Err(error)
+                    if was_stopped && stop_reason.as_deref() == Some("disk_threshold_exceeded") =>
+                {
+                    (
+                        "failed",
+                        "error",
+                        format!("failed to wait child process after disk threshold stop: {error}"),
+                        json!({
+                            "output_target": output_target,
+                            "reason": "disk_threshold_exceeded",
+                            "wait_error": error.to_string(),
+                        }),
+                    )
+                }
                 Err(error) => (
                     "failed",
                     "error",
@@ -3016,11 +3056,24 @@ fn allocate_managed_output(
     }
 
     let target = path.to_string_lossy().to_string();
+    let output_args = if format.eq_ignore_ascii_case("hls") {
+        vec![
+            "-hls_time".to_string(),
+            settings.hls_record_segment_sec.to_string(),
+            "-hls_list_size".to_string(),
+            "0".to_string(),
+            "-hls_segment_filename".to_string(),
+            hls_segment_template(&target),
+        ]
+    } else {
+        Vec::new()
+    };
+
     PublishOutput {
         success_check: SuccessCheck::FileExists(PathBuf::from(&target)),
         target,
         format,
-        output_args: Vec::new(),
+        output_args,
     }
 }
 
@@ -3038,6 +3091,13 @@ fn hls_segment_template(playlist_path: &str) -> String {
         .join(format!("{stem}-%05d.ts"))
         .to_string_lossy()
         .to_string()
+}
+
+fn hls_record_segment_sec(settings: &AgentSettings, spec: &TaskSpec) -> u32 {
+    spec.record
+        .segment_sec
+        .filter(|value| *value > 0)
+        .unwrap_or(settings.hls_record_segment_sec)
 }
 
 fn allocate_managed_file_output(
@@ -3312,7 +3372,7 @@ fn build_stream_ingest_fast_record_plan(
                 "-f".to_string(),
                 "hls".to_string(),
                 "-hls_time".to_string(),
-                spec.record.segment_sec.unwrap_or(6).to_string(),
+                hls_record_segment_sec(settings, spec).to_string(),
                 "-hls_list_size".to_string(),
                 "0".to_string(),
                 "-hls_segment_filename".to_string(),
@@ -3348,7 +3408,7 @@ fn build_stream_ingest_fast_record_plan(
                 "-f".to_string(),
                 "hls".to_string(),
                 "-hls_time".to_string(),
-                spec.record.segment_sec.unwrap_or(6).to_string(),
+                hls_record_segment_sec(settings, spec).to_string(),
                 "-hls_list_size".to_string(),
                 "0".to_string(),
                 "-hls_segment_filename".to_string(),
@@ -5482,6 +5542,15 @@ fn completion_reason_from_handle(handle: &RuntimeHandle) -> Option<String> {
         })
 }
 
+fn stop_reason_from_handle(handle: &RuntimeHandle) -> Option<String> {
+    handle
+        .metadata
+        .get("stop")
+        .and_then(|value| value.get("reason"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn fatal_recording_error_from_handle(handle: &RuntimeHandle) -> Option<String> {
     handle
         .metadata
@@ -7107,6 +7176,7 @@ fn spawn_live_relay_monitor(
                         handle
                     });
                 let completion_reason = completion_reason_from_handle(&exited_handle);
+                let stop_reason = stop_reason_from_handle(&exited_handle);
                 let (event_type, event_level, message, reason) =
                     if completion_reason.as_deref() == Some("record_duration_reached") {
                         (
@@ -7114,6 +7184,13 @@ fn spawn_live_relay_monitor(
                             "info",
                             "live_relay completed after recording duration reached",
                             "record_duration_reached",
+                        )
+                    } else if stop_reason.as_deref() == Some("disk_threshold_exceeded") {
+                        (
+                            "failed",
+                            "error",
+                            "live_relay stopped after disk threshold was exceeded",
+                            "disk_threshold_exceeded",
                         )
                     } else {
                         (
@@ -8086,6 +8163,7 @@ fn spawn_live_relay_monitor(
                     let auto_close_enabled =
                         live_relay_auto_close_enabled_from_handle(&settings, &handle);
                     let completion_reason = completion_reason_from_handle(&exited_handle);
+                    let stop_reason = stop_reason_from_handle(&exited_handle);
                     let (event_type, event_level, message, reason) =
                         if completion_reason.as_deref() == Some("record_duration_reached") {
                             (
@@ -8093,6 +8171,13 @@ fn spawn_live_relay_monitor(
                                 "info",
                                 "live_relay completed after recording duration reached".to_string(),
                                 "record_duration_reached",
+                            )
+                        } else if stop_reason.as_deref() == Some("disk_threshold_exceeded") {
+                            (
+                                "failed",
+                                "error",
+                                "live_relay stopped after disk threshold was exceeded".to_string(),
+                                "disk_threshold_exceeded",
                             )
                         } else if stop_requested {
                             (
@@ -8902,6 +8987,18 @@ fn classify_adopted_exit(
         );
     }
     if stop_requested {
+        if stop_reason_from_handle(handle).as_deref() == Some("disk_threshold_exceeded") {
+            return (
+                "failed",
+                "error",
+                "adopted child process stopped after disk threshold was exceeded".to_string(),
+                json!({
+                    "output_target": output_target,
+                    "orphaned": true,
+                    "reason": "disk_threshold_exceeded",
+                }),
+            );
+        }
         return (
             "canceled",
             "info",

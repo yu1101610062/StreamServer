@@ -87,8 +87,11 @@ sanitize_systemd_fragment() {
 compose_systemd_unit_name() {
   local safe_name
   safe_name="$(sanitize_systemd_fragment "${PROJECT_NAME:-streamserver}")"
-  [ -n "${safe_name}" ] || safe_name="streamserver"
-  printf '%s' "streamserver-compose-${safe_name}.service"
+  [ -n "${safe_name}" ] || safe_name="ss"
+  case "${safe_name}" in
+    ss-*) printf '%s' "${safe_name}.service" ;;
+    *) printf '%s' "ss-${safe_name}.service" ;;
+  esac
 }
 
 current_user_is_root() {
@@ -243,11 +246,38 @@ normalize_csv_labels() {
 
 collect_agent_labels() {
   local default_label="$1"
+  local existing_labels="${2:-${default_label}}"
   local extra_labels
+  local extra_default
 
   printf '当前节点默认会写入算力标签: %s\n' "${default_label}" >&2
-  extra_labels="$(prompt "额外节点标签（逗号分隔，可留空）" "")"
+  extra_default="$(extra_agent_labels_from_existing "${existing_labels}")"
+  extra_labels="$(prompt "额外节点标签（英文逗号分隔，可留空）" "${extra_default}")"
+  extra_labels="$(extra_agent_labels_from_existing "${extra_labels}")"
   printf '%s' "$(normalize_csv_labels "${default_label},${extra_labels}")"
+}
+
+extra_agent_labels_from_existing() {
+  local raw="${1:-}"
+  local part
+  local trimmed
+  local joined=""
+
+  IFS=',' read -r -a parts <<< "${raw}"
+  for part in "${parts[@]}"; do
+    trimmed="$(printf '%s' "${part}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "${trimmed}" ] || continue
+    case "${trimmed}" in
+      cpu|gpu) continue ;;
+    esac
+    if [ -n "${joined}" ]; then
+      joined="${joined},${trimmed}"
+    else
+      joined="${trimmed}"
+    fi
+  done
+
+  normalize_csv_labels "${joined}"
 }
 
 generate_uuid() {
@@ -432,6 +462,7 @@ binary_rel_for_key() {
   case "$1" in
     media-core) printf '%s' "${MEDIA_CORE_BINARY_PATH:-}" ;;
     media-agent) printf '%s' "${MEDIA_AGENT_BINARY_PATH:-}" ;;
+    streamserver-config) printf '%s' "${STREAMSERVER_CONFIG_BINARY_PATH:-}" ;;
     *) fail "未知二进制标识: $1" ;;
   esac
 }
@@ -511,6 +542,22 @@ install_host_ui() {
   mkdir -p "${target_path}"
   cp -R "${source_path}/." "${target_path}/"
   log "已写入宿主机挂载前端静态资源: ${target_path}"
+}
+
+run_streamserver_config_tui_if_requested() {
+  local install_dir="$1"
+  local config_bin="${install_dir}/bin/streamserver-config"
+  local env_file="${install_dir}/.env"
+
+  [ -t 0 ] || return 0
+  [ -x "${config_bin}" ] || return 0
+  log "配置界面可复核/调整端口、网卡、鉴权、节点标签、最大同时任务数和存储宿主机路径。"
+  log "如需把录制产物目录挂载到 NAS/NFS 等网络存储，请在这一步进入配置并确认挂载目录。"
+  if prompt_yes_no "是否现在打开配置界面？" "Y"; then
+    "${config_bin}" --env "${env_file}" --no-restart-prompt
+  else
+    "${config_bin}" --env "${env_file}" --non-interactive --no-restart-prompt
+  fi
 }
 
 write_compose_wrapper_script() {
@@ -805,12 +852,17 @@ AGENT_PRIMARY_INTERFACE_NAME
 AGENT_PRIMARY_INTERFACE_IP
 OUTPUT_MOUNT_RELATIVE_PREFIX_MP4
 OUTPUT_MOUNT_RELATIVE_PREFIX_HLS
+ZLM_WWW_MOUNT_HOST_DIR
+ZLM_OUTPUT_MOUNT_HOST_DIR
+ZLM_WWW_HOST_DIR
+ZLM_OUTPUT_HOST_DIR
 AGENT_MULTICAST_INTERFACE_NAME
 AGENT_MULTICAST_INTERFACE_IP
 AGENT_NETWORK_MODE
 AGENT_ACCELERATION_MODE
 AGENT_LABELS
 AGENT_MAX_RUNTIME_SLOTS
+AGENT_HLS_RECORD_SEGMENT_SEC
 AGENT_ARTIFACT_CLEANUP_ENABLED
 AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT
 AGENT_ARTIFACT_CLEANUP_STRATEGY
@@ -821,6 +873,11 @@ EOF
 
 is_managed_env_key() {
   local key="$1"
+  case "${key}" in
+    AGENT_ARTIFACT_CLEANUP_PRE*ALLOCATE_PERCENT|AGENT_ARTIFACT_CLEANUP_PRE*ALLOCATE_HEADROOM_PERCENT)
+      return 0
+      ;;
+  esac
   managed_env_keys | grep -Fxq -- "${key}"
 }
 
@@ -872,6 +929,25 @@ log_runtime_commands() {
   fi
   log "  ${install_dir}/bin/streamserver-compose ps"
   log "  ${install_dir}/bin/streamserver-compose logs -f"
+}
+
+install_role_has_agent() {
+  local install_role="$1"
+  case "${install_role}" in
+    worker-host-cpu|worker-host-gpu|all-in-one-host-cpu|all-in-one-host-gpu) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+log_output_storage_notice() {
+  local install_role="$1"
+
+  install_role_has_agent "${install_role}" || return 0
+
+  log "存储布局提示:"
+  log "  - 在线播放宿主机路径: ${ZLM_WWW_MOUNT_HOST_DIR:-${ZLM_WWW_HOST_DIR:-./data/zlm/www}}，建议本机磁盘。"
+  log "  - 录制产物宿主机路径: ${ZLM_OUTPUT_MOUNT_HOST_DIR:-${ZLM_OUTPUT_HOST_DIR:-./data/zlm/www/output}}，可挂载网络存储。"
+  log "  - 安装脚本不会自动执行 mount；如需网络存储，请先挂载到录制产物宿主机路径后再启动服务。"
 }
 
 restart_existing_stack() {
@@ -979,11 +1055,12 @@ finalize_deployment() {
     fi
     log "常用命令:"
     log_runtime_commands "${install_dir}"
+    log_output_storage_notice "${install_role}"
     return 0
   fi
 
   show_tls_notice "${install_dir}" "${grpc_host_hint}" "${grpc_port_hint}" || return 0
-  start_stack_if_requested "${install_dir}"
+  start_stack_if_requested "${install_dir}" "${install_role}"
 }
 
 prepare_install_dir() {
@@ -1035,7 +1112,7 @@ prompt_local_auth_configuration() {
     default_answer="Y"
     existing_enabled=1
   fi
-  if ! prompt_yes_no "是否启用 media-core 内建用户名密码鉴权？" "${default_answer}"; then
+  if ! prompt_yes_no "是否启用控制面板内建用户名密码鉴权？" "${default_answer}"; then
     configure_auth_defaults
     return 0
   fi
@@ -1080,6 +1157,67 @@ prepare_local_auth_assets() {
   AUTH_JWT_PRIVATE_KEY_PATH="/certs/auth/$(basename "${private_key_host_path}")"
   AUTH_JWT_PUBLIC_KEY_PATH="/certs/auth/$(basename "${public_key_host_path}")"
   JWT_PUBLIC_KEY=""
+}
+
+set_env_file_value() {
+  local env_file="$1"
+  local key="$2"
+  local value="$3"
+  local temp_path
+
+  temp_path="$(mktemp "${env_file}.XXXXXX")"
+  awk -v key="${key}" -v value="${value}" '
+    BEGIN { written = 0 }
+    /^[[:space:]]*#/ { print; next }
+    index($0, "=") > 0 {
+      current_key = substr($0, 1, index($0, "=") - 1)
+      if (current_key == key) {
+        print key "=" value
+        written = 1
+        next
+      }
+    }
+    { print }
+    END {
+      if (!written) {
+        print key "=" value
+      }
+    }
+  ' "${env_file}" >"${temp_path}"
+  mv -f "${temp_path}" "${env_file}"
+}
+
+sync_local_auth_env_entries() {
+  local env_file="$1"
+
+  set_env_file_value "${env_file}" "AUTH_MODE" "${AUTH_MODE}"
+  set_env_file_value "${env_file}" "AUTH_ENABLED" "${AUTH_ENABLED}"
+  set_env_file_value "${env_file}" "JWT_PUBLIC_KEY" "${JWT_PUBLIC_KEY}"
+  set_env_file_value "${env_file}" "AUTH_JWT_PRIVATE_KEY_PATH" "${AUTH_JWT_PRIVATE_KEY_PATH}"
+  set_env_file_value "${env_file}" "AUTH_JWT_PUBLIC_KEY_PATH" "${AUTH_JWT_PUBLIC_KEY_PATH}"
+  set_env_file_value "${env_file}" "AUTH_ACCESS_TOKEN_TTL" "${AUTH_ACCESS_TOKEN_TTL}"
+  set_env_file_value "${env_file}" "AUTH_REFRESH_TOKEN_TTL" "${AUTH_REFRESH_TOKEN_TTL}"
+}
+
+ensure_local_auth_after_config_tui() {
+  local install_dir="$1"
+  local env_file="${install_dir}/.env"
+
+  [ "${AUTH_MODE}" = "local_password" ] || [ "${AUTH_ENABLED}" = "true" ] || return 0
+
+  AUTH_MODE="local_password"
+  AUTH_ENABLED="true"
+  [ -n "${AUTH_ACCESS_TOKEN_TTL}" ] || AUTH_ACCESS_TOKEN_TTL="15m"
+  [ -n "${AUTH_REFRESH_TOKEN_TTL}" ] || AUTH_REFRESH_TOKEN_TTL="7d"
+  prepare_local_auth_assets "${install_dir}"
+  sync_local_auth_env_entries "${env_file}"
+
+  if [ -z "${AUTH_BOOTSTRAP_ADMIN_USERNAME}" ]; then
+    AUTH_BOOTSTRAP_ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "admin")"
+  fi
+  if [ -z "${AUTH_BOOTSTRAP_ADMIN_PASSWORD}" ]; then
+    AUTH_BOOTSTRAP_ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
+  fi
 }
 
 wait_for_compose_service_ready() {
@@ -1148,7 +1286,7 @@ bootstrap_local_admin_if_needed() {
     cd "${install_dir}" &&
     printf '%s' "${AUTH_BOOTSTRAP_ADMIN_PASSWORD}" | \
       compose_with_file run --rm --no-deps -T media-core \
-        media-core auth bootstrap-admin --username "${AUTH_BOOTSTRAP_ADMIN_USERNAME}" --password-stdin 2>&1
+        auth bootstrap-admin --username "${AUTH_BOOTSTRAP_ADMIN_USERNAME}" --password-stdin 2>&1
   )"; then
     (
       cd "${install_dir}"
@@ -1201,6 +1339,15 @@ env_value_or_default() {
   else
     printf '%s' "${default_value}"
   fi
+}
+
+load_runtime_env() {
+  local env_file="$1"
+  [ -f "${env_file}" ] || return 0
+  set -a
+  # shellcheck disable=SC1090
+  . "${env_file}"
+  set +a
 }
 
 describe_tcp_port_usage_via_proc() {
@@ -1566,6 +1713,82 @@ validate_port_range() {
   fi
 }
 
+validate_positive_integer() {
+  local key="$1"
+  local value="$2"
+
+  case "${value}" in
+    ''|*[!0-9]*)
+      fail "${key} 必须是大于 0 的整数"
+      ;;
+  esac
+
+  if [ "${value}" -lt 1 ]; then
+    fail "${key} 必须是大于 0 的整数"
+  fi
+}
+
+validate_percent_value() {
+  local key="$1"
+  local value="$2"
+
+  if ! awk -v value="${value}" 'BEGIN {
+    if (value !~ /^([0-9]+)(\.[0-9]+)?$/) {
+      exit 1
+    }
+    numeric = value + 0
+    if (numeric < 0 || numeric > 100) {
+      exit 1
+    }
+  }'; then
+    fail "${key} 必须是 0-100 之间的数字"
+  fi
+}
+
+validate_artifact_cleanup_config() {
+  case "${AGENT_ARTIFACT_CLEANUP_STRATEGY}" in
+    delete_oldest_then_reject|reject_only) ;;
+    *)
+      fail "AGENT_ARTIFACT_CLEANUP_STRATEGY 必须是 delete_oldest_then_reject/reject_only 之一"
+      ;;
+  esac
+
+  validate_percent_value "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}"
+  validate_positive_integer "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC}"
+}
+
+validate_hls_record_segment_config() {
+  case "${AGENT_HLS_RECORD_SEGMENT_SEC}" in
+    30|60) ;;
+    *) fail "AGENT_HLS_RECORD_SEGMENT_SEC 必须是 30 或 60" ;;
+  esac
+}
+
+configure_output_storage_defaults() {
+  local existing_env_file="$1"
+  local install_dir
+  local default_www_host_dir
+  local default_output_host_dir
+  local legacy_www_host_dir
+  local legacy_output_host_dir
+
+  install_dir="$(dirname "${existing_env_file}")"
+  case "${install_dir}" in
+    /*) ;;
+    *) install_dir="$(pwd)/${install_dir}" ;;
+  esac
+  default_www_host_dir="$(host_dir_path "${install_dir}" "./data/zlm/www")"
+  default_output_host_dir="$(host_dir_path "${install_dir}" "./data/zlm/www/output")"
+  legacy_www_host_dir="$(env_value_or_default "${existing_env_file}" "ZLM_WWW_HOST_DIR" "")"
+  legacy_output_host_dir="$(env_value_or_default "${existing_env_file}" "ZLM_OUTPUT_HOST_DIR" "")"
+  ZLM_WWW_MOUNT_HOST_DIR="$(env_value_or_default "${existing_env_file}" "ZLM_WWW_MOUNT_HOST_DIR" "${legacy_www_host_dir:-${default_www_host_dir}}")"
+  ZLM_OUTPUT_MOUNT_HOST_DIR="$(env_value_or_default "${existing_env_file}" "ZLM_OUTPUT_MOUNT_HOST_DIR" "${legacy_output_host_dir:-${default_output_host_dir}}")"
+  ZLM_WWW_MOUNT_HOST_DIR="$(host_dir_path "${install_dir}" "${ZLM_WWW_MOUNT_HOST_DIR}")"
+  ZLM_OUTPUT_MOUNT_HOST_DIR="$(host_dir_path "${install_dir}" "${ZLM_OUTPUT_MOUNT_HOST_DIR}")"
+  OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="output"
+  OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="output"
+}
+
 set_default_zlm_port_config() {
   local existing_env_file="$1"
   assign_default_local_tcp_port ZLM_HTTP_PORT "${existing_env_file}" "ZLM_HTTP_PORT" "ZLM HTTP 宿主机监听端口" "80"
@@ -1615,25 +1838,25 @@ write_control_plane_env() {
   write_env_entry "${env_file}" "当前安装角色。" "INSTALL_ROLE" "${INSTALL_ROLE}"
   write_env_entry "${env_file}" "Compose 项目名。" "COMPOSE_PROJECT_NAME" "${PROJECT_NAME}"
   write_env_entry "${env_file}" "PostgreSQL 镜像名。" "POSTGRES_IMAGE" "${POSTGRES_IMAGE}"
-  write_env_entry "${env_file}" "media-core 镜像名。" "MEDIA_CORE_IMAGE" "${MEDIA_CORE_IMAGE}"
+  write_env_entry "${env_file}" "控制面板镜像名。" "MEDIA_CORE_IMAGE" "${MEDIA_CORE_IMAGE}"
   write_env_entry "${env_file}" "PostgreSQL 数据库名。" "POSTGRES_DB" "${POSTGRES_DB}"
   write_env_entry "${env_file}" "PostgreSQL 用户名。" "POSTGRES_USER" "${POSTGRES_USER}"
   write_env_entry "${env_file}" "PostgreSQL 密码。" "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD}"
-  write_env_entry "${env_file}" "PostgreSQL 宿主机监听端口。" "POSTGRES_PORT" "${POSTGRES_PORT}"
-  write_env_entry "${env_file}" "media-core HTTP 宿主机监听端口。" "CORE_HTTP_PORT" "${CORE_HTTP_PORT}"
-  write_env_entry "${env_file}" "media-core gRPC 宿主机监听端口。" "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
+  write_env_entry "${env_file}" "数据库宿主机监听端口。" "POSTGRES_PORT" "${POSTGRES_PORT}"
+  write_env_entry "${env_file}" "控制面板网页和 HTTP API 端口。" "CORE_HTTP_PORT" "${CORE_HTTP_PORT}"
+  write_env_entry "${env_file}" "控制面板内部通信端口。" "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
   write_env_entry "${env_file}" "ZLM Hook 与 API 共用密钥。" "HOOK_SHARED_SECRET" "${HOOK_SHARED_SECRET}"
   write_env_entry "${env_file}" "允许访问 Hook 接口的源 IP 白名单，多个值用逗号分隔，留空表示不限制。" "HOOK_SOURCE_ALLOWLIST" "${HOOK_SOURCE_ALLOWLIST}"
   write_env_entry "${env_file}" "允许访问宿主机挂载存储的路径白名单，多个值用逗号分隔。" "STORAGE_ALLOWLIST" "${STORAGE_ALLOWLIST}"
   write_env_entry "${env_file}" "鉴权模式，disabled 表示关闭，local_password 表示启用内建用户名密码。" "AUTH_MODE" "${AUTH_MODE}"
   write_env_entry "${env_file}" "是否启用鉴权，true 表示启用。" "AUTH_ENABLED" "${AUTH_ENABLED}"
   write_env_entry "${env_file}" "JWT 公钥内容，留空时由 AUTH_JWT_PUBLIC_KEY_PATH 指向文件。" "JWT_PUBLIC_KEY" "${JWT_PUBLIC_KEY}"
-  write_env_entry "${env_file}" "JWT 私钥文件在容器内的路径。" "AUTH_JWT_PRIVATE_KEY_PATH" "${AUTH_JWT_PRIVATE_KEY_PATH}"
-  write_env_entry "${env_file}" "JWT 公钥文件在容器内的路径。" "AUTH_JWT_PUBLIC_KEY_PATH" "${AUTH_JWT_PUBLIC_KEY_PATH}"
+  write_env_entry "${env_file}" "JWT 私钥文件路径。" "AUTH_JWT_PRIVATE_KEY_PATH" "${AUTH_JWT_PRIVATE_KEY_PATH}"
+  write_env_entry "${env_file}" "JWT 公钥文件路径。" "AUTH_JWT_PUBLIC_KEY_PATH" "${AUTH_JWT_PUBLIC_KEY_PATH}"
   write_env_entry "${env_file}" "访问令牌有效期，例如 15m。" "AUTH_ACCESS_TOKEN_TTL" "${AUTH_ACCESS_TOKEN_TTL}"
   write_env_entry "${env_file}" "刷新令牌有效期，例如 7d。" "AUTH_REFRESH_TOKEN_TTL" "${AUTH_REFRESH_TOKEN_TTL}"
   write_env_blank_line "${env_file}"
-  write_env_example "${env_file}" "HTTPS 默认关闭，当前应用不内置 HTTPS listener，如需 HTTPS，请在反向代理中终止 TLS 后转发到 media-core HTTP 端口。" "CORE_GRPC_TLS_CERT_PATH=/certs/self-signed/media-core.pem"
+  write_env_example "${env_file}" "HTTPS 默认关闭，当前应用不内置 HTTPS 监听；如需 HTTPS，请在反向代理中终止 TLS 后转发到控制面板 HTTP 端口。" "CORE_GRPC_TLS_CERT_PATH=/certs/self-signed/media-core.pem"
   printf '# CORE_GRPC_TLS_KEY_PATH=/certs/self-signed/media-core.key\n# CORE_GRPC_TLS_CLIENT_CA_PATH=/certs/self-signed/ca.pem\n' >>"${env_file}"
   append_preserved_custom_env_entries "${env_file}" "${PRESERVED_ENV_SOURCE}"
 }
@@ -1646,8 +1869,8 @@ write_worker_host_env() {
   write_env_reset "${env_file}"
   write_env_entry "${env_file}" "当前安装角色。" "INSTALL_ROLE" "${INSTALL_ROLE}"
   write_env_entry "${env_file}" "Compose 项目名。" "COMPOSE_PROJECT_NAME" "${PROJECT_NAME}"
-  write_env_entry "${env_file}" "media-agent 镜像名。" "MEDIA_AGENT_IMAGE" "${media_agent_image}"
-  write_env_entry "${env_file}" "ZLMediaKit 镜像名。" "ZLM_IMAGE" "${ZLM_IMAGE}"
+  write_env_entry "${env_file}" "工作节点镜像名。" "MEDIA_AGENT_IMAGE" "${media_agent_image}"
+  write_env_entry "${env_file}" "流媒体服务镜像名。" "ZLM_IMAGE" "${ZLM_IMAGE}"
   write_env_entry "${env_file}" "当前工作节点 UUID。" "NODE_ID" "${NODE_ID}"
   write_env_entry "${env_file}" "当前工作节点名称。" "AGENT_NODE_NAME" "${AGENT_NODE_NAME}"
   write_env_entry "${env_file}" "control-plane HTTP 地址或域名。" "CORE_HTTP_HOST" "${CORE_HTTP_HOST}"
@@ -1655,8 +1878,8 @@ write_worker_host_env() {
   write_env_entry "${env_file}" "control-plane gRPC 地址或域名。" "CORE_GRPC_HOST" "${CORE_GRPC_HOST}"
   write_env_entry "${env_file}" "control-plane gRPC 端口。" "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
   write_env_entry "${env_file}" "当前工作节点对外可访问的主机名或 IP。" "PUBLIC_HOST" "${PUBLIC_HOST}"
-  write_env_entry "${env_file}" "供 media-agent 访问 ZLM API 使用的主机名或 IP。" "ZLM_API_HOST" "${ZLM_API_HOST}"
-  write_env_entry "${env_file}" "media-agent 宿主机监听端口。" "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
+  write_env_entry "${env_file}" "工作节点访问本机流媒体服务接口使用的主机名或 IP。" "ZLM_API_HOST" "${ZLM_API_HOST}"
+  write_env_entry "${env_file}" "工作节点本地接口端口。" "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
   write_env_entry "${env_file}" "ZLM HTTP 宿主机监听端口。" "ZLM_HTTP_PORT" "${ZLM_HTTP_PORT}"
   write_env_entry "${env_file}" "ZLM HTTPS 宿主机监听端口，0 表示关闭。" "ZLM_HTTPS_PORT" "${ZLM_HTTPS_PORT}"
   write_env_entry "${env_file}" "ZLM RTMP 宿主机监听端口。" "ZLM_RTMP_PORT" "${ZLM_RTMP_PORT}"
@@ -1677,20 +1900,21 @@ write_worker_host_env() {
   write_env_entry "${env_file}" "ZLM ONVIF 宿主机监听端口，0 表示关闭。" "ZLM_ONVIF_PORT" "${ZLM_ONVIF_PORT}"
   write_env_entry "${env_file}" "主网卡名称。" "AGENT_PRIMARY_INTERFACE_NAME" "${PRIMARY_INTERFACE_NAME}"
   write_env_entry "${env_file}" "主网卡 IP。" "AGENT_PRIMARY_INTERFACE_IP" "${PRIMARY_INTERFACE_IP}"
-  write_env_entry "${env_file}" "MP4 对外输出挂载相对前缀，留空表示直接暴露在 ZLM HTTP 根目录下。" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "${OUTPUT_MOUNT_RELATIVE_PREFIX_MP4}"
-  write_env_entry "${env_file}" "HLS 对外输出挂载相对前缀，留空表示直接暴露在 ZLM HTTP 根目录下。" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "${OUTPUT_MOUNT_RELATIVE_PREFIX_HLS}"
+  write_env_entry "${env_file}" "服务挂载源宿主机目录，用于在线播放临时文件，建议本机磁盘。" "ZLM_WWW_MOUNT_HOST_DIR" "${ZLM_WWW_MOUNT_HOST_DIR}"
+  write_env_entry "${env_file}" "服务挂载源宿主机目录，用于录制和转码产物，可挂载网络存储。" "ZLM_OUTPUT_MOUNT_HOST_DIR" "${ZLM_OUTPUT_MOUNT_HOST_DIR}"
   write_env_entry "${env_file}" "组播网卡名称。" "AGENT_MULTICAST_INTERFACE_NAME" "${MULTICAST_INTERFACE_NAME}"
   write_env_entry "${env_file}" "组播网卡 IP。" "AGENT_MULTICAST_INTERFACE_IP" "${MULTICAST_INTERFACE_IP}"
   write_env_entry "${env_file}" "ZLM Hook 与 API 共用密钥，需与 control-plane 一致。" "HOOK_SHARED_SECRET" "${HOOK_SHARED_SECRET}"
-  write_env_entry "${env_file}" "当前节点网络模式。" "AGENT_NETWORK_MODE" "${AGENT_NETWORK_MODE}"
-  write_env_entry "${env_file}" "当前节点算力模式。" "AGENT_ACCELERATION_MODE" "${acceleration_mode}"
-  write_env_entry "${env_file}" "节点标签，多个值用逗号分隔。" "AGENT_LABELS" "${agent_labels}"
-  write_env_entry "${env_file}" "最大运行时槽位，0 表示自动估算。" "AGENT_MAX_RUNTIME_SLOTS" "${AGENT_MAX_RUNTIME_SLOTS}"
+  write_env_entry "${env_file}" "当前节点网络模式，固定 host。" "AGENT_NETWORK_MODE" "${AGENT_NETWORK_MODE}"
+  write_env_entry "${env_file}" "当前节点算力模式，由安装角色决定。" "AGENT_ACCELERATION_MODE" "${acceleration_mode}"
+  write_env_entry "${env_file}" "节点标签，固定包含算力标签 cpu/gpu，额外标签用英文逗号分隔。" "AGENT_LABELS" "${agent_labels}"
+  write_env_entry "${env_file}" "最大同时任务数，0 表示自动估算。" "AGENT_MAX_RUNTIME_SLOTS" "${AGENT_MAX_RUNTIME_SLOTS}"
+  write_env_entry "${env_file}" "工作节点托管 HLS 录制默认分片秒数，可选 30/60；任务接口显式传值时优先。" "AGENT_HLS_RECORD_SEGMENT_SEC" "${AGENT_HLS_RECORD_SEGMENT_SEC}"
   write_env_entry "${env_file}" "是否开启产物清理。" "AGENT_ARTIFACT_CLEANUP_ENABLED" "${AGENT_ARTIFACT_CLEANUP_ENABLED}"
-  write_env_entry "${env_file}" "产物清理触发磁盘阈值，单位百分比。" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}"
-  write_env_entry "${env_file}" "产物清理策略。" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "${AGENT_ARTIFACT_CLEANUP_STRATEGY}"
+  write_env_entry "${env_file}" "产物清理触发阈值，单位百分比。" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}"
+  write_env_entry "${env_file}" "产物清理策略，可选 delete_oldest_then_reject/reject_only。" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "${AGENT_ARTIFACT_CLEANUP_STRATEGY}"
   write_env_entry "${env_file}" "产物清理检查周期，单位秒。" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC}"
-  write_env_entry "${env_file}" "media-agent 工作目录。" "WORK_ROOT" "${WORK_ROOT}"
+  write_env_entry "${env_file}" "工作节点工作目录。" "WORK_ROOT" "${WORK_ROOT}"
   write_env_blank_line "${env_file}"
   write_env_example "${env_file}" "mTLS 默认关闭，如需开启，请将 AGENT_CORE_ENDPOINT 改为 https 后再补充证书路径。" "AGENT_CORE_ENDPOINT=https://${CORE_GRPC_HOST}:${CORE_GRPC_PORT}"
   printf '# AGENT_CERT_PATH=/certs/self-signed/media-agent.pem\n# AGENT_KEY_PATH=/certs/self-signed/media-agent.key\n# AGENT_CA_PATH=/certs/self-signed/ca.pem\n# AGENT_TLS_DOMAIN_NAME=streamserver-core.local\n' >>"${env_file}"
@@ -1706,16 +1930,16 @@ write_all_in_one_host_env() {
   write_env_entry "${env_file}" "当前安装角色。" "INSTALL_ROLE" "${INSTALL_ROLE}"
   write_env_entry "${env_file}" "Compose 项目名。" "COMPOSE_PROJECT_NAME" "${PROJECT_NAME}"
   write_env_entry "${env_file}" "PostgreSQL 镜像名。" "POSTGRES_IMAGE" "${POSTGRES_IMAGE}"
-  write_env_entry "${env_file}" "media-core 镜像名。" "MEDIA_CORE_IMAGE" "${MEDIA_CORE_IMAGE}"
-  write_env_entry "${env_file}" "media-agent 镜像名。" "MEDIA_AGENT_IMAGE" "${media_agent_image}"
-  write_env_entry "${env_file}" "ZLMediaKit 镜像名。" "ZLM_IMAGE" "${ZLM_IMAGE}"
+  write_env_entry "${env_file}" "控制面板镜像名。" "MEDIA_CORE_IMAGE" "${MEDIA_CORE_IMAGE}"
+  write_env_entry "${env_file}" "工作节点镜像名。" "MEDIA_AGENT_IMAGE" "${media_agent_image}"
+  write_env_entry "${env_file}" "流媒体服务镜像名。" "ZLM_IMAGE" "${ZLM_IMAGE}"
   write_env_entry "${env_file}" "PostgreSQL 数据库名。" "POSTGRES_DB" "${POSTGRES_DB}"
   write_env_entry "${env_file}" "PostgreSQL 用户名。" "POSTGRES_USER" "${POSTGRES_USER}"
   write_env_entry "${env_file}" "PostgreSQL 密码。" "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD}"
-  write_env_entry "${env_file}" "PostgreSQL 宿主机监听端口。" "POSTGRES_PORT" "${POSTGRES_PORT}"
-  write_env_entry "${env_file}" "media-core HTTP 宿主机监听端口。" "CORE_HTTP_PORT" "${CORE_HTTP_PORT}"
-  write_env_entry "${env_file}" "media-core gRPC 宿主机监听端口。" "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
-  write_env_entry "${env_file}" "media-agent 宿主机监听端口。" "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
+  write_env_entry "${env_file}" "数据库宿主机监听端口。" "POSTGRES_PORT" "${POSTGRES_PORT}"
+  write_env_entry "${env_file}" "控制面板网页和 HTTP API 端口。" "CORE_HTTP_PORT" "${CORE_HTTP_PORT}"
+  write_env_entry "${env_file}" "控制面板内部通信端口。" "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
+  write_env_entry "${env_file}" "工作节点本地接口端口。" "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
   write_env_entry "${env_file}" "ZLM HTTP 宿主机监听端口。" "ZLM_HTTP_PORT" "${ZLM_HTTP_PORT}"
   write_env_entry "${env_file}" "ZLM HTTPS 宿主机监听端口，0 表示关闭。" "ZLM_HTTPS_PORT" "${ZLM_HTTPS_PORT}"
   write_env_entry "${env_file}" "ZLM RTMP 宿主机监听端口。" "ZLM_RTMP_PORT" "${ZLM_RTMP_PORT}"
@@ -1734,7 +1958,7 @@ write_all_in_one_host_env() {
   write_env_entry "${env_file}" "ZLM SRT 宿主机监听端口，0 表示关闭。" "ZLM_SRT_PORT" "${ZLM_SRT_PORT}"
   write_env_entry "${env_file}" "ZLM Shell 宿主机监听端口，0 表示关闭。" "ZLM_SHELL_PORT" "${ZLM_SHELL_PORT}"
   write_env_entry "${env_file}" "ZLM ONVIF 宿主机监听端口，0 表示关闭。" "ZLM_ONVIF_PORT" "${ZLM_ONVIF_PORT}"
-  write_env_entry "${env_file}" "供 media-agent 访问 ZLM API 使用的主机名或 IP。" "ZLM_API_HOST" "${ZLM_API_HOST}"
+  write_env_entry "${env_file}" "工作节点访问本机流媒体服务接口使用的主机名或 IP。" "ZLM_API_HOST" "${ZLM_API_HOST}"
   write_env_entry "${env_file}" "ZLM Hook 与 API 共用密钥。" "HOOK_SHARED_SECRET" "${HOOK_SHARED_SECRET}"
   write_env_entry "${env_file}" "允许访问 Hook 接口的源 IP 白名单，多个值用逗号分隔，留空表示不限制。" "HOOK_SOURCE_ALLOWLIST" "${HOOK_SOURCE_ALLOWLIST}"
   write_env_entry "${env_file}" "当前主机对外可访问的主机名或 IP。" "PUBLIC_HOST" "${PUBLIC_HOST}"
@@ -1742,28 +1966,30 @@ write_all_in_one_host_env() {
   write_env_entry "${env_file}" "当前节点名称。" "AGENT_NODE_NAME" "${AGENT_NODE_NAME}"
   write_env_entry "${env_file}" "主网卡名称。" "AGENT_PRIMARY_INTERFACE_NAME" "${PRIMARY_INTERFACE_NAME}"
   write_env_entry "${env_file}" "主网卡 IP。" "AGENT_PRIMARY_INTERFACE_IP" "${PRIMARY_INTERFACE_IP}"
-  write_env_entry "${env_file}" "MP4 对外输出挂载相对前缀，留空表示直接暴露在 ZLM HTTP 根目录下。" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "${OUTPUT_MOUNT_RELATIVE_PREFIX_MP4}"
-  write_env_entry "${env_file}" "HLS 对外输出挂载相对前缀，留空表示直接暴露在 ZLM HTTP 根目录下。" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "${OUTPUT_MOUNT_RELATIVE_PREFIX_HLS}"
+  write_env_entry "${env_file}" "服务挂载源宿主机目录，用于在线播放临时文件，建议本机磁盘。" "ZLM_WWW_MOUNT_HOST_DIR" "${ZLM_WWW_MOUNT_HOST_DIR}"
+  write_env_entry "${env_file}" "服务挂载源宿主机目录，用于录制和转码产物，可挂载网络存储。" "ZLM_OUTPUT_MOUNT_HOST_DIR" "${ZLM_OUTPUT_MOUNT_HOST_DIR}"
   write_env_entry "${env_file}" "组播网卡名称。" "AGENT_MULTICAST_INTERFACE_NAME" "${MULTICAST_INTERFACE_NAME}"
   write_env_entry "${env_file}" "组播网卡 IP。" "AGENT_MULTICAST_INTERFACE_IP" "${MULTICAST_INTERFACE_IP}"
-  write_env_entry "${env_file}" "当前节点算力模式。" "AGENT_ACCELERATION_MODE" "${acceleration_mode}"
-  write_env_entry "${env_file}" "节点标签，多个值用逗号分隔。" "AGENT_LABELS" "${agent_labels}"
-  write_env_entry "${env_file}" "最大运行时槽位，0 表示自动估算。" "AGENT_MAX_RUNTIME_SLOTS" "${AGENT_MAX_RUNTIME_SLOTS}"
+  write_env_entry "${env_file}" "当前节点网络模式，固定 host。" "AGENT_NETWORK_MODE" "${AGENT_NETWORK_MODE}"
+  write_env_entry "${env_file}" "当前节点算力模式，由安装角色决定。" "AGENT_ACCELERATION_MODE" "${acceleration_mode}"
+  write_env_entry "${env_file}" "节点标签，固定包含算力标签 cpu/gpu，额外标签用英文逗号分隔。" "AGENT_LABELS" "${agent_labels}"
+  write_env_entry "${env_file}" "最大同时任务数，0 表示自动估算。" "AGENT_MAX_RUNTIME_SLOTS" "${AGENT_MAX_RUNTIME_SLOTS}"
+  write_env_entry "${env_file}" "工作节点托管 HLS 录制默认分片秒数，可选 30/60；任务接口显式传值时优先。" "AGENT_HLS_RECORD_SEGMENT_SEC" "${AGENT_HLS_RECORD_SEGMENT_SEC}"
   write_env_entry "${env_file}" "是否开启产物清理。" "AGENT_ARTIFACT_CLEANUP_ENABLED" "${AGENT_ARTIFACT_CLEANUP_ENABLED}"
-  write_env_entry "${env_file}" "产物清理触发磁盘阈值，单位百分比。" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}"
-  write_env_entry "${env_file}" "产物清理策略。" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "${AGENT_ARTIFACT_CLEANUP_STRATEGY}"
+  write_env_entry "${env_file}" "产物清理触发阈值，单位百分比。" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}"
+  write_env_entry "${env_file}" "产物清理策略，可选 delete_oldest_then_reject/reject_only。" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "${AGENT_ARTIFACT_CLEANUP_STRATEGY}"
   write_env_entry "${env_file}" "产物清理检查周期，单位秒。" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC}"
-  write_env_entry "${env_file}" "media-agent 工作目录。" "WORK_ROOT" "${WORK_ROOT}"
+  write_env_entry "${env_file}" "工作节点工作目录。" "WORK_ROOT" "${WORK_ROOT}"
   write_env_entry "${env_file}" "允许访问宿主机挂载存储的路径白名单，多个值用逗号分隔。" "STORAGE_ALLOWLIST" "${STORAGE_ALLOWLIST}"
   write_env_entry "${env_file}" "鉴权模式，disabled 表示关闭，local_password 表示启用内建用户名密码。" "AUTH_MODE" "${AUTH_MODE}"
   write_env_entry "${env_file}" "是否启用鉴权，true 表示启用。" "AUTH_ENABLED" "${AUTH_ENABLED}"
   write_env_entry "${env_file}" "JWT 公钥内容，留空时由 AUTH_JWT_PUBLIC_KEY_PATH 指向文件。" "JWT_PUBLIC_KEY" "${JWT_PUBLIC_KEY}"
-  write_env_entry "${env_file}" "JWT 私钥文件在容器内的路径。" "AUTH_JWT_PRIVATE_KEY_PATH" "${AUTH_JWT_PRIVATE_KEY_PATH}"
-  write_env_entry "${env_file}" "JWT 公钥文件在容器内的路径。" "AUTH_JWT_PUBLIC_KEY_PATH" "${AUTH_JWT_PUBLIC_KEY_PATH}"
+  write_env_entry "${env_file}" "JWT 私钥文件路径。" "AUTH_JWT_PRIVATE_KEY_PATH" "${AUTH_JWT_PRIVATE_KEY_PATH}"
+  write_env_entry "${env_file}" "JWT 公钥文件路径。" "AUTH_JWT_PUBLIC_KEY_PATH" "${AUTH_JWT_PUBLIC_KEY_PATH}"
   write_env_entry "${env_file}" "访问令牌有效期，例如 15m。" "AUTH_ACCESS_TOKEN_TTL" "${AUTH_ACCESS_TOKEN_TTL}"
   write_env_entry "${env_file}" "刷新令牌有效期，例如 7d。" "AUTH_REFRESH_TOKEN_TTL" "${AUTH_REFRESH_TOKEN_TTL}"
   write_env_blank_line "${env_file}"
-  write_env_example "${env_file}" "HTTPS 默认关闭，当前应用不内置 HTTPS listener，如需 HTTPS，请在反向代理中终止 TLS 后转发到 media-core HTTP 端口。" "CORE_GRPC_TLS_CERT_PATH=/certs/self-signed/media-core.pem"
+  write_env_example "${env_file}" "HTTPS 默认关闭，当前应用不内置 HTTPS 监听；如需 HTTPS，请在反向代理中终止 TLS 后转发到控制面板 HTTP 端口。" "CORE_GRPC_TLS_CERT_PATH=/certs/self-signed/media-core.pem"
   printf '# CORE_GRPC_TLS_KEY_PATH=/certs/self-signed/media-core.key\n# CORE_GRPC_TLS_CLIENT_CA_PATH=/certs/self-signed/ca.pem\n# AGENT_CORE_ENDPOINT=https://127.0.0.1:%s\n# AGENT_CERT_PATH=/certs/self-signed/media-agent.pem\n# AGENT_KEY_PATH=/certs/self-signed/media-agent.key\n# AGENT_CA_PATH=/certs/self-signed/ca.pem\n# AGENT_TLS_DOMAIN_NAME=streamserver-core.local\n' "${CORE_GRPC_PORT}" >>"${env_file}"
   append_preserved_custom_env_entries "${env_file}" "${PRESERVED_ENV_SOURCE}"
 }
@@ -1811,18 +2037,36 @@ prepare_control_plane_layout() {
     "${install_dir}/data/postgres/18/docker" 2>/dev/null || true
 }
 
+host_dir_path() {
+  local install_dir="$1"
+  local configured_path="$2"
+
+  case "${configured_path}" in
+    /*) printf '%s' "${configured_path}" ;;
+    ./*) printf '%s/%s' "${install_dir}" "${configured_path#./}" ;;
+    *) printf '%s/%s' "${install_dir}" "${configured_path}" ;;
+  esac
+}
+
 prepare_worker_layout() {
   local install_dir="$1"
+  local www_host_dir
+  local output_host_dir
+
+  www_host_dir="$(host_dir_path "${install_dir}" "${ZLM_WWW_MOUNT_HOST_DIR:-./data/zlm/www}")"
+  output_host_dir="$(host_dir_path "${install_dir}" "${ZLM_OUTPUT_MOUNT_HOST_DIR:-./data/zlm/www/output}")"
+
   mkdir -p \
     "${install_dir}/data/media/work" \
     "${install_dir}/data/media/logs" \
-    "${install_dir}/data/zlm/www" \
-    "${install_dir}/data/zlm/www/output/mp4" \
-    "${install_dir}/data/zlm/www/output/hls"
+    "${www_host_dir}" \
+    "${output_host_dir}/mp4" \
+    "${output_host_dir}/hls"
 }
 
 emit_manual_start_hint() {
   local install_dir="$1"
+  local install_role="${2:-${INSTALL_ROLE}}"
   log "已写入部署文件。"
   if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
     log "开机自启动已启用，可手动执行:"
@@ -1832,7 +2076,8 @@ emit_manual_start_hint() {
     log "稍后可手动执行:"
     log "  cd ${install_dir} && ${COMPOSE_CMD_DISPLAY} -f ${COMPOSE_FILE_NAME} up -d"
   fi
-  log "后续如仅更新 media-core/media-agent，可直接替换 ${install_dir}/bin 下对应二进制后再重新拉起相关服务。"
+  log "后续如仅更新 控制面板/工作节点服务，可直接替换 ${install_dir}/bin 下对应二进制后再重新拉起相关服务。"
+  log_output_storage_notice "${install_role}"
 }
 
 show_tls_notice() {
@@ -1858,19 +2103,20 @@ show_tls_notice() {
     log "  AGENT_CA_PATH=/certs/custom/ca.pem"
     log "  AGENT_TLS_DOMAIN_NAME=streamserver-core.local"
     log "HTTPS 开启说明:"
-    log "  当前应用无内置 HTTPS 监听，请在反向代理中加载 ${install_dir}/certs/custom/https.pem 和 https.key 后转发到 media-core:8080。"
-    emit_manual_start_hint "${install_dir}"
+    log "  当前应用无内置 HTTPS 监听，请在反向代理中加载 ${install_dir}/certs/custom/https.pem 和 https.key 后转发到 控制面板 HTTP 端口。"
+    emit_manual_start_hint "${install_dir}" "${INSTALL_ROLE}"
     return 1
   fi
 
   log "如需后续测试 TLS，可直接使用 ${install_dir}/certs/self-signed 下的测试证书。"
   log "mTLS 启用时，建议将 agent 侧地址改为 https://${grpc_host_hint}:${grpc_port_hint} 并设置 AGENT_TLS_DOMAIN_NAME=streamserver-core.local"
-  log "HTTPS 如需启用，请在前置 Nginx/Caddy/Traefik 中加载 ${install_dir}/certs/self-signed/https.pem 和 https.key，再转发到 media-core:8080。"
+  log "HTTPS 如需启用，请在前置 Nginx/Caddy/Traefik 中加载 ${install_dir}/certs/self-signed/https.pem 和 https.key，再转发到 控制面板 HTTP 端口。"
   return 0
 }
 
 start_stack_if_requested() {
   local install_dir="$1"
+  local install_role="${2:-${INSTALL_ROLE}}"
   if prompt_yes_no "是否立即启动该部署？" "Y"; then
     if [ -n "${STACK_SYSTEMD_UNIT_NAME}" ]; then
       run_systemctl start "${STACK_SYSTEMD_UNIT_NAME}"
@@ -1887,8 +2133,9 @@ start_stack_if_requested() {
     fi
     log "  ${install_dir}/bin/streamserver-compose ps"
     log "  ${install_dir}/bin/streamserver-compose logs -f"
+    log_output_storage_notice "${install_role}"
   else
-    emit_manual_start_hint "${install_dir}"
+    emit_manual_start_hint "${install_dir}" "${install_role}"
   fi
 }
 
@@ -1897,15 +2144,15 @@ select_role() {
   {
     echo "请选择安装角色:"
     echo "  1) control-plane"
-    echo "     用途: 只安装中心控制面，包含 media-core 和 PostgreSQL。"
+    echo "     用途: 只安装中心控制面，包含控制面板和数据库。"
     echo "     适合: 多工作节点部署中的中心节点，或你已经有独立媒体工作节点的情况。"
-    echo "     网络特性: media-core 和 PostgreSQL 都使用 host。"
+    echo "     网络特性: 控制面板和数据库都使用 host。"
     echo "     注意: 会直接占用宿主机 5432/8080/50051 端口。"
     echo
     echo "  2) worker-host-cpu"
-    echo "     用途: 安装 CPU-only 媒体工作节点，包含 media-agent 和 ZLMediaKit。"
+    echo "     用途: 安装 CPU-only 媒体工作节点，包含工作节点服务和流媒体服务。"
     echo "     适合: 所有工作节点场景，尤其是组播和需要直接绑定宿主机网卡的情况。"
-    echo "     网络特性: media-agent 和 ZLMediaKit 直接使用 host 网络。"
+    echo "     网络特性: 工作节点服务和流媒体服务直接使用 host 网络。"
     echo "     注意: 会直接占用宿主机媒体端口，更适合专用媒体节点。"
     echo
     if [ "${BUNDLE_GPU_SUPPORT}" = "true" ]; then
@@ -1917,7 +2164,7 @@ select_role() {
       echo "  4) all-in-one-host-cpu"
       echo "     用途: 单机安装完整系统（CPU-only 工作节点），但媒体面直连宿主机网络。"
       echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-      echo "     网络特性: media-core/media-agent/ZLMediaKit/PostgreSQL 全部使用 host。"
+      echo "     网络特性: 控制面板、工作节点服务、流媒体服务和数据库全部使用 host。"
       echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
       echo "     注意: 会直接占用宿主机的 5432/8080/50051/8081/80/554/1935 等端口。"
       echo
@@ -1931,7 +2178,7 @@ select_role() {
       echo "  3) all-in-one-host-cpu"
       echo "     用途: 单机安装完整系统（CPU-only 工作节点），但媒体面直连宿主机网络。"
       echo "     适合: 同一台机器上既跑控制面又跑真实组播验证。"
-      echo "     网络特性: media-core/media-agent/ZLMediaKit/PostgreSQL 全部使用 host。"
+      echo "     网络特性: 控制面板、工作节点服务、流媒体服务和数据库全部使用 host。"
       echo "     适用前提: 只有在确实需要 host 网络或直连网卡时才值得选择。"
       echo "     注意: 会直接占用宿主机的 5432/8080/50051/8081/80/554/1935 等端口。"
       echo
@@ -1984,7 +2231,7 @@ configure_control_plane() {
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   prepare_existing_install_context "${INSTALL_DIR}" "${INSTALL_ROLE}"
   existing_env_file="${INSTALL_DIR}/.env"
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "streamserver-control")")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "ss-core")")"
   require_upgrade_project_name_unchanged
   POSTGRES_DB="$(prompt_non_empty "PostgreSQL 数据库名" "$(env_value_or_default "${existing_env_file}" "POSTGRES_DB" "streamserver")")"
   POSTGRES_USER="$(prompt_non_empty "PostgreSQL 用户名" "$(env_value_or_default "${existing_env_file}" "POSTGRES_USER" "postgres")")"
@@ -1992,9 +2239,9 @@ configure_control_plane() {
   POSTGRES_PASSWORD="$(prompt "PostgreSQL 密码（留空自动生成）" "")"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
-  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432"
-  assign_prompt_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 暴露端口" "8080"
-  assign_prompt_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 暴露端口" "50051"
+  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "数据库宿主机监听端口" "5432"
+  assign_prompt_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "控制面板网页和 HTTP API 端口" "8080"
+  assign_prompt_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "控制面板内部通信端口" "50051"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")")"
   STORAGE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "/data/media/work,/data/zlm/www")"
   prompt_local_auth_configuration "${existing_env_file}"
@@ -2012,9 +2259,12 @@ configure_control_plane() {
   prepare_local_auth_assets "${INSTALL_DIR}"
   copy_compose_template "control-plane" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
-  install_host_binaries "${INSTALL_DIR}" media-core
+  install_host_binaries "${INSTALL_DIR}" media-core streamserver-config
   install_host_ui "${INSTALL_DIR}" media-core
   write_control_plane_env "${INSTALL_DIR}/.env"
+  run_streamserver_config_tui_if_requested "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  ensure_local_auth_after_config_tui "${INSTALL_DIR}"
   ensure_images_loaded postgres media-core
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
   finalize_deployment "${INSTALL_DIR}" "${INSTALL_ROLE}" "streamserver-core.local" "${CORE_GRPC_PORT}"
@@ -2032,7 +2282,7 @@ configure_worker_host() {
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   prepare_existing_install_context "${INSTALL_DIR}" "${INSTALL_ROLE}"
   existing_env_file="${INSTALL_DIR}/.env"
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "streamserver-worker-cpu")")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "ss-worker-cpu")")"
   require_upgrade_project_name_unchanged
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(env_value_or_default "${existing_env_file}" "NODE_ID" "$(generate_uuid)")")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(env_value_or_default "${existing_env_file}" "AGENT_NODE_NAME" "$(hostname -s 2>/dev/null || echo worker-1)")")"
@@ -2050,18 +2300,18 @@ configure_worker_host() {
   PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
-  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "工作节点本地接口端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "")"
+  configure_output_storage_defaults "${existing_env_file}"
   AGENT_NETWORK_MODE="$(env_value_or_default "${existing_env_file}" "AGENT_NETWORK_MODE" "host")"
   AGENT_MAX_RUNTIME_SLOTS="$(env_value_or_default "${existing_env_file}" "AGENT_MAX_RUNTIME_SLOTS" "0")"
+  AGENT_HLS_RECORD_SEGMENT_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_HLS_RECORD_SEGMENT_SEC" "60")"
   AGENT_ARTIFACT_CLEANUP_ENABLED="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_ENABLED" "true")"
   AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "85")"
   AGENT_ARTIFACT_CLEANUP_STRATEGY="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")"
   AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
-  agent_labels="$(normalize_csv_labels "$(prompt "节点标签（逗号分隔）" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "cpu")")")"
+  agent_labels="$(collect_agent_labels "cpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "cpu")")"
 
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${existing_hook_secret}"
   [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
@@ -2069,14 +2319,19 @@ configure_worker_host() {
   validate_port_number "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
   validate_port_number "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
   validate_zlm_port_config
+  validate_artifact_cleanup_config
+  validate_hls_record_segment_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
   copy_compose_template "worker-host-cpu" "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
-  install_host_binaries "${INSTALL_DIR}" media-agent
+  install_host_binaries "${INSTALL_DIR}" media-agent streamserver-config
   copy_zlm_runtime_assets "${INSTALL_DIR}"
   write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "${agent_labels}"
+  run_streamserver_config_tui_if_requested "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  prepare_worker_layout "${INSTALL_DIR}"
   ensure_images_loaded media-agent zlmediakit
   finalize_deployment "${INSTALL_DIR}" "${INSTALL_ROLE}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}"
 }
@@ -2096,7 +2351,7 @@ configure_worker_host_gpu() {
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   prepare_existing_install_context "${INSTALL_DIR}" "${INSTALL_ROLE}"
   existing_env_file="${INSTALL_DIR}/.env"
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "streamserver-worker-gpu")")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "ss-worker-gpu")")"
   require_upgrade_project_name_unchanged
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(env_value_or_default "${existing_env_file}" "NODE_ID" "$(generate_uuid)")")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(env_value_or_default "${existing_env_file}" "AGENT_NODE_NAME" "$(hostname -s 2>/dev/null || echo worker-gpu-1)")")"
@@ -2114,18 +2369,18 @@ configure_worker_host_gpu() {
   PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
-  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "工作节点本地接口端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "")"
+  configure_output_storage_defaults "${existing_env_file}"
   AGENT_NETWORK_MODE="$(env_value_or_default "${existing_env_file}" "AGENT_NETWORK_MODE" "host")"
   AGENT_MAX_RUNTIME_SLOTS="$(env_value_or_default "${existing_env_file}" "AGENT_MAX_RUNTIME_SLOTS" "0")"
+  AGENT_HLS_RECORD_SEGMENT_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_HLS_RECORD_SEGMENT_SEC" "60")"
   AGENT_ARTIFACT_CLEANUP_ENABLED="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_ENABLED" "true")"
   AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "85")"
   AGENT_ARTIFACT_CLEANUP_STRATEGY="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")"
   AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
-  agent_labels="$(normalize_csv_labels "$(prompt "节点标签（逗号分隔）" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "gpu")")")"
+  agent_labels="$(collect_agent_labels "gpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "gpu")")"
 
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${existing_hook_secret}"
   [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
@@ -2133,14 +2388,19 @@ configure_worker_host_gpu() {
   validate_port_number "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
   validate_port_number "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
   validate_zlm_port_config
+  validate_artifact_cleanup_config
+  validate_hls_record_segment_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
   copy_compose_template "worker-host-gpu" "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
-  install_host_binaries "${INSTALL_DIR}" media-agent
+  install_host_binaries "${INSTALL_DIR}" media-agent streamserver-config
   copy_zlm_runtime_assets "${INSTALL_DIR}"
   write_worker_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "${agent_labels}"
+  run_streamserver_config_tui_if_requested "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  prepare_worker_layout "${INSTALL_DIR}"
   ensure_images_loaded media-agent-gpu zlmediakit
   finalize_deployment "${INSTALL_DIR}" "${INSTALL_ROLE}" "${CORE_GRPC_HOST}" "${CORE_GRPC_PORT}"
 }
@@ -2163,7 +2423,7 @@ configure_all_in_one_host() {
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   prepare_existing_install_context "${INSTALL_DIR}" "${INSTALL_ROLE}"
   existing_env_file="${INSTALL_DIR}/.env"
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "streamserver-all-in-one-host-cpu")")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "ss-aio-cpu")")"
   require_upgrade_project_name_unchanged
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(env_value_or_default "${existing_env_file}" "NODE_ID" "$(generate_uuid)")")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(env_value_or_default "${existing_env_file}" "AGENT_NODE_NAME" "$(hostname -s 2>/dev/null || echo node-1)")")"
@@ -2181,15 +2441,16 @@ configure_all_in_one_host() {
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
   PUBLIC_HOST="$(prompt_non_empty "当前主机对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
-  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432"
-  assign_default_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 宿主机监听端口" "8080"
-  assign_default_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 宿主机监听端口" "50051"
-  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
+  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "数据库宿主机监听端口" "5432"
+  assign_default_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "控制面板网页和 HTTP API 端口" "8080"
+  assign_default_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "控制面板内部通信端口" "50051"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "工作节点本地接口端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
   HOOK_SOURCE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "")"
+  configure_output_storage_defaults "${existing_env_file}"
+  AGENT_NETWORK_MODE="$(env_value_or_default "${existing_env_file}" "AGENT_NETWORK_MODE" "host")"
   AGENT_MAX_RUNTIME_SLOTS="$(env_value_or_default "${existing_env_file}" "AGENT_MAX_RUNTIME_SLOTS" "0")"
+  AGENT_HLS_RECORD_SEGMENT_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_HLS_RECORD_SEGMENT_SEC" "60")"
   AGENT_ARTIFACT_CLEANUP_ENABLED="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_ENABLED" "true")"
   AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "85")"
   AGENT_ARTIFACT_CLEANUP_STRATEGY="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")"
@@ -2197,7 +2458,7 @@ configure_all_in_one_host() {
   STORAGE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "/data/media/work,/data/zlm/www")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
   prompt_local_auth_configuration "${existing_env_file}"
-  agent_labels="$(normalize_csv_labels "$(prompt "节点标签（逗号分隔）" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "cpu")")")"
+  agent_labels="$(collect_agent_labels "cpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "cpu")")"
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${existing_postgres_password}"
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
@@ -2208,6 +2469,8 @@ configure_all_in_one_host() {
   validate_port_number "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
   validate_port_number "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
   validate_zlm_port_config
+  validate_artifact_cleanup_config
+  validate_hls_record_segment_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
@@ -2215,14 +2478,19 @@ configure_all_in_one_host() {
   copy_compose_template "all-in-one-host-cpu" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
-  install_host_binaries "${INSTALL_DIR}" media-core media-agent
+  install_host_binaries "${INSTALL_DIR}" media-core media-agent streamserver-config
   install_host_ui "${INSTALL_DIR}" media-core
   copy_zlm_runtime_assets "${INSTALL_DIR}"
   write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_IMAGE}" "cpu" "${agent_labels}"
+  run_streamserver_config_tui_if_requested "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  ensure_local_auth_after_config_tui "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  prepare_worker_layout "${INSTALL_DIR}"
   ensure_images_loaded postgres media-core media-agent zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
-  log "all-in-one-host-cpu 说明: PostgreSQL、media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${POSTGRES_PORT}/${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
-  log "如果这些端口已被宿主机其他服务占用，请先释放端口，或改用非 host 模式。"
+  log "all-in-one-host-cpu 说明: 数据库、控制面板、工作节点服务和流媒体服务 会直接占用宿主机端口 ${POSTGRES_PORT}/${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  log "如果这些端口已被宿主机其他服务占用，请先释放端口，或在配置中调整端口后再启动。"
   finalize_deployment "${INSTALL_DIR}" "${INSTALL_ROLE}" "127.0.0.1" "${CORE_GRPC_PORT}"
 }
 
@@ -2247,7 +2515,7 @@ configure_all_in_one_host_gpu() {
   INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   prepare_existing_install_context "${INSTALL_DIR}" "${INSTALL_ROLE}"
   existing_env_file="${INSTALL_DIR}/.env"
-  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "streamserver-all-in-one-host-gpu")")"
+  PROJECT_NAME="$(prompt_non_empty "Compose 项目名" "$(env_value_or_default "${existing_env_file}" "COMPOSE_PROJECT_NAME" "ss-aio-gpu")")"
   require_upgrade_project_name_unchanged
   NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(env_value_or_default "${existing_env_file}" "NODE_ID" "$(generate_uuid)")")"
   AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(env_value_or_default "${existing_env_file}" "AGENT_NODE_NAME" "$(hostname -s 2>/dev/null || echo node-gpu-1)")")"
@@ -2265,15 +2533,16 @@ configure_all_in_one_host_gpu() {
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空自动生成）" "")"
   PUBLIC_HOST="$(prompt_non_empty "当前主机对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
-  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "PostgreSQL 宿主机监听端口" "5432"
-  assign_default_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "media-core HTTP 宿主机监听端口" "8080"
-  assign_default_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "media-core gRPC 宿主机监听端口" "50051"
-  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "media-agent 宿主机监听端口" "8081"
+  assign_default_local_tcp_port POSTGRES_PORT "${existing_env_file}" "POSTGRES_PORT" "数据库宿主机监听端口" "5432"
+  assign_default_local_tcp_port CORE_HTTP_PORT "${existing_env_file}" "CORE_HTTP_PORT" "控制面板网页和 HTTP API 端口" "8080"
+  assign_default_local_tcp_port CORE_GRPC_PORT "${existing_env_file}" "CORE_GRPC_PORT" "控制面板内部通信端口" "50051"
+  assign_default_local_tcp_port AGENT_HTTP_PORT "${existing_env_file}" "AGENT_HTTP_PORT" "工作节点本地接口端口" "8081"
   set_default_zlm_port_config "${existing_env_file}"
   HOOK_SOURCE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_MP4="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_MP4" "")"
-  OUTPUT_MOUNT_RELATIVE_PREFIX_HLS="$(env_value_or_default "${existing_env_file}" "OUTPUT_MOUNT_RELATIVE_PREFIX_HLS" "")"
+  configure_output_storage_defaults "${existing_env_file}"
+  AGENT_NETWORK_MODE="$(env_value_or_default "${existing_env_file}" "AGENT_NETWORK_MODE" "host")"
   AGENT_MAX_RUNTIME_SLOTS="$(env_value_or_default "${existing_env_file}" "AGENT_MAX_RUNTIME_SLOTS" "0")"
+  AGENT_HLS_RECORD_SEGMENT_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_HLS_RECORD_SEGMENT_SEC" "60")"
   AGENT_ARTIFACT_CLEANUP_ENABLED="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_ENABLED" "true")"
   AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "85")"
   AGENT_ARTIFACT_CLEANUP_STRATEGY="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")"
@@ -2281,7 +2550,7 @@ configure_all_in_one_host_gpu() {
   STORAGE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "/data/media/work,/data/zlm/www")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
   prompt_local_auth_configuration "${existing_env_file}"
-  agent_labels="$(normalize_csv_labels "$(prompt "节点标签（逗号分隔）" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "gpu")")")"
+  agent_labels="$(collect_agent_labels "gpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "gpu")")"
 
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${existing_postgres_password}"
   [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${default_password}"
@@ -2292,6 +2561,8 @@ configure_all_in_one_host_gpu() {
   validate_port_number "CORE_GRPC_PORT" "${CORE_GRPC_PORT}"
   validate_port_number "AGENT_HTTP_PORT" "${AGENT_HTTP_PORT}"
   validate_zlm_port_config
+  validate_artifact_cleanup_config
+  validate_hls_record_segment_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
@@ -2299,13 +2570,18 @@ configure_all_in_one_host_gpu() {
   copy_compose_template "all-in-one-host-gpu" "${INSTALL_DIR}"
   prepare_control_plane_layout "${INSTALL_DIR}"
   prepare_worker_layout "${INSTALL_DIR}"
-  install_host_binaries "${INSTALL_DIR}" media-core media-agent
+  install_host_binaries "${INSTALL_DIR}" media-core media-agent streamserver-config
   install_host_ui "${INSTALL_DIR}" media-core
   copy_zlm_runtime_assets "${INSTALL_DIR}"
   write_all_in_one_host_env "${INSTALL_DIR}/.env" "${MEDIA_AGENT_GPU_IMAGE}" "gpu" "${agent_labels}"
+  run_streamserver_config_tui_if_requested "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  ensure_local_auth_after_config_tui "${INSTALL_DIR}"
+  load_runtime_env "${INSTALL_DIR}/.env"
+  prepare_worker_layout "${INSTALL_DIR}"
   ensure_images_loaded postgres media-core media-agent-gpu zlmediakit
   bootstrap_local_admin_if_needed "${INSTALL_DIR}"
-  log "all-in-one-host-gpu 说明: PostgreSQL、media-core、media-agent 和 ZLMediaKit 会直接占用宿主机端口 ${POSTGRES_PORT}/${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
+  log "all-in-one-host-gpu 说明: 数据库、控制面板、工作节点服务和流媒体服务 会直接占用宿主机端口 ${POSTGRES_PORT}/${CORE_HTTP_PORT}/${CORE_GRPC_PORT}/${AGENT_HTTP_PORT}/${ZLM_HTTP_PORT}/${ZLM_RTMP_PORT}/${ZLM_RTSP_PORT}。"
   log "该模式要求宿主机 NVIDIA 驱动和 Docker nvidia runtime 均已就绪。"
   finalize_deployment "${INSTALL_DIR}" "${INSTALL_ROLE}" "127.0.0.1" "${CORE_GRPC_PORT}"
 }

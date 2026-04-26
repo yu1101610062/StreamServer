@@ -114,6 +114,8 @@ pub struct HeartbeatSnapshot {
     pub slot_usage: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
+    pub artifact_cleanup_blocked: bool,
+    pub artifact_cleanup_block_reason: Option<String>,
     pub gpu_runtime: Vec<GpuRuntimeStats>,
 }
 

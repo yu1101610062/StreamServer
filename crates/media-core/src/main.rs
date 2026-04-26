@@ -1364,7 +1364,7 @@ fn apply_live_load(node: &mut repository::NodeSummary, load: Option<NodeLiveLoad
         node.zlm_alive = Some(load.zlm_alive);
         node.ffmpeg_alive = Some(load.ffmpeg_alive);
         node.gpu_runtime = Some(load.gpu_runtime);
-        node.healthy = node.control_connected;
+        node.healthy = node.control_connected && !load.artifact_cleanup_blocked;
     } else {
         node.connected = Some(false);
         node.control_connected = false;

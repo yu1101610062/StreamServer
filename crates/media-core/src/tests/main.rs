@@ -248,8 +248,8 @@ async fn upsert_test_node_with_ports(
                 ffmpeg_bin: "ffmpeg".to_string(),
                 ffprobe_bin: "ffprobe".to_string(),
                 zlm_server_id: format!("zlm-{node_id}"),
-                output_mount_relative_prefix_mp4: String::new(),
-                output_mount_relative_prefix_hls: String::new(),
+                output_mount_relative_prefix_mp4: "output".to_string(),
+                output_mount_relative_prefix_hls: "output".to_string(),
             },
             Utc::now(),
         )
@@ -1852,6 +1852,8 @@ async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
                 slot_usage: 0.4,
                 zlm_alive: true,
                 ffmpeg_alive: true,
+                artifact_cleanup_blocked: false,
+                artifact_cleanup_block_reason: None,
                 gpu_runtime: Vec::new(),
             },
         )
@@ -1871,6 +1873,8 @@ async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
                 slot_usage: 0.55,
                 zlm_alive: true,
                 ffmpeg_alive: false,
+                artifact_cleanup_blocked: false,
+                artifact_cleanup_block_reason: None,
                 gpu_runtime: Vec::new(),
             },
         )
@@ -1931,6 +1935,8 @@ async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<
                 slot_usage: 0.2,
                 zlm_alive: true,
                 ffmpeg_alive: true,
+                artifact_cleanup_blocked: false,
+                artifact_cleanup_block_reason: None,
                 gpu_runtime: Vec::new(),
             },
         )
@@ -5470,6 +5476,78 @@ async fn sticky_live_ingest_failed_event_keeps_running_status() -> anyhow::Resul
             .as_ref()
             .and_then(|attempt| attempt.failure_code.as_deref()),
         None
+    );
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn disk_threshold_failed_event_completes_task_as_failed() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01"},
+        "record": {"enabled": true},
+        "recovery": {"policy": "auto"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+    sqlx::query(
+        r#"
+        update task_attempts
+           set lease_token = 'lease-1'
+         where task_id = $1
+           and attempt_no = 1
+        "#,
+    )
+    .bind(task_id)
+    .execute(&db.pool)
+    .await?;
+
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "failed".to_string(),
+                event_level: "error".to_string(),
+                message: "child process stopped after disk threshold was exceeded".to_string(),
+                payload: json!({"reason": "disk_threshold_exceeded"}),
+            },
+        )
+        .await?;
+
+    let detail = repository.get_task(task_id).await?;
+    assert_eq!(detail.task.status, media_domain::TaskStatus::Failed);
+    let attempt = detail.current_attempt.expect("current attempt");
+    assert_eq!(attempt.status, media_domain::AttemptStatus::Failed);
+    assert_eq!(
+        attempt.failure_code.as_deref(),
+        Some("disk_threshold_exceeded")
+    );
+    assert_eq!(
+        attempt.failure_reason.as_deref(),
+        Some("disk_threshold_exceeded")
     );
 
     db.cleanup().await?;

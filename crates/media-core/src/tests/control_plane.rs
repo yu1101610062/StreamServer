@@ -200,8 +200,8 @@ fn sample_registration(node_id: Uuid) -> AgentRegistration {
         ffmpeg_bin: "ffmpeg".to_string(),
         ffprobe_bin: "ffprobe".to_string(),
         zlm_server_id: format!("zlm-{node_id}"),
-        output_mount_relative_prefix_mp4: String::new(),
-        output_mount_relative_prefix_hls: String::new(),
+        output_mount_relative_prefix_mp4: "output".to_string(),
+        output_mount_relative_prefix_hls: "output".to_string(),
     }
 }
 
@@ -218,6 +218,8 @@ fn sample_heartbeat(running_tasks: u32, slot_usage: f64) -> HeartbeatSnapshot {
         slot_usage,
         zlm_alive: true,
         ffmpeg_alive: true,
+        artifact_cleanup_blocked: false,
+        artifact_cleanup_block_reason: None,
         gpu_runtime: Vec::new(),
     }
 }
@@ -241,6 +243,8 @@ fn sample_heartbeat_with_states(
         slot_usage,
         zlm_alive: true,
         ffmpeg_alive: true,
+        artifact_cleanup_blocked: false,
+        artifact_cleanup_block_reason: None,
         gpu_runtime: Vec::new(),
     }
 }
@@ -465,7 +469,46 @@ async fn pick_best_session_skips_saturated_node_without_database() {
                 disk_percent: 0.0,
                 zlm_alive: true,
                 ffmpeg_alive: true,
+                artifact_cleanup_blocked: false,
                 gpu_runtime: Vec::new(),
+            },
+            reservations: VecDeque::new(),
+        },
+    );
+
+    assert!(
+        pick_best_session_for_test(
+            &service,
+            None,
+            &sample_immediate_task_spec(),
+            ExecutionPreference::CpuOnly,
+        )
+        .await
+        .is_none()
+    );
+}
+
+#[tokio::test]
+async fn pick_best_session_skips_artifact_cleanup_blocked_node_without_database() {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgresql://postgres:test@127.0.0.1/postgres")
+        .expect("lazy test pool should parse");
+    let service = ControlPlaneService::new(Arc::new(TaskRepository::new(pool)));
+    let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000019").unwrap();
+    let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+
+    service.sessions.lock().await.insert(
+        node_id,
+        SessionHandle {
+            session_id: 1,
+            sender,
+            registration: sample_registration(node_id),
+            capabilities: SessionCapabilities::default(),
+            load: SessionLoad {
+                zlm_alive: true,
+                ffmpeg_alive: true,
+                artifact_cleanup_blocked: true,
+                ..SessionLoad::default()
             },
             reservations: VecDeque::new(),
         },

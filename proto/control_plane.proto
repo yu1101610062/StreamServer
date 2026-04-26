@@ -61,6 +61,8 @@ message Heartbeat {
   uint32 starting_tasks = 10;
   uint32 stopping_tasks = 11;
   uint32 orphaned_tasks = 12;
+  bool artifact_cleanup_blocked = 13;
+  string artifact_cleanup_block_reason = 14;
 }
 
 message CapabilitySnapshot {

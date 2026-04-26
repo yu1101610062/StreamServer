@@ -66,15 +66,17 @@ pub struct AgentSettings {
     pub zlm_auto_close_on_no_reader_enabled: bool,
     #[serde(default = "default_allow_enhanced_rtmp_expose")]
     pub allow_enhanced_rtmp_expose: bool,
+    #[serde(default = "default_hls_record_segment_sec")]
+    pub hls_record_segment_sec: u32,
     #[serde(default = "default_agent_stream_addr")]
     pub agent_stream_addr: String,
     #[serde(default)]
     pub primary_interface_name: String,
     #[serde(default)]
     pub primary_interface_ip: String,
-    #[serde(default)]
+    #[serde(default = "default_output_mount_relative_prefix")]
     pub output_mount_relative_prefix_mp4: String,
-    #[serde(default)]
+    #[serde(default = "default_output_mount_relative_prefix")]
     pub output_mount_relative_prefix_hls: String,
     #[serde(default)]
     pub multicast_interface_name: String,
@@ -125,11 +127,12 @@ impl Default for AgentSettings {
             zlm_api_secret: String::new(),
             zlm_auto_close_on_no_reader_enabled: false,
             allow_enhanced_rtmp_expose: default_allow_enhanced_rtmp_expose(),
+            hls_record_segment_sec: default_hls_record_segment_sec(),
             agent_stream_addr: default_agent_stream_addr(),
             primary_interface_name: String::new(),
             primary_interface_ip: String::new(),
-            output_mount_relative_prefix_mp4: String::new(),
-            output_mount_relative_prefix_hls: String::new(),
+            output_mount_relative_prefix_mp4: default_output_mount_relative_prefix(),
+            output_mount_relative_prefix_hls: default_output_mount_relative_prefix(),
             multicast_interface_name: String::new(),
             multicast_interface_ip: String::new(),
             network_mode: default_network_mode(),
@@ -241,6 +244,10 @@ impl Settings {
             "AGENT_ACCELERATION_MODE must be one of cpu/gpu"
         );
         anyhow::ensure!(
+            matches!(self.agent.hls_record_segment_sec, 30 | 60),
+            "AGENT_HLS_RECORD_SEGMENT_SEC must be one of 30/60"
+        );
+        anyhow::ensure!(
             self.agent.artifact_cleanup.threshold_percent.is_finite()
                 && self.agent.artifact_cleanup.threshold_percent >= 0.0
                 && self.agent.artifact_cleanup.threshold_percent <= 100.0,
@@ -312,6 +319,10 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("AGENT_ALLOW_ENHANCED_RTMP_EXPOSE") {
         settings.agent.allow_enhanced_rtmp_expose =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
+    if let Some(value) = env("AGENT_HLS_RECORD_SEGMENT_SEC") {
+        settings.agent.hls_record_segment_sec =
+            value.parse().unwrap_or(default_hls_record_segment_sec());
     }
     if let Some(value) = env("AGENT_STREAM_ADDR") {
         settings.agent.agent_stream_addr = value;
@@ -442,6 +453,10 @@ fn default_agent_stream_addr() -> String {
     "http://127.0.0.1:8081".to_string()
 }
 
+fn default_output_mount_relative_prefix() -> String {
+    "output".to_string()
+}
+
 fn default_network_mode() -> String {
     "bridge".to_string()
 }
@@ -460,6 +475,10 @@ fn default_acceleration_mode() -> String {
 
 fn default_allow_enhanced_rtmp_expose() -> bool {
     true
+}
+
+fn default_hls_record_segment_sec() -> u32 {
+    60
 }
 
 fn default_artifact_cleanup_enabled() -> bool {

@@ -84,6 +84,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --locked --release -p media-agent
 
+FROM rust-builder-base AS streamserver-config-builder
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --locked --release -p streamserver-config
+
 FROM scratch AS media-core-bin-export
 
 COPY --from=media-core-builder /app/target/release/media-core /media-core
@@ -91,6 +97,10 @@ COPY --from=media-core-builder /app/target/release/media-core /media-core
 FROM scratch AS media-agent-bin-export
 
 COPY --from=media-agent-builder /app/target/release/media-agent /media-agent
+
+FROM scratch AS streamserver-config-bin-export
+
+COPY --from=streamserver-config-builder /app/target/release/streamserver-config /streamserver-config
 
 FROM scratch AS media-ui-export
 
@@ -100,11 +110,13 @@ FROM scratch AS media-bin-export
 
 COPY --from=media-core-bin-export /media-core /media-core
 COPY --from=media-agent-bin-export /media-agent /media-agent
+COPY --from=streamserver-config-bin-export /streamserver-config /streamserver-config
 
 FROM scratch AS media-host-assets-export
 
 COPY --from=media-core-bin-export /media-core /media-core
 COPY --from=media-agent-bin-export /media-agent /media-agent
+COPY --from=streamserver-config-bin-export /streamserver-config /streamserver-config
 COPY --from=media-ui-export /ui /ui
 
 FROM ${MEDIA_CORE_RUNTIME_BASE_IMAGE} AS media-core-runtime

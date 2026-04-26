@@ -225,8 +225,8 @@ fn absolute_http_url_from_file_path_uses_node_stream_base() {
 #[test]
 fn externalize_managed_path_strips_mount_roots() {
     let prefixes = OutputMountPrefixes {
-        mp4: "output/mp4".to_string(),
-        hls: "output/hls".to_string(),
+        mp4: "output".to_string(),
+        hls: "output".to_string(),
     };
     assert_eq!(
         externalize_managed_path(
@@ -235,7 +235,7 @@ fn externalize_managed_path_strips_mount_roots() {
             &prefixes,
         )
         .expect("mp4 path should externalize"),
-        "/node-192_168_1_10-mp4/task-1/clip.mp4"
+        "/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
     );
     assert_eq!(
         externalize_managed_path(
@@ -244,7 +244,7 @@ fn externalize_managed_path_strips_mount_roots() {
             &prefixes,
         )
         .expect("hls path should externalize"),
-        "/node-192_168_1_10-hls/task-1/index.m3u8"
+        "/hls/node-192_168_1_10-hls/task-1/index.m3u8"
     );
 }
 
@@ -277,8 +277,8 @@ fn is_hls_playlist_record_path_accepts_record_root_m3u8_only() {
 #[test]
 fn externalize_path_fields_in_payload_rewrites_file_path_and_folder() {
     let prefixes = OutputMountPrefixes {
-        mp4: "output/mp4".to_string(),
-        hls: "output/hls".to_string(),
+        mp4: "output".to_string(),
+        hls: "output".to_string(),
     };
     let payload = externalize_path_fields_in_payload(
         json!({
@@ -297,16 +297,19 @@ fn externalize_path_fields_in_payload_rewrites_file_path_and_folder() {
 
     assert_eq!(
         payload["file_path"],
-        json!("/node-192_168_1_10-hls/task-1/index.m3u8")
+        json!("/hls/node-192_168_1_10-hls/task-1/index.m3u8")
     );
-    assert_eq!(payload["folder"], json!("/node-192_168_1_10-hls/task-1"));
+    assert_eq!(
+        payload["folder"],
+        json!("/hls/node-192_168_1_10-hls/task-1")
+    );
     assert_eq!(
         payload["records"][0]["file_path"],
-        json!("/node-192_168_1_10-mp4/task-1/out.mp4")
+        json!("/mp4/node-192_168_1_10-mp4/task-1/out.mp4")
     );
     assert_eq!(
         payload["records"][0]["folder"],
-        json!("/node-192_168_1_10-mp4/task-1")
+        json!("/mp4/node-192_168_1_10-mp4/task-1")
     );
 }
 

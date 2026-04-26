@@ -274,6 +274,7 @@ export_host_binaries() {
     --target-triple "${HOST_BINARY_TARGET_TRIPLE}" \
     --package media-core \
     --package media-agent \
+    --package streamserver-config \
     --output-dir "${output_dir}"
 }
 
@@ -537,6 +538,7 @@ MEDIA_CORE_UI_PATH=ui/media-core
 MEDIA_AGENT_IMAGE=${media_agent_image}
 MEDIA_AGENT_IMAGE_ARCHIVE=images/media-agent-linux-amd64.tar
 MEDIA_AGENT_BINARY_PATH=binaries/media-agent-linux-amd64
+STREAMSERVER_CONFIG_BINARY_PATH=binaries/streamserver-config-linux-amd64
 MEDIA_AGENT_GPU_IMAGE=${media_agent_gpu_image_value}
 MEDIA_AGENT_GPU_IMAGE_ARCHIVE=${media_agent_gpu_archive_value}
 ZLM_IMAGE=${zlm_image}
@@ -719,9 +721,11 @@ save_host_artifacts() {
   mkdir -p "${bundle_root}/binaries"
   cp "${host_artifacts_output_dir}/media-core" "${bundle_root}/binaries/media-core-linux-amd64"
   cp "${host_artifacts_output_dir}/media-agent" "${bundle_root}/binaries/media-agent-linux-amd64"
+  cp "${host_artifacts_output_dir}/streamserver-config" "${bundle_root}/binaries/streamserver-config-linux-amd64"
   chmod 755 \
     "${bundle_root}/binaries/media-core-linux-amd64" \
-    "${bundle_root}/binaries/media-agent-linux-amd64"
+    "${bundle_root}/binaries/media-agent-linux-amd64" \
+    "${bundle_root}/binaries/streamserver-config-linux-amd64"
 
   mkdir -p "${bundle_root}/ui/media-core"
   cp -R "${host_artifacts_output_dir}/ui/." "${bundle_root}/ui/media-core/"

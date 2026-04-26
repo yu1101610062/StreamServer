@@ -7,6 +7,7 @@ storage_allowlist = ["./data/media/work", "./data/zlm/www"]
 
 [agent]
 work_root = "./data/media/work"
+hls_record_segment_sec = 60
 
 [agent.artifact_cleanup]
 enabled = true

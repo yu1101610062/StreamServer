@@ -671,7 +671,7 @@ function previewTask() {
           </el-col>
           <el-col v-if="draft.record.enabled" :md="6" :span="24">
             <el-form-item label="分段时长（秒，可选，仅 HLS 或需要切片 MP4 时填写）">
-              <el-input v-model="draft.record.segment_sec" placeholder="例如 300；实时 MP4 默认 7200" />
+              <el-input v-model="draft.record.segment_sec" placeholder="例如 300；MP4 默认 7200，HLS 默认按节点配置" />
             </el-form-item>
           </el-col>
           <el-col v-if="draft.record.enabled" :md="6" :span="24">

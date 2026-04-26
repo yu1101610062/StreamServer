@@ -4,6 +4,7 @@ members = [
     "crates/media-core",
     "crates/media-domain",
     "crates/media-rpc",
+    "crates/streamserver-config",
 ]
 resolver = "3"
 
@@ -20,12 +21,14 @@ axum = { version = "0.8.4", features = ["macros"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 config = { version = "0.15.18", default-features = false, features = ["toml"] }
+crossterm = "0.28.1"
 cron = "0.15.0"
 hmac = "0.12.1"
 jsonwebtoken = "9.3.0"
 libc = "0.2.177"
 prost = "0.13.5"
 rand = "0.8.5"
+ratatui = "0.29.0"
 reqwest = { version = "0.12.15", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -40,4 +43,5 @@ tower = { version = "0.5.2", features = ["util"] }
 tower-http = { version = "0.6.6", features = ["trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+unicode-width = "0.2.0"
 uuid = { version = "1.18.1", features = ["serde", "v5", "v7"] }

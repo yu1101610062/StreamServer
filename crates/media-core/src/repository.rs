@@ -3340,7 +3340,7 @@ impl TaskRepository {
         let result = sqlx::query(
             r#"
             update media_nodes
-               set healthy = control_connected,
+               set healthy = control_connected and not $4,
                    last_seen_at = $1,
                    updated_at = $2
              where id = $3
@@ -3349,6 +3349,7 @@ impl TaskRepository {
         .bind(heartbeat.node_time)
         .bind(Utc::now())
         .bind(node_id)
+        .bind(heartbeat.artifact_cleanup_blocked)
         .execute(&mut *tx)
         .await?;
 
@@ -3561,6 +3562,13 @@ impl TaskRepository {
             }),
         )
         .await?;
+
+        let disk_threshold_failure = event.event_type == "failed"
+            && event
+                .payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason == "disk_threshold_exceeded");
 
         match event.event_type.as_str() {
             "accepted" | "starting"
@@ -3875,8 +3883,13 @@ impl TaskRepository {
                 )
                 .await?;
             }
-            "failed" if sticky_reconnect_active => {}
+            "failed" if sticky_reconnect_active && !disk_threshold_failure => {}
             "failed" => {
+                let (failure_code, failure_reason) = if disk_threshold_failure {
+                    ("disk_threshold_exceeded", "disk_threshold_exceeded")
+                } else {
+                    ("agent_failed", event.message.as_str())
+                };
                 self.complete_task_attempt(
                     &mut tx,
                     event.task_id,
@@ -3884,8 +3897,8 @@ impl TaskRepository {
                     node_id,
                     TaskStatus::Failed,
                     AttemptStatus::Failed,
-                    Some("agent_failed"),
-                    Some(event.message.as_str()),
+                    Some(failure_code),
+                    Some(failure_reason),
                     now,
                 )
                 .await?;
@@ -5556,6 +5569,27 @@ impl TaskRepository {
                 .get("stream_ingest_record_artifacts")
                 .and_then(Value::as_array)
                 .is_some_and(|value| !value.is_empty());
+
+        let disk_threshold_stop = metadata
+            .get("stop")
+            .and_then(|value| value.get("reason"))
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason == "disk_threshold_exceeded");
+        if disk_threshold_stop {
+            self.complete_task_attempt(
+                tx,
+                task_id,
+                attempt_no,
+                node_id,
+                TaskStatus::Failed,
+                AttemptStatus::Failed,
+                Some("disk_threshold_exceeded"),
+                Some("disk_threshold_exceeded"),
+                now,
+            )
+            .await?;
+            return Ok(());
+        }
 
         if ownership.task_status == TaskStatus::Stopping || ownership.stop_requested_at.is_some() {
             self.complete_task_attempt(

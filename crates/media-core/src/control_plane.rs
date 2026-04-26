@@ -87,6 +87,7 @@ struct SessionLoad {
     disk_percent: f64,
     zlm_alive: bool,
     ffmpeg_alive: bool,
+    artifact_cleanup_blocked: bool,
     gpu_runtime: Vec<GpuRuntimeStats>,
 }
 
@@ -118,6 +119,7 @@ pub struct NodeLiveLoad {
     pub disk_percent: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
+    pub artifact_cleanup_blocked: bool,
     pub gpu_runtime: Vec<GpuRuntimeStats>,
 }
 
@@ -747,6 +749,7 @@ impl ControlPlaneService {
             disk_percent: snapshot.disk_percent,
             zlm_alive: snapshot.zlm_alive,
             ffmpeg_alive: snapshot.ffmpeg_alive,
+            artifact_cleanup_blocked: snapshot.artifact_cleanup_blocked,
             gpu_runtime: snapshot.gpu_runtime.clone(),
         };
         Ok(())
@@ -929,6 +932,7 @@ impl ControlPlaneService {
                         disk_percent: handle.load.disk_percent,
                         zlm_alive: handle.load.zlm_alive,
                         ffmpeg_alive: handle.load.ffmpeg_alive,
+                        artifact_cleanup_blocked: handle.load.artifact_cleanup_blocked,
                         gpu_runtime: handle.load.gpu_runtime.clone(),
                     },
                 )
@@ -1045,6 +1049,9 @@ fn heartbeat_from_rpc(heartbeat: RpcHeartbeat) -> Result<HeartbeatSnapshot, Stat
         slot_usage: heartbeat.slot_usage,
         zlm_alive: heartbeat.zlm_alive,
         ffmpeg_alive: heartbeat.ffmpeg_alive,
+        artifact_cleanup_blocked: heartbeat.artifact_cleanup_blocked,
+        artifact_cleanup_block_reason: (!heartbeat.artifact_cleanup_block_reason.trim().is_empty())
+            .then(|| heartbeat.artifact_cleanup_block_reason),
         gpu_runtime: heartbeat
             .gpu_runtime
             .into_iter()
@@ -1303,6 +1310,9 @@ fn task_keeps_retry_node_affinity(spec: &TaskSpec) -> bool {
 }
 
 fn base_execution_eligible(spec: &TaskSpec, load: &SessionLoad, reserved_dispatches: u32) -> bool {
+    if load.artifact_cleanup_blocked {
+        return false;
+    }
     if session_is_saturated(load, reserved_dispatches) || !load.ffmpeg_alive {
         return false;
     }

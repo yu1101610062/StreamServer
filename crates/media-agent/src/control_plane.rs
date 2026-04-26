@@ -83,8 +83,11 @@ impl AgentController {
             runtime_registry.clone(),
             RuntimeEventSink::new(runtime_priority_tx, runtime_log_tx),
         ));
-        let artifact_cleanup =
-            ArtifactCleanupManager::new(&settings.agent, runtime_registry.clone());
+        let artifact_cleanup = ArtifactCleanupManager::with_executor(
+            &settings.agent,
+            runtime_registry.clone(),
+            Some(executor.clone()),
+        );
 
         Ok(Self {
             settings: Arc::new(settings),
@@ -122,6 +125,9 @@ impl AgentController {
     }
 
     async fn connect_once(&self) -> anyhow::Result<()> {
+        if let Some(reason) = self.artifact_cleanup.control_plane_block_reason() {
+            anyhow::bail!("artifact cleanup is not ready for control-plane registration: {reason}");
+        }
         let session_epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let result = self.connect_once_active(session_epoch).await;
         self.invalidate_session_epoch(session_epoch);
@@ -250,6 +256,11 @@ impl AgentController {
                         slot_usage: snapshot.slot_usage,
                         zlm_alive: snapshot.zlm_alive,
                         ffmpeg_alive: snapshot.ffmpeg_alive,
+                        artifact_cleanup_blocked: snapshot.artifact_cleanup_blocked,
+                        artifact_cleanup_block_reason: snapshot
+                            .artifact_cleanup_block_reason
+                            .clone()
+                            .unwrap_or_default(),
                         gpu_runtime: snapshot
                             .gpu_runtime
                             .iter()

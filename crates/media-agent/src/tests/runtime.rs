@@ -20,11 +20,12 @@ fn test_settings(work_root: &str) -> AgentSettings {
         zlm_api_secret: String::new(),
         zlm_auto_close_on_no_reader_enabled: false,
         allow_enhanced_rtmp_expose: true,
+        hls_record_segment_sec: 60,
         agent_stream_addr: "http://127.0.0.1:8081".to_string(),
         primary_interface_name: String::new(),
         primary_interface_ip: String::new(),
-        output_mount_relative_prefix_mp4: String::new(),
-        output_mount_relative_prefix_hls: String::new(),
+        output_mount_relative_prefix_mp4: "output".to_string(),
+        output_mount_relative_prefix_hls: "output".to_string(),
         multicast_interface_name: String::new(),
         multicast_interface_ip: String::new(),
         network_mode: "bridge".to_string(),
@@ -519,6 +520,52 @@ fn build_file_transcode_plan_allocates_managed_output_path() {
         )
     );
     assert!(plan.output_target.ends_with(".mp4"));
+}
+
+#[test]
+fn build_file_transcode_plan_hls_uses_configured_archive_segments() {
+    let mut settings = test_settings("/tmp/work");
+    settings.hls_record_segment_sec = 30;
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": "test-hls",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.mp4"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "format": "hls"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert!(plan.output_target.ends_with(".m3u8"));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-hls_time", "30"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-hls_list_size", "0"])
+    );
+    assert!(plan.args.iter().any(|arg| arg.ends_with("-%05d.ts")));
 }
 
 #[test]
@@ -2263,6 +2310,56 @@ fn build_stream_ingest_fast_record_plan_copies_hls_h264_aac_for_hls_output() {
 }
 
 #[test]
+fn build_stream_ingest_fast_record_plan_uses_configured_hls_segment_default() {
+    let mut settings = test_settings("/tmp/work");
+    settings.hls_record_segment_sec = 30;
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "vod-fast-record-hls-default-segment",
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "file",
+                "source_mode": "vod",
+                "url": "archive.mp4"
+            },
+            "stream": {"app": "live", "name": "archive-hls-default-segment"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {
+                "enabled": true,
+                "format": "hls"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-hls_time", "30"])
+    );
+}
+
+#[test]
 fn build_stream_ingest_fast_record_plan_generates_mp4_and_hls_outputs_for_both_format() {
     let settings = test_settings("/tmp/work");
     let request = StartTaskRequest {
@@ -3911,6 +4008,31 @@ fn classify_adopted_exit_treats_record_duration_reached_as_success() {
         classify_adopted_exit(&handle, &SuccessCheck::ProcessExit, true);
     assert_eq!(event_type, "succeeded");
     assert_eq!(payload["reason"], json!("record_duration_reached"));
+}
+
+#[test]
+fn classify_adopted_exit_treats_disk_threshold_stop_as_failed() {
+    let handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(1234),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Exited,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["/data/zlm/www/output/mp4/node-test-mp4/task/out.mp4".to_string()],
+        metadata: json!({
+            "task_type": "file_transcode",
+            "stop": {"reason": "disk_threshold_exceeded"},
+        }),
+    };
+
+    let (event_type, _, _, payload) =
+        classify_adopted_exit(&handle, &SuccessCheck::ProcessExit, true);
+    assert_eq!(event_type, "failed");
+    assert_eq!(payload["reason"], json!("disk_threshold_exceeded"));
 }
 
 #[test]

@@ -5,7 +5,8 @@ mod tests;
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
-    fs, io,
+    fs,
+    io::{self, Read},
     net::IpAddr,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
@@ -15,7 +16,9 @@ use std::{
 
 use anyhow::{Context, bail};
 use chrono::{DateTime, Utc};
-use media_domain::{PublishTargetKind, RecordFormat, TaskSpec, TaskType};
+use media_domain::{
+    PublishTargetKind, RecordFormat, RuntimeHandle, RuntimeState, TaskSpec, TaskType,
+};
 use serde_json::Value;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
@@ -23,13 +26,15 @@ use uuid::Uuid;
 
 use crate::{
     config::{AgentArtifactCleanupSettings, AgentSettings},
-    runtime::LocalRuntimeRegistry,
+    runtime::{LocalExecutor, LocalRuntimeRegistry, StopTaskRequest},
 };
 
 const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
 const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
 const CLEANUP_HYSTERESIS_PERCENT: f64 = 5.0;
 const CLEANUP_RECENT_WRITE_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const RUNNING_SEGMENT_RETAIN_COUNT: usize = 2;
+const DISK_THRESHOLD_STOP_REASON: &str = "disk_threshold_exceeded";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactBucket {
@@ -53,17 +58,27 @@ impl ArtifactBucket {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ArtifactCleanupManager {
     inner: Arc<ArtifactCleanupManagerInner>,
 }
 
-#[derive(Debug)]
 struct ArtifactCleanupManagerInner {
     cleanup: AgentArtifactCleanupSettings,
     registry: LocalRuntimeRegistry,
+    executor: Option<Arc<dyn LocalExecutor>>,
     layout: ArtifactCleanupLayout,
     state: RwLock<ArtifactCleanupState>,
+}
+
+impl std::fmt::Debug for ArtifactCleanupManager {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArtifactCleanupManager")
+            .field("cleanup", &self.inner.cleanup)
+            .field("layout", &self.inner.layout)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +120,20 @@ struct CleanupCandidate {
     task_id: Uuid,
     last_write: SystemTime,
     paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct RunningCleanupCandidate {
+    task_id: Uuid,
+    bucket: ArtifactBucket,
+    path: PathBuf,
+    last_write: SystemTime,
+    size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiskSample {
+    percent_used: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,13 +202,23 @@ impl ArtifactCleanupLayout {
 }
 
 impl ArtifactCleanupManager {
+    #[cfg(test)]
     pub fn new(settings: &AgentSettings, registry: LocalRuntimeRegistry) -> Self {
+        Self::with_executor(settings, registry, None)
+    }
+
+    pub fn with_executor(
+        settings: &AgentSettings,
+        registry: LocalRuntimeRegistry,
+        executor: Option<Arc<dyn LocalExecutor>>,
+    ) -> Self {
         let layout = ArtifactCleanupLayout::from_settings(settings);
         let state = ArtifactCleanupState::unknown(&layout);
         Self {
             inner: Arc::new(ArtifactCleanupManagerInner {
                 cleanup: settings.artifact_cleanup.clone(),
                 registry,
+                executor,
                 layout,
                 state: RwLock::new(state),
             }),
@@ -215,6 +254,21 @@ impl ArtifactCleanupManager {
             .read()
             .expect("artifact cleanup state lock poisoned")
             .max_disk_percent
+    }
+
+    pub fn control_plane_block_reason(&self) -> Option<String> {
+        if !self.inner.cleanup.enabled {
+            return None;
+        }
+
+        self.inner
+            .state
+            .read()
+            .expect("artifact cleanup state lock poisoned")
+            .buckets
+            .values()
+            .find(|bucket_state| !bucket_state.start_allowed)
+            .map(|bucket_state| bucket_state.reason.clone())
     }
 
     pub fn ensure_task_start_allowed(&self, resolved_spec: &Value) -> anyhow::Result<()> {
@@ -275,7 +329,7 @@ impl ArtifactCleanupManager {
             }
         }
 
-        let active_task_ids = self.inner.registry.tracked_task_ids();
+        let active_handles = self.inner.registry.active_handles();
         let strategy = ArtifactCleanupStrategy::from_settings(&self.inner.cleanup);
         let threshold = self.inner.cleanup.threshold_percent;
         let mut by_device: HashMap<u64, Vec<BucketObservation>> = HashMap::new();
@@ -293,28 +347,50 @@ impl ArtifactCleanupManager {
                 .unwrap_or_default();
             let mut blocked_reason = None;
 
-            if self.inner.cleanup.enabled && disk_percent >= threshold {
+            if self.inner.cleanup.enabled {
                 match strategy {
                     ArtifactCleanupStrategy::RejectOnly => {
-                        blocked_reason = Some(format!(
-                            "artifact volume usage {:.1}% exceeds threshold {:.1}%",
-                            disk_percent, threshold
-                        ));
+                        if disk_percent >= threshold {
+                            let reason = format!(
+                                "artifact volume usage {:.1}% exceeds threshold {:.1}%",
+                                disk_percent, threshold
+                            );
+                            self.stop_active_artifact_tasks_for_volume(
+                                &observations,
+                                &active_handles,
+                                &reason,
+                            );
+                            blocked_reason = Some(reason);
+                        }
                     }
                     ArtifactCleanupStrategy::DeleteOldestThenReject => {
-                        let cleanup_result =
-                            self.cleanup_volume(&observations, &active_task_ids, threshold);
-                        disk_percent = cleanup_result.final_disk_percent;
-                        if !cleanup_result.deleted_task_ids.is_empty() {
-                            info!(
-                                bucket_count = observations.len(),
-                                deleted_tasks = ?cleanup_result.deleted_task_ids,
-                                disk_percent = cleanup_result.final_disk_percent,
-                                "artifact cleanup deleted old task directories"
+                        if disk_percent >= threshold {
+                            let cleanup_result = self.cleanup_volume_by_disk(
+                                &observations,
+                                &active_handles,
+                                threshold,
                             );
-                        }
-                        if cleanup_result.final_disk_percent >= threshold {
-                            blocked_reason = Some(cleanup_result.reason);
+                            disk_percent = cleanup_result.final_percent;
+                            if !cleanup_result.deleted_task_ids.is_empty() {
+                                let deleted_task_ids = &cleanup_result.deleted_task_ids;
+                                info!(
+                                    bucket_count = observations.len(),
+                                    deleted_tasks = ?deleted_task_ids,
+                                    disk_percent = cleanup_result.final_percent,
+                                    "artifact cleanup deleted old task directories"
+                                );
+                            }
+                            if !cleanup_result.deleted_running_paths.is_empty() {
+                                info!(
+                                    bucket_count = observations.len(),
+                                    deleted_files = cleanup_result.deleted_running_paths.len(),
+                                    disk_percent = cleanup_result.final_percent,
+                                    "artifact cleanup deleted old running task segments"
+                                );
+                            }
+                            if cleanup_result.final_percent >= threshold {
+                                blocked_reason = Some(cleanup_result.reason);
+                            }
                         }
                     }
                 }
@@ -337,22 +413,51 @@ impl ArtifactCleanupManager {
         next_state
     }
 
-    fn cleanup_volume(
+    fn cleanup_volume_by_disk(
         &self,
         observations: &[BucketObservation],
-        active_task_ids: &HashSet<Uuid>,
+        active_handles: &[RuntimeHandle],
         threshold_percent: f64,
     ) -> CleanupVolumeResult {
         let target_percent = (threshold_percent - CLEANUP_HYSTERESIS_PERCENT).max(0.0);
-        let mut disk_percent = observations
-            .first()
-            .map(|observation| observation.disk_percent)
-            .unwrap_or_default();
-        let candidates = collect_cleanup_candidates(observations, active_task_ids);
+        self.cleanup_volume_to_metric(
+            observations,
+            active_handles,
+            threshold_percent,
+            target_percent,
+            "artifact volume usage",
+            "inactive task directories or running task segments",
+            || sample_disk_percent(observations[0].root.as_path()),
+        )
+    }
+
+    fn cleanup_volume_to_metric(
+        &self,
+        observations: &[BucketObservation],
+        active_handles: &[RuntimeHandle],
+        threshold_percent: f64,
+        target_percent: f64,
+        metric_name: &str,
+        candidate_label: &str,
+        mut sample_metric_percent: impl FnMut() -> io::Result<f64>,
+    ) -> CleanupVolumeResult {
+        let mut metric_percent = sample_metric_percent().unwrap_or_else(|_| {
+            observations
+                .first()
+                .map(|observation| observation.disk_percent)
+                .unwrap_or_default()
+        });
+        let active_task_ids = active_handles
+            .iter()
+            .filter(|handle| handle.state != RuntimeState::Exited)
+            .map(|handle| handle.task_id)
+            .collect::<HashSet<_>>();
+        let candidates = collect_cleanup_candidates(observations, &active_task_ids);
         let mut deleted_task_ids = Vec::new();
+        let mut deleted_running_paths = Vec::new();
 
         for candidate in candidates {
-            if disk_percent < target_percent {
+            if metric_percent < target_percent {
                 break;
             }
             if let Err(error) = delete_cleanup_candidate(&candidate) {
@@ -364,12 +469,13 @@ impl ArtifactCleanupManager {
                 continue;
             }
             deleted_task_ids.push(candidate.task_id);
-            match sample_disk_percent(observations[0].root.as_path()) {
-                Ok(value) => disk_percent = value,
+            match sample_metric_percent() {
+                Ok(value) => metric_percent = value,
                 Err(error) => {
                     return CleanupVolumeResult {
                         deleted_task_ids,
-                        final_disk_percent: 100.0,
+                        deleted_running_paths,
+                        final_percent: 100.0,
                         reason: format!(
                             "artifact volume could not be resampled after cleanup: {error}"
                         ),
@@ -378,16 +484,55 @@ impl ArtifactCleanupManager {
             }
         }
 
-        let reason = if disk_percent >= threshold_percent {
-            if deleted_task_ids.is_empty() {
+        if metric_percent >= target_percent {
+            let running_candidates =
+                collect_running_cleanup_candidates(observations, active_handles);
+            for candidate in running_candidates {
+                if metric_percent < target_percent {
+                    break;
+                }
+                match fs::remove_file(&candidate.path) {
+                    Ok(()) => {
+                        deleted_running_paths.push(candidate.path.clone());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        warn!(
+                            task_id = %candidate.task_id,
+                            bucket = candidate.bucket.as_str(),
+                            path = %candidate.path.display(),
+                            error = %error,
+                            "failed to delete old running artifact segment"
+                        );
+                        continue;
+                    }
+                }
+                match sample_metric_percent() {
+                    Ok(value) => metric_percent = value,
+                    Err(error) => {
+                        return CleanupVolumeResult {
+                            deleted_task_ids,
+                            deleted_running_paths,
+                            final_percent: 100.0,
+                            reason: format!(
+                                "artifact volume could not be resampled after running segment cleanup: {error}"
+                            ),
+                        };
+                    }
+                }
+            }
+        }
+
+        let reason = if metric_percent >= threshold_percent {
+            if deleted_task_ids.is_empty() && deleted_running_paths.is_empty() {
                 format!(
-                    "artifact volume usage {:.1}% exceeds threshold {:.1}% and no inactive task directories are eligible for cleanup",
-                    disk_percent, threshold_percent
+                    "{metric_name} {:.1}% exceeds threshold {:.1}% and no {candidate_label} are eligible for cleanup",
+                    metric_percent, threshold_percent
                 )
             } else {
                 format!(
-                    "artifact volume usage {:.1}% remains above threshold {:.1}% after cleanup",
-                    disk_percent, threshold_percent
+                    "{metric_name} {:.1}% remains above threshold {:.1}% after cleanup",
+                    metric_percent, threshold_percent
                 )
             }
         } else {
@@ -396,8 +541,73 @@ impl ArtifactCleanupManager {
 
         CleanupVolumeResult {
             deleted_task_ids,
-            final_disk_percent: disk_percent,
+            deleted_running_paths,
+            final_percent: metric_percent,
             reason,
+        }
+    }
+
+    fn stop_active_artifact_tasks_for_volume(
+        &self,
+        observations: &[BucketObservation],
+        active_handles: &[RuntimeHandle],
+        reason: &str,
+    ) {
+        let Some(executor) = self.inner.executor.as_ref() else {
+            warn!(
+                bucket_count = observations.len(),
+                "artifact cleanup cannot stop active tasks because no executor is attached"
+            );
+            return;
+        };
+        let volume_buckets = observations
+            .iter()
+            .map(|observation| observation.bucket)
+            .collect::<HashSet<_>>();
+
+        for handle in active_handles {
+            if matches!(handle.state, RuntimeState::Exited | RuntimeState::Stopping) {
+                continue;
+            }
+            let handle_buckets = artifact_buckets_for_runtime_handle(handle);
+            if handle_buckets.is_disjoint(&volume_buckets) {
+                continue;
+            }
+            let lease_token = handle
+                .metadata
+                .get("lease_token")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if lease_token.is_empty() {
+                continue;
+            }
+            let request = StopTaskRequest {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token,
+                reason: DISK_THRESHOLD_STOP_REASON.to_string(),
+                grace_period_sec: 0,
+                force_after_sec: 5,
+            };
+            match executor.stop_task(&request) {
+                Ok(()) => {
+                    warn!(
+                        task_id = %handle.task_id,
+                        attempt_no = handle.attempt_no,
+                        reason,
+                        "artifact cleanup stopped active task after disk threshold was exceeded"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        task_id = %handle.task_id,
+                        attempt_no = handle.attempt_no,
+                        error = %error,
+                        "artifact cleanup failed to stop active task after disk threshold was exceeded"
+                    );
+                }
+            }
         }
     }
 
@@ -475,7 +685,8 @@ impl ArtifactCleanupManager {
 #[derive(Debug)]
 struct CleanupVolumeResult {
     deleted_task_ids: Vec<Uuid>,
-    final_disk_percent: f64,
+    deleted_running_paths: Vec<PathBuf>,
+    final_percent: f64,
     reason: String,
 }
 
@@ -521,13 +732,13 @@ fn inspect_bucket_root(
             format!("{} is not a directory", layout.root.display()),
         ));
     }
-    let disk_percent = sample_disk_percent(&layout.root)?;
+    let disk = sample_disk(&layout.root)?;
     Ok(BucketObservation {
         bucket,
         root: layout.root.clone(),
         node_dir: layout.node_dir.clone(),
         device_id: metadata.dev(),
-        disk_percent,
+        disk_percent: disk.percent_used,
     })
 }
 
@@ -599,6 +810,261 @@ fn collect_cleanup_candidates(
     candidates
 }
 
+fn collect_running_cleanup_candidates(
+    observations: &[BucketObservation],
+    active_handles: &[RuntimeHandle],
+) -> Vec<RunningCleanupCandidate> {
+    let active_by_task_id = active_handles
+        .iter()
+        .filter(|handle| handle.state != RuntimeState::Exited)
+        .map(|handle| (handle.task_id, handle))
+        .collect::<HashMap<_, _>>();
+    let now = SystemTime::now();
+    let mut candidates = Vec::new();
+
+    for observation in observations {
+        let entries = match fs::read_dir(&observation.node_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn!(
+                    bucket = observation.bucket.as_str(),
+                    node_dir = %observation.node_dir.display(),
+                    error = %error,
+                    "failed to enumerate artifact cleanup running node directory"
+                );
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(task_id) = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                continue;
+            };
+            let Some(handle) = active_by_task_id.get(&task_id).copied() else {
+                continue;
+            };
+            let handle_buckets = artifact_buckets_for_runtime_handle(handle);
+            if !handle_buckets.contains(&observation.bucket) {
+                continue;
+            }
+
+            match observation.bucket {
+                ArtifactBucket::Mp4 => {
+                    candidates.extend(collect_running_mp4_candidates(
+                        task_id,
+                        observation.bucket,
+                        &path,
+                        now,
+                    ));
+                }
+                ArtifactBucket::Hls => {
+                    candidates.extend(collect_running_hls_candidates(
+                        task_id,
+                        observation.bucket,
+                        &path,
+                        now,
+                    ));
+                }
+            }
+        }
+    }
+
+    candidates.sort_by_key(|candidate| (candidate.last_write, candidate.size_bytes));
+    candidates
+}
+
+fn collect_running_mp4_candidates(
+    task_id: Uuid,
+    bucket: ArtifactBucket,
+    task_dir: &Path,
+    now: SystemTime,
+) -> Vec<RunningCleanupCandidate> {
+    let mut files = list_files_with_extension(task_dir, "mp4")
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .filter_map(|path| running_candidate_from_path(task_id, bucket, path, now))
+        .collect::<Vec<_>>();
+    files.sort_by_key(|candidate| candidate.last_write);
+    retain_oldest_beyond_latest(files)
+}
+
+fn collect_running_hls_candidates(
+    task_id: Uuid,
+    bucket: ArtifactBucket,
+    task_dir: &Path,
+    now: SystemTime,
+) -> Vec<RunningCleanupCandidate> {
+    let referenced_segments = hls_playlist_references(task_dir);
+    let mut files = list_files_with_extension(task_dir, "ts")
+        .into_iter()
+        .filter(|path| !referenced_segments.contains(&normalize_existing_or_lexical_path(path)))
+        .filter_map(|path| running_candidate_from_path(task_id, bucket, path, now))
+        .collect::<Vec<_>>();
+    files.sort_by_key(|candidate| candidate.last_write);
+    retain_oldest_beyond_latest(files)
+}
+
+fn retain_oldest_beyond_latest(
+    mut files: Vec<RunningCleanupCandidate>,
+) -> Vec<RunningCleanupCandidate> {
+    if files.len() <= RUNNING_SEGMENT_RETAIN_COUNT {
+        return Vec::new();
+    }
+    let keep_from = files.len() - RUNNING_SEGMENT_RETAIN_COUNT;
+    files.truncate(keep_from);
+    files
+}
+
+fn running_candidate_from_path(
+    task_id: Uuid,
+    bucket: ArtifactBucket,
+    path: PathBuf,
+    now: SystemTime,
+) -> Option<RunningCleanupCandidate> {
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let last_write = metadata.modified().ok()?;
+    if now
+        .duration_since(last_write)
+        .is_ok_and(|age| age < CLEANUP_RECENT_WRITE_GRACE_PERIOD)
+    {
+        return None;
+    }
+    Some(RunningCleanupCandidate {
+        task_id,
+        bucket,
+        path,
+        last_write,
+        size_bytes: metadata.len(),
+    })
+}
+
+fn list_files_with_extension(root: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+fn hls_playlist_references(task_dir: &Path) -> HashSet<PathBuf> {
+    let mut references = HashSet::new();
+    for playlist in list_files_with_extension(task_dir, "m3u8") {
+        let Some(parent) = playlist.parent() else {
+            continue;
+        };
+        let Ok(mut file) = fs::File::open(&playlist) else {
+            continue;
+        };
+        let mut contents = String::new();
+        if file.read_to_string(&mut contents).is_err() {
+            continue;
+        }
+        for line in contents.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if !line
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.eq_ignore_ascii_case("ts"))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let path = Path::new(line);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                parent.join(path)
+            };
+            references.insert(normalize_existing_or_lexical_path(&resolved));
+        }
+    }
+    references
+}
+
+fn normalize_existing_or_lexical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            normalized.push(component.as_os_str());
+        }
+        normalized
+    })
+}
+
+fn artifact_buckets_for_runtime_handle(handle: &RuntimeHandle) -> HashSet<ArtifactBucket> {
+    let mut buckets = HashSet::new();
+    if let Some(spec) = handle
+        .metadata
+        .get("resolved_spec")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskSpec>(value).ok())
+    {
+        buckets.extend(artifact_buckets_for_task_spec(&spec));
+    }
+    for output in &handle.outputs {
+        add_bucket_for_path(output, &mut buckets);
+    }
+    if let Some(recording) = handle.metadata.get("recording") {
+        for key in ["root_path_mp4", "root_path_hls"] {
+            if let Some(path) = recording.get(key).and_then(Value::as_str) {
+                add_bucket_for_path(path, &mut buckets);
+            }
+        }
+    }
+    buckets
+}
+
+fn add_bucket_for_path(path: &str, buckets: &mut HashSet<ArtifactBucket>) {
+    let path = Path::new(path);
+    if path.starts_with(ZLM_OUTPUT_MP4_ROOT) {
+        buckets.insert(ArtifactBucket::Mp4);
+    }
+    if path.starts_with(ZLM_OUTPUT_HLS_ROOT) {
+        buckets.insert(ArtifactBucket::Hls);
+    }
+}
+
 fn latest_file_write_time(path: &Path) -> Option<SystemTime> {
     let metadata = fs::metadata(path).ok()?;
     let mut latest = metadata.modified().ok().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -638,6 +1104,10 @@ fn delete_cleanup_candidate(candidate: &CleanupCandidate) -> io::Result<()> {
 }
 
 fn sample_disk_percent(path: &Path) -> io::Result<f64> {
+    sample_disk(path).map(|sample| sample.percent_used)
+}
+
+fn sample_disk(path: &Path) -> io::Result<DiskSample> {
     let path = CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid disk path"))?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -650,10 +1120,12 @@ fn sample_disk_percent(path: &Path) -> io::Result<f64> {
     let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
     let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
     if total == 0 {
-        return Ok(0.0);
+        return Ok(DiskSample { percent_used: 0.0 });
     }
 
-    Ok(((total - free) as f64 / total as f64) * 100.0)
+    Ok(DiskSample {
+        percent_used: ((total - free) as f64 / total as f64) * 100.0,
+    })
 }
 
 fn sanitize_output_node_token(value: &str) -> String {

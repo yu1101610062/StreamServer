@@ -94,7 +94,8 @@ services:
       retries: 20
     volumes:
       - ./data/media/work:/data/media/work
-      - ./data/zlm/www:/data/zlm/www
+      - ${ZLM_WWW_MOUNT_HOST_DIR}:/data/zlm/www
+      - ${ZLM_OUTPUT_MOUNT_HOST_DIR}:/data/zlm/www/output
       - ./zlm/config.ini.template:/opt/media/conf/config.ini.template:ro
       - ./zlm/render-config.sh:/opt/media/conf/render-config.sh:ro
 
@@ -117,14 +118,15 @@ services:
       AGENT_STREAM_ADDR: http://${PUBLIC_HOST}:${ZLM_HTTP_PORT}
       AGENT_PRIMARY_INTERFACE_NAME: ${AGENT_PRIMARY_INTERFACE_NAME}
       AGENT_PRIMARY_INTERFACE_IP: ${AGENT_PRIMARY_INTERFACE_IP}
-      OUTPUT_MOUNT_RELATIVE_PREFIX_MP4: ${OUTPUT_MOUNT_RELATIVE_PREFIX_MP4}
-      OUTPUT_MOUNT_RELATIVE_PREFIX_HLS: ${OUTPUT_MOUNT_RELATIVE_PREFIX_HLS}
+      OUTPUT_MOUNT_RELATIVE_PREFIX_MP4: output
+      OUTPUT_MOUNT_RELATIVE_PREFIX_HLS: output
       AGENT_MULTICAST_INTERFACE_NAME: ${AGENT_MULTICAST_INTERFACE_NAME}
       AGENT_MULTICAST_INTERFACE_IP: ${AGENT_MULTICAST_INTERFACE_IP}
       AGENT_NETWORK_MODE: host
       AGENT_ACCELERATION_MODE: ${AGENT_ACCELERATION_MODE}
       AGENT_LABELS: ${AGENT_LABELS}
       AGENT_MAX_RUNTIME_SLOTS: ${AGENT_MAX_RUNTIME_SLOTS}
+      AGENT_HLS_RECORD_SEGMENT_SEC: ${AGENT_HLS_RECORD_SEGMENT_SEC}
       AGENT_ARTIFACT_CLEANUP_ENABLED: ${AGENT_ARTIFACT_CLEANUP_ENABLED}
       AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT: ${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}
       AGENT_ARTIFACT_CLEANUP_STRATEGY: ${AGENT_ARTIFACT_CLEANUP_STRATEGY}
@@ -147,5 +149,6 @@ services:
       - ./bin:/opt/streamserver/bin:ro
       - ./data/media/work:/data/media/work
       - ./data/media/logs:/data/media/logs
-      - ./data/zlm/www:/data/zlm/www
+      - ${ZLM_WWW_MOUNT_HOST_DIR}:/data/zlm/www
+      - ${ZLM_OUTPUT_MOUNT_HOST_DIR}:/data/zlm/www/output
       - ./certs:/certs:ro
