@@ -1764,6 +1764,9 @@ impl ManagedProcessExecutor {
                         }),
                     }));
                 }
+                restart_executor
+                    .cleanup_managed_stream_before_restart(&exited_handle)
+                    .await;
                 let _ = registry.remove(runtime_id);
 
                 if restart_executor
@@ -2074,6 +2077,63 @@ impl ManagedProcessExecutor {
             .events
             .send(RuntimeNotification::TaskSnapshot(restarted.clone()));
         Ok(restarted)
+    }
+
+    async fn cleanup_managed_stream_before_restart(&self, handle: &RuntimeHandle) {
+        let Some(binding) = managed_stream_restart_cleanup_binding(handle) else {
+            return;
+        };
+
+        match call_zlm_api(
+            &self.http_client,
+            &self.settings,
+            "/index/api/close_streams",
+            &build_close_stream_params(&binding, true),
+        )
+        .await
+        {
+            Ok(_) => {
+                let _ = self
+                    .events
+                    .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                        task_id: handle.task_id,
+                        attempt_no: handle.attempt_no,
+                        lease_token: runtime_lease_token(handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(handle),
+                        event_type: "stream_cleanup".to_string(),
+                        event_level: "info".to_string(),
+                        message: "closed stale ZLM stream before managed process restart"
+                            .to_string(),
+                        payload: json!({
+                            "schema": binding.schema,
+                            "vhost": binding.vhost,
+                            "app": binding.app,
+                            "stream": binding.stream,
+                            "reason": "managed_process_restart",
+                        }),
+                    }));
+            }
+            Err(error) => {
+                let _ = self.events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                    task_id: handle.task_id,
+                    attempt_no: handle.attempt_no,
+                    lease_token: runtime_lease_token(handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(handle),
+                    event_type: "zlm_api_error".to_string(),
+                    event_level: "warn".to_string(),
+                    message: format!(
+                        "failed to close stale ZLM stream before managed process restart: {error}"
+                    ),
+                    payload: json!({
+                        "schema": binding.schema,
+                        "vhost": binding.vhost,
+                        "app": binding.app,
+                        "stream": binding.stream,
+                        "reason": "managed_process_restart",
+                    }),
+                }));
+            }
+        }
     }
 
     fn start_live_relay_task(
@@ -5565,6 +5625,23 @@ fn stream_binding_from_handle(handle: &RuntimeHandle) -> Option<StreamBinding> {
         .get("stream_binding")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn managed_stream_restart_cleanup_binding(handle: &RuntimeHandle) -> Option<StreamBinding> {
+    if task_type_from_handle(handle) != Some(TaskType::StreamIngest)
+        || task_runtime_mode_from_handle(handle) != Some(TaskRuntimeMode::ManagedProcess)
+    {
+        return None;
+    }
+
+    stream_binding_from_handle(handle).or_else(|| {
+        startup_probe_from_handle(handle).map(|probe| StreamBinding {
+            schema: probe.schema,
+            vhost: probe.vhost,
+            app: probe.app,
+            stream: probe.stream,
+        })
+    })
 }
 
 fn rtp_stream_id_from_handle(handle: &RuntimeHandle) -> Option<String> {

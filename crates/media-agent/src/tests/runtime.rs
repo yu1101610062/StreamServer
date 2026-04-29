@@ -4106,6 +4106,61 @@ fn sticky_reconnect_respects_recovery_never() {
 }
 
 #[test]
+fn managed_restart_cleanup_uses_stream_binding() {
+    let mut handle = sticky_live_ingest_handle(true);
+    handle.metadata["stream_binding"] = json!({
+        "schema": "rtmp",
+        "vhost": "__defaultVhost__",
+        "app": "preview",
+        "stream": "channel-1",
+    });
+
+    let binding = managed_stream_restart_cleanup_binding(&handle)
+        .expect("managed stream_ingest should clean stale ZLM stream before restart");
+
+    assert_eq!(binding.schema.as_deref(), Some("rtmp"));
+    assert_eq!(binding.vhost, "__defaultVhost__");
+    assert_eq!(binding.app, "preview");
+    assert_eq!(binding.stream, "channel-1");
+}
+
+#[test]
+fn managed_restart_cleanup_falls_back_to_startup_probe() {
+    let mut handle = sticky_live_ingest_handle(true);
+    handle.metadata["startup_probe"] = json!({
+        "schema": "rtmp",
+        "vhost": "__defaultVhost__",
+        "app": "preview",
+        "stream": "channel-2",
+    });
+
+    let binding = managed_stream_restart_cleanup_binding(&handle)
+        .expect("startup probe should identify managed stream cleanup target");
+
+    assert_eq!(binding.schema.as_deref(), Some("rtmp"));
+    assert_eq!(binding.app, "preview");
+    assert_eq!(binding.stream, "channel-2");
+}
+
+#[test]
+fn managed_restart_cleanup_skips_zlm_proxy_ingest() {
+    let mut handle = sticky_live_ingest_handle(true);
+    handle.metadata["resolved_spec"]["input"] = json!({
+        "kind": "rtsp",
+        "source_mode": "live",
+        "url": "rtsp://camera.example/live"
+    });
+    handle.metadata["stream_binding"] = json!({
+        "schema": "rtmp",
+        "vhost": "__defaultVhost__",
+        "app": "preview",
+        "stream": "channel-3",
+    });
+
+    assert!(managed_stream_restart_cleanup_binding(&handle).is_none());
+}
+
+#[test]
 fn classify_adopted_exit_marks_unstopped_continuous_stream_exit_as_failed() {
     let mut handle = continuous_stream_ingest_handle();
     handle.state = RuntimeState::Exited;
