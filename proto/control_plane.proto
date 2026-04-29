@@ -46,6 +46,7 @@ message Register {
   string output_mount_relative_prefix_hls = 15;
   uint32 zlm_rtmp_port = 16;
   uint32 zlm_rtsp_port = 17;
+  string agent_http_base_url = 18;
 }
 
 message Heartbeat {
@@ -63,6 +64,9 @@ message Heartbeat {
   uint32 orphaned_tasks = 12;
   bool artifact_cleanup_blocked = 13;
   string artifact_cleanup_block_reason = 14;
+  uint64 upload_disk_total_bytes = 15;
+  uint64 upload_disk_available_bytes = 16;
+  double upload_disk_used_percent = 17;
 }
 
 message CapabilitySnapshot {

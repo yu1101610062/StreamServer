@@ -1253,6 +1253,185 @@ impl TaskRepository {
         Ok(Page::new(rows, page, page_size, total))
     }
 
+    pub async fn insert_media_upload_asset(
+        &self,
+        asset: NewMediaUploadAsset,
+    ) -> Result<MediaUploadAssetSummary, RepoError> {
+        sqlx::query(
+            r#"
+            insert into media_upload_assets (
+              id, node_id, file_name, source_url, http_url, duration_sec, file_size,
+              sha256, content_type, created_by, created_at
+            ) values (
+              $1, $2, $3, $4, $5, $6, $7,
+              $8, $9, $10, $11
+            )
+            "#,
+        )
+        .bind(asset.id)
+        .bind(asset.node_id)
+        .bind(&asset.file_name)
+        .bind(&asset.source_url)
+        .bind(&asset.http_url)
+        .bind(asset.duration_sec)
+        .bind(asset.file_size)
+        .bind(&asset.sha256)
+        .bind(&asset.content_type)
+        .bind(&asset.created_by)
+        .bind(asset.created_at)
+        .execute(&self.pool)
+        .await?;
+
+        self.get_media_upload_asset(asset.id)
+            .await?
+            .ok_or(RepoError::MediaUploadAssetNotFound(asset.id))
+    }
+
+    pub async fn list_media_upload_assets(
+        &self,
+        filter: MediaUploadAssetListFilter,
+    ) -> Result<Page<MediaUploadAssetSummary>, RepoError> {
+        let page = filter.page.unwrap_or(1).max(1);
+        let page_size = filter.page_size.unwrap_or(20).clamp(1, 200);
+        let total = self.count_media_upload_assets(&filter).await?;
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            select
+              a.id,
+              a.node_id,
+              n.node_name,
+              a.file_name,
+              a.source_url,
+              a.http_url,
+              a.duration_sec,
+              a.file_size,
+              a.sha256,
+              a.content_type,
+              a.status,
+              a.file_deleted,
+              a.created_by,
+              a.created_at,
+              a.deleted_by,
+              a.deleted_at
+            from media_upload_assets a
+            join media_nodes n on n.id = a.node_id
+            where 1 = 1
+            "#,
+        );
+        apply_media_upload_asset_filters(&mut builder, &filter);
+        builder.push(" order by a.created_at desc, a.id desc limit ");
+        builder.push_bind(i64::from(page_size));
+        builder.push(" offset ");
+        builder.push_bind(i64::from((page - 1) * page_size));
+
+        let rows = builder
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|row| MediaUploadAssetSummary::from_row(&row))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Page::new(rows, page, page_size, total))
+    }
+
+    pub async fn get_media_upload_asset(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<MediaUploadAssetSummary>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              a.id,
+              a.node_id,
+              n.node_name,
+              a.file_name,
+              a.source_url,
+              a.http_url,
+              a.duration_sec,
+              a.file_size,
+              a.sha256,
+              a.content_type,
+              a.status,
+              a.file_deleted,
+              a.created_by,
+              a.created_at,
+              a.deleted_by,
+              a.deleted_at
+            from media_upload_assets a
+            join media_nodes n on n.id = a.node_id
+            where a.id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| MediaUploadAssetSummary::from_row(&row))
+        .transpose()
+    }
+
+    pub async fn get_media_upload_asset_delete_target(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<MediaUploadAssetDeleteTarget>, RepoError> {
+        sqlx::query(
+            r#"
+            select
+              a.node_id,
+              a.source_url,
+              a.file_deleted,
+              n.agent_http_base_url
+            from media_upload_assets a
+            join media_nodes n on n.id = a.node_id
+            where a.id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|row| {
+            Ok(MediaUploadAssetDeleteTarget {
+                node_id: row.try_get("node_id")?,
+                source_url: row.try_get("source_url")?,
+                file_deleted: row.try_get("file_deleted")?,
+                agent_http_base_url: row.try_get("agent_http_base_url")?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn mark_media_upload_asset_deleted(
+        &self,
+        id: Uuid,
+        file_deleted: bool,
+        deleted_by: &str,
+    ) -> Result<MediaUploadAssetSummary, RepoError> {
+        let result = sqlx::query(
+            r#"
+            update media_upload_assets
+               set status = 'deleted',
+                   file_deleted = file_deleted or $2,
+                   deleted_by = nullif($3, ''),
+                   deleted_at = coalesce(deleted_at, now())
+             where id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(file_deleted)
+        .bind(deleted_by)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepoError::MediaUploadAssetNotFound(id));
+        }
+
+        self.get_media_upload_asset(id)
+            .await?
+            .ok_or(RepoError::MediaUploadAssetNotFound(id))
+    }
+
     pub async fn list_task_file_artifacts(
         &self,
         task_id: Uuid,
@@ -1300,6 +1479,7 @@ impl TaskRepository {
               n.labels,
               n.zlm_api_base,
               n.agent_stream_addr,
+              n.agent_http_base_url,
               n.zlm_rtmp_port,
               n.zlm_rtsp_port,
               n.network_mode,
@@ -1345,6 +1525,9 @@ impl TaskRepository {
               cpu_percent,
               mem_percent,
               disk_percent,
+              upload_disk_total_bytes,
+              upload_disk_available_bytes,
+              upload_disk_used_percent,
               running_tasks,
               starting_tasks,
               stopping_tasks,
@@ -3258,13 +3441,13 @@ impl TaskRepository {
             r#"
             insert into media_nodes (
               id, node_name, hostname, labels, zlm_api_base, zlm_api_secret, agent_stream_addr,
-              zlm_rtmp_port, zlm_rtsp_port,
+              agent_http_base_url, zlm_rtmp_port, zlm_rtsp_port,
               output_mount_relative_prefix_mp4, output_mount_relative_prefix_hls,
               network_mode, interfaces, healthy, control_connected, last_seen_at,
               control_last_seen_at, created_at, updated_at
             ) values (
               $1, $2, $3, $4, $5, $6, $7,
-              $8, $9, $10, $11, $12, $13, true, true, $14, $14, $15, $15
+              $8, $9, $10, $11, $12, $13, $14, true, true, $15, $15, $16, $16
             )
             on conflict (id) do update
                set node_name = excluded.node_name,
@@ -3273,6 +3456,7 @@ impl TaskRepository {
                    zlm_api_base = excluded.zlm_api_base,
                    zlm_api_secret = excluded.zlm_api_secret,
                    agent_stream_addr = excluded.agent_stream_addr,
+                   agent_http_base_url = excluded.agent_http_base_url,
                    zlm_rtmp_port = excluded.zlm_rtmp_port,
                    zlm_rtsp_port = excluded.zlm_rtsp_port,
                    output_mount_relative_prefix_mp4 =
@@ -3295,6 +3479,7 @@ impl TaskRepository {
         .bind(&registration.zlm_api_base)
         .bind(&registration.zlm_api_secret)
         .bind(&registration.agent_stream_addr)
+        .bind(&registration.agent_http_base_url)
         .bind(i32::from(registration.zlm_rtmp_port))
         .bind(i32::from(registration.zlm_rtsp_port))
         .bind(&registration.output_mount_relative_prefix_mp4)
@@ -3361,12 +3546,14 @@ impl TaskRepository {
             r#"
             insert into node_heartbeats (
               id, node_id, cpu_percent, mem_percent, disk_percent, running_tasks,
+              upload_disk_total_bytes, upload_disk_available_bytes, upload_disk_used_percent,
               starting_tasks, stopping_tasks, orphaned_tasks,
               slot_usage, zlm_alive, ffmpeg_alive, gpu_runtime, node_time, received_at
             ) values (
               $1, $2, $3, $4, $5, $6,
               $7, $8, $9,
-              $10, $11, $12, $13, $14, $15
+              $10, $11, $12,
+              $13, $14, $15, $16, $17, $18
             )
             "#,
         )
@@ -3376,6 +3563,9 @@ impl TaskRepository {
         .bind(heartbeat.mem_percent)
         .bind(heartbeat.disk_percent)
         .bind(i32::try_from(heartbeat.running_tasks).unwrap_or(i32::MAX))
+        .bind(i64::try_from(heartbeat.upload_disk_total_bytes).unwrap_or(i64::MAX))
+        .bind(i64::try_from(heartbeat.upload_disk_available_bytes).unwrap_or(i64::MAX))
+        .bind(heartbeat.upload_disk_used_percent)
         .bind(i32::try_from(heartbeat.starting_tasks).unwrap_or(i32::MAX))
         .bind(i32::try_from(heartbeat.stopping_tasks).unwrap_or(i32::MAX))
         .bind(i32::try_from(heartbeat.orphaned_tasks).unwrap_or(i32::MAX))
@@ -4947,6 +5137,20 @@ impl TaskRepository {
         Ok(total as u64)
     }
 
+    async fn count_media_upload_assets(
+        &self,
+        filter: &MediaUploadAssetListFilter,
+    ) -> Result<u64, RepoError> {
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "select count(*) as total from media_upload_assets a join media_nodes n on n.id = a.node_id where 1 = 1",
+        );
+        apply_media_upload_asset_filters(&mut builder, filter);
+
+        let row = builder.build().fetch_one(&self.pool).await?;
+        let total: i64 = row.try_get("total")?;
+        Ok(total as u64)
+    }
+
     fn apply_filters<'a>(
         &self,
         builder: &mut QueryBuilder<'a, Postgres>,
@@ -6481,6 +6685,90 @@ impl FileArtifactSummary {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct NewMediaUploadAsset {
+    pub id: Uuid,
+    pub node_id: Uuid,
+    pub file_name: String,
+    pub source_url: String,
+    pub http_url: String,
+    pub duration_sec: i64,
+    pub file_size: i64,
+    pub sha256: String,
+    pub content_type: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MediaUploadAssetListFilter {
+    #[serde(default)]
+    pub node_id: Option<Uuid>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub date_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub date_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MediaUploadAssetSummary {
+    pub id: Uuid,
+    pub node_id: Uuid,
+    pub node_name: String,
+    pub file_name: String,
+    pub source_url: String,
+    pub http_url: String,
+    pub duration_sec: i64,
+    pub file_size: i64,
+    pub sha256: String,
+    pub content_type: String,
+    pub status: String,
+    pub file_deleted: bool,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub deleted_by: Option<String>,
+    pub deleted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaUploadAssetDeleteTarget {
+    pub node_id: Uuid,
+    pub source_url: String,
+    pub file_deleted: bool,
+    pub agent_http_base_url: String,
+}
+
+impl MediaUploadAssetSummary {
+    fn from_row(row: &PgRow) -> Result<Self, RepoError> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            node_id: row.try_get("node_id")?,
+            node_name: row.try_get("node_name")?,
+            file_name: row.try_get("file_name")?,
+            source_url: row.try_get("source_url")?,
+            http_url: row.try_get("http_url")?,
+            duration_sec: row.try_get("duration_sec")?,
+            file_size: row.try_get("file_size")?,
+            sha256: row.try_get("sha256")?,
+            content_type: row.try_get("content_type")?,
+            status: row.try_get("status")?,
+            file_deleted: row.try_get("file_deleted")?,
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+            deleted_by: row.try_get("deleted_by")?,
+            deleted_at: row.try_get("deleted_at")?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeSummary {
     pub id: Uuid,
@@ -6489,6 +6777,7 @@ pub struct NodeSummary {
     pub labels: Vec<String>,
     pub zlm_api_base: String,
     pub agent_stream_addr: String,
+    pub agent_http_base_url: String,
     pub zlm_rtmp_port: u16,
     pub zlm_rtsp_port: u16,
     pub network_mode: String,
@@ -6529,6 +6818,12 @@ pub struct NodeSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_percent: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_disk_total_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_disk_available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_disk_used_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub zlm_alive: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ffmpeg_alive: Option<bool>,
@@ -6553,6 +6848,7 @@ impl NodeSummary {
             labels: serde_json::from_value(row.try_get("labels")?)?,
             zlm_api_base: row.try_get("zlm_api_base")?,
             agent_stream_addr: row.try_get("agent_stream_addr")?,
+            agent_http_base_url: row.try_get("agent_http_base_url")?,
             zlm_rtmp_port,
             zlm_rtsp_port,
             network_mode: row.try_get("network_mode")?,
@@ -6611,6 +6907,9 @@ impl NodeSummary {
             cpu_percent: None,
             mem_percent: None,
             disk_percent: None,
+            upload_disk_total_bytes: None,
+            upload_disk_available_bytes: None,
+            upload_disk_used_percent: None,
             zlm_alive: None,
             ffmpeg_alive: None,
             gpu_runtime: None,
@@ -6624,6 +6923,9 @@ pub struct NodeHeartbeatSummary {
     pub cpu_percent: f64,
     pub mem_percent: f64,
     pub disk_percent: f64,
+    pub upload_disk_total_bytes: u64,
+    pub upload_disk_available_bytes: u64,
+    pub upload_disk_used_percent: f64,
     pub running_tasks: u32,
     pub starting_tasks: u32,
     pub stopping_tasks: u32,
@@ -6644,6 +6946,15 @@ impl NodeHeartbeatSummary {
             cpu_percent: row.try_get("cpu_percent")?,
             mem_percent: row.try_get("mem_percent")?,
             disk_percent: row.try_get("disk_percent")?,
+            upload_disk_total_bytes: u64::try_from(
+                row.try_get::<i64, _>("upload_disk_total_bytes")?,
+            )
+            .unwrap_or_default(),
+            upload_disk_available_bytes: u64::try_from(
+                row.try_get::<i64, _>("upload_disk_available_bytes")?,
+            )
+            .unwrap_or_default(),
+            upload_disk_used_percent: row.try_get("upload_disk_used_percent")?,
             running_tasks: u32::try_from(running_tasks).unwrap_or_default(),
             starting_tasks: u32::try_from(row.try_get::<i32, _>("starting_tasks")?)
                 .unwrap_or_default(),
@@ -6814,6 +7125,43 @@ fn apply_file_artifact_filters<'a>(
     }
     if let Some(date_to) = filter.date_to {
         builder.push(" and ta.created_at <= ");
+        builder.push_bind(date_to);
+    }
+}
+
+fn apply_media_upload_asset_filters<'a>(
+    builder: &mut QueryBuilder<'a, Postgres>,
+    filter: &'a MediaUploadAssetListFilter,
+) {
+    if let Some(node_id) = filter.node_id {
+        builder.push(" and a.node_id = ");
+        builder.push_bind(node_id);
+    }
+    let status = filter.status.as_deref().map(str::trim).unwrap_or("active");
+    if !status.is_empty() && status != "all" {
+        builder.push(" and a.status = ");
+        builder.push_bind(status);
+    }
+    if let Some(keyword) = filter
+        .keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        builder.push(" and (a.file_name ilike ");
+        builder.push_bind(format!("%{keyword}%"));
+        builder.push(" or a.source_url ilike ");
+        builder.push_bind(format!("%{keyword}%"));
+        builder.push(" or a.sha256 ilike ");
+        builder.push_bind(format!("%{keyword}%"));
+        builder.push(")");
+    }
+    if let Some(date_from) = filter.date_from {
+        builder.push(" and a.created_at >= ");
+        builder.push_bind(date_from);
+    }
+    if let Some(date_to) = filter.date_to {
+        builder.push(" and a.created_at <= ");
         builder.push_bind(date_to);
     }
 }
@@ -8065,6 +8413,8 @@ pub enum RepoError {
     AuthUserNotFound(String),
     #[error("node {0} was not found")]
     NodeNotFound(Uuid),
+    #[error("media upload asset {0} was not found")]
+    MediaUploadAssetNotFound(Uuid),
     #[error("task {0} is missing resolved_spec")]
     TaskMissingResolvedSpec(Uuid),
     #[error("task is not dispatchable from status {0}")]

@@ -87,6 +87,12 @@ impl IntoResponse for AppError {
                     format!("task {task_id} was not found"),
                     Value::Null,
                 ),
+                RepoError::MediaUploadAssetNotFound(asset_id) => (
+                    StatusCode::NOT_FOUND,
+                    "MEDIA_UPLOAD_ASSET_NOT_FOUND",
+                    format!("media upload asset {asset_id} was not found"),
+                    Value::Null,
+                ),
                 RepoError::TaskMissingResolvedSpec(task_id) => (
                     StatusCode::CONFLICT,
                     "TASK_MISSING_RESOLVED_SPEC",

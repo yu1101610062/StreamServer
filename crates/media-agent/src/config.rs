@@ -90,6 +90,14 @@ pub struct AgentSettings {
     pub max_runtime_slots: u32,
     #[serde(default = "default_work_root")]
     pub work_root: String,
+    #[serde(default = "default_upload_max_bytes")]
+    pub upload_max_bytes: u64,
+    #[serde(default = "default_upload_allowed_extensions")]
+    pub upload_allowed_extensions: Vec<String>,
+    #[serde(default = "default_upload_probe_timeout_sec")]
+    pub upload_probe_timeout_sec: u64,
+    #[serde(default)]
+    pub public_media_base_url: String,
     #[serde(default = "default_acceleration_mode")]
     pub acceleration_mode: String,
     #[serde(default)]
@@ -139,6 +147,10 @@ impl Default for AgentSettings {
             labels: Vec::new(),
             max_runtime_slots: default_max_runtime_slots(),
             work_root: default_work_root(),
+            upload_max_bytes: default_upload_max_bytes(),
+            upload_allowed_extensions: default_upload_allowed_extensions(),
+            upload_probe_timeout_sec: default_upload_probe_timeout_sec(),
+            public_media_base_url: String::new(),
             acceleration_mode: default_acceleration_mode(),
             artifact_cleanup: AgentArtifactCleanupSettings::default(),
         }
@@ -238,6 +250,28 @@ impl Settings {
         anyhow::ensure!(
             !self.agent.work_root.trim().is_empty(),
             "WORK_ROOT must not be empty"
+        );
+        anyhow::ensure!(
+            self.agent.upload_max_bytes > 0,
+            "UPLOAD_MAX_BYTES must be greater than 0"
+        );
+        anyhow::ensure!(
+            !self.agent.upload_allowed_extensions.is_empty(),
+            "UPLOAD_ALLOWED_EXTENSIONS must not be empty"
+        );
+        anyhow::ensure!(
+            self.agent
+                .upload_allowed_extensions
+                .iter()
+                .all(|value| !value.trim().is_empty()
+                    && !value.contains('/')
+                    && !value.contains('\\')
+                    && !value.contains('.')),
+            "UPLOAD_ALLOWED_EXTENSIONS entries must be bare extensions"
+        );
+        anyhow::ensure!(
+            self.agent.upload_probe_timeout_sec > 0,
+            "UPLOAD_PROBE_TIMEOUT_SEC must be greater than 0"
         );
         anyhow::ensure!(
             matches!(self.agent.acceleration_mode.trim(), "cpu" | "gpu"),
@@ -357,6 +391,24 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("WORK_ROOT") {
         settings.agent.work_root = value;
     }
+    if let Some(value) = env("UPLOAD_MAX_BYTES") {
+        settings.agent.upload_max_bytes =
+            value.parse().expect("UPLOAD_MAX_BYTES must be an integer");
+    }
+    if let Some(value) = env("UPLOAD_ALLOWED_EXTENSIONS") {
+        settings.agent.upload_allowed_extensions = split_csv(&value)
+            .into_iter()
+            .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+    }
+    if let Some(value) = env("UPLOAD_PROBE_TIMEOUT_SEC") {
+        settings.agent.upload_probe_timeout_sec = value
+            .parse()
+            .expect("UPLOAD_PROBE_TIMEOUT_SEC must be an integer");
+    }
+    if let Some(value) = env("PUBLIC_MEDIA_BASE_URL") {
+        settings.agent.public_media_base_url = value;
+    }
     if let Some(value) = env("AGENT_ACCELERATION_MODE") {
         settings.agent.acceleration_mode = value;
     }
@@ -467,6 +519,23 @@ fn default_max_runtime_slots() -> u32 {
 
 fn default_work_root() -> String {
     "/data/media/work".to_string()
+}
+
+fn default_upload_max_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
+}
+
+fn default_upload_allowed_extensions() -> Vec<String> {
+    [
+        "mp4", "mov", "m4v", "mkv", "webm", "ts", "m2ts", "mts", "flv",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn default_upload_probe_timeout_sec() -> u64 {
+    30
 }
 
 fn default_acceleration_mode() -> String {

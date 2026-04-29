@@ -34,6 +34,7 @@ pub(crate) fn router() -> Router<AppState> {
         .route("/multicast", get(shell))
         .route("/records", get(shell))
         .route("/file-artifacts", get(shell))
+        .route("/media-upload", get(shell))
         .route("/security", get(shell))
         .route("/nodes", get(shell))
         .route("/debug", get(shell))

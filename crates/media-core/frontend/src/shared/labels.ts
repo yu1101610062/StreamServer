@@ -12,6 +12,7 @@ export const NAV_ITEMS: Array<{ path: string; label: string; note: string; permi
   { path: "/multicast", label: "组播中心", note: "组播任务、网卡、TTL、上下游", permission: "task_read" },
   { path: "/records", label: "录像中心", note: "录像索引、日期检索、路径复制", permission: "record_read" },
   { path: "/file-artifacts", label: "文件产物", note: "桥接输出、转码输出与快录文件的 HTTP 地址、文件路径", permission: "record_read" },
+  { path: "/media-upload", label: "媒资上传", note: "上传点播文件，生成 file 输入路径", permission: "task_write" },
   { path: "/security", label: "安全设置", note: "修改密码、维护机器 API 白名单", permission: "security_write" },
   { path: "/debug", label: "调试台", note: "ZLM 原始调试、会话、踢人、关流", permission: "debug_read" },
 ];

@@ -33,6 +33,10 @@ fn test_settings(work_root: &str) -> AgentSettings {
         labels: Vec::new(),
         max_runtime_slots: 2,
         work_root: work_root.to_string(),
+        upload_max_bytes: 1024 * 1024 * 1024,
+        upload_allowed_extensions: vec!["mp4".to_string()],
+        upload_probe_timeout_sec: 30,
+        public_media_base_url: String::new(),
         artifact_cleanup: crate::config::AgentArtifactCleanupSettings::default(),
     }
 }

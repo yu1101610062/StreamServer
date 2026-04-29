@@ -125,6 +125,7 @@
 
 - `input.kind` 表示任务直接接收的输入源类型。
 - `input.kind=file` 时，`input.url` 必须填写相对 `/data/media/work` 的文件路径；如果误写成 `/demo.mp4`，系统会自动按 `demo.mp4` 处理。
+- 手动上传生成的文件路径固定为 `uploads/<node_id>/YYYY/MM/DD/<upload_id>.<ext>`；Core 下发任务时会解析其中的 `<node_id>` 并强制调度到该 Agent，避免上层额外维护“文件在哪个节点”的映射表。
 - `input.kind=ftp` 时，`input.url` 必须填写 `ftp://` 地址；当前不支持 `ftps://`。
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；`ftp` 固定为 `vod`，其他输入类型按规则自动推断。
 - `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时关闭全部播放协议并启用录制，任务会进入快录分支，此时必须填写 `record.duration_sec` 作为快录终点。
@@ -195,6 +196,80 @@
 
 - `201 CREATED`
 - 响应体为完整 Task 摘要
+
+### 3.1.1 `POST /uploads/media`
+
+手动媒资上传入口。北向调用 Core 的 `/api/v1/uploads/media`，Core 完成业务鉴权与上传节点选择后，将 multipart 请求转发到目标 Agent；最终文件接收、落盘、SHA-256 计算与 `ffprobe` 时长探测均由 Agent 执行。时长探测为尽力而为：Agent 会使用较大的 `probesize/analyzeduration` 提升 TS/PPS 异常类文件的识别概率，探测失败不阻断上传。
+
+请求：
+
+- `Content-Type: multipart/form-data`
+- 可选查询参数：
+  - `node_id`：指定上传落盘节点 UUID。
+  - `required_labels`：指定上传节点必须具备的标签，多个标签用英文逗号分隔。
+- 字段：
+  - `file`：必填，单个视频文件。
+
+节点与路径规则：
+
+- Agent 使用 `agent.work_root` 作为根目录，默认 `/data/media/work`。
+- 相对路径固定为 `uploads/<node_id>/YYYY/MM/DD/<upload_id>.<ext>`，其中 `<node_id>` 为最终落盘 Agent 的节点 UUID。
+- 真实路径为 `<work_root>/<relative path>`。
+- 返回的 `sourceUrl` 用于后续任务 `input.kind=file`；返回的 `httpUrl` 用于页面预览、下载与排查。
+- Core 会将上传结果写入 `media_upload_assets` 台账；后续任务仍依赖 `sourceUrl` 中的 `<node_id>` 做节点亲和调度。
+- Core 代理上传到 Agent HTTP 接口时使用节点注册上报的 `agent_http_base_url` 生成目标地址；该地址由 Agent 根据 `AGENT_STREAM_ADDR` 的 scheme/host 与 `AGENT_HTTP_ADDR` 的端口自动生成，不需要额外配置上传地址模板。
+- 自动选择节点时先过滤健康、在线、标签匹配、上传盘空间满足请求大小的节点，再按 `upload_disk_available_bytes` 从大到小排序。
+
+响应示例：
+
+```json
+{
+  "id": "019d77d3-a942-7c91-8e82-ff963ccf1222",
+  "fileName": "origin.mp4",
+  "sourceUrl": "uploads/019d77d3-a942-7c91-8e82-ff963ccf1222/2026/04/29/019d77d3-a942-7c91-8e82-ff963ccf1223.mp4",
+  "httpUrl": "http://agent.example/media/uploads/019d77d3-a942-7c91-8e82-ff963ccf1222/2026/04/29/019d77d3-a942-7c91-8e82-ff963ccf1223.mp4",
+  "durationSec": 123,
+  "fileSize": 123456789,
+  "sha256": "hex",
+  "contentType": "video/mp4",
+  "createdAt": 1777392000000
+}
+```
+
+失败规则：
+
+- 未带文件、空文件、超过大小、非法扩展名、落盘失败返回错误。
+- Agent 使用临时文件写入，完整写入后原子重命名到目标路径；写入/提交失败时清理临时文件。
+- `ffprobe` 探测失败或超时时不删除目标文件、不返回上传失败；响应中 `durationSec` 使用默认值 `0`，并记录 Agent 告警日志。
+
+### 3.1.2 `GET /uploads/media`
+
+查询 Core 上传产物台账，供控制台任务创建时选择 `input.kind=file` 的输入文件。
+
+查询参数：
+
+- `status`：默认 `active`，可选 `active`、`deleted`、`all`。
+- `node_id`：按落盘节点过滤。
+- `keyword`：按文件名、`sourceUrl` 或 SHA-256 模糊查询。
+- `page` / `page_size`：分页参数。
+
+响应为分页列表，字段包含 `id`、`node_id`、`node_name`、`file_name`、`source_url`、`http_url`、`duration_sec`、`file_size`、`sha256`、`content_type`、`status`、`file_deleted`、`created_at`、`deleted_at`。
+
+### 3.1.3 `GET /uploads/media/{id}`
+
+查询单个上传产物台账记录。
+
+### 3.1.4 `DELETE /uploads/media/{id}`
+
+删除上传产物台账。查询参数 `delete_file=false` 时仅删除台账；`delete_file=true` 时 Core 会请求落盘 Agent 同步删除底层文件后再标记台账删除。同步删除底层文件可能影响外部业务系统、历史任务和已复制的预览地址。
+
+### 3.1.5 `GET /media/{*path}`
+
+Agent 只读静态文件访问入口，用于预览、下载与排查。
+
+- 仅允许访问 `agent.work_root` 下文件。
+- 拒绝空路径、绝对路径、`..`、符号链接逃逸。
+- 返回 `Content-Type`、`Content-Length`，以流式响应大文件。
 
 `stream_ingest` 中的 `gb_rtp` 请求约束：
 

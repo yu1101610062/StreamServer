@@ -30,6 +30,12 @@ export interface RequestOptions {
   skipAuth?: boolean;
 }
 
+export interface UploadRequestOptions {
+  headers?: HeadersInit;
+  onProgress?: (progress: { loaded: number; total: number | null; percent: number | null }) => void;
+  skipAuth?: boolean;
+}
+
 export async function apiRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const headers = new Headers(options.headers ?? {});
   if (!options.skipAuth && accessToken.value) {
@@ -68,6 +74,69 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   }
 
   return payload as T;
+}
+
+export function uploadFormData<T>(
+  path: string,
+  form: FormData,
+  options: UploadRequestOptions = {},
+): Promise<T> {
+  const headers = new Headers(options.headers ?? {});
+  if (!options.skipAuth && accessToken.value) {
+    headers.set("Authorization", `Bearer ${accessToken.value}`);
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", path);
+    headers.forEach((value, key) => {
+      request.setRequestHeader(key, value);
+    });
+    request.responseType = "text";
+
+    request.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        options.onProgress?.({
+          loaded: event.loaded,
+          total: event.total,
+          percent: Math.min(100, Math.round((event.loaded / event.total) * 100)),
+        });
+        return;
+      }
+      options.onProgress?.({
+        loaded: event.loaded,
+        total: null,
+        percent: null,
+      });
+    };
+
+    request.onerror = () => reject(new ApiError("网络请求失败", 0));
+    request.ontimeout = () => reject(new ApiError("上传请求超时", 0));
+    request.onabort = () => reject(new ApiError("上传已取消", 0));
+    request.onload = () => {
+      const contentType = request.getResponseHeader("content-type") ?? "";
+      const text = request.responseText ?? "";
+      let payload: unknown = null;
+      try {
+        payload = contentType.includes("application/json") && text ? JSON.parse(text) : text;
+      } catch {
+        payload = text;
+      }
+
+      if (request.status < 200 || request.status >= 300) {
+        const message =
+          typeof payload === "object" && payload && "message" in payload
+            ? String((payload as { message?: unknown }).message ?? `HTTP ${request.status}`)
+            : `HTTP ${request.status}`;
+        reject(new ApiError(message, request.status, (payload as Record<string, unknown>) ?? undefined));
+        return;
+      }
+
+      resolve(payload as T);
+    };
+
+    request.send(form);
+  });
 }
 
 export function readRefreshToken() {

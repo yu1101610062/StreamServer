@@ -49,12 +49,12 @@ impl HeartbeatSampler {
     ) -> HeartbeatSnapshot {
         let cpu_percent = self.sample_cpu_percent().unwrap_or(0.0);
         let mem_percent = sample_mem_percent().unwrap_or(0.0);
+        let upload_disk = sample_disk(&self.work_root).unwrap_or_default();
         let disk_percent = self
             .artifact_cleanup
             .as_ref()
             .and_then(ArtifactCleanupManager::current_disk_percent)
-            .or_else(|| sample_disk_percent(&self.work_root))
-            .unwrap_or(0.0);
+            .unwrap_or(upload_disk.used_percent);
         let artifact_cleanup_block_reason = self
             .artifact_cleanup
             .as_ref()
@@ -75,6 +75,9 @@ impl HeartbeatSampler {
             cpu_percent,
             mem_percent,
             disk_percent,
+            upload_disk_total_bytes: upload_disk.total_bytes,
+            upload_disk_available_bytes: upload_disk.available_bytes,
+            upload_disk_used_percent: upload_disk.used_percent,
             running_tasks,
             starting_tasks,
             stopping_tasks,
@@ -147,7 +150,14 @@ fn sample_mem_percent() -> Option<f64> {
     Some(((total_kb - available_kb) as f64 / total_kb as f64) * 100.0)
 }
 
-fn sample_disk_percent(path: &str) -> Option<f64> {
+#[derive(Debug, Clone, Copy, Default)]
+struct DiskSample {
+    total_bytes: u64,
+    available_bytes: u64,
+    used_percent: f64,
+}
+
+fn sample_disk(path: &str) -> Option<DiskSample> {
     let path = CString::new(path).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     let rc = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
@@ -159,8 +169,12 @@ fn sample_disk_percent(path: &str) -> Option<f64> {
     let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
     let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
     if total == 0 {
-        return Some(0.0);
+        return Some(DiskSample::default());
     }
 
-    Some(((total - free) as f64 / total as f64) * 100.0)
+    Some(DiskSample {
+        total_bytes: total,
+        available_bytes: free,
+        used_percent: ((total - free) as f64 / total as f64) * 100.0,
+    })
 }

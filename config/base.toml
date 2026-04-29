@@ -48,6 +48,10 @@ network_mode = "bridge"
 labels = []
 max_runtime_slots = 0
 work_root = "/data/media/work"
+upload_max_bytes = 10737418240
+upload_allowed_extensions = ["mp4", "mov", "m4v", "mkv", "webm", "ts", "m2ts", "mts", "flv"]
+upload_probe_timeout_sec = 30
+public_media_base_url = ""
 
 [agent.artifact_cleanup]
 enabled = true

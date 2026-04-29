@@ -85,6 +85,9 @@ struct SessionLoad {
     cpu_percent: f64,
     mem_percent: f64,
     disk_percent: f64,
+    upload_disk_total_bytes: u64,
+    upload_disk_available_bytes: u64,
+    upload_disk_used_percent: f64,
     zlm_alive: bool,
     ffmpeg_alive: bool,
     artifact_cleanup_blocked: bool,
@@ -117,6 +120,9 @@ pub struct NodeLiveLoad {
     pub cpu_percent: f64,
     pub mem_percent: f64,
     pub disk_percent: f64,
+    pub upload_disk_total_bytes: u64,
+    pub upload_disk_available_bytes: u64,
+    pub upload_disk_used_percent: f64,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
     pub artifact_cleanup_blocked: bool,
@@ -157,6 +163,7 @@ impl ControlPlaneService {
         let resolved_spec =
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
         let source_affinity_ip = task_source_affinity_ip(&resolved_spec);
+        let uploaded_file_affinity_node = task_uploaded_file_affinity_node(&resolved_spec);
         let execution_preference = task_execution_preference(&resolved_spec);
         let retry_affinity_node = if task_keeps_retry_node_affinity(&resolved_spec) {
             self.repository
@@ -165,7 +172,8 @@ impl ControlPlaneService {
         } else {
             None
         };
-        let claim = if let Some(node_id) = retry_affinity_node {
+        let forced_node = uploaded_file_affinity_node.or(retry_affinity_node);
+        let claim = if let Some(node_id) = forced_node {
             self.claim_session_by_node(
                 node_id,
                 source_affinity_ip,
@@ -747,6 +755,9 @@ impl ControlPlaneService {
             cpu_percent: snapshot.cpu_percent,
             mem_percent: snapshot.mem_percent,
             disk_percent: snapshot.disk_percent,
+            upload_disk_total_bytes: snapshot.upload_disk_total_bytes,
+            upload_disk_available_bytes: snapshot.upload_disk_available_bytes,
+            upload_disk_used_percent: snapshot.upload_disk_used_percent,
             zlm_alive: snapshot.zlm_alive,
             ffmpeg_alive: snapshot.ffmpeg_alive,
             artifact_cleanup_blocked: snapshot.artifact_cleanup_blocked,
@@ -930,6 +941,9 @@ impl ControlPlaneService {
                         cpu_percent: handle.load.cpu_percent,
                         mem_percent: handle.load.mem_percent,
                         disk_percent: handle.load.disk_percent,
+                        upload_disk_total_bytes: handle.load.upload_disk_total_bytes,
+                        upload_disk_available_bytes: handle.load.upload_disk_available_bytes,
+                        upload_disk_used_percent: handle.load.upload_disk_used_percent,
                         zlm_alive: handle.load.zlm_alive,
                         ffmpeg_alive: handle.load.ffmpeg_alive,
                         artifact_cleanup_blocked: handle.load.artifact_cleanup_blocked,
@@ -1012,6 +1026,7 @@ fn registration_from_rpc(register: RpcRegister) -> Result<AgentRegistration, Sta
         zlm_api_base: register.zlm_api_base.trim().to_string(),
         zlm_api_secret: register.zlm_api_secret.trim().to_string(),
         agent_stream_addr: require_field("agent_stream_addr", register.agent_stream_addr)?,
+        agent_http_base_url: register.agent_http_base_url.trim().to_string(),
         zlm_rtmp_port,
         zlm_rtsp_port,
         network_mode,
@@ -1042,6 +1057,9 @@ fn heartbeat_from_rpc(heartbeat: RpcHeartbeat) -> Result<HeartbeatSnapshot, Stat
         cpu_percent: heartbeat.cpu_percent,
         mem_percent: heartbeat.mem_percent,
         disk_percent: heartbeat.disk_percent,
+        upload_disk_total_bytes: heartbeat.upload_disk_total_bytes,
+        upload_disk_available_bytes: heartbeat.upload_disk_available_bytes,
+        upload_disk_used_percent: heartbeat.upload_disk_used_percent,
         running_tasks: heartbeat.running_tasks,
         starting_tasks: heartbeat.starting_tasks,
         stopping_tasks: heartbeat.stopping_tasks,
@@ -1227,6 +1245,13 @@ fn task_source_affinity_ip(spec: &TaskSpec) -> Option<IpAddr> {
             .and_then(parse_url_host_ip_literal),
         _ => None,
     }
+}
+
+fn task_uploaded_file_affinity_node(spec: &TaskSpec) -> Option<Uuid> {
+    if spec.input.kind != Some(InputKind::File) {
+        return None;
+    }
+    crate::upload::uploaded_file_node_id(spec.input.url.as_deref()?)
 }
 
 fn parse_ip_literal(value: &str) -> Option<IpAddr> {

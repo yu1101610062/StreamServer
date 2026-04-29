@@ -242,6 +242,7 @@ async fn upsert_test_node_with_ports(
                 zlm_api_base: zlm_api_base.to_string(),
                 zlm_api_secret: "secret".to_string(),
                 agent_stream_addr: agent_stream_addr.to_string(),
+                agent_http_base_url: "http://127.0.0.1:8081".to_string(),
                 zlm_rtmp_port,
                 zlm_rtsp_port,
                 network_mode: NetworkMode::Bridge,
@@ -751,11 +752,25 @@ async fn ddl_migrations_create_core_schema() -> anyhow::Result<()> {
     )
     .fetch_one(&db.pool)
     .await?;
+    let agent_http_base_url_exists: bool = sqlx::query_scalar(
+        r#"
+        select exists (
+          select 1
+            from information_schema.columns
+           where table_schema = 'public'
+             and table_name = 'media_nodes'
+             and column_name = 'agent_http_base_url'
+        )
+        "#,
+    )
+    .fetch_one(&db.pool)
+    .await?;
 
     assert_eq!(tasks.as_deref(), Some("tasks"));
     assert_eq!(media_nodes.as_deref(), Some("media_nodes"));
     assert!(task_status_type);
     assert!(!node_name_unique_exists);
+    assert!(agent_http_base_url_exists);
 
     db.cleanup().await?;
     Ok(())
@@ -1845,6 +1860,9 @@ async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
                 cpu_percent: 12.5,
                 mem_percent: 48.0,
                 disk_percent: 61.0,
+                upload_disk_total_bytes: 1_000,
+                upload_disk_available_bytes: 390,
+                upload_disk_used_percent: 61.0,
                 running_tasks: 2,
                 starting_tasks: 0,
                 stopping_tasks: 0,
@@ -1866,6 +1884,9 @@ async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
                 cpu_percent: 20.0,
                 mem_percent: 52.0,
                 disk_percent: 63.0,
+                upload_disk_total_bytes: 1_000,
+                upload_disk_available_bytes: 370,
+                upload_disk_used_percent: 63.0,
                 running_tasks: 3,
                 starting_tasks: 0,
                 stopping_tasks: 0,
@@ -1928,6 +1949,9 @@ async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<
                 cpu_percent: 10.0,
                 mem_percent: 20.0,
                 disk_percent: 30.0,
+                upload_disk_total_bytes: 1_000,
+                upload_disk_available_bytes: 700,
+                upload_disk_used_percent: 30.0,
                 running_tasks: 1,
                 starting_tasks: 0,
                 stopping_tasks: 0,

@@ -169,6 +169,37 @@ export interface FileArtifactSummary {
   created_at: string;
 }
 
+export interface MediaUploadAssetSummary {
+  id: string;
+  node_id: string;
+  node_name: string;
+  file_name: string;
+  source_url: string;
+  http_url: string;
+  duration_sec: number;
+  file_size: number;
+  sha256: string;
+  content_type: string;
+  status: "active" | "deleted";
+  file_deleted: boolean;
+  created_by: string;
+  created_at: string;
+  deleted_by?: string | null;
+  deleted_at?: string | null;
+}
+
+export interface UploadMediaResponse {
+  id: string;
+  fileName: string;
+  sourceUrl: string;
+  httpUrl: string;
+  durationSec: number;
+  fileSize: number;
+  sha256: string;
+  contentType: string;
+  createdAt: number;
+}
+
 export interface GpuRuntimeStats {
   name?: string;
   utilization_gpu?: number;
@@ -184,12 +215,17 @@ export interface NodeSummary {
   labels: string[];
   zlm_api_base: string;
   agent_stream_addr: string;
+  agent_http_base_url: string;
   zlm_rtmp_port: number;
   zlm_rtsp_port: number;
   network_mode: string;
   interfaces: string[];
   healthy: boolean;
+  control_connected: boolean;
+  media_alive: boolean;
   last_seen_at?: string | null;
+  control_last_seen_at?: string | null;
+  media_last_seen_at?: string | null;
   created_at: string;
   updated_at: string;
   ffmpeg_protocols: string[];
@@ -203,10 +239,16 @@ export interface NodeSummary {
   capability_captured_at?: string | null;
   slot_usage?: number | null;
   running_tasks?: number | null;
+  starting_tasks?: number | null;
+  stopping_tasks?: number | null;
+  orphaned_tasks?: number | null;
   connected?: boolean | null;
   cpu_percent?: number | null;
   mem_percent?: number | null;
   disk_percent?: number | null;
+  upload_disk_total_bytes?: number | null;
+  upload_disk_available_bytes?: number | null;
+  upload_disk_used_percent?: number | null;
   zlm_alive?: boolean | null;
   ffmpeg_alive?: boolean | null;
 }
@@ -216,6 +258,9 @@ export interface NodeHeartbeatSummary {
   cpu_percent: number;
   mem_percent: number;
   disk_percent: number;
+  upload_disk_total_bytes: number;
+  upload_disk_available_bytes: number;
+  upload_disk_used_percent: number;
   running_tasks: number;
   slot_usage: number;
   zlm_alive: boolean;

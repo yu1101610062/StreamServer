@@ -1,6 +1,7 @@
 import {
   apiRequest,
   type RequestOptions,
+  uploadFormData,
 } from "@/shared/api/client";
 import type {
   AuthTokensResponse,
@@ -9,6 +10,7 @@ import type {
   FileArtifactSummary,
   HookEventSummary,
   MachineAllowlistEntry,
+  MediaUploadAssetSummary,
   NodeHeartbeatSummary,
   NodeSummary,
   PageResult,
@@ -22,6 +24,7 @@ import type {
   TaskPreview,
   TaskSummary,
   UnknownJson,
+  UploadMediaResponse,
 } from "@/shared/api/types";
 
 export function toQuery(params: Record<string, unknown>) {
@@ -143,6 +146,33 @@ export const recordApi = {
 export const artifactApi = {
   list: (params: Record<string, unknown>) =>
     apiRequest<PageResult<FileArtifactSummary>>(`/api/v1/file-artifacts${toQuery(params)}`),
+};
+
+export const mediaUploadApi = {
+  list: (params: Record<string, unknown>) =>
+    apiRequest<PageResult<MediaUploadAssetSummary>>(`/api/v1/uploads/media${toQuery(params)}`),
+  get: (id: string) => apiRequest<MediaUploadAssetSummary>(`/api/v1/uploads/media/${id}`),
+  remove: (id: string, deleteFile: boolean) =>
+    apiRequest<MediaUploadAssetSummary>(
+      `/api/v1/uploads/media/${id}${toQuery({ delete_file: deleteFile })}`,
+      { method: "DELETE" },
+    ),
+  upload: (
+    file: File,
+    params: { nodeId?: string; requiredLabels?: string } = {},
+    options: { onProgress?: (progress: { loaded: number; total: number | null; percent: number | null }) => void } = {},
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    return uploadFormData<UploadMediaResponse>(
+      `/api/v1/uploads/media${toQuery({
+        node_id: params.nodeId,
+        required_labels: params.requiredLabels,
+      })}`,
+      form,
+      { onProgress: options.onProgress },
+    );
+  },
 };
 
 export const nodeApi = {

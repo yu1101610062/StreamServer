@@ -11,6 +11,7 @@ mod repository;
 mod scheduler;
 mod telemetry;
 mod ui;
+mod upload;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -28,7 +29,7 @@ use auth::{
 };
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, FromRequestParts, Path, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
@@ -222,6 +223,16 @@ pub(crate) fn build_app(state: AppState) -> Router {
             get(list_machine_allowlist).put(update_machine_allowlist),
         )
         .route("/tasks/preview", post(ui::preview_task))
+        .route(
+            "/uploads/media",
+            post(upload::upload_media)
+                .get(upload::list_media_upload_assets)
+                .layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/uploads/media/{id}",
+            get(upload::get_media_upload_asset).delete(upload::delete_media_upload_asset),
+        )
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", get(get_task).delete(delete_task))
         .route("/tasks/{id}/events", get(get_task_events))
@@ -1361,6 +1372,9 @@ fn apply_live_load(node: &mut repository::NodeSummary, load: Option<NodeLiveLoad
         node.cpu_percent = Some(load.cpu_percent);
         node.mem_percent = Some(load.mem_percent);
         node.disk_percent = Some(load.disk_percent);
+        node.upload_disk_total_bytes = Some(load.upload_disk_total_bytes);
+        node.upload_disk_available_bytes = Some(load.upload_disk_available_bytes);
+        node.upload_disk_used_percent = Some(load.upload_disk_used_percent);
         node.zlm_alive = Some(load.zlm_alive);
         node.ffmpeg_alive = Some(load.ffmpeg_alive);
         node.gpu_runtime = Some(load.gpu_runtime);

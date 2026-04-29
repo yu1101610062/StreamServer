@@ -5,8 +5,8 @@ import { useMutation, useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
 import { activeSession } from "@/shared/api/client";
-import { nodeApi, taskApi } from "@/shared/api/resources";
-import type { TaskPreview } from "@/shared/api/types";
+import { mediaUploadApi, nodeApi, taskApi } from "@/shared/api/resources";
+import type { MediaUploadAssetSummary, TaskPreview } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import {
   buildDraftPayload,
@@ -20,15 +20,14 @@ import {
   normalizeDraftForTaskType,
   optionSets,
 } from "@/shared/task-create";
-import { formatJson, taskValidationMessage } from "@/shared/utils/format";
+import { formatBytes, formatJson, formatTime, taskValidationMessage } from "@/shared/utils/format";
 
 const router = useRouter();
 const draft = reactive(createDefaultDraft());
 const createMode = ref<"guided" | "expert">("guided");
 const selectedScenario = ref(guidedScenarios[0].id);
 const previewData = ref<TaskPreview | null>(null);
-const managedFileInputRoot = "/data/media/work";
-const managedFileHostPath = "/home/streamserver/data/media/work";
+const selectedUploadAssetId = ref("");
 const currentCreator = computed(() => activeSession.value?.subject?.trim() ?? "");
 
 const nodeFormatsQuery = useQuery({
@@ -36,6 +35,13 @@ const nodeFormatsQuery = useQuery({
   queryFn: () => nodeApi.list(),
   retry: false,
   staleTime: 60_000,
+});
+
+const uploadAssetsQuery = useQuery({
+  queryKey: ["task-create", "upload-assets"],
+  queryFn: () => mediaUploadApi.list({ status: "active", page_size: 100 }),
+  retry: false,
+  staleTime: 30_000,
 });
 
 const previewMutation = useMutation({
@@ -58,7 +64,7 @@ const createMutation = useMutation({
 
 const showExplicitSourceMode = computed(() => inputKindSupportsExplicitSourceMode(draft.input.kind));
 const showInputUrl = computed(() =>
-  ["rtsp", "rtmp", "hls", "ftp", "http_mp4", "http_flv", "http_ts", "file"].includes(draft.input.kind),
+  ["rtsp", "rtmp", "hls", "ftp", "http_mp4", "http_flv", "http_ts"].includes(draft.input.kind),
 );
 const showInputMulticast = computed(() =>
   ["udp_mpegts_multicast", "rtp_multicast"].includes(draft.input.kind),
@@ -98,9 +104,18 @@ const showRecordSection = computed(() => draft.task_type === "stream_ingest");
 const derivedRecordMode = computed(() => deriveStreamIngestRecordMode(draft));
 const previewPayload = computed(() => buildDraftPayload(draft));
 const summaryText = computed(() => humanSummary(draft));
+const activeUploadAssets = computed(() =>
+  (uploadAssetsQuery.data.value?.items ?? []).filter((asset) => asset.status === "active" && !asset.file_deleted),
+);
+const selectedUploadAsset = computed(
+  () =>
+    activeUploadAssets.value.find((asset) => asset.id === selectedUploadAssetId.value) ??
+    activeUploadAssets.value.find((asset) => asset.source_url === draft.input.url) ??
+    null,
+);
 const managedFileInputHint = computed(
   () =>
-    `任务里只填相对 ${managedFileInputRoot} 的路径，例如 demo.mp4 或 vod/demo.ts。文件实际应放到宿主机安装目录下的 data/media/work；当前标准实例路径是 ${managedFileHostPath}。如果误写成 /demo.mp4，系统会自动按 demo.mp4 处理。`,
+    "文件输入使用媒资上传产生的 Source URL。选择产物后会自动填入任务规格，任务调度会按路径中的节点信息保持亲和。",
 );
 const ftpInputHint = computed(
   () =>
@@ -182,6 +197,11 @@ watch(
     if (draft.task_type === "file_transcode") {
       draft.publish.kind = "file";
     }
+    if (kind === "file") {
+      uploadAssetsQuery.refetch();
+    } else {
+      selectedUploadAssetId.value = "";
+    }
   },
 );
 
@@ -248,6 +268,13 @@ function updateTaskType(value: string) {
 
 function updateInputKind(value: string) {
   draft.input.kind = value;
+  previewData.value = null;
+}
+
+function selectUploadAsset(assetId: string) {
+  selectedUploadAssetId.value = assetId;
+  const asset = activeUploadAssets.value.find((item: MediaUploadAssetSummary) => item.id === assetId);
+  draft.input.url = asset?.source_url ?? "";
   previewData.value = null;
 }
 
@@ -396,6 +423,39 @@ function previewTask() {
             </el-form-item>
           </el-col>
         </el-row>
+
+        <el-row v-if="showManagedFileInputHint" :gutter="16">
+          <el-col :span="24">
+            <el-form-item label="上传媒资">
+              <el-select
+                v-model="selectedUploadAssetId"
+                filterable
+                placeholder="选择已上传媒资"
+                style="width: 100%"
+                :loading="uploadAssetsQuery.isFetching.value"
+                @update:model-value="selectUploadAsset"
+              >
+                <el-option
+                  v-for="asset in activeUploadAssets"
+                  :key="asset.id"
+                  :label="`${asset.file_name} · ${asset.node_name} · ${formatBytes(asset.file_size)}`"
+                  :value="asset.id"
+                >
+                  <div class="asset-option">
+                    <span>{{ asset.file_name }}</span>
+                    <span class="subtle">{{ asset.node_name }} · {{ formatBytes(asset.file_size) }} · {{ formatTime(asset.created_at) }}</span>
+                  </div>
+                </el-option>
+              </el-select>
+            </el-form-item>
+          </el-col>
+        </el-row>
+
+        <el-descriptions v-if="selectedUploadAsset" :column="1" border size="small">
+          <el-descriptions-item label="Source URL">{{ selectedUploadAsset.source_url }}</el-descriptions-item>
+          <el-descriptions-item label="HTTP URL">{{ selectedUploadAsset.http_url }}</el-descriptions-item>
+          <el-descriptions-item label="落盘节点">{{ selectedUploadAsset.node_name }}</el-descriptions-item>
+        </el-descriptions>
 
         <el-alert
           v-if="showManagedFileInputHint"
@@ -823,3 +883,11 @@ function previewTask() {
     </div>
   </section>
 </template>
+
+<style scoped>
+.asset-option {
+  display: grid;
+  gap: 2px;
+  line-height: 1.25;
+}
+</style>

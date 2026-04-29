@@ -24,6 +24,12 @@ const routes = [
     component: () => import("@/pages/ArtifactsPage.vue"),
     meta: { permission: "record_read" },
   },
+  {
+    path: "/media-upload",
+    name: "media-upload",
+    component: () => import("@/pages/MediaUploadPage.vue"),
+    meta: { permission: "task_write" },
+  },
   { path: "/security", name: "security", component: () => import("@/pages/SecurityPage.vue"), meta: { permission: "security_write" } },
   { path: "/nodes", redirect: { path: "/overview", query: { focus: "nodes" } } },
   { path: "/debug", name: "debug", component: () => import("@/pages/DebugPage.vue"), meta: { permission: "debug_read" } },

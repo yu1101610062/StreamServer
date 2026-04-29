@@ -5,10 +5,15 @@ mod control_plane;
 mod heartbeat;
 mod runtime;
 mod telemetry;
+mod upload;
 
 use std::path::Path;
 
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, State},
+    routing::{delete, get, post},
+};
 use capability::binary_available;
 use chrono::{DateTime, Utc};
 use control_plane::AgentController;
@@ -16,12 +21,15 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 struct AppState {
     started_at: DateTime<Utc>,
     environment: String,
     readiness: AgentReadiness,
+    node_id: Uuid,
+    upload: upload::UploadConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,13 +58,18 @@ async fn main() -> anyhow::Result<()> {
         "starting media-agent"
     );
 
+    let controller = AgentController::new(settings.clone())?;
+    let node_id = controller.node_id();
+    let upload = upload::UploadConfig::from_settings(&settings.agent)?;
+
     let state = AppState {
         started_at: Utc::now(),
         environment: settings.environment.clone(),
         readiness,
+        node_id,
+        upload,
     };
 
-    let controller = AgentController::new(settings.clone())?;
     tokio::spawn(async move {
         controller.run().await;
     });
@@ -65,6 +78,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/live", get(live_health))
         .route("/health/ready", get(ready_health))
         .route("/health/metadata", get(agent_metadata))
+        .route(
+            "/internal/uploads/media",
+            post(upload::upload_media).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/internal/uploads/media/{*path}",
+            delete(upload::delete_media_file),
+        )
+        .route("/media/{*path}", get(upload::serve_media_file))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

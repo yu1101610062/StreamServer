@@ -103,6 +103,10 @@ impl AgentController {
         })
     }
 
+    pub fn node_id(&self) -> Uuid {
+        self.node_id
+    }
+
     pub async fn run(self) {
         self.artifact_cleanup.refresh_now().await;
         self.artifact_cleanup.start_background();
@@ -249,6 +253,9 @@ impl AgentController {
                         cpu_percent: snapshot.cpu_percent,
                         mem_percent: snapshot.mem_percent,
                         disk_percent: snapshot.disk_percent,
+                        upload_disk_total_bytes: snapshot.upload_disk_total_bytes,
+                        upload_disk_available_bytes: snapshot.upload_disk_available_bytes,
+                        upload_disk_used_percent: snapshot.upload_disk_used_percent,
                         running_tasks: snapshot.running_tasks,
                         starting_tasks: snapshot.starting_tasks,
                         stopping_tasks: snapshot.stopping_tasks,
@@ -704,6 +711,10 @@ impl AgentController {
             &self.settings.agent.output_mount_relative_prefix_hls,
         )
         .map_err(|error| anyhow::anyhow!("invalid OUTPUT_MOUNT_RELATIVE_PREFIX_HLS: {error}"))?;
+        let agent_http_base_url = build_agent_http_base_url(
+            &self.settings.agent.agent_stream_addr,
+            &self.settings.agent.http_addr,
+        )?;
 
         Ok(AgentRegistration {
             node_id: self.node_id,
@@ -715,6 +726,7 @@ impl AgentController {
             zlm_api_base: self.settings.agent.zlm_api_base.clone(),
             zlm_api_secret: self.settings.agent.zlm_api_secret.clone(),
             agent_stream_addr: self.settings.agent.agent_stream_addr.clone(),
+            agent_http_base_url,
             zlm_rtmp_port: self.settings.agent.zlm_rtmp_port,
             zlm_rtsp_port: self.settings.agent.zlm_rtsp_port,
             network_mode,
@@ -952,6 +964,7 @@ fn registration_to_rpc(registration: &AgentRegistration) -> RpcRegister {
         zlm_api_base: registration.zlm_api_base.clone(),
         zlm_api_secret: registration.zlm_api_secret.clone(),
         agent_stream_addr: registration.agent_stream_addr.clone(),
+        agent_http_base_url: registration.agent_http_base_url.clone(),
         zlm_rtmp_port: u32::from(registration.zlm_rtmp_port),
         zlm_rtsp_port: u32::from(registration.zlm_rtsp_port),
         network_mode: registration.network_mode.as_str().to_string(),
@@ -1031,6 +1044,41 @@ fn parse_json_field(value: &str) -> anyhow::Result<Value> {
 fn non_empty(value: String) -> Option<String> {
     let value = value.trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+fn build_agent_http_base_url(agent_stream_addr: &str, http_addr: &str) -> anyhow::Result<String> {
+    let stream_url = reqwest::Url::parse(agent_stream_addr.trim())
+        .with_context(|| format!("invalid AGENT_STREAM_ADDR: {agent_stream_addr}"))?;
+    let scheme = stream_url.scheme();
+    let host = stream_url
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("AGENT_STREAM_ADDR host missing"))?;
+    let port = parse_http_addr_port(http_addr)?;
+    let url = reqwest::Url::parse(&format!("{scheme}://{host}:{port}"))
+        .with_context(|| format!("build agent http base url from {agent_stream_addr}"))?;
+    Ok(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn parse_http_addr_port(http_addr: &str) -> anyhow::Result<u16> {
+    let trimmed = http_addr.trim();
+    if let Ok(addr) = trimmed.parse::<std::net::SocketAddr>() {
+        return Ok(addr.port());
+    }
+
+    let port = if let Some(close_bracket) = trimmed.rfind(']') {
+        trimmed
+            .get(close_bracket + 1..)
+            .and_then(|suffix| suffix.strip_prefix(':'))
+    } else {
+        trimmed.rsplit_once(':').map(|(_, port)| port)
+    }
+    .ok_or_else(|| anyhow::anyhow!("AGENT_HTTP_ADDR must include a port: {http_addr}"))?;
+
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("invalid AGENT_HTTP_ADDR port: {http_addr}"))?;
+    anyhow::ensure!(port > 0, "AGENT_HTTP_ADDR port must be greater than 0");
+    Ok(port)
 }
 
 fn build_endpoint(settings: &crate::config::AgentSettings) -> anyhow::Result<Endpoint> {
@@ -1145,4 +1193,30 @@ async fn recv_runtime_log_batch(
 ) -> Option<RuntimeTaskLogBatch> {
     let mut receiver = receiver.lock().await;
     receiver.recv().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_agent_http_base_url, parse_http_addr_port};
+
+    #[test]
+    fn agent_http_base_url_uses_stream_host_and_http_addr_port() {
+        let base = build_agent_http_base_url("http://172.17.13.196:80", "0.0.0.0:18081")
+            .expect("base url should build");
+
+        assert_eq!(base, "http://172.17.13.196:18081");
+    }
+
+    #[test]
+    fn agent_http_base_url_supports_ipv6_stream_hosts() {
+        let base = build_agent_http_base_url("http://[2001:db8::1]:80", "[::]:8081")
+            .expect("base url should build");
+
+        assert_eq!(base, "http://[2001:db8::1]:8081");
+    }
+
+    #[test]
+    fn parse_http_addr_port_rejects_missing_port() {
+        assert!(parse_http_addr_port("0.0.0.0").is_err());
+    }
 }

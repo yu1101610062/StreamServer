@@ -868,6 +868,10 @@ AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT
 AGENT_ARTIFACT_CLEANUP_STRATEGY
 AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC
 WORK_ROOT
+UPLOAD_MAX_BYTES
+UPLOAD_ALLOWED_EXTENSIONS
+UPLOAD_PROBE_TIMEOUT_SEC
+PUBLIC_MEDIA_BASE_URL
 EOF
 }
 
@@ -1764,6 +1768,25 @@ validate_hls_record_segment_config() {
   esac
 }
 
+validate_upload_config() {
+  local extension
+  local -a upload_extensions
+
+  validate_positive_integer "UPLOAD_MAX_BYTES" "${UPLOAD_MAX_BYTES}"
+  validate_positive_integer "UPLOAD_PROBE_TIMEOUT_SEC" "${UPLOAD_PROBE_TIMEOUT_SEC}"
+  [ -n "${UPLOAD_ALLOWED_EXTENSIONS}" ] || fail "UPLOAD_ALLOWED_EXTENSIONS 不能为空"
+
+  IFS=',' read -r -a upload_extensions <<<"${UPLOAD_ALLOWED_EXTENSIONS}"
+  for extension in "${upload_extensions[@]}"; do
+    extension="$(printf '%s' "${extension}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^\\.//')"
+    case "${extension}" in
+      ''|*/*|*\\*|*.*)
+        fail "UPLOAD_ALLOWED_EXTENSIONS 只能包含不带点号的文件扩展名"
+        ;;
+    esac
+  done
+}
+
 configure_output_storage_defaults() {
   local existing_env_file="$1"
   local install_dir
@@ -1915,6 +1938,10 @@ write_worker_host_env() {
   write_env_entry "${env_file}" "产物清理策略，可选 delete_oldest_then_reject/reject_only。" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "${AGENT_ARTIFACT_CLEANUP_STRATEGY}"
   write_env_entry "${env_file}" "产物清理检查周期，单位秒。" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC}"
   write_env_entry "${env_file}" "工作节点工作目录。" "WORK_ROOT" "${WORK_ROOT}"
+  write_env_entry "${env_file}" "手动上传单文件最大字节数。" "UPLOAD_MAX_BYTES" "${UPLOAD_MAX_BYTES}"
+  write_env_entry "${env_file}" "允许手动上传的视频扩展名，多个值用逗号分隔。" "UPLOAD_ALLOWED_EXTENSIONS" "${UPLOAD_ALLOWED_EXTENSIONS}"
+  write_env_entry "${env_file}" "手动上传后 ffprobe 探测超时，单位秒。" "UPLOAD_PROBE_TIMEOUT_SEC" "${UPLOAD_PROBE_TIMEOUT_SEC}"
+  write_env_entry "${env_file}" "上传文件对外访问基址，留空时使用请求 Host 生成。" "PUBLIC_MEDIA_BASE_URL" "${PUBLIC_MEDIA_BASE_URL}"
   write_env_blank_line "${env_file}"
   write_env_example "${env_file}" "mTLS 默认关闭，如需开启，请将 AGENT_CORE_ENDPOINT 改为 https 后再补充证书路径。" "AGENT_CORE_ENDPOINT=https://${CORE_GRPC_HOST}:${CORE_GRPC_PORT}"
   printf '# AGENT_CERT_PATH=/certs/self-signed/media-agent.pem\n# AGENT_KEY_PATH=/certs/self-signed/media-agent.key\n# AGENT_CA_PATH=/certs/self-signed/ca.pem\n# AGENT_TLS_DOMAIN_NAME=streamserver-core.local\n' >>"${env_file}"
@@ -1980,6 +2007,10 @@ write_all_in_one_host_env() {
   write_env_entry "${env_file}" "产物清理策略，可选 delete_oldest_then_reject/reject_only。" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "${AGENT_ARTIFACT_CLEANUP_STRATEGY}"
   write_env_entry "${env_file}" "产物清理检查周期，单位秒。" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC}"
   write_env_entry "${env_file}" "工作节点工作目录。" "WORK_ROOT" "${WORK_ROOT}"
+  write_env_entry "${env_file}" "手动上传单文件最大字节数。" "UPLOAD_MAX_BYTES" "${UPLOAD_MAX_BYTES}"
+  write_env_entry "${env_file}" "允许手动上传的视频扩展名，多个值用逗号分隔。" "UPLOAD_ALLOWED_EXTENSIONS" "${UPLOAD_ALLOWED_EXTENSIONS}"
+  write_env_entry "${env_file}" "手动上传后 ffprobe 探测超时，单位秒。" "UPLOAD_PROBE_TIMEOUT_SEC" "${UPLOAD_PROBE_TIMEOUT_SEC}"
+  write_env_entry "${env_file}" "上传文件对外访问基址，留空时使用请求 Host 生成。" "PUBLIC_MEDIA_BASE_URL" "${PUBLIC_MEDIA_BASE_URL}"
   write_env_entry "${env_file}" "允许访问宿主机挂载存储的路径白名单，多个值用逗号分隔。" "STORAGE_ALLOWLIST" "${STORAGE_ALLOWLIST}"
   write_env_entry "${env_file}" "鉴权模式，disabled 表示关闭，local_password 表示启用内建用户名密码。" "AUTH_MODE" "${AUTH_MODE}"
   write_env_entry "${env_file}" "是否启用鉴权，true 表示启用。" "AUTH_ENABLED" "${AUTH_ENABLED}"
@@ -2311,6 +2342,10 @@ configure_worker_host() {
   AGENT_ARTIFACT_CLEANUP_STRATEGY="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")"
   AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
+  UPLOAD_MAX_BYTES="$(env_value_or_default "${existing_env_file}" "UPLOAD_MAX_BYTES" "10737418240")"
+  UPLOAD_ALLOWED_EXTENSIONS="$(env_value_or_default "${existing_env_file}" "UPLOAD_ALLOWED_EXTENSIONS" "mp4,mov,m4v,mkv,webm,ts,m2ts,mts,flv")"
+  UPLOAD_PROBE_TIMEOUT_SEC="$(env_value_or_default "${existing_env_file}" "UPLOAD_PROBE_TIMEOUT_SEC" "30")"
+  PUBLIC_MEDIA_BASE_URL="$(env_value_or_default "${existing_env_file}" "PUBLIC_MEDIA_BASE_URL" "")"
   agent_labels="$(collect_agent_labels "cpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "cpu")")"
 
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${existing_hook_secret}"
@@ -2321,6 +2356,7 @@ configure_worker_host() {
   validate_zlm_port_config
   validate_artifact_cleanup_config
   validate_hls_record_segment_config
+  validate_upload_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
@@ -2380,6 +2416,10 @@ configure_worker_host_gpu() {
   AGENT_ARTIFACT_CLEANUP_STRATEGY="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")"
   AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
+  UPLOAD_MAX_BYTES="$(env_value_or_default "${existing_env_file}" "UPLOAD_MAX_BYTES" "10737418240")"
+  UPLOAD_ALLOWED_EXTENSIONS="$(env_value_or_default "${existing_env_file}" "UPLOAD_ALLOWED_EXTENSIONS" "mp4,mov,m4v,mkv,webm,ts,m2ts,mts,flv")"
+  UPLOAD_PROBE_TIMEOUT_SEC="$(env_value_or_default "${existing_env_file}" "UPLOAD_PROBE_TIMEOUT_SEC" "30")"
+  PUBLIC_MEDIA_BASE_URL="$(env_value_or_default "${existing_env_file}" "PUBLIC_MEDIA_BASE_URL" "")"
   agent_labels="$(collect_agent_labels "gpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "gpu")")"
 
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${existing_hook_secret}"
@@ -2390,6 +2430,7 @@ configure_worker_host_gpu() {
   validate_zlm_port_config
   validate_artifact_cleanup_config
   validate_hls_record_segment_config
+  validate_upload_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
@@ -2457,6 +2498,10 @@ configure_all_in_one_host() {
   AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")"
   STORAGE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "/data/media/work,/data/zlm/www")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
+  UPLOAD_MAX_BYTES="$(env_value_or_default "${existing_env_file}" "UPLOAD_MAX_BYTES" "10737418240")"
+  UPLOAD_ALLOWED_EXTENSIONS="$(env_value_or_default "${existing_env_file}" "UPLOAD_ALLOWED_EXTENSIONS" "mp4,mov,m4v,mkv,webm,ts,m2ts,mts,flv")"
+  UPLOAD_PROBE_TIMEOUT_SEC="$(env_value_or_default "${existing_env_file}" "UPLOAD_PROBE_TIMEOUT_SEC" "30")"
+  PUBLIC_MEDIA_BASE_URL="$(env_value_or_default "${existing_env_file}" "PUBLIC_MEDIA_BASE_URL" "")"
   prompt_local_auth_configuration "${existing_env_file}"
   agent_labels="$(collect_agent_labels "cpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "cpu")")"
 
@@ -2471,6 +2516,7 @@ configure_all_in_one_host() {
   validate_zlm_port_config
   validate_artifact_cleanup_config
   validate_hls_record_segment_config
+  validate_upload_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
@@ -2549,6 +2595,10 @@ configure_all_in_one_host_gpu() {
   AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")"
   STORAGE_ALLOWLIST="$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "/data/media/work,/data/zlm/www")"
   WORK_ROOT="$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "/data/media/work")"
+  UPLOAD_MAX_BYTES="$(env_value_or_default "${existing_env_file}" "UPLOAD_MAX_BYTES" "10737418240")"
+  UPLOAD_ALLOWED_EXTENSIONS="$(env_value_or_default "${existing_env_file}" "UPLOAD_ALLOWED_EXTENSIONS" "mp4,mov,m4v,mkv,webm,ts,m2ts,mts,flv")"
+  UPLOAD_PROBE_TIMEOUT_SEC="$(env_value_or_default "${existing_env_file}" "UPLOAD_PROBE_TIMEOUT_SEC" "30")"
+  PUBLIC_MEDIA_BASE_URL="$(env_value_or_default "${existing_env_file}" "PUBLIC_MEDIA_BASE_URL" "")"
   prompt_local_auth_configuration "${existing_env_file}"
   agent_labels="$(collect_agent_labels "gpu" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "gpu")")"
 
@@ -2563,6 +2613,7 @@ configure_all_in_one_host_gpu() {
   validate_zlm_port_config
   validate_artifact_cleanup_config
   validate_hls_record_segment_config
+  validate_upload_config
 
   prepare_install_target "${INSTALL_DIR}"
   copy_common_assets "${INSTALL_DIR}"
