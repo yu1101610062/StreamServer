@@ -1631,10 +1631,13 @@ pub(crate) fn build_play_urls(
                 "rtsp://{}:{}/{app}/{stream}",
                 host, node.zlm_rtsp_port
             )),
-            "rtmp" => urls.push(format!(
-                "rtmp://{}:{}/{app}/{stream}",
-                host, node.zlm_rtmp_port
-            )),
+            "rtmp" => {
+                urls.push(format!(
+                    "rtmp://{}:{}/{app}/{stream}",
+                    host, node.zlm_rtmp_port
+                ));
+                urls.push(format!("{http_base}/{app}/{stream}.live.flv"));
+            }
             "hls" => urls.push(format!("{http_base}/{app}/{stream}/hls.m3u8")),
             "ts" | "http_ts" => urls.push(format!("{http_base}/{app}/{stream}.live.ts")),
             "fmp4" | "http_fmp4" | "http_fmp4_ts" => {

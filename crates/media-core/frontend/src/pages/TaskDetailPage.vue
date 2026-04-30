@@ -4,12 +4,12 @@ import { useRoute, useRouter } from "vue-router";
 import { useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
-import { taskApi } from "@/shared/api/resources";
+import { streamApi, taskApi } from "@/shared/api/resources";
 import type { RecordingControlRequest } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
 import { copyText } from "@/shared/utils/clipboard";
-import { formatBytes, formatJson, formatTime, shortId } from "@/shared/utils/format";
+import { formatBitrateKbps, formatBytes, formatJson, formatTime, shortId } from "@/shared/utils/format";
 
 const route = useRoute();
 const router = useRouter();
@@ -42,6 +42,11 @@ const logsQuery = useQuery({
 const resolvedSpecQuery = useQuery({
   queryKey: computed(() => ["task-resolved-spec", taskId.value]),
   queryFn: () => taskApi.resolvedSpec(taskId.value),
+});
+
+const onlineStreamsQuery = useQuery({
+  queryKey: computed(() => ["task-detail-streams", taskId.value]),
+  queryFn: () => streamApi.list({ task_id: taskId.value }),
 });
 
 const resolvedSpec = computed(() => detailQuery.data.value?.resolved_spec ?? null);
@@ -98,7 +103,7 @@ function numericField(value: string) {
 }
 
 async function refreshTaskViews() {
-  await Promise.all([detailQuery.refetch(), eventsQuery.refetch()]);
+  await Promise.all([detailQuery.refetch(), eventsQuery.refetch(), onlineStreamsQuery.refetch()]);
 }
 
 async function submitStartRecording() {
@@ -135,9 +140,10 @@ async function stopRecording() {
   <section class="page-grid">
     <PageHeader
       :title="detailQuery.data.value?.task.name ?? '任务详情'"
-      description="查看任务摘要、当前 Attempt、最近事件、日志，以及任务关联的录像和文件产物。"
+      description="查看任务摘要、在线流、录像、文件产物、最近事件和日志。"
     >
       <el-button @click="router.push('/tasks')">返回任务中心</el-button>
+      <el-button @click="router.push(`/streams?task_id=${taskId}`)">流中心</el-button>
       <el-button @click="router.push(`/records?task_id=${taskId}`)">录像中心</el-button>
       <el-button @click="router.push(`/file-artifacts?task_id=${taskId}`)">文件产物</el-button>
       <el-tooltip :disabled="supportsRecordingControl" :content="recordingControlDisabledReason">
@@ -177,6 +183,10 @@ async function stopRecording() {
         <div class="subtle">录制状态</div>
         <strong>{{ recordingStateLabel }}</strong>
       </div>
+      <div class="surface-card metric-card">
+        <div class="subtle">在线流</div>
+        <strong>{{ onlineStreamsQuery.data.value?.length ?? 0 }}</strong>
+      </div>
     </div>
 
     <div class="surface-card">
@@ -189,9 +199,74 @@ async function stopRecording() {
             <el-descriptions-item label="更新时间">{{ formatTime(detailQuery.data.value.task.updated_at) }}</el-descriptions-item>
             <el-descriptions-item label="录像数量">{{ detailQuery.data.value.records.length }}</el-descriptions-item>
             <el-descriptions-item label="产物数量">{{ detailQuery.data.value.file_artifacts.length }}</el-descriptions-item>
+            <el-descriptions-item label="在线流数量">{{ onlineStreamsQuery.data.value?.length ?? 0 }}</el-descriptions-item>
             <el-descriptions-item label="最近回调状态">{{ detailQuery.data.value.callback_delivery?.status ?? "—" }}</el-descriptions-item>
             <el-descriptions-item label="最近回调错误">{{ detailQuery.data.value.callback_delivery?.last_error ?? "—" }}</el-descriptions-item>
           </el-descriptions>
+        </el-tab-pane>
+
+        <el-tab-pane :label="`在线流 (${onlineStreamsQuery.data.value?.length ?? 0})`" name="streams">
+          <div class="table-scroll">
+            <el-table
+              v-if="(onlineStreamsQuery.data.value?.length ?? 0) > 0"
+              v-loading="onlineStreamsQuery.isLoading.value"
+              :data="onlineStreamsQuery.data.value ?? []"
+            >
+              <el-table-column label="协议" min-width="100">
+                <template #default="{ row }">
+                  <el-tag round>{{ row.schema }}</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="Vhost / 应用 / 流" min-width="280">
+                <template #default="{ row }">
+                  <div><strong>{{ row.vhost }}</strong></div>
+                  <div class="subtle">{{ row.app }}/{{ row.stream }}</div>
+                </template>
+              </el-table-column>
+              <el-table-column label="观众数" min-width="100">
+                <template #default="{ row }">
+                  {{ row.viewer_count ?? (row.has_viewer === true ? "至少 1" : row.has_viewer === false ? 0 : "—") }}
+                </template>
+              </el-table-column>
+              <el-table-column label="最近码率" min-width="120">
+                <template #default="{ row }">{{ formatBitrateKbps(row.bitrate_kbps) }}</template>
+              </el-table-column>
+              <el-table-column label="开始时间" min-width="180">
+                <template #default="{ row }">{{ formatTime(row.started_at) }}</template>
+              </el-table-column>
+              <el-table-column label="播放地址" min-width="360">
+                <template #default="{ row }">
+                  <div class="stack-inline-links">
+                    <el-link
+                      v-for="url in row.play_urls"
+                      :key="url"
+                      type="primary"
+                      :href="url"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {{ url }}
+                    </el-link>
+                  </div>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" min-width="180" fixed="right">
+                <template #default="{ row }">
+                  <div class="table-actions">
+                    <el-button
+                      v-if="row.play_urls?.[0]"
+                      link
+                      @click="copyText(row.play_urls[0]).then(() => ElMessage.success('已复制播放地址'))"
+                    >
+                      复制地址
+                    </el-button>
+                    <el-button link @click="router.push(`/streams?task_id=${taskId}`)">流中心</el-button>
+                  </div>
+                </template>
+              </el-table-column>
+            </el-table>
+            <el-empty v-else description="当前任务没有在线流" />
+          </div>
         </el-tab-pane>
 
         <el-tab-pane :label="`录像 (${detailQuery.data.value?.records.length ?? 0})`" name="records">

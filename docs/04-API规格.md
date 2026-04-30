@@ -521,7 +521,7 @@ Agent 只读静态文件访问入口，用于预览、下载与排查。
 
 - `viewer_count`：从节点 ZLM `getMediaList.totalReaderCount` 富化得到的精确 viewer 数
 - `bitrate_kbps`：从节点 ZLM `getMediaList.bytesSpeed` 换算得到的实时码率
-- `play_urls`：ControlPlane 根据节点 `agent_stream_addr` 和当前在线 schema 生成的播放地址列表
+- `play_urls`：ControlPlane 根据节点 `agent_stream_addr` 和当前在线 schema 生成的播放地址列表；在线 schema 包含 `rtmp` 时同时返回对应 HTTP-FLV (`.live.flv`) 地址
 
 ### 4.2 `GET /records`
 

@@ -1564,6 +1564,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         play_urls: [
           "rtsp://127.0.0.1/live/camera01",
           "rtmp://127.0.0.1/live/camera01",
+          "http://127.0.0.1/live/camera01.live.flv",
           "http://127.0.0.1/live/camera01.live.mp4",
         ],
       },

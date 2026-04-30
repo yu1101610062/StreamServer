@@ -161,6 +161,71 @@ fn parse_cli_command_parses_auth_command() {
     );
 }
 
+fn play_url_test_node(agent_stream_addr: &str) -> repository::NodeSummary {
+    let now = Utc::now();
+    repository::NodeSummary {
+        id: Uuid::now_v7(),
+        node_name: "node-a".to_string(),
+        hostname: "node-a".to_string(),
+        labels: Vec::new(),
+        zlm_api_base: "http://127.0.0.1".to_string(),
+        agent_stream_addr: agent_stream_addr.to_string(),
+        agent_http_base_url: "http://127.0.0.1:8081".to_string(),
+        zlm_rtmp_port: 2935,
+        zlm_rtsp_port: 9554,
+        network_mode: "bridge".to_string(),
+        interfaces: Vec::new(),
+        healthy: true,
+        control_connected: true,
+        media_alive: true,
+        last_seen_at: Some(now),
+        control_last_seen_at: Some(now),
+        media_last_seen_at: Some(now),
+        created_at: now,
+        updated_at: now,
+        ffmpeg_protocols: Vec::new(),
+        ffmpeg_formats: Vec::new(),
+        ffmpeg_encoders: Vec::new(),
+        ffmpeg_decoders: Vec::new(),
+        zlm_api_list: Vec::new(),
+        zlm_version: None,
+        gpu: Vec::new(),
+        gpu_devices: Vec::new(),
+        capability_captured_at: None,
+        slot_usage: None,
+        running_tasks: None,
+        starting_tasks: None,
+        stopping_tasks: None,
+        orphaned_tasks: None,
+        connected: None,
+        cpu_percent: None,
+        mem_percent: None,
+        disk_percent: None,
+        upload_disk_total_bytes: None,
+        upload_disk_available_bytes: None,
+        upload_disk_used_percent: None,
+        zlm_alive: None,
+        ffmpeg_alive: None,
+        gpu_runtime: None,
+    }
+}
+
+#[test]
+fn build_play_urls_returns_http_flv_when_rtmp_schema_is_online() {
+    let node = play_url_test_node("http://stream.example:18080");
+    let schemas = ["rtmp".to_string()].into_iter().collect::<BTreeSet<_>>();
+
+    let urls = build_play_urls(&node, &schemas, "live", "camera01");
+
+    assert_eq!(
+        urls,
+        vec![
+            "rtmp://stream.example:2935/live/camera01",
+            "http://stream.example:18080/live/camera01.live.flv",
+        ]
+    );
+}
+
 async fn database_is_reachable(database_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(database_url) else {
         return false;
@@ -2155,6 +2220,11 @@ async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::
     assert!(
         play_urls
             .iter()
+            .any(|value| value == "http://stream.example/live/camera01.live.flv")
+    );
+    assert!(
+        play_urls
+            .iter()
             .any(|value| value == "http://stream.example/live/camera01/hls.m3u8")
     );
 
@@ -2224,6 +2294,11 @@ async fn list_streams_uses_current_node_stream_ports() -> anyhow::Result<()> {
         play_urls
             .iter()
             .any(|value| value == "rtmp://stream.example:2935/live/camera01")
+    );
+    assert!(
+        play_urls
+            .iter()
+            .any(|value| value == "http://stream.example:18080/live/camera01.live.flv")
     );
     assert!(
         play_urls
