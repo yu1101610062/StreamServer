@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>StreamServer 客户端设置</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family:
+          Inter, "SF Pro Display", "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        --text: #172033;
+        --muted: #64748b;
+        --label: #334155;
+        --accent: #2563eb;
+        --accent-strong: #1d4ed8;
+        --page-bg: #f4f7fb;
+        --page-gradient: linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(244, 247, 251, 0.96));
+        --surface: #ffffff;
+        --surface-subtle: #f8fafc;
+        --border: #dbe4f0;
+        --control-border: #cbd5e1;
+        --shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
+        --focus: rgba(37, 99, 235, 0.2);
+        --status-ok-bg: #ecfdf5;
+        --status-ok-text: #047857;
+        --status-error-bg: #fef2f2;
+        --status-error-text: #b91c1c;
+        color: var(--text);
+        background: var(--page-bg);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          var(--page-gradient),
+          var(--page-bg);
+      }
+
+      main {
+        width: min(760px, calc(100vw - 32px));
+        margin: 0 auto;
+        padding: 32px 0 40px;
+      }
+
+      header {
+        margin-bottom: 18px;
+      }
+
+      .kicker {
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+      }
+
+      h1 {
+        margin: 8px 0;
+        font-size: 30px;
+        line-height: 1.2;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.65;
+      }
+
+      section {
+        margin-top: 16px;
+        padding: 20px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+      }
+
+      h2 {
+        margin: 0 0 16px;
+        font-size: 18px;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: 150px minmax(240px, 1fr) 150px;
+        gap: 14px;
+      }
+
+      label {
+        display: grid;
+        gap: 6px;
+        color: var(--label);
+        font-size: 13px;
+        font-weight: 600;
+      }
+
+      input,
+      select {
+        width: 100%;
+        min-height: 38px;
+        padding: 8px 10px;
+        border: 1px solid var(--control-border);
+        border-radius: 6px;
+        background: var(--surface-subtle);
+        color: var(--text);
+        font: inherit;
+      }
+
+      input:focus,
+      select:focus {
+        outline: 2px solid var(--focus);
+        border-color: var(--accent);
+      }
+
+      .path-row {
+        display: grid;
+        grid-template-columns: minmax(240px, 1fr) auto;
+        gap: 10px;
+      }
+
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 16px;
+      }
+
+      button {
+        min-height: 38px;
+        padding: 0 14px;
+        border: 1px solid var(--control-border);
+        border-radius: 6px;
+        background: var(--surface);
+        color: var(--text);
+        font: inherit;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      button.primary {
+        border-color: var(--accent);
+        background: var(--accent);
+        color: #ffffff;
+      }
+
+      button.primary:hover {
+        border-color: var(--accent-strong);
+        background: var(--accent-strong);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.58;
+      }
+
+      .hint {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .status {
+        display: none;
+        margin-top: 16px;
+        padding: 10px 12px;
+        border-radius: 6px;
+        font-size: 14px;
+      }
+
+      .status.visible {
+        display: block;
+      }
+
+      .status.ok {
+        background: var(--status-ok-bg);
+        color: var(--status-ok-text);
+      }
+
+      .status.error {
+        background: var(--status-error-bg);
+        color: var(--status-error-text);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --text: #e5edf7;
+          --muted: #9aa8bc;
+          --label: #c7d2e1;
+          --accent: #38bdf8;
+          --accent-strong: #0ea5e9;
+          --page-bg: #080d14;
+          --page-gradient: linear-gradient(180deg, rgba(16, 24, 35, 0.94), rgba(8, 13, 20, 0.98));
+          --surface: #101823;
+          --surface-subtle: #0c131d;
+          --border: #263447;
+          --control-border: #344358;
+          --shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
+          --focus: rgba(56, 189, 248, 0.22);
+          --status-ok-bg: rgba(20, 83, 45, 0.34);
+          --status-ok-text: #86efac;
+          --status-error-bg: rgba(127, 29, 29, 0.34);
+          --status-error-text: #fca5a5;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .grid,
+        .path-row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="kicker">STREAMSERVER DESKTOP</div>
+        <h1>客户端设置</h1>
+        <p>先配置管理中心地址和本机 VLC 路径，再打开管理中心页面。即使现场网络暂时不可达，也可以在这里修改配置。</p>
+      </header>
+
+      <section>
+        <h2>管理中心地址</h2>
+        <div class="grid">
+          <label>
+            协议
+            <select id="protocol">
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </label>
+          <label>
+            IP / 域名
+            <input id="host" placeholder="172.17.13.196" />
+          </label>
+          <label>
+            端口
+            <input id="port" type="number" min="1" max="65535" step="1" />
+          </label>
+        </div>
+        <div class="hint" id="server-preview"></div>
+      </section>
+
+      <section>
+        <h2>VLC</h2>
+        <label>
+          路径模式
+          <select id="vlc-mode">
+            <option value="auto">自动检测</option>
+            <option value="custom">手动指定</option>
+          </select>
+        </label>
+        <div id="custom-path-block" style="margin-top: 14px">
+          <label>
+            VLC 可执行文件路径
+            <div class="path-row">
+              <input id="custom-path" placeholder="选择 vlc.exe 或 VLC 可执行文件" />
+              <button id="pick-vlc" type="button">选择</button>
+            </div>
+          </label>
+        </div>
+      </section>
+
+      <div class="actions">
+        <button id="save" type="button">保存设置</button>
+        <button id="test-vlc" type="button">测试 VLC</button>
+        <button id="open-center" class="primary" type="button">打开管理中心</button>
+      </div>
+
+      <div id="status" class="status"></div>
+    </main>
+
+    <script>
+      const fallbackSettings = {
+        server: { protocol: "http", host: "172.17.13.196", port: 8080 },
+        vlc: { mode: "auto", customPath: null },
+      };
+
+      const fields = {
+        protocol: document.querySelector("#protocol"),
+        host: document.querySelector("#host"),
+        port: document.querySelector("#port"),
+        vlcMode: document.querySelector("#vlc-mode"),
+        customPath: document.querySelector("#custom-path"),
+        customPathBlock: document.querySelector("#custom-path-block"),
+        preview: document.querySelector("#server-preview"),
+        status: document.querySelector("#status"),
+      };
+
+      function bridge() {
+        return window.streamServerDesktop;
+      }
+
+      function showStatus(message, type = "ok") {
+        fields.status.textContent = message;
+        fields.status.className = `status visible ${type}`;
+      }
+
+      function readForm() {
+        return {
+          server: {
+            protocol: fields.protocol.value,
+            host: fields.host.value.trim(),
+            port: Number(fields.port.value),
+          },
+          vlc: {
+            mode: fields.vlcMode.value,
+            customPath: fields.vlcMode.value === "custom" ? fields.customPath.value.trim() || null : null,
+          },
+        };
+      }
+
+      function applySettings(settings) {
+        fields.protocol.value = settings.server.protocol || fallbackSettings.server.protocol;
+        fields.host.value = settings.server.host || fallbackSettings.server.host;
+        fields.port.value = settings.server.port || fallbackSettings.server.port;
+        fields.vlcMode.value = settings.vlc.mode || fallbackSettings.vlc.mode;
+        fields.customPath.value = settings.vlc.customPath || "";
+        updateUiState();
+      }
+
+      function serverUrl(settings = readForm()) {
+        return `${settings.server.protocol}://${settings.server.host}:${settings.server.port}/`;
+      }
+
+      function updateUiState() {
+        const custom = fields.vlcMode.value === "custom";
+        fields.customPathBlock.style.display = custom ? "block" : "none";
+        fields.preview.textContent = `当前地址：${serverUrl()}`;
+      }
+
+      async function saveSettings() {
+        const api = bridge();
+        if (!api) {
+          showStatus("桌面桥接未初始化，请重新启动客户端。", "error");
+          return false;
+        }
+        const result = await api.saveSettings(readForm());
+        if (!result.ok) {
+          showStatus(result.error || "保存失败", "error");
+          return false;
+        }
+        showStatus("设置已保存。");
+        return true;
+      }
+
+      async function init() {
+        if (!bridge()) {
+          applySettings(fallbackSettings);
+          showStatus("桌面桥接未初始化，请重新启动客户端。", "error");
+          return;
+        }
+        try {
+          applySettings(await bridge().getSettings());
+        } catch (error) {
+          applySettings(fallbackSettings);
+          showStatus(error instanceof Error ? error.message : "读取设置失败", "error");
+        }
+      }
+
+      fields.protocol.addEventListener("change", updateUiState);
+      fields.host.addEventListener("input", updateUiState);
+      fields.port.addEventListener("input", updateUiState);
+      fields.vlcMode.addEventListener("change", updateUiState);
+      fields.customPath.addEventListener("input", updateUiState);
+
+      document.querySelector("#save").addEventListener("click", async () => {
+        try {
+          await saveSettings();
+        } catch (error) {
+          showStatus(error instanceof Error ? error.message : "保存失败", "error");
+        }
+      });
+
+      document.querySelector("#pick-vlc").addEventListener("click", async () => {
+        try {
+          const result = await bridge().pickVlcPath();
+          if (result.path) {
+            fields.vlcMode.value = "custom";
+            fields.customPath.value = result.path;
+            updateUiState();
+          }
+        } catch (error) {
+          showStatus(error instanceof Error ? error.message : "选择 VLC 路径失败", "error");
+        }
+      });
+
+      document.querySelector("#test-vlc").addEventListener("click", async () => {
+        try {
+          const result = await bridge().testVlc(readForm());
+          if (result.ok) {
+            showStatus("VLC 已启动或路径检测通过。");
+          } else {
+            showStatus(result.error || "VLC 检测失败", "error");
+          }
+        } catch (error) {
+          showStatus(error instanceof Error ? error.message : "VLC 检测失败", "error");
+        }
+      });
+
+      document.querySelector("#open-center").addEventListener("click", async () => {
+        try {
+          const result = await bridge().openManagementCenter(readForm());
+          if (!result.ok) {
+            showStatus(result.error || "打开管理中心失败", "error");
+          }
+        } catch (error) {
+          showStatus(error instanceof Error ? error.message : "打开管理中心失败", "error");
+        }
+      });
+
+      init();
+    </script>
+  </body>
+</html>
