@@ -1040,6 +1040,7 @@ impl TaskRepository {
               sb.rtp_stream_id,
               t.started_at,
               t.updated_at,
+              greatest(sb.created_at, t.created_at) as sort_created_at,
               (
                 select case
                   when te.event_type = 'stream_no_reader' then false
@@ -1096,7 +1097,9 @@ impl TaskRepository {
             builder.push(" and t.assigned_node_id = ");
             builder.push_bind(node_id);
         }
-        builder.push(" order by t.updated_at desc, sb.created_at desc, sb.schema asc, sb.app asc, sb.stream asc");
+        builder.push(
+            " order by sort_created_at desc, sb.created_at desc, t.created_at desc, sb.id desc, sb.schema asc, sb.app asc, sb.stream asc",
+        );
         let mut streams = builder
             .build()
             .fetch_all(&self.pool)
@@ -6510,6 +6513,8 @@ pub struct StreamSummary {
     pub rtp_stream_id: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip)]
+    pub sort_created_at: DateTime<Utc>,
     pub has_viewer: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub viewer_count: Option<u32>,
@@ -6537,6 +6542,7 @@ impl StreamSummary {
             rtp_stream_id: row.try_get("rtp_stream_id")?,
             started_at: row.try_get("started_at")?,
             updated_at: row.try_get("updated_at")?,
+            sort_created_at: row.try_get("sort_created_at")?,
             has_viewer: row.try_get("has_viewer")?,
             viewer_count: None,
             bitrate_kbps: None,

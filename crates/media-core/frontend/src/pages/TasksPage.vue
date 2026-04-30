@@ -7,7 +7,7 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { nodeApi, taskApi } from "@/shared/api/resources";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
-import { TASK_TYPES, taskTypeLabel } from "@/shared/labels";
+import { TASK_STATUSES, TASK_TYPES, taskTypeLabel } from "@/shared/labels";
 import type { TaskSummary } from "@/shared/api/types";
 import { errorMessage, formatTime, shortId } from "@/shared/utils/format";
 
@@ -172,7 +172,19 @@ function transcodeTagType(task: TaskSummary) {
     <div class="surface-card">
       <el-form label-position="top" inline>
         <el-form-item label="状态">
-          <el-input v-model="filters.status" placeholder="RUNNING / FAILED" />
+          <el-select v-model="filters.status" clearable placeholder="全部状态" style="width: 180px">
+            <el-option
+              v-for="item in TASK_STATUSES"
+              :key="item.value"
+              :label="item.label"
+              :value="item.value"
+            >
+              <div class="task-status-option">
+                <StatusTag :status="item.value" />
+                <span class="subtle">{{ item.note }}</span>
+              </div>
+            </el-option>
+          </el-select>
         </el-form-item>
         <el-form-item label="类型">
           <el-select v-model="filters.type" clearable style="width: 180px">
@@ -269,3 +281,16 @@ function transcodeTagType(task: TaskSummary) {
     </div>
   </section>
 </template>
+
+<style scoped>
+.task-status-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.task-status-option .subtle {
+  white-space: nowrap;
+}
+</style>

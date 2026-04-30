@@ -1110,6 +1110,7 @@ async fn list_streams(
             .collect();
     }
     streams = collapse_duplicate_streams(streams);
+    sort_streams_by_created_at_desc(&mut streams);
     if let Some(expected_has_viewer) = expected_has_viewer {
         streams.retain(|stream| stream_has_viewers(stream) == Some(expected_has_viewer));
     }
@@ -1513,6 +1514,15 @@ fn collapse_duplicate_streams(
     collapsed
 }
 
+fn sort_streams_by_created_at_desc(streams: &mut [repository::StreamSummary]) {
+    streams.sort_by(|left, right| {
+        right
+            .sort_created_at
+            .cmp(&left.sort_created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+}
+
 fn merge_stream_summary(
     existing: &mut repository::StreamSummary,
     incoming: repository::StreamSummary,
@@ -1530,6 +1540,7 @@ fn merge_stream_summary(
         existing.started_at = incoming.started_at;
     }
     existing.updated_at = existing.updated_at.max(incoming.updated_at);
+    existing.sort_created_at = existing.sort_created_at.max(incoming.sort_created_at);
     existing.viewer_count = match (existing.viewer_count, incoming.viewer_count) {
         (Some(left), Some(right)) => Some(left.max(right)),
         (Some(value), None) | (None, Some(value)) => Some(value),

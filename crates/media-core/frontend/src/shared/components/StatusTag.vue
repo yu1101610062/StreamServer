@@ -13,6 +13,7 @@ const type = computed(() => {
     case "STARTING":
     case "DISPATCHING":
     case "RECOVERING":
+    case "RECLAIMING":
       return "primary";
     case "STOPPING":
       return "warning";

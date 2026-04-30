@@ -23,6 +23,22 @@ export const TASK_TYPES: OptionItem[] = [
   { value: "file_transcode", label: "文件转码", note: "离线转码并生成目标文件" },
 ];
 
+export const TASK_STATUSES: OptionItem[] = [
+  { value: "CREATED", label: "CREATED", note: "已创建" },
+  { value: "VALIDATING", label: "VALIDATING", note: "校验中" },
+  { value: "QUEUED", label: "QUEUED", note: "等待调度" },
+  { value: "DISPATCHING", label: "DISPATCHING", note: "下发中" },
+  { value: "STARTING", label: "STARTING", note: "启动中" },
+  { value: "RUNNING", label: "RUNNING", note: "执行中" },
+  { value: "STOPPING", label: "STOPPING", note: "停止中" },
+  { value: "RECOVERING", label: "RECOVERING", note: "恢复中" },
+  { value: "RECLAIMING", label: "RECLAIMING", note: "回收中" },
+  { value: "SUCCEEDED", label: "SUCCEEDED", note: "已成功" },
+  { value: "FAILED", label: "FAILED", note: "已失败" },
+  { value: "CANCELED", label: "CANCELED", note: "已取消" },
+  { value: "LOST", label: "LOST", note: "已失联" },
+];
+
 export const INPUT_KINDS: OptionItem[] = [
   { value: "rtsp", label: "RTSP" },
   { value: "rtmp", label: "RTMP" },

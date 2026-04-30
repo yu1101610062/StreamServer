@@ -399,6 +399,95 @@ async fn insert_running_stream_task(
     Ok(task_id)
 }
 
+async fn insert_running_stream_task_with_times(
+    pool: &sqlx::PgPool,
+    node_id: Uuid,
+    name: &str,
+    stream: &str,
+    task_created_at: DateTime<Utc>,
+    task_updated_at: DateTime<Utc>,
+    binding_created_at: DateTime<Utc>,
+) -> anyhow::Result<Uuid> {
+    let task_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": name,
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "publish": {},
+        "record": {"enabled": false},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+
+    sqlx::query(
+        r#"
+        insert into tasks (
+          id, name, type, status, idempotency_key,
+          priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+          current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+        ) values (
+          $1, $2, 'stream_ingest'::task_type, 'RUNNING'::task_status, $3,
+          50, $4, $4, 'tester', $5,
+          1, 'immediate', $6, $7, $6, null
+        )
+        "#,
+    )
+    .bind(task_id)
+    .bind(name)
+    .bind(format!("stream-order-{task_id}"))
+    .bind(&resolved_spec)
+    .bind(node_id)
+    .bind(task_created_at)
+    .bind(task_updated_at)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into task_attempts (
+          id, task_id, attempt_no, node_id, worker_kind, status,
+          pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+          rtp_port, exit_code, failure_code, failure_reason,
+          checkpoint_json, started_at, ended_at, created_at
+        ) values (
+          $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'RUNNING'::attempt_status,
+          null, null, 'rtsp', '__defaultVhost__', 'live', $4,
+          null, null, null, null,
+          null, $5, null, $5
+        )
+        "#,
+    )
+    .bind(attempt_id)
+    .bind(task_id)
+    .bind(node_id)
+    .bind(stream)
+    .bind(task_created_at)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into stream_bindings (
+          id, task_id, attempt_id, server_id, node_id, schema, vhost, app, stream,
+          zlm_proxy_key, zlm_pusher_key, rtp_stream_id, created_at
+        ) values (
+          $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', 'live', $6, null, null, null, $7
+        )
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(task_id)
+    .bind(attempt_id)
+    .bind(format!("zlm-{node_id}"))
+    .bind(node_id)
+    .bind(stream)
+    .bind(binding_created_at)
+    .execute(pool)
+    .await?;
+    Ok(task_id)
+}
+
 async fn insert_starting_stream_task(
     pool: &sqlx::PgPool,
     node_id: Uuid,
@@ -2229,6 +2318,66 @@ async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::
     );
 
     zlm_handle.abort();
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_streams_orders_by_stream_or_task_created_at_desc() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:8081",
+        "http://stream.example",
+    )
+    .await?;
+
+    let now = Utc::now();
+    insert_running_stream_task_with_times(
+        &db.pool,
+        node_id,
+        "older-stream",
+        "camera-old",
+        now - chrono::Duration::minutes(30),
+        now + chrono::Duration::minutes(30),
+        now - chrono::Duration::minutes(20),
+    )
+    .await?;
+    insert_running_stream_task_with_times(
+        &db.pool,
+        node_id,
+        "newer-stream",
+        "camera-new",
+        now - chrono::Duration::minutes(5),
+        now - chrono::Duration::minutes(25),
+        now - chrono::Duration::minutes(10),
+    )
+    .await?;
+
+    let streams = repository
+        .list_streams(StreamListFilter {
+            schema: None,
+            app: None,
+            stream: None,
+            task_id: None,
+            node_id: None,
+            has_viewer: None,
+        })
+        .await?;
+
+    assert_eq!(
+        streams
+            .iter()
+            .map(|stream| stream.stream.as_str())
+            .collect::<Vec<_>>(),
+        vec!["camera-new", "camera-old"]
+    );
+
     db.cleanup().await?;
     Ok(())
 }
