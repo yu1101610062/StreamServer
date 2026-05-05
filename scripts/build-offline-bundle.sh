@@ -6,7 +6,11 @@ OUTPUT_DIR="${ROOT_DIR}/dist"
 SKIP_IMAGES=0
 GPU_SUPPORT=""
 HOST_BINARY_TARGET_TRIPLE="x86_64-unknown-linux-musl"
-BUILD_MUSL_BIN_SCRIPT="${ROOT_DIR}/scripts/build_musl_bin_by_docker.sh"
+BUILD_MUSL_BIN_SCRIPT="${ROOT_DIR}/scripts/build-musl-binaries.sh"
+PREBUILD_UI=1
+ALLOW_MISSING_DESKTOP_INSTALLERS=1
+FRONTEND_SKIP_INSTALL=0
+FRONTEND_SOURCE_DIRS=()
 
 DEFAULT_APT_MIRROR="http://mirrors.aliyun.com"
 DEFAULT_UBUNTU_APT_MIRROR="${DEFAULT_APT_MIRROR}"
@@ -105,11 +109,11 @@ POSTGRES_SOURCE_IMAGE="$(resolve_env_or_default POSTGRES_SOURCE_IMAGE "$(dockerh
 ZLM_SOURCE_IMAGE="$(resolve_env_or_default ZLM_SOURCE_IMAGE 'zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f')"
 
 log() {
-  printf '[offline-package] %s\n' "$*"
+  printf '[offline-bundle] %s\n' "$*"
 }
 
 fail() {
-  printf '[offline-package] ERROR: %s\n' "$*" >&2
+  printf '[offline-bundle] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -121,10 +125,24 @@ usage() {
   cat <<EOF
 用法:
   $(basename "$0") [--output-dir DIR] [--skip-images] [--with-gpu|--without-gpu]
+                 [--prebuilt-ui-dir DIR|--build-ui-in-docker]
 
 说明:
   在 macOS arm64 或 Linux 主机上构建 Linux AMD64 离线部署包。
-  默认输出到 ./dist。
+  默认先本地构建 media-core 前端静态资源，并同步已存在的 Windows/macOS 桌面安装包；
+  然后生成离线部署包。默认输出到 ./dist。
+
+参数:
+  --output-dir DIR                输出目录，默认 ./dist
+  --skip-images                   只生成骨架包，跳过镜像和宿主机挂载二进制
+  --with-gpu                      生成 GPU-enabled 包
+  --without-gpu                   生成 CPU-only 包
+  --prebuilt-ui-dir DIR           使用已有前端静态资源目录，跳过本地前端构建
+  --build-ui-in-docker            使用 Docker 的 media-ui-export 阶段导出 UI，等同旧底层打包行为
+  --require-desktop-installers    本地构建 UI 时要求 Windows/macOS 安装包都存在
+  --allow-missing-installers      本地构建 UI 时允许缺少某个平台安装包，默认行为
+  --desktop-source-dir DIR        额外桌面安装包扫描目录，可重复
+  --skip-frontend-install         跳过前端 npm ci / npm install 检查
 
 环境变量:
   APT_MIRROR             默认 http://mirrors.aliyun.com；如显式置空则回退 Debian 官方源，也会作为 media-agent Ubuntu 运行时的默认镜像源。
@@ -140,6 +158,7 @@ usage() {
   MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 默认 jrottenberg/ffmpeg:7.1-nvidia2204；可覆写 media-agent GPU 运行时基础镜像。
   POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
   ZLM_SOURCE_IMAGE       可覆盖 ZLMediaKit 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
+  PREBUILT_UI_DIR        如设置，直接使用该目录中的前端静态资源，不再本地或通过 Docker 构建前端。
 EOF
 }
 
@@ -181,6 +200,34 @@ parse_args() {
         GPU_SUPPORT="false"
         shift
         ;;
+      --prebuilt-ui-dir)
+        [ "$#" -ge 2 ] || fail "--prebuilt-ui-dir 需要参数"
+        PREBUILT_UI_DIR="$2"
+        PREBUILD_UI=0
+        shift 2
+        ;;
+      --build-ui-in-docker)
+        PREBUILD_UI=0
+        unset PREBUILT_UI_DIR
+        shift
+        ;;
+      --require-desktop-installers|--require-desktop-clients)
+        ALLOW_MISSING_DESKTOP_INSTALLERS=0
+        shift
+        ;;
+      --allow-missing-installers|--allow-missing-clients)
+        ALLOW_MISSING_DESKTOP_INSTALLERS=1
+        shift
+        ;;
+      --desktop-source-dir)
+        [ "$#" -ge 2 ] || fail "--desktop-source-dir 需要参数"
+        FRONTEND_SOURCE_DIRS+=("$2")
+        shift 2
+        ;;
+      --skip-frontend-install)
+        FRONTEND_SKIP_INSTALL=1
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -190,6 +237,45 @@ parse_args() {
         ;;
     esac
   done
+}
+
+prepare_frontend_ui() {
+  local frontend_args=()
+  local source_dir=""
+
+  if [ -n "${PREBUILT_UI_DIR:-}" ]; then
+    [ -f "${PREBUILT_UI_DIR}/index.html" ] || fail "PREBUILT_UI_DIR 不是有效前端静态资源目录: ${PREBUILT_UI_DIR}"
+    log "使用预构建前端静态资源: ${PREBUILT_UI_DIR}"
+    return 0
+  fi
+
+  if [ "${PREBUILD_UI}" -eq 0 ]; then
+    log "前端静态资源将通过 Docker media-ui-export 阶段导出"
+    return 0
+  fi
+
+  require_cmd node
+
+  if [ "${ALLOW_MISSING_DESKTOP_INSTALLERS}" -eq 1 ]; then
+    frontend_args+=(--allow-missing-installers)
+  fi
+  if [ "${FRONTEND_SKIP_INSTALL}" -eq 1 ]; then
+    frontend_args+=(--skip-install)
+  fi
+  if [ "${#FRONTEND_SOURCE_DIRS[@]}" -gt 0 ]; then
+    for source_dir in "${FRONTEND_SOURCE_DIRS[@]}"; do
+      frontend_args+=(--source-dir "${source_dir}")
+    done
+  fi
+
+  log "构建前端静态资源并同步桌面安装包"
+  if [ "${#frontend_args[@]}" -gt 0 ]; then
+    node "${ROOT_DIR}/scripts/build-frontend-ui.mjs" "${frontend_args[@]}"
+  else
+    node "${ROOT_DIR}/scripts/build-frontend-ui.mjs"
+  fi
+  PREBUILT_UI_DIR="${ROOT_DIR}/crates/media-core/ui"
+  export PREBUILT_UI_DIR
 }
 
 resolve_gpu_support() {
@@ -282,6 +368,15 @@ export_ui_assets() {
   local output_dir="$1"
 
   mkdir -p "${output_dir}"
+  if [ -n "${PREBUILT_UI_DIR:-}" ]; then
+    [ -f "${PREBUILT_UI_DIR}/index.html" ] || fail "PREBUILT_UI_DIR 不是有效前端静态资源目录: ${PREBUILT_UI_DIR}"
+    log "使用预构建前端静态资源: ${PREBUILT_UI_DIR}"
+    rm -rf "${output_dir}/ui"
+    mkdir -p "${output_dir}/ui"
+    cp -R "${PREBUILT_UI_DIR}/." "${output_dir}/ui/"
+    return 0
+  fi
+
   log "导出 media-core 前端静态资源"
   docker buildx build \
     --platform linux/amd64 \
@@ -795,6 +890,7 @@ main() {
   ensure_supported_packaging_host
   ensure_tools
   resolve_gpu_support
+  prepare_frontend_ui
   media_agent_ubuntu_mirror="$(resolve_media_agent_ubuntu_mirror)"
 
   if [ -n "${APT_MIRROR}" ]; then
@@ -854,10 +950,16 @@ main() {
     log "跳过镜像与宿主机挂载物构建导出，仅生成骨架包"
     mkdir -p "${bundle_root}/images"
     mkdir -p "${bundle_root}/binaries"
-    mkdir -p "${bundle_root}/ui"
     echo "此包由 --skip-images 生成，未包含任何镜像。" >"${bundle_root}/images/SKIPPED.txt"
     echo "此包由 --skip-images 生成，未包含任何宿主机挂载二进制。" >"${bundle_root}/binaries/SKIPPED.txt"
-    echo "此包由 --skip-images 生成，未包含任何宿主机挂载前端静态资源。" >"${bundle_root}/ui/SKIPPED.txt"
+    if [ -n "${PREBUILT_UI_DIR:-}" ] && [ -f "${PREBUILT_UI_DIR}/index.html" ]; then
+      log "写入预构建前端静态资源: ${PREBUILT_UI_DIR}"
+      mkdir -p "${bundle_root}/ui/media-core"
+      cp -R "${PREBUILT_UI_DIR}/." "${bundle_root}/ui/media-core/"
+    else
+      mkdir -p "${bundle_root}/ui"
+      echo "此包由 --skip-images 生成，未包含任何宿主机挂载前端静态资源。" >"${bundle_root}/ui/SKIPPED.txt"
+    fi
   fi
 
   copy_static_assets "${bundle_root}" "${GPU_SUPPORT}"

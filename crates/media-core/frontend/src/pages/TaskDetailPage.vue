@@ -6,6 +6,7 @@ import { ElMessage } from "element-plus";
 
 import { streamApi, taskApi } from "@/shared/api/resources";
 import type { RecordingControlRequest } from "@/shared/api/types";
+import OpenInVlcLink from "@/shared/components/OpenInVlcLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
 import { copyText } from "@/shared/utils/clipboard";
@@ -237,16 +238,13 @@ async function stopRecording() {
               <el-table-column label="播放地址" min-width="360">
                 <template #default="{ row }">
                   <div class="stack-inline-links">
-                    <el-link
+                    <OpenInVlcLink
                       v-for="url in row.play_urls"
                       :key="url"
-                      type="primary"
-                      :href="url"
-                      target="_blank"
-                      rel="noreferrer"
+                      :url="url"
                     >
                       {{ url }}
-                    </el-link>
+                    </OpenInVlcLink>
                   </div>
                 </template>
               </el-table-column>
@@ -300,7 +298,7 @@ async function stopRecording() {
                     >
                       复制 HTTP 地址
                     </el-button>
-                    <el-link v-if="row.http_url" type="primary" :href="row.http_url" target="_blank" rel="noreferrer">打开</el-link>
+                    <OpenInVlcLink v-if="row.http_url" :url="row.http_url" label="打开" />
                   </div>
                 </template>
               </el-table-column>
@@ -335,7 +333,7 @@ async function stopRecording() {
                   <div class="table-actions">
                     <el-button link @click="copyText(row.file_path).then(() => ElMessage.success('已复制文件路径'))">复制路径</el-button>
                     <el-button link @click="copyText(row.http_url).then(() => ElMessage.success('已复制 HTTP 地址'))">复制 HTTP 地址</el-button>
-                    <el-link type="primary" :href="row.http_url" target="_blank" rel="noreferrer">打开</el-link>
+                    <OpenInVlcLink :url="row.http_url" label="打开" />
                   </div>
                 </template>
               </el-table-column>

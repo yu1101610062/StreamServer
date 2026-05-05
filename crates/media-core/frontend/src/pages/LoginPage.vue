@@ -3,6 +3,7 @@ import { reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 
+import DesktopClientDownload from "@/shared/components/DesktopClientDownload.vue";
 import { errorMessage } from "@/shared/utils/format";
 import { useSessionStore } from "@/stores/session";
 
@@ -72,6 +73,9 @@ async function submitBearerToken() {
             <p class="subtle">
               适用于 <code>external_jwt</code> 模式。不会写入本地存储，适合临时会话或第三方签发令牌。
             </p>
+          </div>
+          <div class="surface-card">
+            <DesktopClientDownload />
           </div>
         </div>
       </section>

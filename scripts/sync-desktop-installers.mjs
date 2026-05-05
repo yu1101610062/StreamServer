@@ -20,27 +20,29 @@ const sourceDirs = [...defaultSourceDirs];
 
 function usage() {
   console.log(`用法:
-  node scripts/sync-desktop-clients.mjs [options]
+  node scripts/sync-desktop-installers.mjs [options]
 
 说明:
-  扫描桌面客户端安装包，复制到前端 public/downloads/desktop，并生成 manifest.json。
+  扫描桌面安装包，复制到前端 public/assets/downloads/desktop，并生成 manifest.json。
 
 参数:
   --output-dir DIR              输出目录，默认 crates/media-core/frontend/public/assets/downloads/desktop
   --source-dir DIR              额外扫描目录，可重复
   --require-platform PLATFORM   要求平台存在，可重复；支持 windows, macos
   --require-dual-system         等同于 --require-platform windows --require-platform macos
-  --allow-missing               允许没有客户端安装包，用于本地开发构建
+  --allow-missing               允许没有桌面安装包，用于本地开发构建
   -h, --help                    显示帮助
 
 环境变量:
-  REQUIRE_DESKTOP_CLIENTS=1     默认要求 windows 和 macos 两个平台安装包
-  REQUIRED_DESKTOP_CLIENT_PLATFORMS=windows,macos
+  REQUIRE_DESKTOP_INSTALLERS=1  默认要求 windows 和 macos 两个平台安装包
+  REQUIRED_DESKTOP_INSTALLER_PLATFORMS=windows,macos
+  REQUIRE_DESKTOP_CLIENTS=1     旧环境变量别名
+  REQUIRED_DESKTOP_CLIENT_PLATFORMS=windows,macos 旧环境变量别名
 `);
 }
 
 function fail(message) {
-  console.error(`[desktop-client-sync] ERROR: ${message}`);
+  console.error(`[desktop-installer-sync] ERROR: ${message}`);
   process.exit(1);
 }
 
@@ -74,12 +76,17 @@ for (let index = 0; index < args.length; index += 1) {
   }
 }
 
-if (process.env.REQUIRED_DESKTOP_CLIENT_PLATFORMS) {
-  for (const platform of process.env.REQUIRED_DESKTOP_CLIENT_PLATFORMS.split(",").map((item) => item.trim()).filter(Boolean)) {
+const requiredPlatformsEnv =
+  process.env.REQUIRED_DESKTOP_INSTALLER_PLATFORMS ?? process.env.REQUIRED_DESKTOP_CLIENT_PLATFORMS;
+if (requiredPlatformsEnv) {
+  for (const platform of requiredPlatformsEnv.split(",").map((item) => item.trim()).filter(Boolean)) {
     addRequiredPlatform(platform);
   }
 }
-if (process.env.REQUIRE_DESKTOP_CLIENTS === "1" && requiredPlatforms.length === 0) {
+if (
+  (process.env.REQUIRE_DESKTOP_INSTALLERS === "1" || process.env.REQUIRE_DESKTOP_CLIENTS === "1") &&
+  requiredPlatforms.length === 0
+) {
   addRequiredPlatform("windows");
   addRequiredPlatform("macos");
 }
@@ -188,7 +195,7 @@ downloads.sort((a, b) => `${a.platform}-${a.arch}-${a.fileName}`.localeCompare(`
 const platforms = new Set(downloads.map((item) => item.platform));
 const missingPlatforms = requiredPlatforms.filter((platform) => !platforms.has(platform));
 if (!allowMissing && missingPlatforms.length > 0) {
-  fail(`缺少桌面客户端安装包: ${missingPlatforms.join(", ")}。请先运行 scripts/build-desktop-clients.mjs，或把安装包放入 apps/desktop-client/releases/`);
+  fail(`缺少桌面安装包: ${missingPlatforms.join(", ")}。请先运行 scripts/build-desktop-installers.mjs，或把安装包放入 apps/desktop-client/releases/`);
 }
 
 const manifest = {
@@ -199,7 +206,7 @@ const manifest = {
 writeFileSync(join(outputDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
 
 if (downloads.length === 0) {
-  console.warn("[desktop-client-sync] 未发现桌面客户端安装包，已生成空 manifest。");
+  console.warn("[desktop-installer-sync] 未发现桌面安装包，已生成空 manifest。");
 } else {
-  console.log(`[desktop-client-sync] 已内置 ${downloads.length} 个桌面客户端安装包。`);
+  console.log(`[desktop-installer-sync] 已内置 ${downloads.length} 个桌面安装包。`);
 }

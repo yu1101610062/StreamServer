@@ -6,6 +6,7 @@ import { ElMessage } from "element-plus";
 
 import { artifactApi } from "@/shared/api/resources";
 import type { OptionItem } from "@/shared/labels";
+import OpenInVlcLink from "@/shared/components/OpenInVlcLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { copyText } from "@/shared/utils/clipboard";
 import { formatBytes, formatTime, shortId } from "@/shared/utils/format";
@@ -153,7 +154,7 @@ async function resetFilters() {
             <div class="table-actions">
               <el-button link @click="copyText(row.file_path).then(() => ElMessage.success('已复制文件路径'))">复制路径</el-button>
               <el-button link @click="copyText(row.http_url).then(() => ElMessage.success('已复制 HTTP 地址'))">复制 HTTP 地址</el-button>
-              <el-link type="primary" :href="row.http_url" target="_blank" rel="noreferrer">打开</el-link>
+              <OpenInVlcLink :url="row.http_url" label="打开" />
             </div>
           </template>
         </el-table-column>

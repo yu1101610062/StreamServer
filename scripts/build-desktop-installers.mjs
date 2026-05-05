@@ -27,23 +27,23 @@ let requireDualSystem = false;
 
 function usage() {
   console.log(`用法:
-  node scripts/build-desktop-clients.mjs [options]
+  node scripts/build-desktop-installers.mjs [options]
 
 说明:
-  构建当前系统的 StreamServer 桌面客户端，并把安装包复制到 apps/desktop-client/releases/。
+  构建当前系统的 StreamServer 桌面客户端安装包，并复制到 apps/desktop-client/releases/。
   Windows 和 macOS 通常需要分别在对应系统运行本脚本；两个系统产物齐全后，前端打包脚本会把它们内置进去。
 
 参数:
   --output-dir DIR       输出目录，默认 apps/desktop-client/releases
   --skip-install         跳过 npm ci / npm install 检查
   --skip-build           不执行 tauri build，只整理已有 bundle 产物
-  --require-dual-system  打包后校验 releases 中同时存在 Windows 和 macOS 客户端
+  --require-dual-system  打包后校验 releases 中同时存在 Windows 和 macOS 安装包
   -h, --help             显示帮助
 `);
 }
 
 function fail(message) {
-  console.error(`[desktop-client-build] ERROR: ${message}`);
+  console.error(`[desktop-installer-build] ERROR: ${message}`);
   process.exit(1);
 }
 
@@ -84,7 +84,7 @@ function copyIfExists(sourcePath, targetName) {
   mkdirSync(outputDir, { recursive: true });
   const targetPath = join(outputDir, targetName);
   copyFileSync(sourcePath, targetPath);
-  console.log(`[desktop-client-build] ${sourcePath} -> ${targetPath}`);
+  console.log(`[desktop-installer-build] ${sourcePath} -> ${targetPath}`);
   return true;
 }
 
@@ -238,7 +238,7 @@ function createMacInstallerDmg(appPath, arch) {
 
 function cleanupMacBundleApp(appPath) {
   rmSync(appPath, { recursive: true, force: true });
-  console.log(`[desktop-client-build] 已清理本地 macOS .app 构建产物: ${appPath}`);
+  console.log(`[desktop-installer-build] 已清理本地 macOS .app 构建产物: ${appPath}`);
 }
 
 function collectBundles() {
@@ -293,6 +293,6 @@ collectBundles();
 if (requireDualSystem) {
   const missing = ["windows", "macos"].filter((platform) => !hasPlatform(platform));
   if (missing.length > 0) {
-    fail(`缺少 ${missing.join(", ")} 客户端安装包。请在对应系统运行本脚本后再校验。`);
+    fail(`缺少 ${missing.join(", ")} 桌面安装包。请在对应系统运行本脚本后再校验。`);
   }
 }

@@ -14,16 +14,17 @@ const passthroughSyncArgs = ["--require-dual-system"];
 
 function usage() {
   console.log(`用法:
-  node scripts/build-frontend-with-desktop-clients.mjs [options]
+  node scripts/build-frontend-ui.mjs [options]
 
 说明:
-  单独构建 media-core 前端，并在打包前内置 Windows/macOS 桌面客户端安装包。
+  构建 media-core 前端，并在构建前内置 Windows/macOS 桌面安装包。
 
 参数:
-  --allow-missing-clients   允许缺少某个平台客户端，用于本地调试
-  --skip-install            跳过 npm ci / npm install 检查
-  --source-dir DIR          额外客户端安装包目录，传给 sync-desktop-clients
-  -h, --help                显示帮助
+  --allow-missing-installers 允许缺少某个平台安装包，用于本地调试
+  --allow-missing-clients    旧参数别名，同 --allow-missing-installers
+  --skip-install             跳过 npm ci / npm install 检查
+  --source-dir DIR           额外安装包目录，传给 sync-desktop-installers
+  -h, --help                 显示帮助
 `);
 }
 
@@ -40,7 +41,7 @@ function run(command, commandArgs, options = {}) {
 
 for (let index = 0; index < args.length; index += 1) {
   const arg = args[index];
-  if (arg === "--allow-missing-clients") {
+  if (arg === "--allow-missing-installers" || arg === "--allow-missing-clients") {
     allowMissingClients = true;
   } else if (arg === "--skip-install") {
     skipInstall = true;
@@ -63,5 +64,5 @@ if (!skipInstall && !existsSync(join(frontendDir, "node_modules"))) {
   run("npm", ["ci"], { cwd: frontendDir });
 }
 
-run("node", [join(rootDir, "scripts", "sync-desktop-clients.mjs"), ...passthroughSyncArgs], { cwd: rootDir });
+run("node", [join(rootDir, "scripts", "sync-desktop-installers.mjs"), ...passthroughSyncArgs], { cwd: rootDir });
 run("npm", ["run", "build:web"], { cwd: frontendDir });

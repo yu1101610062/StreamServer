@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
+import DesktopClientDownloadMenu from "@/shared/components/DesktopClientDownloadMenu.vue";
 import { NAV_ITEMS } from "@/shared/labels";
 import { useSessionStore } from "@/stores/session";
 import { useThemeStore, type ThemePreference } from "@/stores/theme";
@@ -56,6 +57,7 @@ function changeTheme(value: ThemePreference) {
           </div>
         </div>
         <div class="topbar-actions">
+          <DesktopClientDownloadMenu />
           <el-select
             :model-value="themeStore.preference"
             class="theme-select"

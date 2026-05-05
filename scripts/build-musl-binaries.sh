@@ -14,11 +14,11 @@ MUSL_CARGO_TARGET_DIR="${MUSL_CARGO_TARGET_DIR:-${ROOT_DIR}/target/docker-musl}"
 MUSL_REBUILD_BUILDER="${MUSL_REBUILD_BUILDER:-0}"
 
 log() {
-  printf '[musl-build] %s\n' "$*"
+  printf '[musl-binaries] %s\n' "$*"
 }
 
 fail() {
-  printf '[musl-build] ERROR: %s\n' "$*" >&2
+  printf '[musl-binaries] ERROR: %s\n' "$*" >&2
   exit 1
 }
 

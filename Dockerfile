@@ -16,6 +16,8 @@ WORKDIR /app/crates/media-core/frontend
 
 COPY crates/media-core/frontend/package.json ./
 COPY crates/media-core/frontend/package-lock.json ./
+COPY scripts/sync-desktop-installers.mjs /app/scripts/sync-desktop-installers.mjs
+COPY apps/desktop-client/releases /app/apps/desktop-client/releases
 
 RUN if [ -n "${NPM_REGISTRY_MIRROR:-}" ]; then npm config set registry "${NPM_REGISTRY_MIRROR}"; fi \
     && npm ci

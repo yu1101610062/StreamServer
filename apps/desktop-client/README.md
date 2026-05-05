@@ -26,4 +26,4 @@ Build the desktop installer on each target platform, then place the installers i
 - `streamserver-desktop-macos-aarch64.dmg`
 - `streamserver-desktop-macos-x64.dmg`
 
-When the web console runs `npm run build`, it copies available installers into `crates/media-core/ui/downloads/desktop/` and generates the download manifest used by the login page.
+When the web console runs `npm run build`, it copies available installers into `crates/media-core/ui/assets/downloads/desktop/` and generates the download manifest used by the login page.
