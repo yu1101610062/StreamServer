@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ALLOW_MISSING_CLIENTS=0
+ALLOW_MISSING_CLIENTS=1
 PACKAGE_ARGS=()
 
 usage() {
@@ -11,13 +11,17 @@ usage() {
   ./scripts/build-deploy-package.sh [--allow-missing-clients] [package-offline-bundle 参数...]
 
 说明:
-  构建离线部署包。脚本会先构建前端静态资源，并内置 Windows/macOS 桌面客户端安装包；
+  构建离线部署包。脚本会先构建前端静态资源，默认允许缺少某个平台客户端，
+  并内置已存在的 Windows/macOS 桌面客户端安装包；
   然后调用 scripts/package-offline-bundle.sh 生成部署包。
+
+参数:
+  --allow-missing-clients   默认行为；允许缺少某个平台客户端
 
 常用示例:
   ./scripts/build-deploy-package.sh --with-gpu
   ./scripts/build-deploy-package.sh --without-gpu --output-dir ./dist
-  ./scripts/build-deploy-package.sh --allow-missing-clients --skip-images
+  ./scripts/build-deploy-package.sh --skip-images
 EOF
 }
 
