@@ -3683,6 +3683,353 @@ async fn orphaned_event_with_stop_intent_reconciles_to_canceled() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn orphaned_running_attempt_marks_lost_and_auto_retries() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let task_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let started_at = Utc::now() - chrono::Duration::seconds(30);
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+
+    sqlx::query(
+        r#"
+        insert into tasks (
+          id, name, type, status, idempotency_key,
+          priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+          current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+        ) values (
+          $1, 'relay-camera-01', 'stream_ingest'::task_type, 'RUNNING'::task_status, $2,
+          50, $3, $3, 'tester', $4,
+          1, 'immediate', $5, $5, $5, null
+        )
+        "#,
+    )
+    .bind(task_id)
+    .bind(format!("orphaned-running-{task_id}"))
+    .bind(&resolved_spec)
+    .bind(node_id)
+    .bind(started_at)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into task_attempts (
+          id, task_id, attempt_no, node_id, worker_kind, status,
+          pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+          rtp_port, exit_code, failure_code, failure_reason,
+          checkpoint_json, started_at, ended_at, created_at, lease_token
+        ) values (
+          $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'RUNNING'::attempt_status,
+          1234, null, 'rtsp', '__defaultVhost__', 'live', 'camera01',
+          null, null, null, null,
+          null, $4, null, $4, 'lease-1'
+        )
+        "#,
+    )
+    .bind(attempt_id)
+    .bind(task_id)
+    .bind(node_id)
+    .bind(started_at)
+    .execute(&db.pool)
+    .await?;
+
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "orphaned".to_string(),
+                event_level: "warn".to_string(),
+                message: "runtime missing".to_string(),
+                payload: json!({"reason": "runtime_not_found"}),
+            },
+        )
+        .await?;
+
+    let summary = repository.get_task_summary(task_id).await?;
+    assert_eq!(summary.status, media_domain::TaskStatus::Queued);
+    assert_eq!(summary.current_attempt_no, 2);
+    assert_eq!(summary.assigned_node_id, None);
+
+    let attempts = sqlx::query(
+        r#"
+        select attempt_no, status::text as status, failure_code, node_id
+          from task_attempts
+         where task_id = $1
+         order by attempt_no asc
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].try_get::<i32, _>("attempt_no")?, 1);
+    assert_eq!(attempts[0].try_get::<String, _>("status")?, "FAILED");
+    assert_eq!(
+        attempts[0].try_get::<Option<String>, _>("failure_code")?,
+        Some("runtime_not_found".to_string())
+    );
+    assert_eq!(attempts[1].try_get::<i32, _>("attempt_no")?, 2);
+    assert_eq!(attempts[1].try_get::<String, _>("status")?, "PENDING");
+    assert_eq!(attempts[1].try_get::<Option<Uuid>, _>("node_id")?, None);
+
+    let event_count: i64 = sqlx::query_scalar(
+        "select count(*) from task_events where task_id = $1 and event_type = 'task_lost_after_reclaim_orphaned'",
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(event_count, 1);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn orphaned_running_attempt_with_retry_disabled_stays_lost() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let task_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let started_at = Utc::now() - chrono::Duration::seconds(30);
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-02",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera02"},
+        "recovery": {"policy": "never"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+
+    sqlx::query(
+        r#"
+        insert into tasks (
+          id, name, type, status, idempotency_key,
+          priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+          current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+        ) values (
+          $1, 'relay-camera-02', 'stream_ingest'::task_type, 'RUNNING'::task_status, $2,
+          50, $3, $3, 'tester', $4,
+          1, 'immediate', $5, $5, $5, null
+        )
+        "#,
+    )
+    .bind(task_id)
+    .bind(format!("orphaned-never-{task_id}"))
+    .bind(&resolved_spec)
+    .bind(node_id)
+    .bind(started_at)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into task_attempts (
+          id, task_id, attempt_no, node_id, worker_kind, status,
+          pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+          rtp_port, exit_code, failure_code, failure_reason,
+          checkpoint_json, started_at, ended_at, created_at, lease_token
+        ) values (
+          $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'RUNNING'::attempt_status,
+          1234, null, 'rtsp', '__defaultVhost__', 'live', 'camera02',
+          null, null, null, null,
+          null, $4, null, $4, 'lease-1'
+        )
+        "#,
+    )
+    .bind(attempt_id)
+    .bind(task_id)
+    .bind(node_id)
+    .bind(started_at)
+    .execute(&db.pool)
+    .await?;
+
+    repository
+        .record_agent_task_event(
+            node_id,
+            repository::AgentTaskEventRecord {
+                task_id,
+                attempt_no: 1,
+                lease_token: "lease-1".to_string(),
+                event_type: "orphaned".to_string(),
+                event_level: "warn".to_string(),
+                message: "runtime missing".to_string(),
+                payload: json!({"reason": "runtime_not_found"}),
+            },
+        )
+        .await?;
+
+    let summary = repository.get_task_summary(task_id).await?;
+    assert_eq!(summary.status, media_domain::TaskStatus::Lost);
+    assert_eq!(summary.current_attempt_no, 1);
+    assert_eq!(summary.assigned_node_id, None);
+
+    let attempts = sqlx::query(
+        r#"
+        select attempt_no, status::text as status, failure_code
+          from task_attempts
+         where task_id = $1
+         order by attempt_no asc
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].try_get::<i32, _>("attempt_no")?, 1);
+    assert_eq!(attempts[0].try_get::<String, _>("status")?, "FAILED");
+    assert_eq!(
+        attempts[0].try_get::<Option<String>, _>("failure_code")?,
+        Some("runtime_not_found".to_string())
+    );
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_reuses_pending_retry_attempt() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let task_id = Uuid::now_v7();
+    let attempt_id = Uuid::now_v7();
+    let now = Utc::now();
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "retry-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "retry-camera01"},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+
+    sqlx::query(
+        r#"
+        insert into tasks (
+          id, name, type, status, idempotency_key,
+          priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+          current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+        ) values (
+          $1, 'retry-camera-01', 'stream_ingest'::task_type, 'FAILED'::task_status, $2,
+          50, $3, $3, 'tester', null,
+          1, 'immediate', $4, $4, $4, $4
+        )
+        "#,
+    )
+    .bind(task_id)
+    .bind(format!("retry-dispatch-{task_id}"))
+    .bind(&resolved_spec)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into task_attempts (
+          id, task_id, attempt_no, node_id, worker_kind, status,
+          pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+          rtp_port, exit_code, failure_code, failure_reason,
+          checkpoint_json, started_at, ended_at, created_at
+        ) values (
+          $1, $2, 1, null, 'zlm_proxy'::worker_kind, 'FAILED'::attempt_status,
+          null, null, null, null, null, null,
+          null, null, 'agent_failed', 'failed before retry',
+          null, $3, $3, $3
+        )
+        "#,
+    )
+    .bind(attempt_id)
+    .bind(task_id)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+
+    let retry = repository.retry_task(task_id).await?;
+    assert_eq!(retry.attempt_no, 2);
+    let command = repository
+        .prepare_task_dispatch(task_id, node_id, "test-holder")
+        .await?;
+    assert_eq!(command.attempt_no, 2);
+
+    let attempts = sqlx::query(
+        r#"
+        select attempt_no, status::text as status, node_id, nullif(lease_token, '') as lease_token
+          from task_attempts
+         where task_id = $1
+         order by attempt_no asc
+        "#,
+    )
+    .bind(task_id)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].try_get::<i32, _>("attempt_no")?, 2);
+    assert_eq!(attempts[1].try_get::<String, _>("status")?, "PENDING");
+    assert_eq!(
+        attempts[1].try_get::<Option<Uuid>, _>("node_id")?,
+        Some(node_id)
+    );
+    assert!(
+        attempts[1]
+            .try_get::<Option<String>, _>("lease_token")?
+            .is_some()
+    );
+
+    let summary = repository.get_task_summary(task_id).await?;
+    assert_eq!(summary.status, media_domain::TaskStatus::Dispatching);
+    assert_eq!(summary.current_attempt_no, 2);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn record_agent_snapshot_ignores_missing_attempt_without_sql_error() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());

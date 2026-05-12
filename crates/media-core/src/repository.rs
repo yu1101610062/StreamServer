@@ -2730,36 +2730,89 @@ impl TaskRepository {
         let resolved_spec = row
             .try_get::<Option<Value>, _>("resolved_spec")?
             .ok_or(RepoError::TaskMissingResolvedSpec(task_id))?;
-        let attempt_no = current.current_attempt_no.max(0) + 1;
-        let worker_kind = current.task_type.default_worker_kind();
         let now = Utc::now();
         let lease_token = Uuid::now_v7().to_string();
-        let attempt_id = Uuid::now_v7();
-
-        sqlx::query(
-            r#"
-            insert into task_attempts (
-              id, task_id, attempt_no, node_id, worker_kind, status, lease_token,
-              pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
-              rtp_port, exit_code, failure_code, failure_reason,
-              checkpoint_json, started_at, ended_at, created_at
-            ) values (
-              $1, $2, $3, $4, $5::worker_kind, 'PENDING'::attempt_status, $6,
-              null, null, null, null, null, null,
-              null, null, null, null,
-              null, null, null, $7
+        let pending_attempt = if current.current_attempt_no > 0 {
+            sqlx::query(
+                r#"
+                select id, worker_kind::text as worker_kind, status::text as status
+                  from task_attempts
+                 where task_id = $1
+                   and attempt_no = $2
+                 for update
+                "#,
             )
-            "#,
-        )
-        .bind(attempt_id)
-        .bind(task_id)
-        .bind(attempt_no)
-        .bind(node_id)
-        .bind(worker_kind.as_str())
-        .bind(&lease_token)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
+            .bind(task_id)
+            .bind(current.current_attempt_no)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+        let reuse_pending_attempt = pending_attempt.as_ref().is_some_and(|row| {
+            row.try_get::<String, _>("status").ok().as_deref() == Some("PENDING")
+        });
+        let attempt_no = if reuse_pending_attempt {
+            current.current_attempt_no
+        } else {
+            current.current_attempt_no.max(0) + 1
+        };
+        let worker_kind = if reuse_pending_attempt {
+            let worker_kind = pending_attempt
+                .as_ref()
+                .expect("pending attempt is present when reuse is enabled")
+                .try_get::<String, _>("worker_kind")?;
+            WorkerKind::from_str(&worker_kind)?
+        } else {
+            current.task_type.default_worker_kind()
+        };
+
+        if reuse_pending_attempt {
+            sqlx::query(
+                r#"
+                update task_attempts
+                   set node_id = $1,
+                       lease_token = $2,
+                       failure_code = null,
+                       failure_reason = null,
+                       ended_at = null
+                 where task_id = $3
+                   and attempt_no = $4
+                   and status = 'PENDING'::attempt_status
+                "#,
+            )
+            .bind(node_id)
+            .bind(&lease_token)
+            .bind(task_id)
+            .bind(attempt_no)
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            sqlx::query(
+                r#"
+                insert into task_attempts (
+                  id, task_id, attempt_no, node_id, worker_kind, status, lease_token,
+                  pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
+                  rtp_port, exit_code, failure_code, failure_reason,
+                  checkpoint_json, started_at, ended_at, created_at
+                ) values (
+                  $1, $2, $3, $4, $5::worker_kind, 'PENDING'::attempt_status, $6,
+                  null, null, null, null, null, null,
+                  null, null, null, null,
+                  null, null, null, $7
+                )
+                "#,
+            )
+            .bind(Uuid::now_v7())
+            .bind(task_id)
+            .bind(attempt_no)
+            .bind(node_id)
+            .bind(worker_kind.as_str())
+            .bind(&lease_token)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -3763,6 +3816,7 @@ impl TaskRepository {
                 .and_then(Value::as_str)
                 .is_some_and(|reason| reason == "disk_threshold_exceeded");
 
+        let mut retry_after_orphaned = false;
         match event.event_type.as_str() {
             "accepted" | "starting"
                 if sticky_reconnect_active && ownership.task_status == TaskStatus::Running => {}
@@ -3894,21 +3948,64 @@ impl TaskRepository {
                     .bind(event.attempt_no)
                     .execute(&mut *tx)
                     .await?;
+                } else if matches!(
+                    ownership.task_status,
+                    TaskStatus::Dispatching
+                        | TaskStatus::Starting
+                        | TaskStatus::Running
+                        | TaskStatus::Recovering
+                        | TaskStatus::Reclaiming
+                ) {
+                    let resolved_spec = ownership
+                        .resolved_spec
+                        .clone()
+                        .map(serde_json::from_value::<TaskSpec>)
+                        .transpose()?;
+                    retry_after_orphaned = resolved_spec
+                        .as_ref()
+                        .is_some_and(retry_enabled_on_disconnect);
+                    self.mark_task_lost(
+                        &mut tx,
+                        event.task_id,
+                        event.attempt_no,
+                        node_id,
+                        "runtime_not_found",
+                        "reclaimed runtime was reported missing by the agent",
+                        now,
+                    )
+                    .await?;
+                    self.insert_event(
+                        &mut tx,
+                        event.task_id,
+                        ownership.attempt_id,
+                        Some(event.attempt_no),
+                        EventSource::Core,
+                        "task_lost_after_reclaim_orphaned",
+                        "warn",
+                        json!({
+                            "node_id": node_id,
+                            "attempt_no": event.attempt_no,
+                            "reason": "runtime_not_found",
+                            "auto_retry": retry_after_orphaned,
+                        }),
+                    )
+                    .await?;
+                } else {
+                    sqlx::query(
+                        r#"
+                        update task_attempts
+                           set status = 'ORPHANED'::attempt_status,
+                               node_id = $1
+                         where task_id = $2
+                           and attempt_no = $3
+                        "#,
+                    )
+                    .bind(node_id)
+                    .bind(event.task_id)
+                    .bind(event.attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
                 }
-                sqlx::query(
-                    r#"
-                    update task_attempts
-                       set status = 'ORPHANED'::attempt_status,
-                           node_id = $1
-                     where task_id = $2
-                       and attempt_no = $3
-                    "#,
-                )
-                .bind(node_id)
-                .bind(event.task_id)
-                .bind(event.attempt_no)
-                .execute(&mut *tx)
-                .await?;
             }
             "running" => {
                 self.promote_task_running(&mut tx, event.task_id, event.attempt_no, node_id, now)
@@ -4114,6 +4211,21 @@ impl TaskRepository {
         }
 
         tx.commit().await?;
+        if retry_after_orphaned {
+            let current = self.fetch_task_summary(event.task_id).await?;
+            if current.status == TaskStatus::Lost {
+                self.enqueue_retry(
+                    current,
+                    EventSource::Core,
+                    "task_retry_after_reclaim_orphaned",
+                    json!({
+                        "reason": "runtime_not_found",
+                        "auto_retry": true,
+                    }),
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
