@@ -1322,6 +1322,80 @@ async fn stop_task_rejects_created_state_via_api() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn stop_task_allows_starting_state_via_api() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:18080",
+        "http://127.0.0.1:8081",
+    )
+    .await?;
+    let task_id = insert_starting_stream_task(
+        &db.pool,
+        node_id,
+        sample_create_task_payload("immediate"),
+        "live",
+        "camera01",
+    )
+    .await?;
+
+    let app = build_app(test_app_state(db.pool.clone()));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/tasks/{task_id}/stop"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = json_body(response).await;
+    assert_eq!(body["id"], json!(task_id));
+    assert_eq!(body["status"], json!("STOPPING"));
+
+    let row = sqlx::query(
+        r#"
+        select
+          t.status::text as task_status,
+          ta.status::text as attempt_status,
+          ta.stop_requested_at,
+          ta.stop_reason,
+          ta.desired_terminal_status::text as desired_terminal_status
+        from tasks t
+        join task_attempts ta on ta.task_id = t.id and ta.attempt_no = t.current_attempt_no
+        where t.id = $1
+        "#,
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(row.try_get::<String, _>("task_status")?, "STOPPING");
+    assert_eq!(row.try_get::<String, _>("attempt_status")?, "STOPPING");
+    assert!(
+        row.try_get::<Option<DateTime<Utc>>, _>("stop_requested_at")?
+            .is_some()
+    );
+    assert_eq!(
+        row.try_get::<Option<String>, _>("stop_reason")?.as_deref(),
+        Some("user_requested")
+    );
+    assert_eq!(
+        row.try_get::<Option<String>, _>("desired_terminal_status")?
+            .as_deref(),
+        Some("CANCELED")
+    );
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stop_task_is_idempotent_when_task_is_already_stopping_via_api() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());

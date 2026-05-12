@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage, ElMessageBox } from "element-plus";
@@ -9,6 +9,13 @@ import PageHeader from "@/shared/components/PageHeader.vue";
 import StatusTag from "@/shared/components/StatusTag.vue";
 import { TASK_STATUSES, TASK_TYPES, taskTypeLabel } from "@/shared/labels";
 import type { TaskSummary } from "@/shared/api/types";
+import {
+  availableTaskOperations,
+  rowActions,
+  taskOperationConfig,
+  tasksSupportingOperation,
+  type TaskOperation,
+} from "@/shared/task-actions";
 import { errorMessage, formatTime, shortId } from "@/shared/utils/format";
 
 const router = useRouter();
@@ -67,14 +74,34 @@ const nodesQuery = useQuery({
   queryFn: () => nodeApi.list(),
 });
 
+const selectedTaskIds = ref<string[]>([]);
+const pendingBatchAction = ref<TaskOperation | null>(null);
+
+const selectedTasks = computed(() => {
+  const tasksById = new Map((tasksQuery.data.value?.items ?? []).map((task) => [task.id, task]));
+  return selectedTaskIds.value.flatMap((id) => {
+    const task = tasksById.get(id);
+    return task ? [task] : [];
+  });
+});
+
+const selectedTaskOperations = computed(() => availableTaskOperations(selectedTasks.value));
+
+function handleSelectionChange(rows: TaskSummary[]) {
+  selectedTaskIds.value = rows.map((row) => row.id);
+}
+
+async function executeTaskOperation(task: TaskSummary, action: TaskOperation) {
+  if (action === "start") return taskApi.start(task.id);
+  if (action === "stop") return taskApi.stop(task.id);
+  if (action === "cancel") return taskApi.cancel(task.id);
+  if (action === "delete") return taskApi.delete(task.id);
+  return taskApi.retry(task.id);
+}
+
 const actionMutation = useMutation({
-  mutationFn: async ({ task, action }: { task: TaskSummary; action: "start" | "stop" | "cancel" | "retry" | "delete" }) => {
-    if (action === "start") return taskApi.start(task.id);
-    if (action === "stop") return taskApi.stop(task.id);
-    if (action === "cancel") return taskApi.cancel(task.id);
-    if (action === "delete") return taskApi.delete(task.id);
-    return taskApi.retry(task.id);
-  },
+  mutationFn: async ({ task, action }: { task: TaskSummary; action: TaskOperation }) =>
+    executeTaskOperation(task, action),
   onSuccess: () => {
     queryClient.invalidateQueries({ queryKey: ["tasks"] });
   },
@@ -99,17 +126,8 @@ async function applyFilters() {
   });
 }
 
-async function runAction(task: TaskSummary, action: "start" | "stop" | "cancel" | "retry" | "delete") {
-  const actionLabel =
-    action === "start"
-      ? "启动"
-      : action === "stop"
-        ? "停止"
-        : action === "cancel"
-          ? "取消"
-          : action === "retry"
-            ? "重试"
-            : "删除";
+async function runAction(task: TaskSummary, action: TaskOperation) {
+  const actionLabel = taskOperationConfig(action).label;
   const message =
     action === "delete"
       ? `确认删除任务 ${task.name} 吗？该操作会同时删除其尝试记录、事件、录像与产物索引。`
@@ -119,21 +137,59 @@ async function runAction(task: TaskSummary, action: "start" | "stop" | "cancel" 
   ElMessage.success(action === "delete" ? "任务已删除" : `已提交${actionLabel}请求`);
 }
 
+async function runBatchAction(action: TaskOperation) {
+  const actionLabel = taskOperationConfig(action).label;
+  const selected = selectedTasks.value;
+  const supportedTasks = tasksSupportingOperation(selected, action);
+  const skippedCount = selected.length - supportedTasks.length;
+
+  if (supportedTasks.length === 0) {
+    ElMessage.success("部分任务不支持该操作，已跳过");
+    return;
+  }
+
+  const skipText = skippedCount > 0 ? `，${skippedCount} 个不支持该操作的任务会跳过` : "";
+  const message =
+    action === "delete"
+      ? `确认删除 ${supportedTasks.length} 个任务吗${skipText}？该操作会同时删除其尝试记录、事件、录像与产物索引。`
+      : `确认对 ${supportedTasks.length} 个任务执行${actionLabel}吗${skipText}？`;
+
+  await ElMessageBox.confirm(message, "批量任务操作", { type: "warning" });
+  pendingBatchAction.value = action;
+
+  try {
+    const results = await Promise.allSettled(supportedTasks.map((task) => executeTaskOperation(task, action)));
+    const failedResults = results.filter((result) => result.status === "rejected");
+    const successCount = results.length - failedResults.length;
+
+    if (successCount > 0) {
+      const successText =
+        action === "delete"
+          ? `已删除 ${successCount} 个任务`
+          : `已提交 ${successCount} 个任务的${actionLabel}请求`;
+      ElMessage.success(
+        skippedCount > 0 ? `${successText}，部分任务不支持该操作，已跳过` : successText,
+      );
+    } else if (skippedCount > 0) {
+      ElMessage.success("部分任务不支持该操作，已跳过");
+    }
+
+    if (failedResults.length > 0) {
+      const firstFailed = failedResults[0];
+      const reason = firstFailed.status === "rejected" ? firstFailed.reason : undefined;
+      ElMessage.error(`${failedResults.length} 个任务操作失败：${errorMessage(reason)}`);
+    }
+
+    queryClient.invalidateQueries({ queryKey: ["tasks"] });
+  } finally {
+    pendingBatchAction.value = null;
+  }
+}
+
 async function cloneTask(task: TaskSummary) {
   const cloned = await taskApi.clone(task.id, {});
   ElMessage.success(`已克隆任务 ${shortId(cloned.id)}`);
   await router.push(`/tasks/${cloned.id}`);
-}
-
-function rowActions(task: TaskSummary) {
-  return {
-    canStart: ["CREATED", "VALIDATING", "FAILED", "CANCELED"].includes(task.status),
-    canStop: ["DISPATCHING", "STARTING", "RUNNING", "RECOVERING"].includes(task.status),
-    canCancel: ["CREATED", "VALIDATING", "QUEUED", "DISPATCHING", "STARTING", "RUNNING", "RECOVERING"].includes(task.status),
-    canRetry: ["FAILED", "LOST"].includes(task.status),
-    canClone: ["SUCCEEDED", "FAILED", "CANCELED", "LOST"].includes(task.status),
-    canDelete: ["CREATED", "VALIDATING", "QUEUED", "SUCCEEDED", "FAILED", "CANCELED", "LOST"].includes(task.status),
-  };
 }
 
 function transcodeLabel(task: TaskSummary) {
@@ -226,45 +282,67 @@ function transcodeTagType(task: TaskSummary) {
     </div>
 
     <div class="surface-card">
+      <div v-if="selectedTasks.length > 0" class="task-bulk-actions">
+        <span class="task-bulk-actions__summary">已选 {{ selectedTasks.length }} 个任务</span>
+        <div class="task-bulk-actions__buttons">
+          <el-button
+            v-for="action in selectedTaskOperations"
+            :key="action.key"
+            size="small"
+            :type="action.danger ? 'danger' : undefined"
+            :loading="pendingBatchAction === action.key"
+            :disabled="pendingBatchAction !== null || actionMutation.isPending.value"
+            @click="runBatchAction(action.key)"
+          >
+            批量{{ action.label }}
+          </el-button>
+        </div>
+      </div>
+
       <div class="table-scroll">
-        <el-table :data="tasksQuery.data.value?.items ?? []" v-loading="tasksQuery.isLoading.value">
-        <el-table-column label="任务 ID" min-width="130">
-          <template #default="{ row }">
-            <el-link type="primary" @click="router.push(`/tasks/${row.id}`)">{{ shortId(row.id) }}</el-link>
-          </template>
-        </el-table-column>
-        <el-table-column prop="name" label="名称" min-width="220" />
-        <el-table-column label="类型" min-width="140">
-          <template #default="{ row }">{{ taskTypeLabel(row.type) }}</template>
-        </el-table-column>
-        <el-table-column label="状态" min-width="120">
-          <template #default="{ row }">
-            <StatusTag :status="row.status" />
-          </template>
-        </el-table-column>
-        <el-table-column label="转码" min-width="120">
-          <template #default="{ row }">
-            <el-tag :type="transcodeTagType(row)" effect="light" round>{{ transcodeLabel(row) }}</el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column prop="priority" label="优先级" min-width="100" />
-        <el-table-column prop="created_by" label="创建人" min-width="140" />
-        <el-table-column label="创建时间" min-width="180">
-          <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
-        </el-table-column>
-        <el-table-column label="操作" min-width="320" fixed="right">
-          <template #default="{ row }">
-            <div style="display: flex; gap: 8px; flex-wrap: wrap">
-              <el-button link type="primary" @click="router.push(`/tasks/${row.id}`)">详情</el-button>
-              <el-button v-if="rowActions(row).canStart" link @click="runAction(row, 'start')">启动</el-button>
-              <el-button v-if="rowActions(row).canStop" link @click="runAction(row, 'stop')">停止</el-button>
-              <el-button v-if="rowActions(row).canCancel" link @click="runAction(row, 'cancel')">取消</el-button>
-              <el-button v-if="rowActions(row).canRetry" link @click="runAction(row, 'retry')">重试</el-button>
-              <el-button v-if="rowActions(row).canClone" link @click="cloneTask(row)">克隆</el-button>
-              <el-button v-if="rowActions(row).canDelete" link type="danger" @click="runAction(row, 'delete')">删除</el-button>
-            </div>
-          </template>
-        </el-table-column>
+        <el-table
+          :data="tasksQuery.data.value?.items ?? []"
+          v-loading="tasksQuery.isLoading.value"
+          @selection-change="handleSelectionChange"
+        >
+          <el-table-column type="selection" width="48" />
+          <el-table-column label="任务 ID" min-width="130">
+            <template #default="{ row }">
+              <el-link type="primary" @click="router.push(`/tasks/${row.id}`)">{{ shortId(row.id) }}</el-link>
+            </template>
+          </el-table-column>
+          <el-table-column prop="name" label="名称" min-width="220" />
+          <el-table-column label="类型" min-width="140">
+            <template #default="{ row }">{{ taskTypeLabel(row.type) }}</template>
+          </el-table-column>
+          <el-table-column label="状态" min-width="120">
+            <template #default="{ row }">
+              <StatusTag :status="row.status" />
+            </template>
+          </el-table-column>
+          <el-table-column label="转码" min-width="120">
+            <template #default="{ row }">
+              <el-tag :type="transcodeTagType(row)" effect="light" round>{{ transcodeLabel(row) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="priority" label="优先级" min-width="100" />
+          <el-table-column prop="created_by" label="创建人" min-width="140" />
+          <el-table-column label="创建时间" min-width="180">
+            <template #default="{ row }">{{ formatTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column label="操作" min-width="320" fixed="right">
+            <template #default="{ row }">
+              <div style="display: flex; gap: 8px; flex-wrap: wrap">
+                <el-button link type="primary" @click="router.push(`/tasks/${row.id}`)">详情</el-button>
+                <el-button v-if="rowActions(row).canStart" link @click="runAction(row, 'start')">启动</el-button>
+                <el-button v-if="rowActions(row).canStop" link @click="runAction(row, 'stop')">停止</el-button>
+                <el-button v-if="rowActions(row).canCancel" link @click="runAction(row, 'cancel')">取消</el-button>
+                <el-button v-if="rowActions(row).canRetry" link @click="runAction(row, 'retry')">重试</el-button>
+                <el-button v-if="rowActions(row).canClone" link @click="cloneTask(row)">克隆</el-button>
+                <el-button v-if="rowActions(row).canDelete" link type="danger" @click="runAction(row, 'delete')">删除</el-button>
+              </div>
+            </template>
+          </el-table-column>
         </el-table>
       </div>
 
@@ -292,5 +370,27 @@ function transcodeTagType(task: TaskSummary) {
 
 .task-status-option .subtle {
   white-space: nowrap;
+}
+
+.task-bulk-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.task-bulk-actions__summary {
+  color: var(--console-muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.task-bulk-actions__buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 </style>

@@ -29,6 +29,7 @@ impl TaskStatus {
                 | (Dispatching, Starting)
                 | (Dispatching, Reclaiming)
                 | (Starting, Running)
+                | (Starting, Stopping)
                 | (Starting, Failed)
                 | (Starting, Reclaiming)
                 | (Running, Stopping)

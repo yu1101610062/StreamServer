@@ -93,6 +93,21 @@ export interface TaskCreateDraft {
   advanced_json: string;
 }
 
+export type DraftWhitespaceField = "name" | "stream.app" | "stream.name" | "stream.vhost";
+
+export interface DraftWhitespaceIssue {
+  field: DraftWhitespaceField;
+  message: string;
+}
+
+const WHITESPACE_PATTERN = /\s/;
+const WHITESPACE_FIELD_LABELS: Record<DraftWhitespaceField, string> = {
+  name: "任务名称",
+  "stream.app": "内部应用名",
+  "stream.name": "内部流名",
+  "stream.vhost": "Vhost",
+};
+
 export const guidedScenarios = [
   {
     id: "live-ingest",
@@ -354,6 +369,56 @@ function setIfList(target: Record<string, unknown>, key: string, raw: string) {
   if (list.length) {
     target[key] = list;
   }
+}
+
+function containsWhitespace(value: unknown) {
+  return typeof value === "string" && WHITESPACE_PATTERN.test(value);
+}
+
+function whitespaceIssue(field: DraftWhitespaceField): DraftWhitespaceIssue {
+  return {
+    field,
+    message: `${WHITESPACE_FIELD_LABELS[field]}不能包含空格`,
+  };
+}
+
+export function collectDraftWhitespaceIssues(draft: TaskCreateDraft) {
+  const issues: DraftWhitespaceIssue[] = [];
+  if (containsWhitespace(draft.name)) {
+    issues.push(whitespaceIssue("name"));
+  }
+  if (draft.task_type === "stream_ingest") {
+    if (containsWhitespace(draft.stream.app)) {
+      issues.push(whitespaceIssue("stream.app"));
+    }
+    if (containsWhitespace(draft.stream.name)) {
+      issues.push(whitespaceIssue("stream.name"));
+    }
+    if (containsWhitespace(draft.stream.vhost)) {
+      issues.push(whitespaceIssue("stream.vhost"));
+    }
+  }
+  return issues;
+}
+
+export function collectTaskPayloadWhitespaceIssues(payload: Record<string, unknown>) {
+  const issues: DraftWhitespaceIssue[] = [];
+  if (containsWhitespace(payload.name)) {
+    issues.push(whitespaceIssue("name"));
+  }
+  if (payload.type === "stream_ingest") {
+    const stream = isPlainObject(payload.stream) ? payload.stream : {};
+    if (containsWhitespace(stream.app)) {
+      issues.push(whitespaceIssue("stream.app"));
+    }
+    if (containsWhitespace(stream.name)) {
+      issues.push(whitespaceIssue("stream.name"));
+    }
+    if (containsWhitespace(stream.vhost)) {
+      issues.push(whitespaceIssue("stream.vhost"));
+    }
+  }
+  return issues;
 }
 
 function pruneEmptyObjects(target: Record<string, unknown>) {

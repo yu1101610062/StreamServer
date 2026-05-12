@@ -42,7 +42,7 @@ use crate::{
         AdoptFilter, AdoptRuntimeFilter, LocalExecutor, LocalRuntimeRegistry,
         ManagedProcessExecutor, RecordingControlAction, RuntimeEventSink, RuntimeNotification,
         RuntimeTaskEvent, RuntimeTaskLogBatch, RuntimeTaskProgress, StartTaskRequest,
-        StopTaskRequest, TaskRecordingControlRequest, TerminalRuntimeReplay,
+        StopTaskRequest, TaskRecordingControlRequest, TerminalRuntimeReplay, bounded_log_batches,
         cleanup_persisted_runtime_state, collect_terminal_runtime_replays,
         is_terminal_runtime_event, rejected_runtime_handle, runtime_session_epoch,
     },
@@ -51,6 +51,7 @@ use crate::{
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const CONTROL_BACKOFF: [u64; 5] = [1, 2, 5, 10, 30];
 const CONTROL_BUFFER: usize = 32;
+const CONTROL_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const LOG_NOTIFICATION_BUFFER: usize = 128;
 const START_TASK_CONCURRENCY_LIMIT: usize = 4;
 
@@ -141,7 +142,9 @@ impl AgentController {
     async fn connect_once_active(&self, session_epoch: u64) -> anyhow::Result<()> {
         let endpoint = build_endpoint(&self.settings.agent)?;
         let channel = endpoint.connect().await?;
-        let mut client = ControlPlaneClient::new(channel);
+        let mut client = ControlPlaneClient::new(channel)
+            .max_decoding_message_size(CONTROL_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(CONTROL_MAX_MESSAGE_BYTES);
 
         let (sender, receiver) = mpsc::channel(CONTROL_BUFFER);
         let registration = self.build_registration().await?;
@@ -826,23 +829,10 @@ async fn send_runtime_log_batch(
     sender: &mpsc::Sender<AgentEnvelope>,
     batch: RuntimeTaskLogBatch,
 ) -> anyhow::Result<()> {
-    send_agent_message(
-        sender,
-        AgentEnvelope {
-            payload: Some(
-                media_rpc::control_plane::agent_envelope::Payload::TaskLogBatch(
-                    media_rpc::control_plane::TaskLogBatch {
-                        task_id: batch.task_id.to_string(),
-                        attempt_no: batch.attempt_no,
-                        lease_token: batch.lease_token,
-                        stream: batch.stream,
-                        lines: batch.lines,
-                    },
-                ),
-            ),
-        },
-    )
-    .await
+    for batch in bounded_log_batches(batch) {
+        send_agent_message(sender, log_batch_envelope(batch)).await?;
+    }
+    Ok(())
 }
 
 fn try_send_runtime_log_batch(
@@ -851,7 +841,6 @@ fn try_send_runtime_log_batch(
     dropped_log_lines: &mut HashMap<(Uuid, i32, String), usize>,
 ) -> anyhow::Result<()> {
     let key = (batch.task_id, batch.attempt_no, batch.stream.clone());
-    let source_line_count = batch.source_line_count;
     let suppressed = dropped_log_lines.remove(&key).unwrap_or(0);
     if suppressed > 0 {
         batch.lines.insert(
@@ -860,29 +849,44 @@ fn try_send_runtime_log_batch(
         );
     }
 
-    let envelope = AgentEnvelope {
+    let batches = bounded_log_batches(batch);
+    for (index, batch) in batches.iter().cloned().enumerate() {
+        match sender.try_send(log_batch_envelope(batch)) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let mut unsent = batches
+                    .iter()
+                    .skip(index)
+                    .map(|batch| batch.source_line_count)
+                    .sum::<usize>();
+                if index == 0 {
+                    unsent += suppressed;
+                }
+                *dropped_log_lines.entry(key).or_insert(0) += unsent;
+                return Ok(());
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(anyhow::anyhow!("control-plane sender closed"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn log_batch_envelope(batch: RuntimeTaskLogBatch) -> AgentEnvelope {
+    AgentEnvelope {
         payload: Some(
             media_rpc::control_plane::agent_envelope::Payload::TaskLogBatch(
                 media_rpc::control_plane::TaskLogBatch {
                     task_id: batch.task_id.to_string(),
                     attempt_no: batch.attempt_no,
-                    lease_token: batch.lease_token.clone(),
-                    stream: batch.stream.clone(),
+                    lease_token: batch.lease_token,
+                    stream: batch.stream,
                     lines: batch.lines,
                 },
             ),
         ),
-    };
-
-    match sender.try_send(envelope) {
-        Ok(()) => Ok(()),
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-            *dropped_log_lines.entry(key).or_insert(0) += suppressed + source_line_count;
-            Ok(())
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            Err(anyhow::anyhow!("control-plane sender closed"))
-        }
     }
 }
 

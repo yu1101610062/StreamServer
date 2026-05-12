@@ -600,9 +600,12 @@ const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const STOP_REQUESTED_STILL_RUNNING_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const AUTO_STOP_FORCE_KILL_DELAY: Duration = Duration::from_secs(1);
+const STALE_ATTEMPT_FORCE_KILL_DELAY: Duration = Duration::from_secs(1);
 const RECORD_DURATION_FORCE_KILL_DELAY: Duration = Duration::from_millis(250);
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_BATCH_LINES: usize = 64;
+const MAX_LOG_BATCH_BYTES: usize = 512 * 1024;
+const LOG_LINE_TRUNCATED_MARKER: &str = " ... [truncated]";
 const DEFAULT_INPUT_PROBE_TIMEOUT_MS: u64 = 7000;
 const STREAM_INGEST_TS_AAC_COPY_PROBE_SIZE: u64 = 8_000_000;
 const FFPROBE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -714,19 +717,118 @@ impl RuntimeEventSink {
             );
         }
 
-        match self.log_tx.try_send(batch) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
-                let mut suppressed_logs = self
-                    .suppressed_logs
-                    .write()
-                    .expect("suppressed logs lock poisoned");
-                *suppressed_logs.entry(key).or_insert(0) += suppressed + batch.source_line_count;
-                Ok(())
+        let batches = bounded_log_batches(batch);
+        let mut delivered_suppressed_notice = suppressed == 0;
+        for (index, batch) in batches.iter().cloned().enumerate() {
+            match self.log_tx.try_send(batch) {
+                Ok(()) => {
+                    if index == 0 {
+                        delivered_suppressed_notice = true;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(batch)) => {
+                    let mut unsent = batch.source_line_count
+                        + batches
+                            .iter()
+                            .skip(index + 1)
+                            .map(|batch| batch.source_line_count)
+                            .sum::<usize>();
+                    if !delivered_suppressed_notice {
+                        unsent += suppressed;
+                    }
+                    let mut suppressed_logs = self
+                        .suppressed_logs
+                        .write()
+                        .expect("suppressed logs lock poisoned");
+                    *suppressed_logs.entry(key).or_insert(0) += unsent;
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Err(()),
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
         }
+        Ok(())
     }
+}
+
+pub(crate) fn bounded_log_batches(batch: RuntimeTaskLogBatch) -> Vec<RuntimeTaskLogBatch> {
+    let RuntimeTaskLogBatch {
+        task_id,
+        attempt_no,
+        lease_token,
+        session_epoch,
+        stream,
+        lines,
+        source_line_count,
+    } = batch;
+
+    let line_count = lines.len();
+    let synthetic_prefix_lines = line_count.saturating_sub(source_line_count);
+    let extra_source_lines = source_line_count.saturating_sub(line_count);
+    let mut batches = Vec::new();
+    let mut current_lines = Vec::new();
+    let mut current_source_line_count = 0usize;
+    let mut current_bytes = 0usize;
+
+    for (index, line) in lines.into_iter().enumerate() {
+        let line = truncate_log_line(line);
+        let line_bytes = log_line_wire_bytes(&line);
+        let line_source_count = if index < synthetic_prefix_lines {
+            0
+        } else {
+            1 + usize::from(index == synthetic_prefix_lines) * extra_source_lines
+        };
+
+        if !current_lines.is_empty() && current_bytes + line_bytes > MAX_LOG_BATCH_BYTES {
+            batches.push(RuntimeTaskLogBatch {
+                task_id,
+                attempt_no,
+                lease_token: lease_token.clone(),
+                session_epoch,
+                stream: stream.clone(),
+                lines: std::mem::take(&mut current_lines),
+                source_line_count: current_source_line_count,
+            });
+            current_source_line_count = 0;
+            current_bytes = 0;
+        }
+
+        current_bytes += line_bytes;
+        current_source_line_count += line_source_count;
+        current_lines.push(line);
+    }
+
+    if !current_lines.is_empty() {
+        batches.push(RuntimeTaskLogBatch {
+            task_id,
+            attempt_no,
+            lease_token,
+            session_epoch,
+            stream,
+            lines: current_lines,
+            source_line_count: current_source_line_count,
+        });
+    }
+
+    batches
+}
+
+fn truncate_log_line(line: String) -> String {
+    if log_line_wire_bytes(&line) <= MAX_LOG_BATCH_BYTES {
+        return line;
+    }
+
+    let max_content_bytes = MAX_LOG_BATCH_BYTES
+        .saturating_sub(LOG_LINE_TRUNCATED_MARKER.len())
+        .saturating_sub(1);
+    let mut end = max_content_bytes.min(line.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &line[..end], LOG_LINE_TRUNCATED_MARKER)
+}
+
+fn log_line_wire_bytes(line: &str) -> usize {
+    line.len().saturating_add(1)
 }
 
 #[derive(Debug, Clone)]
@@ -772,6 +874,85 @@ impl ManagedProcessExecutor {
             .read()
             .expect("zlm_rtmp_enhanced_enabled lock poisoned")
     }
+
+    fn emit_adopted_event(&self, handle: &RuntimeHandle, message: &str, payload: Value) {
+        let _ = self
+            .events
+            .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: runtime_lease_token(handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(handle),
+                event_type: "adopted".to_string(),
+                event_level: "info".to_string(),
+                message: message.to_string(),
+                payload,
+            }));
+    }
+
+    fn cleanup_stale_attempt_runtimes(&self, request: &StartTaskRequest) {
+        let active_handles = self.registry.active_handles();
+        let mut handled_attempts = HashSet::new();
+        for handle in active_handles {
+            if !is_stale_attempt_for_request(&handle, request) {
+                continue;
+            }
+            handled_attempts.insert((handle.task_id, handle.attempt_no));
+
+            let runtime = self
+                .runtimes
+                .read()
+                .expect("runtime map lock poisoned")
+                .get(&handle.runtime_id)
+                .cloned();
+            if let Some(runtime) = runtime {
+                runtime.stop_requested.store(true, Ordering::Relaxed);
+                let pids = runtime_pids(&runtime);
+                if pids.is_empty() {
+                    continue;
+                }
+                self.registry.update(handle.runtime_id, |runtime| {
+                    runtime.state = RuntimeState::Stopping;
+                    runtime.last_progress_at = Some(Utc::now());
+                    runtime.metadata["stop"] = json!({
+                        "reason": "stale_attempt_replaced",
+                        "replacement_attempt_no": request.attempt_no,
+                    });
+                });
+                for pid in &pids {
+                    if let Err(error) = signal_pid(*pid, libc::SIGTERM) {
+                        warn!(
+                            pid,
+                            error = %error,
+                            reason = "stale_attempt_replaced",
+                            "failed to signal stale runtime process"
+                        );
+                    }
+                }
+                schedule_force_kill_if_running(
+                    handle.runtime_id,
+                    pids,
+                    self.runtimes.clone(),
+                    STALE_ATTEMPT_FORCE_KILL_DELAY,
+                    "stale_attempt_replaced",
+                );
+                continue;
+            }
+
+            let pids = runtime_handle_live_pids(&handle);
+            signal_stale_pids(&pids, "stale_registry_attempt_replaced");
+        }
+
+        for persisted in scan_persisted_runtimes(&self.settings.work_root) {
+            if handled_attempts.contains(&(persisted.handle.task_id, persisted.handle.attempt_no))
+                || !is_stale_attempt_for_request(&persisted.handle, request)
+            {
+                continue;
+            }
+            let pids = runtime_handle_live_pids(&persisted.handle);
+            signal_stale_pids(&pids, "stale_persisted_attempt_replaced");
+        }
+    }
 }
 
 impl LocalExecutor for ManagedProcessExecutor {
@@ -809,6 +990,8 @@ impl LocalExecutor for ManagedProcessExecutor {
                 request.task_id, request.attempt_no
             )));
         }
+
+        self.cleanup_stale_attempt_runtimes(request);
 
         let slot_permit = self.slot_limiter.try_acquire()?;
         let spec = parse_task_spec(request)?;
@@ -1054,26 +1237,30 @@ impl LocalExecutor for ManagedProcessExecutor {
         }
         let zlm_server_id = self.current_zlm_server_id();
 
-        let mut snapshots = self
-            .registry
-            .snapshots(filter)
-            .into_iter()
-            .map(|handle| {
-                let updated = self
-                    .registry
-                    .update(handle.runtime_id, |runtime| {
-                        runtime.metadata["session_epoch"] = json!(filter.session_epoch);
-                        attach_zlm_server_id(&mut runtime.metadata, zlm_server_id.as_deref());
-                    })
-                    .unwrap_or_else(|| {
-                        let mut handle = handle.clone();
-                        handle.metadata["session_epoch"] = json!(filter.session_epoch);
-                        attach_zlm_server_id(&mut handle.metadata, zlm_server_id.as_deref());
-                        handle
-                    });
-                updated
-            })
-            .collect::<Vec<_>>();
+        let mut snapshots = Vec::new();
+        for handle in self.registry.snapshots(filter) {
+            let updated = self
+                .registry
+                .update(handle.runtime_id, |runtime| {
+                    runtime.metadata["session_epoch"] = json!(filter.session_epoch);
+                    attach_zlm_server_id(&mut runtime.metadata, zlm_server_id.as_deref());
+                })
+                .unwrap_or_else(|| {
+                    let mut handle = handle.clone();
+                    handle.metadata["session_epoch"] = json!(filter.session_epoch);
+                    attach_zlm_server_id(&mut handle.metadata, zlm_server_id.as_deref());
+                    handle
+                });
+            self.emit_adopted_event(
+                &updated,
+                "reattached active runtime after control-plane reconnect",
+                json!({
+                    "runtime_id": updated.runtime_id,
+                    "orphaned": false,
+                }),
+            );
+            snapshots.push(updated);
+        }
         let mut seen = snapshots
             .iter()
             .map(|handle| (handle.task_id, handle.attempt_no))
@@ -1118,6 +1305,15 @@ impl LocalExecutor for ManagedProcessExecutor {
                     );
                 let _ =
                     persist_runtime_state(&persisted.work_dir, &handle, &persisted.success_check);
+                self.emit_adopted_event(
+                    &handle,
+                    "reattached persisted child process",
+                    json!({
+                        "runtime_id": handle.runtime_id,
+                        "orphaned": true,
+                        "pid": pid,
+                    }),
+                );
                 let needs_startup_probe = !stream_online(&handle)
                     || live_relay_recording_from_handle(&handle)
                         .is_some_and(|recording| should_start_live_relay_recording(&recording));
@@ -6327,6 +6523,44 @@ fn runtime_pids(runtime: &ManagedRuntime) -> Vec<i32> {
     pids
 }
 
+fn runtime_handle_live_pids(handle: &RuntimeHandle) -> Vec<i32> {
+    let mut pids = Vec::new();
+    if let Some(pid) = handle.pid.filter(|pid| is_pid_running(*pid)) {
+        pids.push(pid);
+    }
+    if let Some(companion_pid) = companion_recording_from_handle(handle)
+        .and_then(|companion| companion.pid)
+        .filter(|pid| is_pid_running(*pid))
+    {
+        pids.push(companion_pid);
+    }
+    pids
+}
+
+fn is_stale_attempt_for_request(handle: &RuntimeHandle, request: &StartTaskRequest) -> bool {
+    handle.task_id == request.task_id
+        && handle.attempt_no < request.attempt_no
+        && handle.state != RuntimeState::Exited
+        && runtime_lease_token(handle).unwrap_or_default() != request.lease_token
+}
+
+fn signal_stale_pids(pids: &[i32], reason: &'static str) {
+    if pids.is_empty() {
+        return;
+    }
+    for pid in pids {
+        if let Err(error) = signal_pid(*pid, libc::SIGTERM) {
+            warn!(
+                pid,
+                error = %error,
+                reason,
+                "failed to signal stale runtime process"
+            );
+        }
+    }
+    schedule_force_kill_pids_if_running(pids.to_vec(), STALE_ATTEMPT_FORCE_KILL_DELAY, reason);
+}
+
 fn signal_runtime_pids(runtime: &ManagedRuntime, signal: i32) -> Result<(), ExecutorError> {
     for pid in runtime_pids(runtime) {
         signal_pid(pid, signal).map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
@@ -6365,6 +6599,28 @@ fn schedule_force_kill_if_running(
                 delay_sec = delay.as_secs_f64(),
                 reason,
                 "process still running after graceful stop; sending SIGKILL"
+            );
+            let _ = signal_pid(pid, libc::SIGKILL);
+        }
+    });
+}
+
+fn schedule_force_kill_pids_if_running(pids: Vec<i32>, delay: Duration, reason: &'static str) {
+    if pids.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        sleep(delay).await;
+        for pid in pids {
+            if !is_pid_running(pid) {
+                continue;
+            }
+            warn!(
+                pid,
+                delay_sec = delay.as_secs_f64(),
+                reason,
+                "stale process still running after graceful stop; sending SIGKILL"
             );
             let _ = signal_pid(pid, libc::SIGKILL);
         }

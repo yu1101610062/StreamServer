@@ -77,10 +77,30 @@ fn stop_operation_allows_reclaiming_task() {
 }
 
 #[test]
+fn stop_operation_allows_starting_task() {
+    assert!(TaskStatus::Starting.can_transition_to(TaskStatus::Stopping));
+
+    let next = TaskStatus::Starting
+        .apply_operation(TaskOperation::Stop)
+        .expect("stop should be allowed while starting");
+
+    assert_eq!(next, TaskStatus::Stopping);
+}
+
+#[test]
 fn cancel_operation_moves_running_task_to_stopping() {
     let next = TaskStatus::Running
         .apply_operation(TaskOperation::Cancel)
         .expect("cancel should be allowed");
+
+    assert_eq!(next, TaskStatus::Stopping);
+}
+
+#[test]
+fn cancel_operation_allows_starting_task() {
+    let next = TaskStatus::Starting
+        .apply_operation(TaskOperation::Cancel)
+        .expect("cancel should be allowed while starting");
 
     assert_eq!(next, TaskStatus::Stopping);
 }

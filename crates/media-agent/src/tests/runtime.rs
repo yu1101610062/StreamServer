@@ -5233,6 +5233,245 @@ async fn adopt_orphans_tracks_persisted_runtime() {
 }
 
 #[tokio::test]
+async fn adopt_orphans_emits_adopted_for_active_registry_runtime() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-adopt-active-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let settings = test_settings(temp_root.to_string_lossy().as_ref());
+    let executor = ManagedProcessExecutor::new(
+        settings,
+        registry.clone(),
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+    let handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(std::process::id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Starting,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+        metadata: json!({
+            "task_type": "file_to_live",
+            "lease_token": "lease",
+        }),
+    };
+    registry.track(handle.clone());
+    executor
+        .runtimes
+        .write()
+        .expect("runtime map lock poisoned")
+        .insert(
+            handle.runtime_id,
+            ManagedRuntime {
+                pid: handle.pid,
+                companion_pids: Vec::new(),
+                _slot_permit: RuntimeSlotPermit::unbounded(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                suppress_companion_events: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+    let adopted = executor.adopt_orphans(&AdoptFilter {
+        session_epoch: 7,
+        runtimes: vec![AdoptRuntimeFilter {
+            task_id: handle.task_id,
+            attempt_no: handle.attempt_no,
+            lease_token: "lease".to_string(),
+            worker_kind: WorkerKind::Ffmpeg,
+        }],
+    });
+
+    assert_eq!(adopted.len(), 1);
+    assert_eq!(runtime_session_epoch(&adopted[0]), 7);
+    let event = priority_rx
+        .try_recv()
+        .expect("active registry adoption should emit an adopted event");
+    let RuntimeNotification::TaskEvent(event) = event else {
+        panic!("expected adopted task event");
+    };
+    assert_eq!(event.task_id, handle.task_id);
+    assert_eq!(event.attempt_no, handle.attempt_no);
+    assert_eq!(event.event_type, "adopted");
+    assert_eq!(event.session_epoch, 7);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn stale_attempt_cleanup_signals_lower_registry_attempt() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-stale-registry-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let executor = ManagedProcessExecutor::new(
+        test_settings(temp_root.to_string_lossy().as_ref()),
+        registry.clone(),
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep should spawn");
+    let task_id = Uuid::now_v7();
+    let runtime_id = Uuid::now_v7();
+    let handle = RuntimeHandle {
+        runtime_id,
+        task_id,
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(child.id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Starting,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+        metadata: json!({"task_type": "file_to_live", "lease_token": "old-lease"}),
+    };
+    registry.track(handle);
+    executor
+        .runtimes
+        .write()
+        .expect("runtime map lock poisoned")
+        .insert(
+            runtime_id,
+            ManagedRuntime {
+                pid: Some(child.id() as i32),
+                companion_pids: Vec::new(),
+                _slot_permit: RuntimeSlotPermit::unbounded(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                suppress_companion_events: Arc::new(AtomicBool::new(false)),
+            },
+        );
+
+    executor.cleanup_stale_attempt_runtimes(&StartTaskRequest {
+        task_id,
+        attempt_no: 2,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: Value::Null,
+        execution_mode: "managed".to_string(),
+        lease_token: "new-lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    });
+
+    let status = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("sleep status should be readable") {
+                break status;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stale registry process should exit after SIGTERM");
+    assert!(!status.success());
+    let updated = registry
+        .get(runtime_id)
+        .expect("stale runtime should remain tracked until monitor removes it");
+    assert_eq!(updated.state, RuntimeState::Stopping);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn stale_attempt_cleanup_signals_lower_persisted_attempt() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-stale-persisted-{}", Uuid::now_v7()));
+    let work_dir = temp_root.join("task").join("attempt-1");
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let executor = ManagedProcessExecutor::new(
+        test_settings(temp_root.to_string_lossy().as_ref()),
+        registry,
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep should spawn");
+    let task_id = Uuid::now_v7();
+    let handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id,
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(child.id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Starting,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+        metadata: json!({"task_type": "file_to_live", "lease_token": "old-lease"}),
+    };
+    persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
+        .expect("runtime state should persist");
+
+    executor.cleanup_stale_attempt_runtimes(&StartTaskRequest {
+        task_id,
+        attempt_no: 2,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: Value::Null,
+        execution_mode: "managed".to_string(),
+        lease_token: "new-lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    });
+
+    let status = timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("sleep status should be readable") {
+                break status;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stale persisted process should exit after SIGTERM");
+    assert!(!status.success());
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn bounded_log_batches_splits_and_truncates_large_payloads() {
+    let batch = RuntimeTaskLogBatch {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        lease_token: "lease".to_string(),
+        session_epoch: 1,
+        stream: "stderr".to_string(),
+        lines: vec![
+            "x".repeat(MAX_LOG_BATCH_BYTES + 1024),
+            "y".repeat(MAX_LOG_BATCH_BYTES / 2),
+        ],
+        source_line_count: 2,
+    };
+
+    let batches = bounded_log_batches(batch);
+
+    assert!(batches.len() >= 2);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.source_line_count)
+            .sum::<usize>(),
+        2
+    );
+    assert!(batches.iter().all(
+        |batch| batch.lines.iter().map(|line| line.len() + 1).sum::<usize>() <= MAX_LOG_BATCH_BYTES
+    ));
+    assert!(batches[0].lines[0].contains("[truncated]"));
+}
+
+#[tokio::test]
 async fn runtime_event_sink_summarizes_dropped_log_lines() {
     let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
     let (log_tx, mut log_rx) = mpsc::channel(1);
@@ -5288,6 +5527,36 @@ async fn runtime_event_sink_summarizes_dropped_log_lines() {
             "after".to_string()
         ]
     );
+}
+
+#[tokio::test]
+async fn runtime_event_sink_bounds_large_log_batches() {
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, mut log_rx) = mpsc::channel(8);
+    let sink = RuntimeEventSink::new(priority_tx, log_tx);
+
+    assert!(
+        sink.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            lease_token: "lease".to_string(),
+            session_epoch: 1,
+            stream: "stderr".to_string(),
+            lines: vec![
+                "x".repeat(MAX_LOG_BATCH_BYTES + 1024),
+                "y".repeat(MAX_LOG_BATCH_BYTES / 2),
+            ],
+            source_line_count: 2,
+        }))
+        .is_ok()
+    );
+
+    let first = log_rx.recv().await.expect("first bounded batch");
+    let second = log_rx.recv().await.expect("second bounded batch");
+    for batch in [first, second] {
+        let bytes = batch.lines.iter().map(|line| line.len() + 1).sum::<usize>();
+        assert!(bytes <= MAX_LOG_BATCH_BYTES);
+    }
 }
 
 #[test]

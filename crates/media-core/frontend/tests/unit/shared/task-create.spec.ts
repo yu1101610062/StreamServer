@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildDraftPayload,
+  collectDraftWhitespaceIssues,
+  collectTaskPayloadWhitespaceIssues,
   createDefaultDraft,
   defaultSourceModeForInputKind,
   deriveStreamIngestRecordMode,
@@ -190,5 +192,32 @@ describe("buildDraftPayload", () => {
     draft.expose.enable_hls = false;
 
     expect(deriveStreamIngestRecordMode(draft)).toBe("fast");
+  });
+
+  it("flags task and stream identifiers containing spaces", () => {
+    const draft = createDefaultDraft();
+    draft.name = "black new";
+    draft.stream.name = "black new";
+
+    const issues = collectDraftWhitespaceIssues(draft);
+
+    expect(issues.map((issue) => issue.field)).toEqual(["name", "stream.name"]);
+    expect(issues[0]?.message).toBe("任务名称不能包含空格");
+  });
+
+  it("flags whitespace introduced by advanced json overrides", () => {
+    const draft = createDefaultDraft();
+    draft.name = "black-new";
+    draft.common.created_by = "alice";
+    draft.advanced_json = JSON.stringify({
+      stream: {
+        name: "black new",
+      },
+    });
+
+    const payload = buildDraftPayload(draft);
+    const issues = collectTaskPayloadWhitespaceIssues(payload);
+
+    expect(issues).toEqual([{ field: "stream.name", message: "内部流名不能包含空格" }]);
   });
 });

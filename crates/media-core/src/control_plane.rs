@@ -44,6 +44,7 @@ use crate::repository::{
 
 const CONTROL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_STREAM_BUFFER: usize = 32;
+const CONTROL_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ControlPlaneService {
@@ -156,6 +157,8 @@ impl ControlPlaneService {
 
     pub fn into_server(self) -> ControlPlaneServer<Self> {
         ControlPlaneServer::new(self)
+            .max_decoding_message_size(CONTROL_MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(CONTROL_MAX_MESSAGE_BYTES)
     }
 
     pub async fn dispatch_task(&self, task_id: Uuid) -> Result<(), ControlPlaneError> {

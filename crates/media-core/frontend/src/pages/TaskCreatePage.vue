@@ -10,8 +10,11 @@ import type { MediaUploadAssetSummary, TaskPreview } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import {
   buildDraftPayload,
+  collectDraftWhitespaceIssues,
+  collectTaskPayloadWhitespaceIssues,
   createDefaultDraft,
   defaultSourceModeForInputKind,
+  type DraftWhitespaceIssue,
   deriveStreamIngestRecordMode,
   guidedScenarios,
   humanSummary,
@@ -29,6 +32,7 @@ const selectedScenario = ref(guidedScenarios[0].id);
 const previewData = ref<TaskPreview | null>(null);
 const selectedUploadAssetId = ref("");
 const currentCreator = computed(() => activeSession.value?.subject?.trim() ?? "");
+type TaskCreatePayload = ReturnType<typeof buildDraftPayload>;
 
 const nodeFormatsQuery = useQuery({
   queryKey: ["task-create-publish-formats"],
@@ -45,7 +49,7 @@ const uploadAssetsQuery = useQuery({
 });
 
 const previewMutation = useMutation({
-  mutationFn: () => taskApi.preview(buildDraftPayload(draft)),
+  mutationFn: (payload: TaskCreatePayload) => taskApi.preview(payload),
   onSuccess: (result) => {
     previewData.value = result;
     ElMessage.success("规格检查通过，已生成解析结果");
@@ -54,7 +58,7 @@ const previewMutation = useMutation({
 });
 
 const createMutation = useMutation({
-  mutationFn: () => taskApi.create(buildDraftPayload(draft)),
+  mutationFn: (payload: TaskCreatePayload) => taskApi.create(payload),
   onSuccess: async (task) => {
     ElMessage.success("任务已创建");
     await router.push(`/tasks/${task.id}`);
@@ -104,6 +108,7 @@ const showRecordSection = computed(() => draft.task_type === "stream_ingest");
 const derivedRecordMode = computed(() => deriveStreamIngestRecordMode(draft));
 const previewPayload = computed(() => buildDraftPayload(draft));
 const summaryText = computed(() => humanSummary(draft));
+const whitespaceIssues = computed(() => collectDraftWhitespaceIssues(draft));
 const activeUploadAssets = computed(() =>
   (uploadAssetsQuery.data.value?.items ?? []).filter((asset) => asset.status === "active" && !asset.file_deleted),
 );
@@ -278,12 +283,37 @@ function selectUploadAsset(assetId: string) {
   previewData.value = null;
 }
 
+function fieldWhitespaceError(field: DraftWhitespaceIssue["field"]) {
+  return whitespaceIssues.value.find((issue) => issue.field === field)?.message ?? "";
+}
+
+function buildValidatedPayload() {
+  const draftIssue = whitespaceIssues.value[0];
+  if (draftIssue) {
+    ElMessage.error(draftIssue.message);
+    return null;
+  }
+  const payload = buildDraftPayload(draft);
+  const payloadIssue = collectTaskPayloadWhitespaceIssues(payload)[0];
+  if (payloadIssue) {
+    ElMessage.error(payloadIssue.message);
+    return null;
+  }
+  return payload;
+}
+
 function createTask() {
-  createMutation.mutate();
+  const payload = buildValidatedPayload();
+  if (payload) {
+    createMutation.mutate(payload);
+  }
 }
 
 function previewTask() {
-  previewMutation.mutate();
+  const payload = buildValidatedPayload();
+  if (payload) {
+    previewMutation.mutate(payload);
+  }
 }
 </script>
 
@@ -349,7 +379,7 @@ function previewTask() {
       <el-form label-position="top">
         <el-row :gutter="16">
           <el-col :md="8" :span="24">
-            <el-form-item label="任务名称">
+            <el-form-item label="任务名称" :error="fieldWhitespaceError('name')">
               <el-input v-model="draft.name" placeholder="给这项任务起一个便于业务识别的名字" />
             </el-form-item>
           </el-col>
@@ -577,17 +607,17 @@ function previewTask() {
       <el-form label-position="top">
         <el-row :gutter="16">
           <el-col :md="8" :span="24">
-            <el-form-item label="内部应用名">
+            <el-form-item label="内部应用名" :error="fieldWhitespaceError('stream.app')">
               <el-input v-model="draft.stream.app" placeholder="live" />
             </el-form-item>
           </el-col>
           <el-col :md="8" :span="24">
-            <el-form-item label="内部流名">
+            <el-form-item label="内部流名" :error="fieldWhitespaceError('stream.name')">
               <el-input v-model="draft.stream.name" placeholder="建议填业务友好的流名，例如 camera01" />
             </el-form-item>
           </el-col>
           <el-col :md="8" :span="24">
-            <el-form-item label="Vhost">
+            <el-form-item label="Vhost" :error="fieldWhitespaceError('stream.vhost')">
               <el-input v-model="draft.stream.vhost" placeholder="__defaultVhost__" />
             </el-form-item>
           </el-col>

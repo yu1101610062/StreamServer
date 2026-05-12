@@ -224,6 +224,36 @@ fn validate_rejects_missing_input_and_creator() {
 }
 
 #[test]
+fn validate_rejects_task_name_with_whitespace() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.name = "black new".to_string();
+
+    let error = task.validate().expect_err("validation should fail");
+
+    assert!(
+        error.issues.iter().any(|issue| {
+            issue.field == "name" && issue.message == "must not contain whitespace"
+        })
+    );
+}
+
+#[test]
+fn validate_rejects_stream_routing_fields_with_whitespace() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.stream.app = Some("live app".to_string());
+    task.stream.name = Some("black new".to_string());
+    task.stream.vhost = Some("__default Vhost__".to_string());
+
+    let error = task.validate().expect_err("validation should fail");
+
+    for field in ["stream.app", "stream.name", "stream.vhost"] {
+        assert!(error.issues.iter().any(|issue| {
+            issue.field == field && issue.message == "must not contain whitespace when provided"
+        }));
+    }
+}
+
+#[test]
 fn validate_allows_stream_bridge_multicast_input_without_explicit_interface_binding() {
     let task = TaskSpec {
         task_type: TaskType::StreamBridge,

@@ -1060,6 +1060,12 @@ async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Resu
     assert_eq!(waiting.status, TaskStatus::Reclaiming);
     assert_eq!(waiting.assigned_node_id, Some(original_node));
     assert_eq!(waiting.current_attempt_no, 1);
+    let reclaim_candidate = repository
+        .list_reclaiming_tasks()
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.task_id == task.id)
+        .expect("reclaiming task should be listed before adoption");
 
     let (reconnected_sender, _reconnected_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
     let _reconnected_session_id = service
@@ -1087,6 +1093,15 @@ async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Resu
     assert_eq!(recovering.status, TaskStatus::Recovering);
     assert_eq!(recovering.assigned_node_id, Some(original_node));
     assert_eq!(recovering.current_attempt_no, 1);
+    assert!(
+        !repository
+            .finalize_reclaim_timeout(&reclaim_candidate)
+            .await?,
+        "stale reclaim timeout must not retry an adopted runtime"
+    );
+    let still_recovering = repository.get_task_summary(task.id).await?;
+    assert_eq!(still_recovering.status, TaskStatus::Recovering);
+    assert_eq!(still_recovering.current_attempt_no, 1);
 
     repository
         .record_agent_task_event(

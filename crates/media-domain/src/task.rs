@@ -345,6 +345,10 @@ fn validate_ftp_input_url(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn contains_whitespace(value: &str) -> bool {
+    value.chars().any(char::is_whitespace)
+}
+
 pub fn normalize_relative_file_input_path(value: &str) -> Result<String, &'static str> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -658,6 +662,8 @@ impl TaskSpec {
 
         if self.name.trim().is_empty() {
             issues.push(ValidationIssue::new("name", "must not be empty"));
+        } else if contains_whitespace(&self.name) {
+            issues.push(ValidationIssue::new("name", "must not contain whitespace"));
         }
         if self.priority > 100 {
             issues.push(ValidationIssue::new(
@@ -862,38 +868,24 @@ impl TaskSpec {
                         "stream_ingest does not accept publish settings",
                     ));
                 }
-                if self
-                    .stream
-                    .app
-                    .as_deref()
-                    .is_some_and(|value| value.trim().is_empty())
-                {
-                    issues.push(ValidationIssue::new(
-                        "stream.app",
-                        "must not be empty when provided",
-                    ));
-                }
-                if self
-                    .stream
-                    .name
-                    .as_deref()
-                    .is_some_and(|value| value.trim().is_empty())
-                {
-                    issues.push(ValidationIssue::new(
-                        "stream.name",
-                        "must not be empty when provided",
-                    ));
-                }
-                if self
-                    .stream
-                    .vhost
-                    .as_deref()
-                    .is_some_and(|value| value.trim().is_empty())
-                {
-                    issues.push(ValidationIssue::new(
-                        "stream.vhost",
-                        "must not be empty when provided",
-                    ));
+                for (field, value) in [
+                    ("stream.app", self.stream.app.as_deref()),
+                    ("stream.name", self.stream.name.as_deref()),
+                    ("stream.vhost", self.stream.vhost.as_deref()),
+                ] {
+                    if let Some(value) = value {
+                        if value.trim().is_empty() {
+                            issues.push(ValidationIssue::new(
+                                field,
+                                "must not be empty when provided",
+                            ));
+                        } else if contains_whitespace(value) {
+                            issues.push(ValidationIssue::new(
+                                field,
+                                "must not contain whitespace when provided",
+                            ));
+                        }
+                    }
                 }
             }
             TaskType::StreamBridge => {
