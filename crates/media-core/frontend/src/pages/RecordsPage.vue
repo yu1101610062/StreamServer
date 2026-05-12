@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { useQuery } from "@tanstack/vue-query";
+import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
 import { recordApi } from "@/shared/api/resources";
@@ -39,6 +39,7 @@ const queryParams = computed(() => ({ ...filters }));
 const recordsQuery = useQuery({
   queryKey: computed(() => ["records", queryParams.value]),
   queryFn: () => recordApi.list(queryParams.value),
+  placeholderData: keepPreviousData,
 });
 
 async function applyFilters() {

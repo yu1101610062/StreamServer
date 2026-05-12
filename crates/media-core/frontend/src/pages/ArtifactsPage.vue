@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { useQuery } from "@tanstack/vue-query";
+import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
 import { artifactApi } from "@/shared/api/resources";
@@ -40,6 +40,7 @@ const queryParams = computed(() => ({ ...filters }));
 const artifactsQuery = useQuery({
   queryKey: computed(() => ["artifacts", queryParams.value]),
   queryFn: () => artifactApi.list(queryParams.value),
+  placeholderData: keepPreviousData,
 });
 
 const artifactKindOptions: OptionItem[] = [

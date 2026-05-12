@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { nodeApi, taskApi } from "@/shared/api/resources";
@@ -67,6 +67,7 @@ const taskParams = computed(() => ({
 const tasksQuery = useQuery({
   queryKey: computed(() => ["tasks", taskParams.value]),
   queryFn: () => taskApi.list(taskParams.value),
+  placeholderData: keepPreviousData,
 });
 
 const nodesQuery = useQuery({

@@ -79,4 +79,34 @@ describe("session store initialize", () => {
     expect(store.loading).toBe(false);
     expect(store.error).toBeNull();
   });
+
+  it("logs out with the latest persisted refresh token", async () => {
+    clientMocks.readRefreshToken.mockReturnValueOnce("refresh-token-in-store");
+    authMocks.login.mockResolvedValueOnce({
+      access_token: "access-token-1",
+      refresh_token: "refresh-token-in-store",
+    });
+    authMocks.currentSession.mockResolvedValueOnce({
+      auth_enabled: true,
+      auth_mode: "local",
+      subject: "admin",
+      role: "admin",
+      must_change_password: false,
+      permissions: ["task_read"],
+      environment: "test",
+    } satisfies CurrentSession);
+    authMocks.logout.mockResolvedValueOnce(null);
+
+    const store = useSessionStore();
+    await store.login("admin", "secret");
+
+    clientMocks.readRefreshToken.mockReturnValueOnce("refresh-token-rotated-by-client");
+    await store.logout();
+
+    expect(authMocks.logout).toHaveBeenCalledWith("refresh-token-rotated-by-client", {
+      skipAuth: true,
+    });
+    expect(clientMocks.clearAccessToken).toHaveBeenCalled();
+    expect(clientMocks.writeRefreshToken).toHaveBeenCalledWith("");
+  });
 });
