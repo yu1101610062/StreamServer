@@ -1931,6 +1931,7 @@ fn build_publish_hook_response_uses_expose_policy_without_auto_recording() {
 
     assert_eq!(response["enable_rtsp"], json!(false));
     assert_eq!(response["enable_hls"], json!(true));
+    assert_eq!(response["add_mute_audio"], json!(false));
     assert_eq!(response["enable_mp4"], json!(false));
     assert_eq!(response["auto_close"], json!(true));
     assert_eq!(response["mp4_as_player"], json!(true));
@@ -1943,6 +1944,7 @@ fn build_publish_hook_response_uses_documented_defaults_without_task_spec() {
     assert_eq!(response["enable_rtsp"], json!(true));
     assert_eq!(response["enable_rtmp"], json!(true));
     assert_eq!(response["enable_ts"], json!(true));
+    assert_eq!(response["add_mute_audio"], json!(false));
     assert_eq!(response["enable_hls"], json!(false));
     assert_eq!(response["auto_close"], json!(false));
 }

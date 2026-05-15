@@ -3402,8 +3402,9 @@ fn build_file_transcode_plan(
             ));
         }
     };
-    let mut args = ffmpeg_base_args(input_url.clone(), false);
-    let audio_copy_decoration = append_process_args(
+    let profile = probe_input_media_profile(settings, spec, input_url.as_str());
+    let mut args = ffmpeg_base_args_without_maps(input_url.clone(), false);
+    let audio_copy_decoration = append_process_args_with_profile(
         &mut args,
         settings,
         spec,
@@ -3412,7 +3413,15 @@ fn build_file_transcode_plan(
         output.format.as_str(),
         VideoOutputPolicy::KeepSourceFamily,
         AudioOutputPolicy::Aac,
+        Some(&profile),
     )?;
+    append_single_audio_output_maps(
+        &mut args,
+        spec,
+        output.format.as_str(),
+        &profile,
+        AudioOutputPolicy::Aac,
+    );
     if let Some(filter) =
         audio_copy_decoration.and_then(|value| value.filter_for_output(output.format.as_str()))
     {
@@ -3462,7 +3471,7 @@ fn build_stream_ingest_realtime_plan(
     let managed_file_output_kind = None;
     let process_output_format = ingress_protocol.compatibility_output_format();
 
-    let mut args = ffmpeg_base_args(
+    let mut args = ffmpeg_base_args_without_maps(
         input_url.clone(),
         spec.stream_ingest_requires_realtime_pacing(),
     );
@@ -3508,7 +3517,9 @@ fn build_stream_ingest_realtime_plan(
         AudioOutputPolicy::CopyWhitelistedElseAac,
         Some(&profile),
     )?;
-    args.extend(["-threads".to_string(), "0".to_string()]);
+    if !matches!(ingress_protocol, InternalIngressProtocol::Rtmp) {
+        args.extend(["-threads".to_string(), "0".to_string()]);
+    }
     if !spec.stream_ingest_uses_wall_clock_record_duration() {
         if let Some(duration_sec) = spec.record.duration_sec {
             args.extend(["-t".to_string(), duration_sec.to_string()]);
@@ -3520,6 +3531,13 @@ fn build_stream_ingest_realtime_plan(
     {
         append_audio_bitstream_filter_arg(&mut args, filter);
     }
+    append_single_audio_output_maps(
+        &mut args,
+        spec,
+        process_output_format,
+        &profile,
+        AudioOutputPolicy::CopyWhitelistedElseAac,
+    );
     append_publish_output_args(&mut args, &publish_output);
 
     if spec.record.enabled.unwrap_or(false) {
@@ -3606,7 +3624,13 @@ fn build_stream_ingest_fast_record_plan(
     {
         media_domain::RecordFormat::Mp4 => {
             let output = allocate_managed_output(settings, request.task_id, Some("mp4"));
-            append_default_output_maps(&mut args);
+            append_single_audio_output_maps(
+                &mut args,
+                spec,
+                output.format.as_str(),
+                &profile,
+                AudioOutputPolicy::CopyWhitelistedElseAac,
+            );
             if let Some(filter) = audio_copy_decoration
                 .and_then(|value| value.filter_for_output(output.format.as_str()))
             {
@@ -3623,7 +3647,13 @@ fn build_stream_ingest_fast_record_plan(
         media_domain::RecordFormat::Hls => {
             let output = allocate_managed_output(settings, request.task_id, Some("hls"));
             let segment_template = hls_segment_template(output.target.as_str());
-            append_default_output_maps(&mut args);
+            append_single_audio_output_maps(
+                &mut args,
+                spec,
+                output.format.as_str(),
+                &profile,
+                AudioOutputPolicy::CopyWhitelistedElseAac,
+            );
             args.extend([
                 "-f".to_string(),
                 "hls".to_string(),
@@ -3642,12 +3672,13 @@ fn build_stream_ingest_fast_record_plan(
             let mp4_output = allocate_managed_output(settings, request.task_id, Some("mp4"));
             let hls_output = allocate_managed_output(settings, request.task_id, Some("hls"));
             let segment_template = hls_segment_template(hls_output.target.as_str());
-            args.extend([
-                "-map".to_string(),
-                "0:v?".to_string(),
-                "-map".to_string(),
-                "0:a?".to_string(),
-            ]);
+            append_single_audio_output_maps(
+                &mut args,
+                spec,
+                mp4_output.format.as_str(),
+                &profile,
+                AudioOutputPolicy::CopyWhitelistedElseAac,
+            );
             if let Some(filter) = audio_copy_decoration
                 .and_then(|value| value.filter_for_output(mp4_output.format.as_str()))
             {
@@ -3657,10 +3688,15 @@ fn build_stream_ingest_fast_record_plan(
                 "-f".to_string(),
                 "mp4".to_string(),
                 mp4_output.target.clone(),
-                "-map".to_string(),
-                "0:v?".to_string(),
-                "-map".to_string(),
-                "0:a?".to_string(),
+            ]);
+            append_single_audio_output_maps(
+                &mut args,
+                spec,
+                hls_output.format.as_str(),
+                &profile,
+                AudioOutputPolicy::CopyWhitelistedElseAac,
+            );
+            args.extend([
                 "-f".to_string(),
                 "hls".to_string(),
                 "-hls_time".to_string(),
@@ -4202,15 +4238,6 @@ fn ffmpeg_base_args(input_url: String, realtime: bool) -> Vec<String> {
     args
 }
 
-fn append_default_output_maps(args: &mut Vec<String>) {
-    args.extend([
-        "-map".to_string(),
-        "0:v?".to_string(),
-        "-map".to_string(),
-        "0:a?".to_string(),
-    ]);
-}
-
 fn append_audio_bitstream_filter_arg(args: &mut Vec<String>, filter: AudioBitstreamFilter) {
     args.extend(["-bsf:a".to_string(), filter.as_ffmpeg_name().to_string()]);
 }
@@ -4516,26 +4543,34 @@ fn resolve_audio_copy_selection(
         };
     }
 
+    let selected_audio_stream =
+        select_audio_stream_for_output(spec, output_format, profile, audio_policy);
+    let Some(selected_audio_stream) = selected_audio_stream else {
+        return AudioCopySelection {
+            copy: true,
+            decoration: None,
+        };
+    };
+
     match audio_policy {
         AudioOutputPolicy::Copy => AudioCopySelection {
-            copy: format_supports_audio_codec_copy(
+            copy: audio_stream_can_be_copied(
                 output_format,
-                profile.audio_codec_name.as_deref(),
-            ) && !requires_audio_reencode_for_output(output_format, profile),
+                profile.source_family,
+                &selected_audio_stream,
+            ),
             decoration: None,
         },
         AudioOutputPolicy::Aac | AudioOutputPolicy::CopyWhitelistedElseAac => {
-            let copy = format_supports_audio_codec_copy(
+            let copy = audio_stream_can_be_copied(
                 output_format,
-                profile.audio_codec_name.as_deref(),
-            ) && !requires_audio_reencode_for_output(output_format, profile);
+                profile.source_family,
+                &selected_audio_stream,
+            );
             AudioCopySelection {
                 copy,
                 decoration: if copy {
-                    resolve_audio_copy_decoration(
-                        profile.source_family,
-                        profile.audio_codec_name.as_deref(),
-                    )
+                    audio_copy_decoration_for_stream(profile, &selected_audio_stream)
                 } else {
                     None
                 },
@@ -4551,17 +4586,25 @@ fn resolve_stream_ingest_audio_copy_probe_input_args(
     audio_policy: AudioOutputPolicy,
 ) -> Result<Vec<String>, ExecutorError> {
     let audio_copy = resolve_audio_copy_selection(spec, output_format, profile, audio_policy);
+    let selected_audio_stream =
+        select_audio_stream_for_output(spec, output_format, profile, audio_policy);
     if !audio_copy.copy
         || !matches!(
             profile.source_family,
             InputSourceFamily::MpegTs | InputSourceFamily::Hls
         )
-        || profile.audio_codec_name.as_deref() != Some("aac")
+        || selected_audio_stream
+            .as_ref()
+            .and_then(|stream| stream.codec_name.as_deref())
+            != Some("aac")
     {
         return Ok(Vec::new());
     }
 
-    if !audio_stream_parameters_available(profile) {
+    if !selected_audio_stream
+        .as_ref()
+        .is_some_and(selected_audio_stream_parameters_available)
+    {
         return Err(ExecutorError::InvalidRequest(format!(
             "input audio stream is AAC in a TS-family source, but sample_rate/channels remain unavailable after probing; refusing audio copy for {output_format} output"
         )));
@@ -4586,12 +4629,27 @@ fn resolve_passthrough_audio_copy_decoration(
         }
     };
     if !profile.has_audio
-        || !format_supports_audio_codec_copy(output_format, profile.audio_codec_name.as_deref())
+        || select_audio_stream_for_output(
+            spec,
+            output_format,
+            profile,
+            AudioOutputPolicy::CopyWhitelistedElseAac,
+        )
+        .as_ref()
+        .is_none_or(|stream| {
+            !audio_stream_can_be_copied(output_format, profile.source_family, stream)
+        })
     {
         return None;
     }
 
-    resolve_audio_copy_decoration(profile.source_family, profile.audio_codec_name.as_deref())
+    select_audio_stream_for_output(
+        spec,
+        output_format,
+        profile,
+        AudioOutputPolicy::CopyWhitelistedElseAac,
+    )
+    .and_then(|stream| audio_copy_decoration_for_stream(profile, &stream))
 }
 
 fn resolve_audio_copy_decoration(
@@ -4607,11 +4665,6 @@ fn resolve_audio_copy_decoration(
 
 fn process_requires_video_transcode(spec: &TaskSpec) -> bool {
     spec.process.bitrate.is_some() || spec.process.fps.is_some() || spec.process.gop.is_some()
-}
-
-fn audio_stream_parameters_available(profile: &InputMediaProfile) -> bool {
-    matches!(profile.audio_sample_rate, Some(value) if value > 0)
-        && matches!(profile.audio_channels, Some(value) if value > 0)
 }
 
 fn process_requires_audio_transcode(spec: &TaskSpec) -> bool {
@@ -4734,27 +4787,6 @@ fn format_supports_audio_codec_copy(output_format: &str, codec_name: Option<&str
     }
 }
 
-fn requires_audio_reencode_for_output(output_format: &str, profile: &InputMediaProfile) -> bool {
-    let Some(audio_codec_name) = profile.audio_codec_name.as_deref() else {
-        return false;
-    };
-
-    if is_rtsp_output_profile(output_format)
-        && audio_codec_name == "aac"
-        && matches!(
-            profile.source_family,
-            InputSourceFamily::MpegTs | InputSourceFamily::Hls
-        )
-        && !profile.audio_extradata_present
-    {
-        return true;
-    }
-
-    is_flv_output_profile(output_format)
-        && audio_codec_name == "mp3"
-        && !matches!(profile.audio_sample_rate, Some(44_100 | 22_050 | 11_025))
-}
-
 fn normalized_output_format_label(output_format: &str) -> String {
     output_format.trim().to_ascii_lowercase()
 }
@@ -4873,6 +4905,7 @@ struct InputMediaProfile {
     audio_sample_rate: Option<u32>,
     audio_channels: Option<u32>,
     audio_extradata_present: bool,
+    audio_streams: Vec<InputAudioStream>,
     source_family: InputSourceFamily,
 }
 
@@ -4889,9 +4922,19 @@ impl Default for InputMediaProfile {
             audio_sample_rate: None,
             audio_channels: None,
             audio_extradata_present: false,
+            audio_streams: Vec::new(),
             source_family: InputSourceFamily::Unknown,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputAudioStream {
+    index: u32,
+    codec_name: Option<String>,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    extradata_present: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4908,6 +4951,7 @@ struct FfprobeFormat {
 
 #[derive(Debug, Deserialize)]
 struct FfprobeStream {
+    index: Option<u32>,
     codec_type: Option<String>,
     codec_name: Option<String>,
     pix_fmt: Option<String>,
@@ -4938,7 +4982,7 @@ fn probe_input_media_profile_with_input_args(
     args.extend(extra_input_args.iter().cloned());
     args.extend([
         "-show_entries".to_string(),
-        "stream=codec_type,codec_name,pix_fmt,sample_rate,channels,extradata_size:format=format_name"
+        "stream=index,codec_type,codec_name,pix_fmt,sample_rate,channels,extradata_size:format=format_name"
             .to_string(),
         "-of".to_string(),
         "json".to_string(),
@@ -4973,7 +5017,7 @@ fn probe_input_media_profile_with_input_args(
         ),
         ..InputMediaProfile::default()
     };
-    for stream in parsed.streams {
+    for (stream_position, stream) in parsed.streams.into_iter().enumerate() {
         match stream.codec_type.as_deref() {
             Some("video") if !profile.has_video => {
                 profile.has_video = true;
@@ -4999,26 +5043,182 @@ fn probe_input_media_profile_with_input_args(
                 };
                 profile.video_extradata_present = stream.extradata_size.unwrap_or_default() > 0;
             }
-            Some("audio") if !profile.has_audio => {
-                profile.has_audio = true;
-                profile.audio_codec_name = stream
-                    .codec_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_ascii_lowercase);
-                profile.audio_sample_rate = stream
-                    .sample_rate
-                    .as_deref()
-                    .and_then(|value| value.trim().parse::<u32>().ok());
-                profile.audio_channels = stream.channels;
-                profile.audio_extradata_present = stream.extradata_size.unwrap_or_default() > 0;
+            Some("audio") => {
+                let audio_stream = InputAudioStream {
+                    index: stream.index.unwrap_or(stream_position as u32),
+                    codec_name: stream
+                        .codec_name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_ascii_lowercase),
+                    sample_rate: stream
+                        .sample_rate
+                        .as_deref()
+                        .and_then(|value| value.trim().parse::<u32>().ok()),
+                    channels: stream.channels,
+                    extradata_present: stream.extradata_size.unwrap_or_default() > 0,
+                };
+                if !profile.has_audio {
+                    profile.has_audio = true;
+                    profile.audio_codec_name = audio_stream.codec_name.clone();
+                    profile.audio_sample_rate = audio_stream.sample_rate;
+                    profile.audio_channels = audio_stream.channels;
+                    profile.audio_extradata_present = audio_stream.extradata_present;
+                }
+                profile.audio_streams.push(audio_stream);
             }
             _ => {}
         }
     }
 
     profile
+}
+
+fn primary_audio_stream(profile: &InputMediaProfile) -> Option<InputAudioStream> {
+    profile.has_audio.then(|| InputAudioStream {
+        index: 1,
+        codec_name: profile.audio_codec_name.clone(),
+        sample_rate: profile.audio_sample_rate,
+        channels: profile.audio_channels,
+        extradata_present: profile.audio_extradata_present,
+    })
+}
+
+fn audio_streams_for_selection(profile: &InputMediaProfile) -> Vec<InputAudioStream> {
+    if !profile.audio_streams.is_empty() {
+        return profile.audio_streams.clone();
+    }
+    primary_audio_stream(profile).into_iter().collect()
+}
+
+fn append_single_audio_output_maps(
+    args: &mut Vec<String>,
+    spec: &TaskSpec,
+    output_format: &str,
+    profile: &InputMediaProfile,
+    audio_policy: AudioOutputPolicy,
+) {
+    args.extend(["-map".to_string(), "0:v?".to_string()]);
+    if let Some(audio_stream) =
+        select_audio_stream_for_output(spec, output_format, profile, audio_policy)
+    {
+        args.extend(["-map".to_string(), format!("0:{}", audio_stream.index)]);
+    }
+}
+
+fn select_audio_stream_for_output(
+    spec: &TaskSpec,
+    output_format: &str,
+    profile: &InputMediaProfile,
+    audio_policy: AudioOutputPolicy,
+) -> Option<InputAudioStream> {
+    let audio_streams = audio_streams_for_selection(profile);
+    if audio_streams.is_empty() {
+        return None;
+    }
+
+    if process_requires_audio_transcode(spec) {
+        return audio_streams.into_iter().next();
+    }
+
+    match audio_policy {
+        AudioOutputPolicy::Copy => audio_streams
+            .iter()
+            .find(|stream| audio_stream_can_be_copied(output_format, profile.source_family, stream))
+            .cloned()
+            .or_else(|| audio_streams.into_iter().next()),
+        AudioOutputPolicy::Aac | AudioOutputPolicy::CopyWhitelistedElseAac => {
+            preferred_copy_audio_stream(output_format, profile.source_family, &audio_streams)
+                .or_else(|| audio_streams.into_iter().next())
+        }
+    }
+}
+
+fn preferred_copy_audio_stream(
+    output_format: &str,
+    source_family: InputSourceFamily,
+    streams: &[InputAudioStream],
+) -> Option<InputAudioStream> {
+    for codec in preferred_audio_copy_codec_order(output_format) {
+        if let Some(stream) = streams.iter().find(|stream| {
+            stream.codec_name.as_deref() == Some(codec)
+                && audio_stream_can_be_copied(output_format, source_family, stream)
+        }) {
+            return Some(stream.clone());
+        }
+    }
+
+    streams
+        .iter()
+        .find(|stream| audio_stream_can_be_copied(output_format, source_family, stream))
+        .cloned()
+}
+
+fn preferred_audio_copy_codec_order(output_format: &str) -> &'static [&'static str] {
+    match normalized_output_format_label(output_format).as_str() {
+        "mp4" => &["aac", "mp3", "ac3", "eac3", "alac"],
+        "internal_flv" | "flv" => &["aac", "mp3", "pcm_alaw", "pcm_mulaw"],
+        "internal_enhanced_flv" => &["aac", "mp3", "opus", "pcm_alaw", "pcm_mulaw"],
+        "internal_rtsp" | "rtsp" => &[
+            "aac",
+            "mp3",
+            "opus",
+            "mp2",
+            "pcm_alaw",
+            "pcm_mulaw",
+            "pcm_s16be",
+            "pcm_s16le",
+        ],
+        "mpegts" | "rtp_mpegts" | "hls" => &["aac", "mp3", "mp2", "ac3", "eac3"],
+        _ => &["aac"],
+    }
+}
+
+fn audio_stream_can_be_copied(
+    output_format: &str,
+    source_family: InputSourceFamily,
+    stream: &InputAudioStream,
+) -> bool {
+    format_supports_audio_codec_copy(output_format, stream.codec_name.as_deref())
+        && !requires_audio_reencode_for_stream(output_format, source_family, stream)
+}
+
+fn selected_audio_stream_parameters_available(stream: &InputAudioStream) -> bool {
+    matches!(stream.sample_rate, Some(value) if value > 0)
+        && matches!(stream.channels, Some(value) if value > 0)
+}
+
+fn requires_audio_reencode_for_stream(
+    output_format: &str,
+    source_family: InputSourceFamily,
+    stream: &InputAudioStream,
+) -> bool {
+    let Some(audio_codec_name) = stream.codec_name.as_deref() else {
+        return false;
+    };
+
+    if is_rtsp_output_profile(output_format)
+        && audio_codec_name == "aac"
+        && matches!(
+            source_family,
+            InputSourceFamily::MpegTs | InputSourceFamily::Hls
+        )
+        && !stream.extradata_present
+    {
+        return true;
+    }
+
+    is_flv_output_profile(output_format)
+        && audio_codec_name == "mp3"
+        && !matches!(stream.sample_rate, Some(44_100 | 22_050 | 11_025))
+}
+
+fn audio_copy_decoration_for_stream(
+    profile: &InputMediaProfile,
+    stream: &InputAudioStream,
+) -> Option<AudioCopyDecoration> {
+    resolve_audio_copy_decoration(profile.source_family, stream.codec_name.as_deref())
 }
 
 #[derive(Debug)]
@@ -5404,7 +5604,7 @@ fn build_live_relay_api_params(
             input_timeout_seconds(spec.input.probe_timeout_ms).to_string(),
         ),
         ("enable_audio".to_string(), "1".to_string()),
-        ("add_mute_audio".to_string(), "1".to_string()),
+        ("add_mute_audio".to_string(), "0".to_string()),
         ("modify_stamp".to_string(), "2".to_string()),
         (
             "enable_rtsp".to_string(),

@@ -293,6 +293,63 @@ fi
     path.to_string_lossy().to_string()
 }
 
+fn create_mock_ffprobe_binary_with_audio_streams(
+    root: &Path,
+    format_name: &str,
+    video_codec_name: &str,
+    audio_streams: &[(&str, Option<u32>, Option<u32>, Option<u64>)],
+) -> String {
+    let path = root.join("mock-ffprobe-multi-audio.sh");
+    let audio_streams_json = audio_streams
+        .iter()
+        .enumerate()
+        .map(|(offset, (codec, sample_rate, channels, extradata_size))| {
+            let sample_rate = sample_rate
+                .map(|value| format!(",\"sample_rate\":\"{value}\""))
+                .unwrap_or_default();
+            let channels = channels
+                .map(|value| format!(",\"channels\":{value}"))
+                .unwrap_or_default();
+            let extradata_size = extradata_size
+                .map(|value| format!(",\"extradata_size\":{value}"))
+                .unwrap_or_default();
+            format!(
+                ",\n    {{\"index\":{},\"codec_type\":\"audio\",\"codec_name\":\"{}\"{}{}{}}}",
+                offset + 1,
+                codec,
+                sample_rate,
+                channels,
+                extradata_size
+            )
+        })
+        .collect::<String>();
+    let body = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+want_json=0
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
+    want_json=1
+    break
+  fi
+  prev="$arg"
+done
+if [ "$want_json" = "1" ]; then
+  cat <<'EOF'
+{{"streams":[
+    {{"index":0,"codec_type":"video","codec_name":"{video_codec_name}","extradata_size":32}}{audio_streams_json}
+],"format":{{"format_name":"{format_name}"}}}}
+EOF
+else
+  echo "{video_codec_name}"
+fi
+"#
+    );
+    write_executable(&path, &body);
+    path.to_string_lossy().to_string()
+}
+
 fn create_recording_mock_ffprobe_binary_with_profile(
     root: &Path,
     recorded_args_path: &Path,
@@ -727,6 +784,148 @@ fn build_file_transcode_plan_copy_or_transcode_copies_mpegts_aac_for_mp4_with_bs
 }
 
 #[test]
+fn build_file_transcode_plan_maps_only_aac_audio_for_multi_audio_mp4() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-copy-transcode-multi-audio-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_audio_streams(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        &[
+            ("mp3", Some(22_050), Some(2), Some(2)),
+            ("truehd", Some(48_000), Some(6), Some(2)),
+            ("dts", Some(48_000), Some(6), Some(2)),
+            ("eac3", Some(48_000), Some(6), Some(2)),
+            ("aac", Some(48_000), Some(2), Some(2)),
+        ],
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": "test-multi-audio-to-mp4",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.ts"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "format": "mp4"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-map", "0:v?"])
+    );
+    assert!(plan.args.windows(2).any(|window| window == ["-map", "0:5"]));
+    assert!(
+        !plan
+            .args
+            .windows(2)
+            .any(|window| window == ["-map", "0:a?"])
+    );
+    assert!(!plan.args.windows(2).any(|window| window == ["-map", "0:2"]));
+    assert!(!plan.args.windows(2).any(|window| window == ["-map", "0:3"]));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-c:a", "copy"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn build_file_transcode_plan_transcodes_first_audio_when_mp4_has_no_copy_safe_audio() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-copy-transcode-truehd-dts-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_audio_streams(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        &[
+            ("truehd", Some(48_000), Some(6), Some(2)),
+            ("dts", Some(48_000), Some(6), Some(2)),
+        ],
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": "test-truehd-dts-to-mp4",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.ts"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "format": "mp4"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-map", "0:v?"])
+    );
+    assert!(plan.args.windows(2).any(|window| window == ["-map", "0:1"]));
+    assert!(
+        !plan
+            .args
+            .windows(2)
+            .any(|window| window == ["-map", "0:a?"])
+    );
+    assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
 fn resolve_video_families_keeps_hevc_input_probe_for_force_h264() {
     let temp_root = std::env::temp_dir().join(format!("streamserver-gpu-probe-{}", Uuid::now_v7()));
     fs::create_dir_all(&temp_root).expect("temp root should exist");
@@ -782,6 +981,55 @@ fn probe_input_media_profile_reads_video_and_audio_codecs() {
     assert_eq!(profile.audio_channels, Some(2));
     assert!(profile.audio_extradata_present);
     assert_eq!(profile.source_family, InputSourceFamily::Mp4Mov);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn probe_input_media_profile_reads_all_audio_streams() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-media-profile-audio-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_audio_streams(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        &[
+            ("mp3", Some(22_050), Some(2), Some(2)),
+            ("truehd", Some(48_000), Some(6), Some(2)),
+            ("dts", Some(48_000), Some(6), Some(2)),
+            ("eac3", Some(48_000), Some(6), Some(2)),
+            ("aac", Some(48_000), Some(2), Some(2)),
+        ],
+    );
+    let spec: TaskSpec = serde_json::from_value(json!({
+        "type": "stream_ingest",
+        "name": "probe-all-audio",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "file", "url": "input.ts"},
+        "process": {"mode": "copy_or_transcode"},
+        "stream": {"app": "live", "name": "probe-all-audio"},
+        "record": {},
+        "recovery": {},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    }))
+    .expect("spec should parse");
+
+    let profile = probe_input_media_profile(&settings, &spec, "/tmp/input.ts");
+
+    assert_eq!(profile.audio_codec_name.as_deref(), Some("mp3"));
+    assert_eq!(profile.audio_streams.len(), 5);
+    assert_eq!(profile.audio_streams[0].index, 1);
+    assert_eq!(profile.audio_streams[0].codec_name.as_deref(), Some("mp3"));
+    assert_eq!(profile.audio_streams[4].index, 5);
+    assert_eq!(profile.audio_streams[4].codec_name.as_deref(), Some("aac"));
+    assert_eq!(profile.audio_streams[4].sample_rate, Some(48_000));
+    assert_eq!(profile.source_family, InputSourceFamily::MpegTs);
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -2177,6 +2425,93 @@ fn build_stream_ingest_fast_record_plan_copies_mpegts_aac_for_mp4_output_with_bs
 }
 
 #[test]
+fn build_stream_ingest_fast_record_plan_maps_only_aac_for_multi_audio_mp4() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-fast-record-multi-audio-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_audio_streams(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        &[
+            ("mp3", Some(22_050), Some(2), Some(2)),
+            ("truehd", Some(48_000), Some(6), Some(2)),
+            ("dts", Some(48_000), Some(6), Some(2)),
+            ("eac3", Some(48_000), Some(6), Some(2)),
+            ("aac", Some(48_000), Some(2), Some(2)),
+        ],
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "vod-fast-record-multi-audio",
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "file",
+                "source_mode": "vod",
+                "url": "archive.ts"
+            },
+            "stream": {"app": "live", "name": "archive-fast-multi-audio"},
+            "expose": {
+                "enable_rtsp": false,
+                "enable_rtmp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {
+                "enabled": true,
+                "format": "mp4"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_stream_ingest_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-map", "0:v?"])
+    );
+    assert!(plan.args.windows(2).any(|window| window == ["-map", "0:5"]));
+    assert!(
+        !plan
+            .args
+            .windows(2)
+            .any(|window| window == ["-map", "0:a?"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-c:a", "copy"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
 fn build_stream_ingest_fast_record_plan_copies_mpegts_h264_aac_for_hls_output() {
     let temp_root = std::env::temp_dir().join(format!(
         "streamserver-fast-record-hls-copy-{}",
@@ -2666,6 +3001,12 @@ fn build_file_to_live_plan_copy_or_transcode_routes_mpegts_aac_to_internal_rtmp(
     );
     assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
     assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtmp"));
+    assert!(
+        !plan
+            .args
+            .windows(2)
+            .any(|window| window == ["-threads", "0"])
+    );
     let input_index = plan
         .args
         .iter()
@@ -2805,6 +3146,110 @@ fn build_file_to_live_plan_copy_or_transcode_copies_hevc_aac_into_internal_enhan
         plan.internal_ingress_protocol.as_deref(),
         Some("enhanced_rtmp")
     );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-threads", "0"])
+    );
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn build_file_to_live_plan_maps_only_aac_for_multi_audio_internal_enhanced_rtmp() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-file-live-multi-audio-enhanced-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary_with_audio_streams(
+        &temp_root,
+        "mpegts",
+        "hevc",
+        &[
+            ("mp3", Some(22_050), Some(2), Some(2)),
+            ("truehd", Some(48_000), Some(6), Some(2)),
+            ("dts", Some(48_000), Some(6), Some(2)),
+            ("eac3", Some(48_000), Some(6), Some(2)),
+            ("aac", Some(48_000), Some(2), Some(2)),
+        ],
+    );
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": "file-live-multi-audio-enhanced",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.ts"},
+            "stream": {"app": "live", "name": "stream"},
+            "expose": {
+                "enable_rtmp": false,
+                "enable_rtsp": false,
+                "enable_http_ts": false,
+                "enable_http_fmp4": true,
+                "enable_hls": false
+            },
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_file_to_live_plan_with_capability_hints(
+        &settings,
+        &request,
+        &spec,
+        RuntimeCapabilityHints {
+            zlm_rtmp_enhanced_enabled: Some(true),
+        },
+    )
+    .expect("plan should build");
+
+    assert_eq!(plan.output_target, "rtmp://127.0.0.1:1935/live/stream");
+    assert_eq!(
+        plan.internal_ingress_protocol.as_deref(),
+        Some("enhanced_rtmp")
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-map", "0:v?"])
+    );
+    assert!(plan.args.windows(2).any(|window| window == ["-map", "0:5"]));
+    assert!(
+        !plan
+            .args
+            .windows(2)
+            .any(|window| window == ["-map", "0:a?"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-c:a", "copy"])
+    );
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-bsf:a", "aac_adtstoasc"])
+    );
+    assert!(plan.args.windows(2).any(|window| window == ["-f", "flv"]));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-threads", "0"])
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -2863,6 +3308,11 @@ fn build_file_to_live_plan_falls_back_to_rtsp_and_transcodes_aac_when_enhanced_i
     assert!(plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
     assert!(plan.args.windows(2).any(|window| window == ["-f", "rtsp"]));
     assert_eq!(plan.internal_ingress_protocol.as_deref(), Some("rtsp"));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-threads", "0"])
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -3716,6 +4166,7 @@ fn build_live_relay_api_params_uses_expose_protocols_without_auto_recording() {
     assert_eq!(params.get("enable_ts").map(String::as_str), Some("0"));
     assert_eq!(params.get("enable_fmp4").map(String::as_str), Some("1"));
     assert_eq!(params.get("enable_hls").map(String::as_str), Some("0"));
+    assert_eq!(params.get("add_mute_audio").map(String::as_str), Some("0"));
     assert_eq!(params.get("enable_mp4").map(String::as_str), Some("0"));
     assert_eq!(params.get("auto_close").map(String::as_str), Some("1"));
     assert_eq!(params.get("timeout_sec").map(String::as_str), Some("7"));

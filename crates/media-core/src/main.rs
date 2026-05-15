@@ -2406,7 +2406,7 @@ fn build_publish_hook_response(
         "code": 0,
         "msg": "success",
         "enable_audio": true,
-        "add_mute_audio": true,
+        "add_mute_audio": false,
         "enable_rtsp": expose.enable_rtsp.unwrap_or(true),
         "enable_rtmp": expose.enable_rtmp.unwrap_or(true),
         "enable_ts": expose.enable_http_ts.unwrap_or(true),
