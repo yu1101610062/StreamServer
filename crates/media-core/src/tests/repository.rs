@@ -407,6 +407,48 @@ fn should_persist_record_file_hook_only_keeps_hls_record_playlists() {
 }
 
 #[test]
+fn event_retention_skips_noisy_runtime_events() {
+    assert!(!should_persist_agent_task_event(
+        "source_reconnecting",
+        "warn"
+    ));
+    assert!(!should_persist_agent_task_event("stream_cleanup", "info"));
+    assert!(!should_persist_zlm_stream_event(
+        "stream_lookup_miss",
+        "info"
+    ));
+    assert!(should_persist_agent_task_event(
+        "source_reconnecting",
+        "error"
+    ));
+    assert!(should_persist_agent_task_event("running", "info"));
+    assert!(should_persist_zlm_stream_event("stream_no_reader", "warn"));
+}
+
+#[test]
+fn compact_hook_payload_keeps_only_route_fields_for_noisy_hooks() {
+    assert!(!should_persist_hook_event("on_server_keepalive"));
+    assert!(should_persist_hook_event("on_server_started"));
+
+    let compacted = compact_hook_payload(
+        "on_stream_not_found",
+        json!({
+            "schema": "rtmp",
+            "vhost": "__defaultVhost__",
+            "app": "live",
+            "stream": "camera01",
+            "secret": "removed",
+            "params": "large-debug-value"
+        }),
+    );
+
+    assert_eq!(compacted["compacted"], true);
+    assert_eq!(compacted["app"], "live");
+    assert!(compacted.get("secret").is_none());
+    assert!(compacted.get("params").is_none());
+}
+
+#[test]
 fn validate_managed_file_publish_target_rejects_file_path_override() {
     let spec: TaskSpec = serde_json::from_value(json!({
         "type": "file_transcode",

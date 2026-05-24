@@ -1683,23 +1683,6 @@ impl TaskRepository {
         .bind(job.id)
         .execute(&mut *tx)
         .await?;
-        self.insert_event(
-            &mut tx,
-            job.task_id,
-            job.attempt_id,
-            Some(job.attempt_no),
-            EventSource::Core,
-            "callback_delivered",
-            "info",
-            json!({
-                "callback_url": job.callback_url,
-                "event_type": job.event_type,
-                "reason": job.reason,
-                "http_status": http_status,
-                "response_body": response_body,
-            }),
-        )
-        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3792,22 +3775,25 @@ impl TaskRepository {
         };
         let sticky_reconnect_active = sticky_reconnect_active(&ownership)?;
 
-        self.insert_event(
-            &mut tx,
-            event.task_id,
-            ownership.attempt_id,
-            Some(event.attempt_no),
-            EventSource::Agent,
-            &event.event_type,
-            &normalize_event_level(&event.event_level),
-            json!({
-                "node_id": node_id,
-                "lease_token": event.lease_token,
-                "message": event.message,
-                "payload": event.payload,
-            }),
-        )
-        .await?;
+        let event_level = normalize_event_level(&event.event_level);
+        if should_persist_agent_task_event(&event.event_type, &event_level) {
+            self.insert_event(
+                &mut tx,
+                event.task_id,
+                ownership.attempt_id,
+                Some(event.attempt_no),
+                EventSource::Agent,
+                &event.event_type,
+                &event_level,
+                json!({
+                    "node_id": node_id,
+                    "lease_token": event.lease_token,
+                    "message": event.message,
+                    "payload": event.payload,
+                }),
+            )
+            .await?;
+        }
 
         let disk_threshold_failure = event.event_type == "failed"
             && event
@@ -4235,7 +4221,7 @@ impl TaskRepository {
         batch: TaskLogBatchRecord,
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
-        let Some(ownership) = self
+        let Some(_ownership) = self
             .validate_attempt_ownership(
                 &mut tx,
                 batch.task_id,
@@ -4250,22 +4236,6 @@ impl TaskRepository {
             tx.commit().await?;
             return Ok(());
         };
-        self.insert_event(
-            &mut tx,
-            batch.task_id,
-            ownership.attempt_id,
-            Some(batch.attempt_no),
-            EventSource::Agent,
-            "task_log_batch",
-            "info",
-            json!({
-                "node_id": node_id,
-                "lease_token": batch.lease_token,
-                "stream": batch.stream,
-                "lines": batch.lines,
-            }),
-        )
-        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -4277,7 +4247,7 @@ impl TaskRepository {
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
-        let Some(ownership) = self
+        let Some(_ownership) = self
             .validate_attempt_ownership(
                 &mut tx,
                 progress.task_id,
@@ -4303,18 +4273,6 @@ impl TaskRepository {
             "dup_frames": progress.dup_frames,
             "drop_frames": progress.drop_frames,
         });
-
-        self.insert_event(
-            &mut tx,
-            progress.task_id,
-            ownership.attempt_id,
-            Some(progress.attempt_no),
-            EventSource::Agent,
-            "task_progress",
-            "info",
-            payload.clone(),
-        )
-        .await?;
 
         self.promote_task_running(&mut tx, progress.task_id, progress.attempt_no, node_id, now)
             .await?;
@@ -4359,27 +4317,29 @@ impl TaskRepository {
             tx.commit().await?;
             return Ok(());
         };
-        self.insert_event(
-            &mut tx,
-            snapshot.task_id,
-            ownership.attempt_id,
-            Some(snapshot.attempt_no),
-            EventSource::Agent,
-            "task_snapshot",
-            "info",
-            json!({
-                "node_id": node_id,
-                "lease_token": snapshot.lease_token,
-                "runtime_id": snapshot.runtime_id,
-                "worker_kind": snapshot.worker_kind,
-                "pid": snapshot.pid,
-                "state": snapshot.state,
-                "command_line": snapshot.command_line,
-                "outputs": snapshot.outputs,
-                "metadata": snapshot.metadata,
-            }),
-        )
-        .await?;
+        if snapshot.state.eq_ignore_ascii_case("exited") {
+            self.insert_event(
+                &mut tx,
+                snapshot.task_id,
+                ownership.attempt_id,
+                Some(snapshot.attempt_no),
+                EventSource::Agent,
+                "task_snapshot",
+                "info",
+                json!({
+                    "node_id": node_id,
+                    "lease_token": snapshot.lease_token,
+                    "runtime_id": snapshot.runtime_id,
+                    "worker_kind": snapshot.worker_kind,
+                    "pid": snapshot.pid,
+                    "state": snapshot.state,
+                    "command_line": snapshot.command_line,
+                    "outputs": snapshot.outputs,
+                    "metadata": snapshot.metadata,
+                }),
+            )
+            .await?;
+        }
 
         sqlx::query(
             r#"
@@ -4690,8 +4650,6 @@ impl TaskRepository {
         {
             if should_persist_record_file_hook(hook_name, &binding, &record)? {
                 let stored_http_url = relative_record_http_url_from_hook(&record);
-                let callback_http_url =
-                    resolve_record_callback_http_url(&mut tx, server_id, &record).await?;
                 sqlx::query(
                     r#"
                     insert into record_files (
@@ -4727,35 +4685,6 @@ impl TaskRepository {
                 .bind(record.start_time)
                 .bind(Utc::now())
                 .execute(&mut *tx)
-                .await?;
-
-                self.insert_event(
-                    &mut tx,
-                    binding.task_id,
-                    Some(binding.attempt_id),
-                    Some(binding.attempt_no),
-                    EventSource::ZlmHook,
-                    "record_file_created",
-                    "info",
-                    json!({
-                        "server_id": server_id,
-                        "hook_name": hook_name,
-                        "record_format": record.record_format,
-                        "schema": record.schema,
-                        "vhost": record.vhost,
-                        "app": record.app,
-                        "stream": record.stream,
-                        "file_path": record.file_path,
-                        "file_name": record.file_name,
-                        "folder": record.folder,
-                        "url": callback_http_url.clone().or(record.url.clone()),
-                        "http_url": callback_http_url,
-                        "file_size": record.file_size,
-                        "time_len": record.time_len_sec,
-                        "start_time": record.start_time,
-                        "source": "hook",
-                    }),
-                )
                 .await?;
 
                 self.enqueue_artifact_update_callback_if_needed(
@@ -4799,25 +4728,27 @@ impl TaskRepository {
             )
             .await?
         {
-            self.insert_event(
-                &mut tx,
-                binding.task_id,
-                Some(binding.attempt_id),
-                Some(binding.attempt_no),
-                EventSource::ZlmHook,
-                &record.event_type,
-                &record.event_level,
-                json!({
-                    "server_id": server_id,
-                    "hook_name": hook_name,
-                    "schema": record.schema,
-                    "vhost": record.vhost,
-                    "app": record.app,
-                    "stream": record.stream,
-                    "payload": record.payload,
-                }),
-            )
-            .await?;
+            if should_persist_zlm_stream_event(&record.event_type, &record.event_level) {
+                self.insert_event(
+                    &mut tx,
+                    binding.task_id,
+                    Some(binding.attempt_id),
+                    Some(binding.attempt_no),
+                    EventSource::ZlmHook,
+                    &record.event_type,
+                    &record.event_level,
+                    json!({
+                        "server_id": server_id,
+                        "hook_name": hook_name,
+                        "schema": record.schema,
+                        "vhost": record.vhost,
+                        "app": record.app,
+                        "stream": record.stream,
+                        "payload": record.payload,
+                    }),
+                )
+                .await?;
+            }
         }
 
         self.mark_hook_event_processed(&mut tx, dedup_key).await?;
@@ -5349,6 +5280,10 @@ impl TaskRepository {
         dedup_key: &str,
         payload: Value,
     ) -> Result<bool, RepoError> {
+        if !should_persist_hook_event(hook_name) {
+            return Ok(true);
+        }
+        let payload = compact_hook_payload(hook_name, payload);
         let result = sqlx::query(
             r#"
             insert into hook_events (
@@ -7598,34 +7533,6 @@ fn is_hls_playlist_record_path(file_path: &str) -> bool {
             .is_some_and(|value| value.eq_ignore_ascii_case("m3u8"))
 }
 
-async fn resolve_record_callback_http_url(
-    tx: &mut sqlx::Transaction<'_, Postgres>,
-    server_id: &str,
-    record: &ZlmRecordFileRecord,
-) -> Result<Option<String>, RepoError> {
-    let Some(agent_stream_addr) = sqlx::query_scalar::<_, String>(
-        r#"
-        select n.agent_stream_addr
-          from media_servers s
-          join media_nodes n
-            on n.id = s.node_id
-         where s.server_id = $1
-         limit 1
-        "#,
-    )
-    .bind(server_id.trim())
-    .fetch_optional(&mut **tx)
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    Ok(absolute_http_url_from_file_path(
-        agent_stream_addr.as_str(),
-        &record.file_path,
-    ))
-}
-
 fn build_resolved_task_json(
     task_type: TaskType,
     request_overrides: &Value,
@@ -7959,6 +7866,7 @@ pub struct TaskSnapshotRecord {
     pub metadata: Value,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ZlmRecordFileRecord {
     pub record_format: Option<String>,
@@ -8622,6 +8530,68 @@ fn normalize_event_level(value: &str) -> String {
         "debug" | "info" | "warn" | "error" => value.trim().to_string(),
         _ => "info".to_string(),
     }
+}
+
+fn should_persist_agent_task_event(event_type: &str, event_level: &str) -> bool {
+    if event_level == "error" {
+        return true;
+    }
+    !matches!(
+        event_type,
+        "source_reconnecting" | "stream_cleanup" | "stream_lookup_miss"
+    )
+}
+
+fn should_persist_zlm_stream_event(event_type: &str, event_level: &str) -> bool {
+    if event_level == "error" {
+        return true;
+    }
+    event_type != "stream_lookup_miss"
+}
+
+fn should_persist_hook_event(hook_name: &str) -> bool {
+    hook_name != "on_server_keepalive"
+}
+
+fn compact_hook_payload(hook_name: &str, payload: Value) -> Value {
+    if hook_name == "on_server_keepalive" {
+        return json!({ "compacted": true });
+    }
+    if !matches!(
+        hook_name,
+        "on_publish"
+            | "on_stream_not_found"
+            | "on_stream_none_reader"
+            | "on_record_ts"
+            | "on_record_mp4"
+    ) {
+        return payload;
+    }
+
+    let mut compacted = serde_json::Map::new();
+    compacted.insert("compacted".to_string(), Value::Bool(true));
+    for key in [
+        "mediaServerId",
+        "schema",
+        "protocol",
+        "vhost",
+        "app",
+        "stream",
+        "ip",
+        "port",
+        "file_path",
+        "file_name",
+        "folder",
+        "url",
+        "file_size",
+        "time_len",
+        "start_time",
+    ] {
+        if let Some(value) = payload.get(key) {
+            compacted.insert(key.to_string(), value.clone());
+        }
+    }
+    Value::Object(compacted)
 }
 
 fn publish_stream_matches(

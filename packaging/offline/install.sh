@@ -2079,20 +2079,58 @@ host_dir_path() {
   esac
 }
 
+path_exists_or_link() {
+  local target_path="$1"
+
+  [ -e "${target_path}" ] || [ -L "${target_path}" ]
+}
+
+path_is_under() {
+  local child_path="${1%/}"
+  local parent_path="${2%/}"
+
+  case "${child_path}" in
+    "${parent_path}"|"${parent_path}"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+mkdir_if_absent() {
+  local target_dir="$1"
+
+  path_exists_or_link "${target_dir}" && return 0
+  mkdir -p "${target_dir}"
+}
+
+prepare_output_mount_layout() {
+  local output_host_dir="$1"
+
+  path_exists_or_link "${output_host_dir}" && return 0
+  mkdir -p "${output_host_dir}/mp4" "${output_host_dir}/hls"
+}
+
 prepare_worker_layout() {
   local install_dir="$1"
   local www_host_dir
   local output_host_dir
+  local www_was_present="false"
 
   www_host_dir="$(host_dir_path "${install_dir}" "${ZLM_WWW_MOUNT_HOST_DIR:-./data/zlm/www}")"
   output_host_dir="$(host_dir_path "${install_dir}" "${ZLM_OUTPUT_MOUNT_HOST_DIR:-./data/zlm/www/output}")"
 
-  mkdir -p \
-    "${install_dir}/data/media/work" \
-    "${install_dir}/data/media/logs" \
-    "${www_host_dir}" \
-    "${output_host_dir}/mp4" \
-    "${output_host_dir}/hls"
+  if path_exists_or_link "${www_host_dir}"; then
+    www_was_present="true"
+  fi
+
+  mkdir_if_absent "${install_dir}/data/media/work"
+  mkdir_if_absent "${install_dir}/data/media/logs"
+  mkdir_if_absent "${www_host_dir}"
+
+  if [ "${www_was_present}" = "true" ] && path_is_under "${output_host_dir}" "${www_host_dir}"; then
+    return 0
+  fi
+
+  prepare_output_mount_layout "${output_host_dir}"
 }
 
 emit_manual_start_hint() {
