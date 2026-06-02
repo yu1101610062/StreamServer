@@ -3,10 +3,12 @@ syntax = "proto3";
 package streamserver.controlplane;
 
 service ControlPlane {
+  // Agent 建连后长期保持双向流：Agent 上报心跳/事件，Core 下发任务控制命令。
   rpc StreamConnect(stream AgentEnvelope) returns (stream CoreEnvelope);
 }
 
 message AgentEnvelope {
+  // 第一条消息必须是 Register，后续消息按同一会话持续上报。
   oneof payload {
     Register register = 1;
     Heartbeat heartbeat = 2;
@@ -19,6 +21,7 @@ message AgentEnvelope {
 }
 
 message CoreEnvelope {
+  // Core 到 Agent 的命令都走同一条流，避免为任务控制再建立额外连接。
   oneof payload {
     StartTask start_task = 1;
     StopTask stop_task = 2;
@@ -29,6 +32,7 @@ message CoreEnvelope {
 }
 
 message Register {
+  // 节点注册字段会落库并参与调度、URL 外部化和 ZLM Hook 关联。
   string node_id = 1;
   string node_name = 2;
   string agent_version = 3;
@@ -50,6 +54,7 @@ message Register {
 }
 
 message Heartbeat {
+  // 心跳同时携带运行负载与清理状态，Core 调度时会把两者一起作为节点可用性依据。
   int64 node_time_ms = 1;
   double cpu_percent = 2;
   double mem_percent = 3;
@@ -70,6 +75,7 @@ message Heartbeat {
 }
 
 message CapabilitySnapshot {
+  // 能力快照来自本机 FFmpeg/ZLM/GPU 探测，用于展示和后续调度策略判断。
   repeated string ffmpeg_protocols = 1;
   repeated string ffmpeg_formats = 2;
   repeated string ffmpeg_encoders = 3;

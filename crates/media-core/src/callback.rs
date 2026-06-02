@@ -289,6 +289,7 @@ fn select_latest_business_event(events: &[TaskEventSummary]) -> Option<TaskEvent
 }
 
 fn synthetic_attempt(detail: &TaskDetail, job: &CallbackOutboxJob) -> AttemptSummary {
+    // 终态任务可能还没有 Agent 快照，例如取消发生在启动前；回调仍需要稳定的 attempt 视图。
     AttemptSummary {
         id: Uuid::nil(),
         attempt_no: job.attempt_no,
@@ -327,6 +328,7 @@ async fn build_task_completed_callback_payload(
     job: &CallbackOutboxJob,
 ) -> anyhow::Result<Option<TaskCompletedCallbackPayload>> {
     let detail = repository.get_task(job.task_id).await?;
+    // 出队时重新确认终态，避免任务被恢复/重试后发送过期的完成回调。
     if !is_terminal(detail.task.status) {
         repository
             .mark_callback_dead(

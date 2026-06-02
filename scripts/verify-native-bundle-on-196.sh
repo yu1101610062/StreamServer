@@ -331,6 +331,7 @@ main() {
   log "准备 native 包到 ${SSH_TARGET}:${remote_bundle}"
   ssh_run "mkdir -p $(shell_quote "${REMOTE_DIR}")"
   if [ "${UPLOAD_METHOD}" = "http" ]; then
+    # 大包优先让 196 主动下载，避免 scp 在弱网下重复握手导致失败。
     start_http_server
     local bundle_url
     bundle_url="http://${HTTP_HOST}:${HTTP_PORT}/${bundle_name}"
@@ -345,6 +346,7 @@ main() {
   remote_script_name="${report_name%.md}.remote.sh"
   remote_script_local="$(cd "$(dirname "${BUNDLE_PATH}")" && pwd)/${remote_script_name}"
   remote_script="${REMOTE_DIR}/${remote_script_name}"
+  # 远端脚本只验证 native 安装包，不调用 Docker，确保目标机运行依赖真的已随包携带。
   cat >"${remote_script_local}" <<'REMOTE'
 set -euo pipefail
 
@@ -1245,6 +1247,7 @@ REMOTE
 
   log "开始远端验证，不使用 Docker"
   set +e
+  # 保留远端脚本退出码，同时无论成功失败都把报告拉回本机。
   ssh_run "STREAMSERVER_VERIFY_BUNDLE=$(shell_quote "${remote_bundle}") STREAMSERVER_VERIFY_DIR=$(shell_quote "${REMOTE_DIR}") STREAMSERVER_VERIFY_REPORT=$(shell_quote "${remote_report}") bash $(shell_quote "${remote_script}")"
   status=$?
   set -e

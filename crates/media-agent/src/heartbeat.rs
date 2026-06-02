@@ -47,6 +47,7 @@ impl HeartbeatSampler {
         ffmpeg_alive: bool,
         gpu_runtime: Vec<GpuRuntimeStats>,
     ) -> HeartbeatSnapshot {
+        // 上传盘与产物盘可能不是同一个挂载点：上传盘来自 work_root，产物盘优先来自清理器采样。
         let cpu_percent = self.sample_cpu_percent().unwrap_or(0.0);
         let mem_percent = sample_mem_percent().unwrap_or(0.0);
         let upload_disk = sample_disk(&self.work_root).unwrap_or_default();
@@ -64,6 +65,7 @@ impl HeartbeatSampler {
             .saturating_add(starting_tasks)
             .saturating_add(stopping_tasks)
             .saturating_add(orphaned_tasks);
+        // max_runtime_slots=0 表示不按槽位限流，心跳仍回传任务计数但 slot_usage 固定为 0。
         let slot_usage = if self.max_runtime_slots == 0 {
             0.0
         } else {
@@ -92,6 +94,7 @@ impl HeartbeatSampler {
     }
 
     fn sample_cpu_percent(&mut self) -> Option<f64> {
+        // CPU 使用率需要两次 /proc/stat 差值，第一次采样没有前序值时返回 None。
         let current = sample_cpu_counters()?;
         let previous = self.previous_cpu.replace(current)?;
         let total_delta = current.total.saturating_sub(previous.total);

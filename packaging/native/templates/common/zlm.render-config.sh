@@ -5,6 +5,7 @@ template_file="${1:?missing template file}"
 output_file="${2:?missing output file}"
 
 escape_sed_replacement() {
+  # sed 替换值里只需要转义本脚本使用的分隔符和 &。
   printf '%s' "$1" | sed 's/[&|]/\\&/g'
 }
 
@@ -18,6 +19,7 @@ require_env() {
   fi
 }
 
+# ZLM 模板全部由环境变量渲染，缺任一关键值都直接失败，避免生成半有效配置。
 for key in \
   ZLM_API_SECRET \
   ZLM_HOOK_SHARED_SECRET \

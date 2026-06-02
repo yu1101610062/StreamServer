@@ -128,6 +128,7 @@ validate_unit_name() {
 unique_units() {
   local seen=" "
   local unit
+  # .env 可能缺少部分 unit，也可能因为手工修改出现重复，这里统一去重并过滤非法名称。
   for unit in "$@"; do
     [ -n "${unit}" ] || continue
     validate_unit_name "${unit}" || {
@@ -145,6 +146,7 @@ unique_units() {
 }
 
 service_units_stop_order() {
+  # 先停业务和 ZLM，再停 Core/Postgres，避免卸载过程中产生新的 Hook 或任务事件。
   unique_units \
     "${SYSTEMD_AGENT_UNIT:-}" \
     "${SYSTEMD_ZLM_UNIT:-}" \
@@ -154,6 +156,7 @@ service_units_stop_order() {
 }
 
 unit_files_remove_order() {
+  # 删除 unit 文件时先删 target，再删被 target 依赖的具体服务。
   unique_units \
     "${SYSTEMD_TARGET:-}" \
     "${SYSTEMD_POSTGRES_UNIT:-}" \
@@ -171,6 +174,7 @@ stop_and_remove_units() {
   fi
 
   mapfile -t units < <(service_units_stop_order)
+  # stop 和 disable 分两轮执行，确保所有服务都先进入停止流程。
   for unit in "${units[@]}"; do
     log "停止 unit: ${unit}"
     systemctl stop "${unit}" >/dev/null 2>&1 || warn "停止失败或 unit 不存在: ${unit}"
@@ -208,6 +212,7 @@ component_count() {
 
 assert_safe_install_dir_for_purge() {
   local count
+  # purge 是破坏性删除，必须同时满足路径层级、.env 和 native 标记三重保护。
   case "${INSTALL_DIR}" in
     ""|"/"|"/bin"|"/boot"|"/dev"|"/etc"|"/home"|"/lib"|"/lib64"|"/opt"|"/proc"|"/root"|"/run"|"/sbin"|"/sys"|"/tmp"|"/usr"|"/var")
       fail "拒绝删除高危目录: ${INSTALL_DIR}"
@@ -224,6 +229,7 @@ choose_data_policy() {
     return 0
   fi
   if [ "${ASSUME_YES}" -eq 1 ]; then
+    # 非交互确认默认保留数据，只有显式 --purge 才删除 .env/data/certs。
     DATA_POLICY="keep"
     return 0
   fi
@@ -236,6 +242,7 @@ choose_data_policy() {
 
 remove_program_files_keep_data() {
   local item
+  # keep-data 只删除程序和 runtime，保留配置、证书和媒体数据，便于重装到同一路径。
   for item in bin runtime ui zlm docs systemd uninstall.sh; do
     [ -e "${INSTALL_DIR}/${item}" ] || continue
     rm -rf "${INSTALL_DIR:?}/${item}"

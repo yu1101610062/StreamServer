@@ -1,5 +1,4 @@
 use super::*;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 
 fn test_settings(work_root: &str) -> AgentSettings {
@@ -71,15 +70,6 @@ fn build_file_to_live_plan_with_capability_hints(
     capability_hints: RuntimeCapabilityHints,
 ) -> Result<ProcessPlan, ExecutorError> {
     build_stream_ingest_realtime_plan(settings, request, spec, capability_hints)
-}
-
-fn write_executable(path: &Path, body: &str) {
-    fs::write(path, body).expect("script should write");
-    let mut permissions = fs::metadata(path)
-        .expect("script metadata should exist")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("script permissions should update");
 }
 
 fn success_exit_status() -> std::process::ExitStatus {
@@ -178,6 +168,22 @@ fn sticky_live_recording_ingest_handle(stream_online: bool) -> RuntimeHandle {
     handle
 }
 
+fn mock_audio_stream(
+    index: Option<u32>,
+    codec_name: &str,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    extradata_size: Option<u64>,
+) -> MockFfprobeAudioStream {
+    MockFfprobeAudioStream {
+        index,
+        codec_name: codec_name.to_string(),
+        sample_rate,
+        channels,
+        extradata_size,
+    }
+}
+
 fn create_mock_ffprobe_binary(
     root: &Path,
     video_codec_name: &str,
@@ -237,7 +243,7 @@ fn create_mock_ffprobe_binary_with_profile(
 }
 
 fn create_mock_ffprobe_binary_with_video_profile(
-    root: &Path,
+    _root: &Path,
     format_name: &str,
     video_codec_name: &str,
     video_pix_fmt: Option<&str>,
@@ -247,113 +253,68 @@ fn create_mock_ffprobe_binary_with_video_profile(
     video_extradata_size: Option<u64>,
     audio_extradata_size: Option<u64>,
 ) -> String {
-    let path = root.join(format!("mock-ffprobe-{}.sh", Uuid::now_v7()));
-    let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
-            let sample_rate = audio_sample_rate
-                .map(|value| format!(",\"sample_rate\":\"{value}\""))
-                .unwrap_or_default();
-            let channels = audio_channels
-                .map(|value| format!(",\"channels\":{value}"))
-                .unwrap_or_default();
-            let extradata_size = audio_extradata_size
-                .map(|value| format!(",\"extradata_size\":{value}"))
-                .unwrap_or_default();
-            format!(
-                ",\n    {{\"codec_type\":\"audio\",\"codec_name\":\"{codec}\"{sample_rate}{channels}{extradata_size}}}"
-            )
-        });
-    let video_extradata_size = video_extradata_size
-        .map(|value| format!(",\"extradata_size\":{value}"))
+    let audio_streams = audio_codec_name
+        .map(|codec| {
+            vec![mock_audio_stream(
+                None,
+                codec,
+                audio_sample_rate,
+                audio_channels,
+                audio_extradata_size,
+            )]
+        })
         .unwrap_or_default();
-    let video_pix_fmt = video_pix_fmt
-        .map(|value| format!(",\"pix_fmt\":\"{value}\""))
-        .unwrap_or_default();
-    let body = format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-want_json=0
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
-    want_json=1
-    break
-  fi
-  prev="$arg"
-done
-if [ "$want_json" = "1" ]; then
-  cat <<'EOF'
-{{"streams":[
-    {{"codec_type":"video","codec_name":"{video_codec_name}"{video_pix_fmt}{video_extradata_size}}}{audio_stream}
-],"format":{{"format_name":"{format_name}"}}}}
-EOF
-else
-  echo "{video_codec_name}"
-fi
-"#
-    );
-    write_executable(&path, &body);
-    path.to_string_lossy().to_string()
+
+    register_mock_ffprobe_binary(
+        "single",
+        MockFfprobeBinary {
+            format_name: format_name.to_string(),
+            video_codec_name: video_codec_name.to_string(),
+            video_pix_fmt: video_pix_fmt.map(str::to_string),
+            video_extradata_size,
+            audio_streams,
+            recorded_args_path: None,
+            sleep_ms: 0,
+        },
+    )
 }
 
 fn create_mock_ffprobe_binary_with_audio_streams(
-    root: &Path,
+    _root: &Path,
     format_name: &str,
     video_codec_name: &str,
     audio_streams: &[(&str, Option<u32>, Option<u32>, Option<u64>)],
 ) -> String {
-    let path = root.join(format!("mock-ffprobe-multi-audio-{}.sh", Uuid::now_v7()));
-    let audio_streams_json = audio_streams
+    let audio_streams = audio_streams
         .iter()
         .enumerate()
         .map(|(offset, (codec, sample_rate, channels, extradata_size))| {
-            let sample_rate = sample_rate
-                .map(|value| format!(",\"sample_rate\":\"{value}\""))
-                .unwrap_or_default();
-            let channels = channels
-                .map(|value| format!(",\"channels\":{value}"))
-                .unwrap_or_default();
-            let extradata_size = extradata_size
-                .map(|value| format!(",\"extradata_size\":{value}"))
-                .unwrap_or_default();
-            format!(
-                ",\n    {{\"index\":{},\"codec_type\":\"audio\",\"codec_name\":\"{}\"{}{}{}}}",
-                offset + 1,
+            mock_audio_stream(
+                Some((offset + 1) as u32),
                 codec,
-                sample_rate,
-                channels,
-                extradata_size
+                *sample_rate,
+                *channels,
+                *extradata_size,
             )
         })
-        .collect::<String>();
-    let body = format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-want_json=0
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
-    want_json=1
-    break
-  fi
-  prev="$arg"
-done
-if [ "$want_json" = "1" ]; then
-  cat <<'EOF'
-{{"streams":[
-    {{"index":0,"codec_type":"video","codec_name":"{video_codec_name}","extradata_size":32}}{audio_streams_json}
-],"format":{{"format_name":"{format_name}"}}}}
-EOF
-else
-  echo "{video_codec_name}"
-fi
-"#
-    );
-    write_executable(&path, &body);
-    path.to_string_lossy().to_string()
+        .collect();
+
+    register_mock_ffprobe_binary(
+        "multi-audio",
+        MockFfprobeBinary {
+            format_name: format_name.to_string(),
+            video_codec_name: video_codec_name.to_string(),
+            video_pix_fmt: None,
+            video_extradata_size: Some(32),
+            audio_streams,
+            recorded_args_path: None,
+            sleep_ms: 0,
+        },
+    )
 }
 
 fn create_recording_mock_ffprobe_binary_with_profile(
-    root: &Path,
+    _root: &Path,
     recorded_args_path: &Path,
     format_name: &str,
     video_codec_name: &str,
@@ -363,96 +324,54 @@ fn create_recording_mock_ffprobe_binary_with_profile(
     video_extradata_size: Option<u64>,
     audio_extradata_size: Option<u64>,
 ) -> String {
-    let path = root.join(format!("mock-ffprobe-recording-{}.sh", Uuid::now_v7()));
-    let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
-        let sample_rate = audio_sample_rate
-            .map(|value| format!(",\"sample_rate\":\"{value}\""))
-            .unwrap_or_default();
-        let channels = audio_channels
-            .map(|value| format!(",\"channels\":{value}"))
-            .unwrap_or_default();
-        let extradata_size = audio_extradata_size
-            .map(|value| format!(",\"extradata_size\":{value}"))
-            .unwrap_or_default();
-        format!(
-            ",\n    {{\"codec_type\":\"audio\",\"codec_name\":\"{codec}\"{sample_rate}{channels}{extradata_size}}}"
-        )
-    });
-    let video_extradata_size = video_extradata_size
-        .map(|value| format!(",\"extradata_size\":{value}"))
+    let audio_streams = audio_codec_name
+        .map(|codec| {
+            vec![mock_audio_stream(
+                None,
+                codec,
+                audio_sample_rate,
+                audio_channels,
+                audio_extradata_size,
+            )]
+        })
         .unwrap_or_default();
-    let body = format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-printf '%s\n' "$@" > "{}"
-want_json=0
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
-    want_json=1
-    break
-  fi
-  prev="$arg"
-done
-if [ "$want_json" = "1" ]; then
-  cat <<'EOF'
-{{"streams":[
-    {{"codec_type":"video","codec_name":"{video_codec_name}"{video_extradata_size}}}{audio_stream}
-],"format":{{"format_name":"{format_name}"}}}}
-EOF
-else
-  echo "{video_codec_name}"
-fi
-"#,
-        recorded_args_path.display()
-    );
-    write_executable(&path, &body);
-    path.to_string_lossy().to_string()
+
+    register_mock_ffprobe_binary(
+        "recording",
+        MockFfprobeBinary {
+            format_name: format_name.to_string(),
+            video_codec_name: video_codec_name.to_string(),
+            video_pix_fmt: None,
+            video_extradata_size,
+            audio_streams,
+            recorded_args_path: Some(recorded_args_path.to_path_buf()),
+            sleep_ms: 0,
+        },
+    )
 }
 
 fn create_slow_mock_ffprobe_binary(
-    root: &Path,
+    _root: &Path,
     sleep_ms: u64,
     video_codec_name: &str,
     audio_codec_name: Option<&str>,
 ) -> String {
-    let path = root.join(format!("mock-ffprobe-slow-{}.sh", Uuid::now_v7()));
-    let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
-            format!(
-                r#",
-    {{"codec_type":"audio","codec_name":"{codec}","sample_rate":"48000","channels":2,"extradata_size":2}}"#
-            )
-        });
-    let body = format!(
-        r#"#!/usr/bin/env bash
-set -euo pipefail
-sleep_sec=$(python3 - <<'PY'
-print({sleep_ms} / 1000)
-PY
-)
-sleep "${{sleep_sec}}"
-want_json=0
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-of" ] && [ "$arg" = "json" ]; then
-    want_json=1
-    break
-  fi
-  prev="$arg"
-done
-if [ "$want_json" = "1" ]; then
-  cat <<'EOF'
-{{"streams":[
-    {{"codec_type":"video","codec_name":"{video_codec_name}","extradata_size":32}}{audio_stream}
-],"format":{{"format_name":"mpegts"}}}}
-EOF
-else
-  echo "{video_codec_name}"
-fi
-"#
-    );
-    write_executable(&path, &body);
-    path.to_string_lossy().to_string()
+    let audio_streams = audio_codec_name
+        .map(|codec| vec![mock_audio_stream(None, codec, Some(48_000), Some(2), Some(2))])
+        .unwrap_or_default();
+
+    register_mock_ffprobe_binary(
+        "slow",
+        MockFfprobeBinary {
+            format_name: "mpegts".to_string(),
+            video_codec_name: video_codec_name.to_string(),
+            video_pix_fmt: None,
+            video_extradata_size: Some(32),
+            audio_streams,
+            recorded_args_path: None,
+            sleep_ms,
+        },
+    )
 }
 
 #[test]

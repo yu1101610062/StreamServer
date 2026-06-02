@@ -34,6 +34,7 @@ pub struct TaskRepository {
 
 impl TaskRepository {
     pub fn new(pool: PgPool) -> Self {
+        // 默认延迟给 Agent 留出上报终态产物的时间，避免终态回调先于文件产物到达。
         Self::with_callback_delays(
             pool,
             chrono::Duration::milliseconds(8_000),
@@ -7224,6 +7225,7 @@ const ZLM_OUTPUT_HTTP_ROOT_SEGMENT: &str = "/data/zlm/www/output";
 const ZLM_OUTPUT_MP4_RELATIVE_ROOT: &str = "output/mp4";
 const ZLM_OUTPUT_HLS_RELATIVE_ROOT: &str = "output/hls";
 
+// 输出路径既可能来自安装目录，也可能来自容器时代遗留路径；统一转成相对 HTTP 根路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedOutputBucket {
     Mp4,
@@ -7273,6 +7275,7 @@ fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
 }
 
 fn zlm_http_root_in_path(path: &str) -> Option<&str> {
+    // 兼容网络挂载和原 Docker 路径，只要路径中包含 /data/zlm/www 就可外部化。
     for (index, _) in path.match_indices(ZLM_HTTP_ROOT_SEGMENT) {
         let end = index + ZLM_HTTP_ROOT_SEGMENT.len();
         let suffix = &path[end..];
@@ -7304,6 +7307,7 @@ fn relative_path_under_output_root<'a>(
 }
 
 fn task_id_from_managed_output_path(path: &str) -> Option<Uuid> {
+    // 托管输出目录约定为 output/{mp4,hls}/node-*/{task_id}/...，Hook 可据此反查任务。
     let normalized = normalized_absolute_path(path).ok()?;
     let relative = relative_path_under_output_root(&normalized, ManagedOutputBucket::Mp4)
         .or_else(|| relative_path_under_output_root(&normalized, ManagedOutputBucket::Hls))?;
@@ -7344,6 +7348,7 @@ fn validate_managed_file_publish_target(spec: &TaskSpec) -> Result<(), RepoError
         return Ok(());
     }
 
+    // 文件输出路径由平台分配，禁止客户端指定绝对路径绕过 allowlist 和清理策略。
     if spec
         .publish
         .url

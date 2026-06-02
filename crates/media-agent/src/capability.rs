@@ -31,6 +31,7 @@ impl CapabilityProbe {
     }
 
     pub async fn snapshot(&self, settings: &AgentSettings) -> CapabilitySnapshot {
+        // 能力探测面向调度和展示，外部命令失败时返回空能力而不是阻断 Agent 启动。
         let ffmpeg_protocols = probe_ffmpeg_entries(
             &settings.ffmpeg_bin,
             &["-protocols"],
@@ -86,6 +87,7 @@ impl CapabilityProbe {
             return Ok(ZlmProbeResult::default());
         }
 
+        // ZLM 不同版本 API 字段存在差异，这里分多次探测并只提取系统实际依赖的能力。
         let version = self
             .fetch_zlm_json(base, "/index/api/version", &settings.zlm_api_secret)
             .await

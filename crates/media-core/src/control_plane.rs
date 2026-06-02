@@ -588,6 +588,7 @@ impl ControlPlaneService {
                         .await
                         .map_err(repo_status)?
                 {
+                    // Agent 重连后可能收养了 Core 已经请求停止的进程，需要补发 stop 保持意图一致。
                     if let Err(error) = self
                         .request_stop(event.task_id, "reclaim_stop", 30, 5)
                         .await
@@ -685,6 +686,7 @@ impl ControlPlaneService {
             return;
         }
 
+        // 控制流断开时任务不立即判失败，先进入 reclaiming，等待 Agent 重连或快照回补。
         if let Err(error) = self
             .repository
             .mark_tasks_reclaiming_for_disconnected_node(node_id)
@@ -744,6 +746,7 @@ impl ControlPlaneService {
             + snapshot.starting_tasks
             + snapshot.stopping_tasks
             + snapshot.orphaned_tasks;
+        // dispatch reservation 是乐观占位；心跳里真实活跃任务数增加后释放对应占位。
         for _ in 0..current_active.saturating_sub(previous_active) {
             if session.reservations.pop_front().is_none() {
                 break;
@@ -799,6 +802,7 @@ impl ControlPlaneService {
         preference: ExecutionPreference,
     ) -> ClaimResult {
         let mut sessions = self.sessions.lock().await;
+        // required_labels 要区分“没有匹配标签节点”和“有匹配节点但当前不可调度”两类错误。
         let has_required_label_match = task_has_required_labels(spec)
             && sessions
                 .values()
@@ -815,6 +819,7 @@ impl ControlPlaneService {
         let Some(handle) = sessions.get_mut(&target.node_id) else {
             return ClaimResult::NoConnectedNode;
         };
+        // 选中节点后立即写入 reservation，降低并发派发时多个任务挤到同一节点的概率。
         handle
             .reservations
             .push_back(DispatchReservation { task_id });
@@ -967,6 +972,7 @@ impl ControlPlane for ControlPlaneService {
         request: Request<Streaming<AgentEnvelope>>,
     ) -> Result<Response<Self::StreamConnectStream>, Status> {
         let mut inbound = request.into_inner();
+        // 双向流的第一包必须是注册信息，Core 依赖它建立 node_id 到 sender 的会话映射。
         let first = match timeout(CONTROL_STREAM_IDLE_TIMEOUT, inbound.message()).await {
             Ok(Ok(Some(message))) => message,
             Ok(Ok(None)) => return Err(Status::invalid_argument("missing register message")),

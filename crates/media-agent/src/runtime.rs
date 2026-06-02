@@ -20,6 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::os::unix::process::ExitStatusExt;
+#[cfg(test)]
+use std::sync::OnceLock;
+
 use chrono::{DateTime, Local, Utc};
 use media_domain::{
     ExposeSpec, InputKind, InputSpec, PublishSpec, PublishTargetKind, RecordingControlSpec,
@@ -3450,6 +3455,7 @@ fn build_stream_ingest_realtime_plan(
     spec: &TaskSpec,
     capability_hints: RuntimeCapabilityHints,
 ) -> Result<ProcessPlan, ExecutorError> {
+    // 实时接入会先推到本机 ZLM，再由 ZLM 负责 RTSP/RTMP/HTTP 等对外播放。
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
     let probe_input_args = stream_ingest_probe_input_args(spec, input_url.as_str());
@@ -3479,6 +3485,7 @@ fn build_stream_ingest_realtime_plan(
         &profile,
         AudioOutputPolicy::CopyWhitelistedElseAac,
     )?;
+    // TS/HLS 中的 AAC 复制到 FLV/MP4 前需要确认参数完整，否则宁可拒绝也不生成坏流。
     if !stream_ingest_audio_copy_probe_args.is_empty() {
         insert_ffmpeg_input_args(&mut args, stream_ingest_audio_copy_probe_args);
     }
@@ -3565,6 +3572,7 @@ fn build_stream_ingest_fast_record_plan(
     request: &StartTaskRequest,
     spec: &TaskSpec,
 ) -> Result<ProcessPlan, ExecutorError> {
+    // 快速录像不经过 ZLM 内部播放链路，直接把 VOD 输入写成托管文件产物。
     let input_url = build_input_url(settings, &spec.input)?;
     let work_dir = attempt_work_dir(settings, request.task_id, request.attempt_no);
     let mut args = ffmpeg_base_args_without_maps(input_url.clone(), false);
@@ -3763,9 +3771,8 @@ fn build_multicast_bridge_plan(
         );
     }
     if should_stabilize_live_mpegts_multicast_bridge(spec, &output) {
-        // ZLM-published live inputs can surface unset/non-monotonic DTS when copied
-        // directly into MPEG-TS. Re-encode video to regenerate timestamps while
-        // keeping audio copy so the bridge stays close to passthrough semantics.
+        // ZLM 发布的实时源直接复制到 MPEG-TS 时可能出现 DTS 缺失或不单调。
+        // 这里只重编码视频以重建时间戳，音频仍尽量复制，保持接近透传的成本。
         append_live_mpegts_multicast_bridge_args(&mut args, settings, spec, input_url.as_str());
     } else {
         let audio_copy_decoration = append_process_args(
@@ -4293,6 +4300,7 @@ fn append_process_args_with_profile(
     let mode = normalized_process_mode(spec, default_mode);
     match mode {
         "passthrough" => {
+            // passthrough 明确要求全复制，只在必要时追加封装格式需要的音频 bitstream filter。
             let audio_copy_decoration = resolve_passthrough_audio_copy_decoration(
                 settings,
                 spec,
@@ -4309,6 +4317,7 @@ fn append_process_args_with_profile(
             Ok(audio_copy_decoration)
         }
         "copy_or_transcode" | "force_transcode" => {
+            // copy_or_transcode 先基于探测结果尝试复制，不满足封装/策略时只转码必要的轨道。
             let probed_profile;
             let selection_profile = match input_profile {
                 Some(profile) => Some(profile),
@@ -4374,6 +4383,7 @@ fn resolve_process_selection(
     input_profile: Option<&InputMediaProfile>,
 ) -> TranscodeSelection {
     if mode == "force_transcode" {
+        // 强制转码仍使用探测到的输入视频族来选择 H.264/HEVC 输出编码器。
         if let Some(profile) = input_profile {
             return resolve_transcode_selection_for_input_family(
                 settings,
@@ -4395,6 +4405,7 @@ fn resolve_process_selection(
     };
     let video_copy = should_copy_video_stream(spec, output_format, profile, video_policy);
     let audio_copy = resolve_audio_copy_selection(spec, output_format, profile, audio_policy);
+    // 视频和音频都可复制时不插入额外输入参数，最大限度保留原始码流。
     if video_copy && audio_copy.copy {
         return TranscodeSelection {
             input_args: Vec::new(),
@@ -4442,6 +4453,7 @@ fn should_copy_video_stream(
     video_policy: VideoOutputPolicy,
 ) -> bool {
     if !profile.has_video {
+        // 没有探测到视频时不强行转码，交给 ffmpeg 对实际输入做容错处理。
         return true;
     }
     if process_requires_video_transcode(spec)
@@ -4466,6 +4478,7 @@ fn should_force_h264_nvenc_to_yuv420p(
     profile: &InputMediaProfile,
     process_args: &[String],
 ) -> bool {
+    // 老显卡/旧驱动对 h264_nvenc 输出 10bit/高位深格式兼容性差，强制降到 yuv420p。
     if !process_args
         .windows(2)
         .any(|window| window == ["-c:v", "h264_nvenc"])
@@ -4603,6 +4616,7 @@ fn resolve_stream_ingest_audio_copy_probe_input_args(
         .as_ref()
         .is_some_and(selected_audio_stream_parameters_available)
     {
+        // TS 系 AAC 缺少 sample_rate/channels 时，复制到 FLV/RTMP 容易得到不可播放输出。
         return Err(ExecutorError::InvalidRequest(format!(
             "input audio stream is AAC in a TS-family source, but sample_rate/channels remain unavailable after probing; refusing audio copy for {output_format} output"
         )));
@@ -4972,6 +4986,7 @@ fn probe_input_media_profile_with_input_args(
     input_url: &str,
     extra_input_args: &[String],
 ) -> InputMediaProfile {
+    // ffprobe 失败时返回带 source_family 的默认 profile，后续策略会保守地转码或拒绝复制。
     let default_profile = InputMediaProfile {
         source_family: infer_input_source_family(spec, input_url, None),
         ..InputMediaProfile::default()
@@ -5121,6 +5136,7 @@ fn select_audio_stream_for_output(
     }
 
     match audio_policy {
+        // 多音轨输出只选择一个轨道，优先选目标封装可以安全复制的 codec。
         AudioOutputPolicy::Copy => audio_streams
             .iter()
             .find(|stream| audio_stream_can_be_copied(output_format, profile.source_family, stream))
@@ -5225,6 +5241,118 @@ struct TimedProcessOutput {
     stdout: Vec<u8>,
 }
 
+// 测试使用进程内 ffprobe mock，避免并行运行时临时脚本执行/清理导致随机失败。
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct MockFfprobeAudioStream {
+    index: Option<u32>,
+    codec_name: String,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    extradata_size: Option<u64>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct MockFfprobeBinary {
+    format_name: String,
+    video_codec_name: String,
+    video_pix_fmt: Option<String>,
+    video_extradata_size: Option<u64>,
+    audio_streams: Vec<MockFfprobeAudioStream>,
+    recorded_args_path: Option<PathBuf>,
+    sleep_ms: u64,
+}
+
+#[cfg(test)]
+static MOCK_FFPROBE_BINARIES: OnceLock<StdMutex<HashMap<String, MockFfprobeBinary>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn register_mock_ffprobe_binary(name: &str, mock: MockFfprobeBinary) -> String {
+    let key = format!("mock-ffprobe://{name}/{}", Uuid::now_v7());
+    MOCK_FFPROBE_BINARIES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("mock ffprobe registry lock poisoned")
+        .insert(key.clone(), mock);
+    key
+}
+
+#[cfg(test)]
+fn run_registered_mock_ffprobe_with_timeout(
+    ffprobe_bin: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<Option<TimedProcessOutput>> {
+    let mock = MOCK_FFPROBE_BINARIES
+        .get_or_init(|| StdMutex::new(HashMap::new()))
+        .lock()
+        .expect("mock ffprobe registry lock poisoned")
+        .get(ffprobe_bin)
+        .cloned()?;
+
+    if mock.sleep_ms > 0 && Duration::from_millis(mock.sleep_ms) >= timeout {
+        return Some(None);
+    }
+
+    if let Some(path) = &mock.recorded_args_path {
+        let mut recorded = args.join("\n");
+        recorded.push('\n');
+        let _ = fs::write(path, recorded);
+    }
+
+    let want_json = args.windows(2).any(|window| window == ["-of", "json"]);
+    let stdout = if want_json {
+        let mut streams = Vec::new();
+        let mut video = json!({
+            "codec_type": "video",
+            "codec_name": mock.video_codec_name,
+        });
+        if !mock.audio_streams.is_empty() {
+            video["index"] = json!(0u32);
+        }
+        if let Some(pix_fmt) = mock.video_pix_fmt {
+            video["pix_fmt"] = json!(pix_fmt);
+        }
+        if let Some(extradata_size) = mock.video_extradata_size {
+            video["extradata_size"] = json!(extradata_size);
+        }
+        streams.push(video);
+
+        for (position, stream) in mock.audio_streams.into_iter().enumerate() {
+            let mut audio = json!({
+                "codec_type": "audio",
+                "codec_name": stream.codec_name,
+            });
+            audio["index"] = json!(stream.index.unwrap_or((position + 1) as u32));
+            if let Some(sample_rate) = stream.sample_rate {
+                audio["sample_rate"] = json!(sample_rate.to_string());
+            }
+            if let Some(channels) = stream.channels {
+                audio["channels"] = json!(channels);
+            }
+            if let Some(extradata_size) = stream.extradata_size {
+                audio["extradata_size"] = json!(extradata_size);
+            }
+            streams.push(audio);
+        }
+
+        serde_json::to_vec(&json!({
+            "streams": streams,
+            "format": {"format_name": mock.format_name},
+        }))
+        .ok()?
+    } else {
+        format!("{}\n", mock.video_codec_name).into_bytes()
+    };
+
+    Some(Some(TimedProcessOutput {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout,
+    }))
+}
+
 fn input_probe_timeout_duration(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(
         timeout_ms
@@ -5238,6 +5366,12 @@ fn run_ffprobe_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<TimedProcessOutput> {
+    #[cfg(test)]
+    if let Some(output) = run_registered_mock_ffprobe_with_timeout(ffprobe_bin, args, timeout) {
+        return output;
+    }
+
+    // ffprobe 可能卡在坏流或不可达网络源上，必须用轮询超时主动 kill 子进程。
     let mut child = std::process::Command::new(ffprobe_bin)
         .args(args)
         .stdout(Stdio::piped())

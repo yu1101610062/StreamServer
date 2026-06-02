@@ -184,6 +184,7 @@ verify_package_checksums() {
 }
 
 assert_no_docker_assets() {
+  # native 安装包必须是 Docker-free 运行时；这里防止历史离线包资产混入。
   if find "${PACKAGE_ROOT}" \( -path '*/images/*' -o -name compose.yml -o -name docker-compose.yml -o -name streamserver-compose \) | grep -q .; then
     fail "native 包中发现 Docker/Compose 运行时资产"
   fi
@@ -213,6 +214,7 @@ role_is_gpu() {
 
 validate_role_supported() {
   local role="$1"
+  # 安装角色受包变体约束，CPU 包不能安装 GPU worker，minimal 包不能安装 worker。
   case "${role}" in
     control-plane)
       ;;
@@ -281,6 +283,7 @@ collect_basic_inputs() {
   [ -n "${INSTANCE_NAME}" ] || INSTANCE_NAME="$(prompt_non_empty "实例名" "$(default_instance_name "${INSTALL_ROLE}")")"
   INSTANCE_NAME="$(sanitize_instance_name "${INSTANCE_NAME}")"
   [ -n "${INSTANCE_NAME}" ] || fail "实例名不能为空"
+  # systemd unit 统一带 ss- 前缀，避免和系统已有服务名称直接冲突。
   case "${INSTANCE_NAME}" in
     ss-*) UNIT_BASENAME="${INSTANCE_NAME}" ;;
     *) UNIT_BASENAME="ss-${INSTANCE_NAME}" ;;
@@ -327,6 +330,7 @@ copy_file_atomically() {
   local source="$1"
   local target="$2"
   local temp
+  # 二进制和脚本先写临时文件再 mv，避免安装中断时留下半写入目标。
   mkdir -p "$(dirname "${target}")"
   temp="$(mktemp "$(dirname "${target}")/.tmp.XXXXXX")"
   cp "${source}" "${temp}"
@@ -358,6 +362,7 @@ write_runtime_wrapper() {
   local binary="$2"
   local lib_dir="$3"
   local python_home="${4:-}"
+  # 三方 runtime 通过 wrapper 设置库路径，自研二进制仍直接放在 bin 下。
   local extra_library_path="${5:-}"
   local argv0_mode="${6:-wrapper}"
   local loader="${lib_dir}/ld-linux-x86-64.so.2"

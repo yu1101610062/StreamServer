@@ -19,6 +19,7 @@ impl TaskStatus {
     pub fn can_transition_to(self, next: Self) -> bool {
         use TaskStatus::*;
 
+        // 任务状态只允许走白名单迁移，避免异步事件把终态任务重新写回运行态。
         matches!(
             (self, next),
             (Created, Validating)
@@ -71,6 +72,7 @@ impl TaskStatus {
         use TaskOperation::*;
         use TaskStatus::*;
 
+        // 用户操作先映射到目标状态，再复用状态机白名单校验实际迁移是否合法。
         let next = match (operation, self) {
             (Start, Created | Failed | Canceled) => Validating,
             (Stop, Dispatching | Starting | Running | Recovering | Reclaiming) => Stopping,
@@ -86,6 +88,7 @@ impl TaskStatus {
             }
         };
 
+        // Clone 创建的是新任务，不是原任务状态迁移；Created/Validating/Queued 可直接取消到终态。
         if operation == Clone || self.can_transition_to(next) || next == Canceled {
             Ok(next)
         } else {

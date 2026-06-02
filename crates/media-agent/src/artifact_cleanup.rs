@@ -34,6 +34,7 @@ const CLEANUP_RECENT_WRITE_GRACE_PERIOD: Duration = Duration::from_secs(60);
 const RUNNING_SEGMENT_RETAIN_COUNT: usize = 2;
 const DISK_THRESHOLD_STOP_REASON: &str = "disk_threshold_exceeded";
 
+// 产物清理按输出桶分别管理，避免 MP4 与 HLS 共享目录时误删对方的任务产物。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ArtifactBucket {
     Mp4,
@@ -92,6 +93,7 @@ struct ArtifactBucketLayout {
 
 #[derive(Debug, Clone, Default)]
 struct ArtifactCleanupState {
+    // 每个 bucket 单独记录是否允许新任务启动；Core 心跳会读取这个阻塞状态参与调度。
     buckets: HashMap<ArtifactBucket, ArtifactBucketState>,
     max_disk_percent: Option<f64>,
     last_refresh_at: Option<DateTime<Utc>>,
@@ -115,6 +117,7 @@ struct BucketObservation {
 
 #[derive(Debug, Clone)]
 struct CleanupCandidate {
+    // 非活跃任务按最后写入时间排序，优先清理最旧的完整任务目录。
     task_id: Uuid,
     last_write: SystemTime,
     paths: Vec<PathBuf>,
@@ -122,6 +125,7 @@ struct CleanupCandidate {
 
 #[derive(Debug, Clone)]
 struct RunningCleanupCandidate {
+    // 运行中 HLS 只允许清理旧 segment，必须保留最近片段给播放器和写入中的 ffmpeg 使用。
     task_id: Uuid,
     bucket: ArtifactBucket,
     path: PathBuf,
@@ -142,6 +146,7 @@ enum ArtifactCleanupStrategy {
 
 impl ArtifactCleanupStrategy {
     fn from_settings(settings: &AgentArtifactCleanupSettings) -> Self {
+        // 默认策略会先尝试释放空间再拒绝任务；reject_only 用于只做保护、不自动删文件的场景。
         match settings.strategy.trim() {
             "reject_only" => Self::RejectOnly,
             _ => Self::DeleteOldestThenReject,
@@ -189,6 +194,7 @@ impl ArtifactBucketState {
 
 impl ArtifactCleanupLayout {
     fn from_settings(settings: &AgentSettings) -> Self {
+        // node_dir 带节点维度，防止多个 worker 共享网络盘时互相清理对方产物。
         let mut buckets = HashMap::new();
         for bucket in [ArtifactBucket::Mp4, ArtifactBucket::Hls] {
             let root = PathBuf::from(bucket.root(settings));

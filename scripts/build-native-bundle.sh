@@ -371,6 +371,7 @@ acquire_runtime_cache_lock() {
   local lock_dir="$1"
   local waited=0
 
+  # runtime 资产缓存可能被 CPU/GPU 两个包并行复用，用目录锁避免半写入缓存被读取。
   while ! mkdir "${lock_dir}" 2>/dev/null; do
     if runtime_cache_lock_stale "${lock_dir}"; then
       log "清理 stale runtime 缓存锁: ${lock_dir}"
@@ -400,6 +401,7 @@ extract_runtime_with_cache() {
   local key cache_dir tmp_dir parent_dir lock_dir
 
   if [ "${NO_RUNTIME_CACHE}" -eq 1 ]; then
+    # 调试时可禁用缓存，强制保持每次从镜像重新提取的旧行为。
     pull_linux_amd64_image "${image}"
     "${extractor}" "${image}" "${output_dir}" "$@"
     return 0
@@ -412,6 +414,7 @@ extract_runtime_with_cache() {
   mkdir -p "${parent_dir}"
   acquire_runtime_cache_lock "${lock_dir}"
 
+  # 命中有效缓存时不再拉镜像，保证离线/重复打包只依赖本地缓存目录。
   if [ "${REFRESH_RUNTIME_CACHE}" -eq 0 ] && runtime_cache_valid "${cache_dir}"; then
     log "复用 runtime 缓存: ${kind} (${image})"
     if ! copy_runtime_from_cache "${cache_dir}" "${output_dir}"; then
@@ -427,6 +430,7 @@ extract_runtime_with_cache() {
   fi
 
   if [ "${OFFLINE_RUNTIME_CACHE}" -eq 1 ]; then
+    # 离线缓存模式用于验证构建机是否已经具备全部 runtime 资产。
     release_runtime_cache_lock "${lock_dir}"
     fail "runtime 缓存缺失或无效: ${kind} (${image}); cache=${cache_dir}"
   fi
@@ -435,6 +439,7 @@ extract_runtime_with_cache() {
   tmp_dir="$(mktemp -d "${parent_dir}/.tmp.${key}.XXXXXX")"
   mkdir -p "${tmp_dir}/payload"
 
+  # 先写临时目录并校验 checksum，最后原子替换正式缓存，避免留下部分提取结果。
   if ! "${extractor}" "${image}" "${tmp_dir}/payload" "$@"; then
     rm -rf "${tmp_dir}"
     release_runtime_cache_lock "${lock_dir}"
@@ -718,6 +723,7 @@ extract_postgres_runtime() {
 copy_static_assets() {
   local bundle_root="$1"
   mkdir -p "${bundle_root}/templates/systemd" "${bundle_root}/templates/common" "${bundle_root}/docs"
+  # 安装器和卸载器随包携带，目标机不需要访问源码仓库。
   cp "${ROOT_DIR}/packaging/native/install.sh" "${bundle_root}/install.sh"
   cp "${ROOT_DIR}/packaging/native/uninstall.sh" "${bundle_root}/uninstall.sh"
   chmod +x "${bundle_root}/install.sh"
@@ -748,6 +754,7 @@ write_manifest() {
   local worker_runtime="$4"
   local gpu_runtime="$5"
 
+  # manifest 只记录包内相对路径，安装到相同相对目录结构即可兼容网络挂载。
   cat >"${bundle_root}/package-manifest.env" <<EOF
 BUNDLE_VERSION=${bundle_version}
 BUNDLE_VARIANT=${NATIVE_VARIANT}
@@ -812,6 +819,7 @@ write_checksums() {
 
 assert_no_docker_runtime_assets() {
   local bundle_root="$1"
+  # Docker 只允许作为构建期提取工具，安装包内不得带 Compose 或镜像运行时资产。
   if find "${bundle_root}" \( -path '*/images/*' -o -name compose.yml -o -name docker-compose.yml -o -name streamserver-compose \) | grep -q .; then
     fail "native 包中发现 Docker/Compose 运行时资产"
   fi

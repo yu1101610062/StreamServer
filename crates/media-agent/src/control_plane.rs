@@ -113,6 +113,7 @@ impl AgentController {
         self.artifact_cleanup.start_background();
         let mut backoff_idx = 0usize;
 
+        // Agent 到 Core 只有一条长期控制流；断开后退避重连，避免任务控制通道永久丢失。
         loop {
             match self.connect_once().await {
                 Ok(()) => {
@@ -133,6 +134,7 @@ impl AgentController {
         if let Some(reason) = self.artifact_cleanup.control_plane_block_reason() {
             anyhow::bail!("artifact cleanup is not ready for control-plane registration: {reason}");
         }
+        // session_epoch 用来丢弃上一条连接残留的日志/事件，防止重连后旧任务消息串入新会话。
         let session_epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let result = self.connect_once_active(session_epoch).await;
         self.invalidate_session_epoch(session_epoch);
@@ -161,6 +163,7 @@ impl AgentController {
         let response = client.stream_connect(ReceiverStream::new(receiver)).await?;
         let mut inbound = response.into_inner();
 
+        // 注册成功后立即上报能力快照，并回放本地持久化的终态运行时，补齐断线窗口事件。
         let snapshot = self.capability_probe.snapshot(&self.settings.agent).await;
         self.executor.set_zlm_rtmp_enhanced_enabled(
             self.capability_probe
@@ -189,6 +192,7 @@ impl AgentController {
         loop {
             tokio::select! {
                 biased;
+                // Core 命令优先级最高，避免心跳或日志批次阻塞启动/停止任务。
                 message = inbound.message() => {
                     match message? {
                         Some(message) => self.handle_core_envelope(&sender, message, session_epoch).await?,
@@ -234,6 +238,7 @@ impl AgentController {
         sender: &mpsc::Sender<AgentEnvelope>,
         sampler: &mut HeartbeatSampler,
     ) -> anyhow::Result<()> {
+        // 心跳中的 slot 与清理状态会直接影响 Core 调度，因此这里每次都取实时快照。
         let zlm_alive = self.capability_probe.zlm_alive(&self.settings.agent).await;
         let ffmpeg_alive = binary_available(&self.settings.agent.ffmpeg_bin);
         let runtime_counts = self.runtime_registry.state_counts();

@@ -509,12 +509,14 @@ impl TaskSpec {
     pub fn resolved(&self) -> Self {
         let mut resolved = self.clone();
 
+        // resolved() 是任务入库前后的统一归一化入口，只补齐缺省值，不改变用户显式选择。
         if resolved.input.source_mode.is_none() {
             resolved.input.source_mode =
                 resolved.input.kind.and_then(InputKind::default_source_mode);
         }
         resolved.input.loop_enabled = Some(resolved.input.loop_enabled.unwrap_or(false));
         if resolved.task_type == TaskType::StreamIngest {
+            // stream_ingest 默认暴露内部 live 流，并把播放协议开关补齐为确定值。
             resolved.stream.app = Some(
                 resolved
                     .stream
@@ -538,11 +540,11 @@ impl TaskSpec {
             resolved.expose.stop_on_no_reader =
                 Some(resolved.expose.stop_on_no_reader.unwrap_or(false));
             resolved.record.enabled = Some(resolved.record.enabled.unwrap_or(false));
-            // Recording output paths are now fully managed by the system for
-            // stream_ingest tasks, so any client-provided override is ignored.
+            // stream_ingest 的录像输出路径由系统统一托管，客户端传入的 save_path 一律忽略。
             resolved.record.save_path = None;
         }
         if matches!(resolved.input.kind, Some(InputKind::File)) {
+            // file 输入只允许 work_root 下的相对路径；这里先规范前导斜杠和当前目录片段。
             if let Some(url) = resolved.input.url.as_deref() {
                 if let Ok(normalized) = normalize_relative_file_input_path(url) {
                     resolved.input.url = Some(normalized);
@@ -581,6 +583,7 @@ impl TaskSpec {
     }
 
     pub fn stream_ingest_record_mode(&self) -> Option<StreamIngestRecordMode> {
+        // VOD 接入录像有两条路径：需要对外播放时实时推流录制，否则直接快速落盘。
         if self.task_type != TaskType::StreamIngest
             || self.input.source_mode != Some(SourceMode::Vod)
             || !self.record.enabled.unwrap_or(false)
@@ -596,6 +599,7 @@ impl TaskSpec {
     }
 
     pub fn stream_ingest_is_continuous(&self) -> bool {
+        // 未设置时长的直播任务需要视为连续任务，异常退出时由恢复逻辑接管。
         if self.task_type != TaskType::StreamIngest {
             return false;
         }
@@ -612,6 +616,7 @@ impl TaskSpec {
     }
 
     pub fn stream_ingest_uses_sticky_reconnect(&self) -> bool {
+        // sticky reconnect 只用于可长期保活的接入任务，有限时长录像不参与自动粘连恢复。
         if self.task_type != TaskType::StreamIngest
             || self.record.duration_sec.is_some()
             || self

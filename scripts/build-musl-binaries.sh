@@ -122,6 +122,7 @@ ensure_tools() {
 
 write_cargo_config() {
   mkdir -p "${MUSL_CARGO_HOME_DIR}"
+  # Cargo home 独立放在构建缓存里，避免 Docker builder 污染开发机默认 Cargo 配置。
   if [ -n "${CARGO_REGISTRY_MIRROR}" ]; then
     cat >"${MUSL_CARGO_HOME_DIR}/config.toml" <<EOF
 [source.crates-io]
@@ -145,6 +146,7 @@ build_builder_image() {
   local platform="$1"
   local image_tag="streamserver-rust-musl-builder:${TARGET_TRIPLE}"
 
+  # builder 镜像只在构建阶段使用，存在时直接复用以减少重复安装 musl 工具链。
   if [ "${MUSL_REBUILD_BUILDER}" != "1" ] && docker image inspect "${image_tag}" >/dev/null 2>&1; then
     log "复用 builder 镜像: ${image_tag}"
     return 0
@@ -176,6 +178,7 @@ run_build() {
   done
 
   log "开始构建: ${PACKAGES[*]} -> ${TARGET_TRIPLE}"
+  # Cargo target 目录挂到宿主机，保证多次构建可以复用增量产物。
   docker run --rm \
     --platform "${platform}" \
     --user "$(id -u):$(id -g)" \
