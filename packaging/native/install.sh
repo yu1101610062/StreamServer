@@ -352,6 +352,8 @@ write_runtime_wrapper() {
   local binary="$2"
   local lib_dir="$3"
   local python_home="${4:-}"
+  local extra_library_path="${5:-}"
+  local argv0_mode="${6:-wrapper}"
   local loader="${lib_dir}/ld-linux-x86-64.so.2"
   [ -x "${binary}" ] || fail "缺少 runtime 二进制: ${binary}"
   mkdir -p "$(dirname "${target}")"
@@ -362,18 +364,69 @@ loader='${loader}'
 lib_dir='${lib_dir}'
 binary='${binary}'
 python_home='${python_home}'
+extra_library_path='${extra_library_path}'
+argv0_mode='${argv0_mode}'
+library_path="\${lib_dir}\${extra_library_path:+:\${extra_library_path}}"
 if [ -n "\${python_home}" ] && [ -d "\${python_home}" ]; then
   PYTHONHOME="\${python_home}"
   export PYTHONHOME
 fi
+case "\${argv0_mode}" in
+  binary) runtime_argv0="\${binary}" ;;
+  wrapper) runtime_argv0="\$0" ;;
+  *) runtime_argv0="\${argv0_mode}" ;;
+esac
 if [ -x "\${loader}" ]; then
-  exec "\${loader}" --library-path "\${lib_dir}" --argv0 "\$0" "\${binary}" "\$@"
+  exec "\${loader}" --library-path "\${library_path}" --argv0 "\${runtime_argv0}" "\${binary}" "\$@"
 fi
-LD_LIBRARY_PATH="\${lib_dir}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+LD_LIBRARY_PATH="\${library_path}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 export LD_LIBRARY_PATH
 exec "\${binary}" "\$@"
 EOF
   chmod 755 "${target}"
+}
+
+postgres_runtime_command_path() {
+  local runtime_root="$1"
+  local command_name="$2"
+  local candidate
+  for candidate in "${runtime_root}"/lib/postgresql/*/bin/"${command_name}"; do
+    [ -x "${candidate}" ] || continue
+    printf '%s\n' "${candidate}"
+    return 0
+  done
+  printf '%s\n' "${runtime_root}/bin/${command_name}"
+}
+
+postgres_runtime_pkglib_dir() {
+  local runtime_root="$1"
+  local candidate
+  for candidate in "${runtime_root}"/lib/postgresql/*/lib; do
+    [ -d "${candidate}" ] || continue
+    printf '%s\n' "${candidate}"
+    return 0
+  done
+  printf '%s\n' "${runtime_root}/lib/postgresql"
+}
+
+postgres_runtime_share_dir() {
+  local runtime_root="$1"
+  local candidate
+  for candidate in "${runtime_root}"/share/postgresql/* "${runtime_root}"/share/*; do
+    [ -d "${candidate}/extension" ] || continue
+    [ -f "${candidate}/postgres.bki" ] || continue
+    printf '%s\n' "${candidate}"
+    return 0
+  done
+  fail "缺少 PostgreSQL share 目录: ${runtime_root}/share"
+}
+
+postgres_runtime_commands() {
+  local runtime_root="$1"
+  {
+    find "${runtime_root}/bin" -maxdepth 1 -type f -perm -111 -print 2>/dev/null || true
+    find "${runtime_root}"/lib/postgresql/*/bin -maxdepth 1 -type f -perm -111 -print 2>/dev/null || true
+  } | sed 's#.*/##' | LC_ALL=C sort -u
 }
 
 backup_existing_install() {
@@ -427,12 +480,22 @@ copy_package_assets() {
   fi
   if role_has_core "${INSTALL_ROLE}" && [ "${DATABASE_MODE}" = "bundled" ]; then
     install_tree "${PACKAGE_ROOT}/${POSTGRES_RUNTIME_PATH}" "${INSTALL_DIR}/runtime/postgres"
-    local postgres_command
-    for postgres_command in postgres initdb pg_ctl pg_isready psql; do
+    local postgres_command postgres_binary postgres_pkglib_dir postgres_argv0_mode
+    postgres_pkglib_dir="$(postgres_runtime_pkglib_dir "${INSTALL_DIR}/runtime/postgres")"
+    while IFS= read -r postgres_command; do
+      [ -n "${postgres_command}" ] || continue
+      postgres_binary="$(postgres_runtime_command_path "${INSTALL_DIR}/runtime/postgres" "${postgres_command}")"
+      postgres_argv0_mode="wrapper"
+      if [ "${postgres_command}" = "postgres" ]; then
+        postgres_argv0_mode="binary"
+      fi
       write_runtime_wrapper "${INSTALL_DIR}/bin/${postgres_command}" \
-        "${INSTALL_DIR}/runtime/postgres/bin/${postgres_command}" \
-        "${INSTALL_DIR}/runtime/postgres/lib"
-    done
+        "${postgres_binary}" \
+        "${INSTALL_DIR}/runtime/postgres/lib" \
+        "" \
+        "${postgres_pkglib_dir}" \
+        "${postgres_argv0_mode}"
+    done < <(postgres_runtime_commands "${INSTALL_DIR}/runtime/postgres")
   fi
   if role_has_core "${INSTALL_ROLE}"; then
     install_tree "${PACKAGE_ROOT}/${MEDIA_CORE_UI_PATH}" "${INSTALL_DIR}/ui"
@@ -675,6 +738,7 @@ render_template() {
   local target="$2"
   local ffmpeg_variant="cpu"
   local postgres_unit="" postgres_requires="" core_unit="" core_requires="" zlm_unit=""
+  local postgres_pkglib_dir=""
   local gpu_nvidia_pre="" gpu_h264_pre="" gpu_hevc_pre=""
   role_is_gpu "${INSTALL_ROLE}" && ffmpeg_variant="gpu"
   role_has_core "${INSTALL_ROLE}" && core_unit="${UNIT_BASENAME}-core.service"
@@ -682,6 +746,7 @@ render_template() {
   if role_has_core "${INSTALL_ROLE}" && [ "${DATABASE_MODE}" = "bundled" ]; then
     postgres_unit="${UNIT_BASENAME}-postgres.service"
     postgres_requires="Requires=${postgres_unit}"
+    postgres_pkglib_dir="$(postgres_runtime_pkglib_dir "${INSTALL_DIR}/runtime/postgres")"
   fi
   if role_has_worker "${INSTALL_ROLE}" && role_has_core "${INSTALL_ROLE}"; then
     core_requires="Requires=${UNIT_BASENAME}-core.service"
@@ -702,6 +767,7 @@ render_template() {
     -e "s|__TARGET_UNIT__|$(sed_escape "${UNIT_BASENAME}.target")|g" \
     -e "s|__POSTGRES_UNIT__|$(sed_escape "${postgres_unit}")|g" \
     -e "s|__POSTGRES_REQUIRES__|$(sed_escape "${postgres_requires}")|g" \
+    -e "s|__POSTGRES_PKGLIB_DIR__|$(sed_escape "${postgres_pkglib_dir}")|g" \
     -e "s|__CORE_UNIT__|$(sed_escape "${core_unit}")|g" \
     -e "s|__CORE_REQUIRES__|$(sed_escape "${core_requires}")|g" \
     -e "s|__ZLM_UNIT__|$(sed_escape "${zlm_unit}")|g" \
@@ -760,6 +826,7 @@ initialize_postgres_if_needed() {
     run_as_service_user "${INSTALL_DIR}/bin/initdb" \
       -D "${data_dir}" \
       -U "${POSTGRES_USER}" \
+      -L "$(postgres_runtime_share_dir "${INSTALL_DIR}/runtime/postgres")" \
       --pwfile="${pwfile}" \
       --encoding=UTF8 \
       --locale=C

@@ -39,6 +39,8 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 - `media-core`、`media-agent`、`streamserver-config` 的 `file` 和 `ldd` 静态链接检查
 - `ffmpeg`、`ffprobe`、`MediaServer`、`default.pem` 的可执行和动态依赖检查
 - 随包 PostgreSQL 模式下 `postgres`、`initdb`、`pg_ctl`、`pg_isready`、`psql` 检查
+- 随包 PostgreSQL 模式下扩展 manifest、`pg_available_extensions` 清单、扩展 `.so` 依赖解析和全量 `CREATE EXTENSION` 检查，确保和 Docker 来源镜像的扩展能力一致
+- 随包 PostgreSQL 模式下 36 个官方工具的 wrapper/version 检查，以及 `pg_dump`/`pg_restore`/`pg_dumpall`、管理工具、`pg_controldata`/`pg_checksums`/`pg_resetwal`、SSL 客户端证书认证、复杂 `pg_hba.conf`、WAL/PITR、`pg_basebackup`、物理复制、逻辑复制、`pg_recvlogical`、业务迁移 smoke；不执行压力读写或基准负载
 - FFmpeg、ZLMediaKit、PostgreSQL smoke test
 
 脚本会生成并拉回：

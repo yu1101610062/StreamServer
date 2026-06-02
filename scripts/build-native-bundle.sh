@@ -368,10 +368,10 @@ extract_postgres_runtime() {
   rm -rf "${output_dir}"
   mkdir -p "${output_dir}"
   log "从 ${image} 提取 PostgreSQL runtime"
-  EXPORT_COMMANDS="postgres initdb pg_ctl pg_isready psql" docker run --rm --platform linux/amd64 --entrypoint sh -e EXPORT_COMMANDS "${image}" -eu -c '
+  docker run --rm --platform linux/amd64 --entrypoint sh "${image}" -eu -c '
     export_dir=/tmp/streamserver-export
     rm -rf "${export_dir}"
-    mkdir -p "${export_dir}/bin" "${export_dir}/lib"
+    mkdir -p "${export_dir}/bin" "${export_dir}/lib" "${export_dir}/share"
     find_postgres_binary() {
       command_name="$1"
       for candidate in \
@@ -385,6 +385,28 @@ extract_postgres_runtime() {
         return 0
       done
       command -v "${command_name}"
+    }
+    postgres_share_dir() {
+      for candidate in \
+        /usr/local/share/postgresql \
+        /usr/share/postgresql
+      do
+        [ -d "${candidate}" ] || continue
+        printf "%s\n" "${candidate}"
+        return 0
+      done
+      return 1
+    }
+    postgres_lib_root() {
+      for candidate in \
+        /usr/local/lib/postgresql \
+        /usr/lib/postgresql
+      do
+        [ -d "${candidate}" ] || continue
+        printf "%s\n" "${candidate}"
+        return 0
+      done
+      return 1
     }
     copy_deps() {
       binary="$1"
@@ -405,24 +427,55 @@ extract_postgres_runtime() {
         cp -L "${lib}" "${export_dir}/lib/$(basename "${lib}")"
       done
     }
-    for command_name in ${EXPORT_COMMANDS}; do
-      binary_path="$(find_postgres_binary "${command_name}")"
-      cp -L "${binary_path}" "${export_dir}/bin/${command_name}"
-      chmod 755 "${export_dir}/bin/${command_name}"
-      copy_deps "${binary_path}"
+    share_dir="$(postgres_share_dir)"
+    cp -a "${share_dir}" "${export_dir}/share/postgresql"
+
+    lib_root="$(postgres_lib_root)"
+    if [ -n "${lib_root}" ]; then
+      mkdir -p "${export_dir}/lib/postgresql"
+      cp -a "${lib_root}/." "${export_dir}/lib/postgresql/"
+      find "${lib_root}" -path "*/bin/*" -type f -perm /111 -print | sort | while read -r postgres_tool; do
+        command_name="$(basename "${postgres_tool}")"
+        cp -L "${postgres_tool}" "${export_dir}/bin/${command_name}"
+        chmod 755 "${export_dir}/bin/${command_name}"
+      done
+      for required_command in postgres initdb pg_ctl pg_isready psql pg_dump pg_restore pg_dumpall pg_basebackup; do
+        [ -x "${export_dir}/bin/${required_command}" ] || {
+          binary_path="$(find_postgres_binary "${required_command}")"
+          cp -L "${binary_path}" "${export_dir}/bin/${required_command}"
+          chmod 755 "${export_dir}/bin/${required_command}"
+        }
+      done
+      find "${lib_root}" -path "*/bin/*" -type f -perm /111 -print | while read -r postgres_tool; do
+        copy_deps "${postgres_tool}"
+      done
+      find "${lib_root}" -type f -name "*.so" -print | while read -r extension_lib; do
+        copy_deps "${extension_lib}"
+      done
+    fi
+
+    manifest="${export_dir}/postgres-extension-manifest.tsv"
+    : >"${manifest}"
+    find "${share_dir}" -path "*/extension/*.control" -type f -print | sort | while read -r control_file; do
+      extension_name="$(basename "${control_file}" .control)"
+      default_version="$(
+        awk -F= "
+          /^[[:space:]]*default_version[[:space:]]*=/ {
+            value = \$2
+            gsub(/^[[:space:]]+|[[:space:]]+$/, \"\", value)
+            gsub(/^'\''|'\''$/, \"\", value)
+            print value
+            exit
+          }
+        " "${control_file}"
+      )"
+      relative_control="${control_file#${share_dir}/}"
+      printf "%s\t%s\t%s\n" "${extension_name}" "${default_version}" "${relative_control}" >>"${manifest}"
     done
-    if [ -d /usr/local/share/postgresql ]; then
-      cp -a /usr/local/share/postgresql "${export_dir}/share"
-    elif [ -d /usr/share/postgresql ]; then
-      cp -a /usr/share/postgresql "${export_dir}/share"
-    fi
-    if [ -d /usr/local/lib/postgresql ]; then
-      mkdir -p "${export_dir}/lib/postgresql"
-      cp -a /usr/local/lib/postgresql/. "${export_dir}/lib/postgresql/"
-    elif [ -d /usr/lib/postgresql ]; then
-      mkdir -p "${export_dir}/lib/postgresql"
-      cp -a /usr/lib/postgresql/. "${export_dir}/lib/postgresql/"
-    fi
+    [ -s "${manifest}" ] || {
+      echo "PostgreSQL extension manifest is empty" >&2
+      exit 1
+    }
     tar -C "${export_dir}" -cf - .
   ' | tar -C "${output_dir}" -xf -
 }
@@ -481,6 +534,7 @@ ZLM_LIB_PATH=runtime/zlm/lib
 POSTGRES_RUNTIME_PATH=runtime/postgres
 POSTGRES_BIN_PATH=runtime/postgres/bin
 POSTGRES_LIB_PATH=runtime/postgres/lib
+POSTGRES_EXTENSION_MANIFEST_PATH=runtime/postgres/postgres-extension-manifest.tsv
 EOF
 }
 
