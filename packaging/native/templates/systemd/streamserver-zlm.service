@@ -1,0 +1,20 @@
+[Unit]
+Description=StreamServer ZLMediaKit (__INSTANCE_NAME__)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__/runtime/zlm
+EnvironmentFile=__INSTALL_DIR__/.env
+ExecStartPre=__INSTALL_DIR__/zlm/render-config.sh __INSTALL_DIR__/zlm/config.ini.template __INSTALL_DIR__/zlm/config.ini
+ExecStart=__INSTALL_DIR__/bin/zlm-mediaserver -s __INSTALL_DIR__/runtime/zlm/default.pem -c __INSTALL_DIR__/zlm/config.ini -l 0
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=__TARGET_UNIT__

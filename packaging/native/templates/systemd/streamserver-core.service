@@ -1,0 +1,20 @@
+[Unit]
+Description=StreamServer media-core (__INSTANCE_NAME__)
+Wants=network-online.target
+After=network-online.target __POSTGRES_UNIT__
+__POSTGRES_REQUIRES__
+
+[Service]
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+Environment=STREAMSERVER_ENV=production
+Environment=STREAMSERVER_UI_DIR=__INSTALL_DIR__/ui
+ExecStart=__INSTALL_DIR__/bin/media-core
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=__TARGET_UNIT__

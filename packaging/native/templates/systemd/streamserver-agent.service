@@ -1,0 +1,23 @@
+[Unit]
+Description=StreamServer media-agent (__INSTANCE_NAME__)
+Wants=network-online.target
+After=network-online.target __ZLM_UNIT__ __CORE_UNIT__
+Requires=__ZLM_UNIT__
+__CORE_REQUIRES__
+
+[Service]
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+Environment=STREAMSERVER_ENV=production
+__GPU_NVIDIA_SMI_PRE__
+__GPU_H264_PRE__
+__GPU_HEVC_PRE__
+ExecStart=__INSTALL_DIR__/bin/media-agent
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=__TARGET_UNIT__

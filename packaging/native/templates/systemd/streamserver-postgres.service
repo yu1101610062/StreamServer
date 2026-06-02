@@ -1,0 +1,17 @@
+[Unit]
+Description=StreamServer PostgreSQL (__INSTANCE_NAME__)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+ExecStart=__INSTALL_DIR__/bin/postgres -D __INSTALL_DIR__/data/postgres -p ${POSTGRES_PORT}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=__TARGET_UNIT__

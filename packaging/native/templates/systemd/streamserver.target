@@ -1,0 +1,7 @@
+[Unit]
+Description=StreamServer native services (__INSTANCE_NAME__)
+Wants=network-online.target
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

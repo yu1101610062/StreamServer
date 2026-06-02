@@ -26,7 +26,14 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 const MANAGED_ORDER: &[&str] = &[
+    "DEPLOY_MODE",
     "INSTALL_ROLE",
+    "INSTANCE_NAME",
+    "SYSTEMD_TARGET",
+    "SYSTEMD_CORE_UNIT",
+    "SYSTEMD_AGENT_UNIT",
+    "SYSTEMD_ZLM_UNIT",
+    "SYSTEMD_POSTGRES_UNIT",
     "COMPOSE_PROJECT_NAME",
     "POSTGRES_IMAGE",
     "MEDIA_CORE_IMAGE",
@@ -192,6 +199,19 @@ const CLEANUP_STRATEGY_CHOICES: &[ChoiceDef] = &[
         value: "reject_only",
         label: "只拒绝任务",
         help: "磁盘到阈值后不删除文件，只拒绝或停止相关产物任务。",
+    },
+];
+
+const DEPLOY_MODE_CHOICES: &[ChoiceDef] = &[
+    ChoiceDef {
+        value: "docker",
+        label: "Docker",
+        help: "Legacy Docker/Compose 离线部署。",
+    },
+    ChoiceDef {
+        value: "native",
+        label: "Native",
+        help: "无 Docker 运行时部署，服务由 systemd 管理。",
     },
 ];
 
@@ -793,11 +813,8 @@ impl ConfigApp {
         add_existing_interfaces(&mut interfaces, &values);
         apply_defaults(&mut values, &interfaces);
         normalize_storage_mount_host_dirs(&env_path, &mut values);
-        let original_project_name = values
-            .get("COMPOSE_PROJECT_NAME")
-            .cloned()
-            .unwrap_or_default();
-        let running_baseline_values = if project_instance_running(&original_project_name) {
+        let original_project_name = service_identity(&values);
+        let running_baseline_values = if instance_running(&values) {
             values.clone()
         } else {
             BTreeMap::new()
@@ -851,6 +868,10 @@ impl ConfigApp {
         self.values.get(key).cloned().unwrap_or_default()
     }
 
+    fn deploy_mode(&self) -> &str {
+        deploy_mode(&self.values)
+    }
+
     fn set(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         if matches!(key, "INSTALL_ROLE" | "AGENT_ACCELERATION_MODE") {
@@ -888,13 +909,19 @@ impl ConfigApp {
         validate_values(&self.values)?;
         let previous_project_name = self.original_project_name.clone();
         write_env_file(&self.env_path, &self.values)?;
-        let current_project_name = self.value("COMPOSE_PROJECT_NAME");
-        let service_message = sync_project_service_name(
-            &self.env_path,
-            &previous_project_name,
-            &current_project_name,
-        )?;
-        if !previous_project_name.trim().is_empty() && previous_project_name != current_project_name
+        let current_project_name = service_identity(&self.values);
+        let service_message = if self.deploy_mode() == "native" {
+            String::new()
+        } else {
+            sync_project_service_name(
+                &self.env_path,
+                &previous_project_name,
+                &current_project_name,
+            )?
+        };
+        if self.deploy_mode() != "native"
+            && !previous_project_name.trim().is_empty()
+            && previous_project_name != current_project_name
         {
             if self.restart_previous_project_name.is_none() {
                 self.restart_previous_project_name = Some(previous_project_name);
@@ -1270,6 +1297,9 @@ impl ConfigApp {
     }
 
     fn uninstall_project_names(&self) -> Vec<String> {
+        if self.deploy_mode() == "native" {
+            return Vec::new();
+        }
         let mut names = Vec::new();
         for name in [
             Some(self.value("COMPOSE_PROJECT_NAME")),
@@ -1345,6 +1375,11 @@ impl ConfigApp {
     }
 
     fn restart_unit_name(&self) -> Option<String> {
+        if self.deploy_mode() == "native" {
+            return native_unit_candidates(&self.values)
+                .into_iter()
+                .find(|unit| Path::new("/etc/systemd/system").join(unit).exists());
+        }
         let current_project_name = self.value("COMPOSE_PROJECT_NAME");
         find_existing_unit(&current_project_name)
             .or_else(|| find_existing_unit(&self.original_project_name))
@@ -1368,8 +1403,16 @@ impl ConfigApp {
                         "重启服务需要 root 或免密 sudo；N 直接退出，Esc 取消".to_string();
                     return Ok(false);
                 }
-                let project_name = self.value("COMPOSE_PROJECT_NAME");
-                let previous_project_name = self.restart_previous_project_name.clone();
+                let project_name = if self.deploy_mode() == "native" {
+                    String::new()
+                } else {
+                    self.value("COMPOSE_PROJECT_NAME")
+                };
+                let previous_project_name = if self.deploy_mode() == "native" {
+                    None
+                } else {
+                    self.restart_previous_project_name.clone()
+                };
                 let install_dir = self
                     .env_path
                     .parent()
@@ -1536,9 +1579,20 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         .unwrap_or_else(|| "./data/zlm/www/output".to_string());
     values.retain(|key, _| !is_hidden_fixed_key(key));
 
+    default_if_missing(values, "DEPLOY_MODE", "docker");
     default_if_missing(values, "INSTALL_ROLE", "control-plane");
     let role = values.get("INSTALL_ROLE").cloned().unwrap_or_default();
-    if values
+    if deploy_mode(values) == "native" {
+        if values
+            .get("INSTANCE_NAME")
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            if let Some(project) = role_default_project(&role) {
+                values.insert("INSTANCE_NAME".to_string(), project.to_string());
+            }
+        }
+        default_native_systemd_units(values);
+    } else if values
         .get("COMPOSE_PROJECT_NAME")
         .is_none_or(|value| value.trim().is_empty())
     {
@@ -1620,6 +1674,65 @@ fn default_if_missing(values: &mut BTreeMap<String, String>, key: &str, default_
     if values.get(key).is_none_or(|value| value.trim().is_empty()) {
         values.insert(key.to_string(), default_value.to_string());
     }
+}
+
+fn deploy_mode(values: &BTreeMap<String, String>) -> &str {
+    values
+        .get("DEPLOY_MODE")
+        .map(String::as_str)
+        .unwrap_or("docker")
+}
+
+fn native_unit_basename(values: &BTreeMap<String, String>) -> String {
+    let instance_name = values
+        .get("INSTANCE_NAME")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| values.get("COMPOSE_PROJECT_NAME"))
+        .map(String::as_str)
+        .unwrap_or("streamserver");
+    if instance_name.starts_with("ss-") {
+        instance_name.to_string()
+    } else {
+        format!("ss-{instance_name}")
+    }
+}
+
+fn default_native_systemd_units(values: &mut BTreeMap<String, String>) {
+    let unit_base = native_unit_basename(values);
+    default_if_missing(values, "SYSTEMD_TARGET", &format!("{unit_base}.target"));
+    default_if_missing(
+        values,
+        "SYSTEMD_CORE_UNIT",
+        &format!("{unit_base}-core.service"),
+    );
+    default_if_missing(
+        values,
+        "SYSTEMD_AGENT_UNIT",
+        &format!("{unit_base}-agent.service"),
+    );
+    default_if_missing(
+        values,
+        "SYSTEMD_ZLM_UNIT",
+        &format!("{unit_base}-zlm.service"),
+    );
+    default_if_missing(
+        values,
+        "SYSTEMD_POSTGRES_UNIT",
+        &format!("{unit_base}-postgres.service"),
+    );
+}
+
+fn service_identity(values: &BTreeMap<String, String>) -> String {
+    if deploy_mode(values) == "native" {
+        return values
+            .get("INSTANCE_NAME")
+            .cloned()
+            .unwrap_or_else(|| native_unit_basename(values));
+    }
+    values
+        .get("COMPOSE_PROJECT_NAME")
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn sync_primary_interface_followers(values: &mut BTreeMap<String, String>) {
@@ -2066,7 +2179,7 @@ fn validate_instance_dir_for_delete(install_dir: &Path) -> anyhow::Result<()> {
     if install_dir.parent().is_none() {
         bail!("实例目录不安全，拒绝删除：{}", install_dir.display());
     }
-    for required in [".env", "compose.yml", "bin/streamserver-config"] {
+    for required in [".env", "bin/streamserver-config"] {
         if !install_dir.join(required).exists() {
             bail!(
                 "目录缺少实例标识文件 {}，拒绝删除：{}",
@@ -2074,6 +2187,13 @@ fn validate_instance_dir_for_delete(install_dir: &Path) -> anyhow::Result<()> {
                 install_dir.display()
             );
         }
+    }
+    let env_values = parse_env_file(&install_dir.join(".env"))?;
+    if deploy_mode(&env_values) != "native" && !install_dir.join("compose.yml").exists() {
+        bail!(
+            "目录缺少实例标识文件 compose.yml，拒绝删除：{}",
+            install_dir.display()
+        );
     }
     Ok(())
 }
@@ -2152,6 +2272,19 @@ fn compose_project_down(install_dir: &Path, project_name: &str) -> anyhow::Resul
     Ok(())
 }
 
+fn instance_running(values: &BTreeMap<String, String>) -> bool {
+    if deploy_mode(values) == "native" {
+        return native_unit_candidates(values)
+            .iter()
+            .any(|unit| unit_is_active(unit));
+    }
+    let project_name = values
+        .get("COMPOSE_PROJECT_NAME")
+        .map(String::as_str)
+        .unwrap_or_default();
+    project_instance_running(project_name)
+}
+
 fn project_instance_running(project_name: &str) -> bool {
     if project_name.trim().is_empty() {
         return false;
@@ -2161,6 +2294,27 @@ fn project_instance_running(project_name: &str) -> bool {
         .as_deref()
         .is_some_and(unit_is_active)
         || docker_compose_project_running(project_name)
+}
+
+fn native_unit_candidates(values: &BTreeMap<String, String>) -> Vec<String> {
+    let mut units = Vec::new();
+    for key in [
+        "SYSTEMD_TARGET",
+        "SYSTEMD_CORE_UNIT",
+        "SYSTEMD_AGENT_UNIT",
+        "SYSTEMD_ZLM_UNIT",
+        "SYSTEMD_POSTGRES_UNIT",
+    ] {
+        if let Some(unit) = values.get(key).filter(|value| !value.trim().is_empty()) {
+            if !units.contains(unit) {
+                units.push(unit.clone());
+            }
+        }
+    }
+    if units.is_empty() {
+        units.push(format!("{}.target", native_unit_basename(values)));
+    }
+    units
 }
 
 fn unit_is_active(unit: &str) -> bool {
@@ -2377,8 +2531,11 @@ fn required_text_field(key: &str) -> bool {
 }
 
 fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
-    if let Some(value) = values.get("COMPOSE_PROJECT_NAME") {
-        validate_compose_project_name(value)?;
+    validate_choice(values, "DEPLOY_MODE", DEPLOY_MODE_CHOICES)?;
+    if deploy_mode(values) != "native" {
+        if let Some(value) = values.get("COMPOSE_PROJECT_NAME") {
+            validate_compose_project_name(value)?;
+        }
     }
 
     let role = values
@@ -3572,7 +3729,16 @@ fn format_kib(value: &str) -> String {
 
 fn env_comment(key: &str) -> Option<&'static str> {
     match key {
+        "DEPLOY_MODE" => {
+            Some("部署模式，docker 为 legacy Compose，native 为 systemd 无 Docker 运行时。")
+        }
         "INSTALL_ROLE" => Some("这台机器的部署角色，由安装器选择，配置模块只展示。"),
+        "INSTANCE_NAME" => Some("native 实例名，用于生成 systemd 服务名。"),
+        "SYSTEMD_TARGET" => Some("native 聚合 target。"),
+        "SYSTEMD_CORE_UNIT" => Some("native media-core systemd 服务名。"),
+        "SYSTEMD_AGENT_UNIT" => Some("native media-agent systemd 服务名。"),
+        "SYSTEMD_ZLM_UNIT" => Some("native ZLMediaKit systemd 服务名。"),
+        "SYSTEMD_POSTGRES_UNIT" => Some("native PostgreSQL systemd 服务名。"),
         "COMPOSE_PROJECT_NAME" => Some("实例项目名；只能使用小写字母、数字、横线 -、下划线 _。"),
         "POSTGRES_DB" => Some("PostgreSQL 数据库名。"),
         "POSTGRES_USER" => Some("PostgreSQL 用户名。"),
