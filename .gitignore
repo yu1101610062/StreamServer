@@ -8,6 +8,7 @@
 /crates/media-core/frontend/node_modules
 /crates/media-core/ui
 /.build-cache
+/tools/docker/*.tar.gz
 
 /docs/site/
 /docs/196服务器访问方式

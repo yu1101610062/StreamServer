@@ -18,6 +18,7 @@ BUNDLE_VARIANT="${BUNDLE_VARIANT:-gpu-enabled}"
 BUNDLE_GPU_SUPPORT="${BUNDLE_GPU_SUPPORT:-true}"
 MEDIA_AGENT_GPU_IMAGE="${MEDIA_AGENT_GPU_IMAGE:-}"
 MEDIA_AGENT_GPU_IMAGE_ARCHIVE="${MEDIA_AGENT_GPU_IMAGE_ARCHIVE:-}"
+DOCKER_OFFLINE_PACKAGE_PATH="${DOCKER_OFFLINE_PACKAGE_PATH:-}"
 
 COMPOSE_CMD=()
 COMPOSE_CMD_DISPLAY=""
@@ -126,9 +127,55 @@ run_systemctl() {
   fi
 }
 
+docker_runtime_ready() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1 || return 1
+  docker compose version >/dev/null 2>&1 && return 0
+  command -v docker-compose >/dev/null 2>&1 && docker-compose version >/dev/null 2>&1
+}
+
+install_offline_docker_from_bundle() {
+  local package_rel="${DOCKER_OFFLINE_PACKAGE_PATH:-}"
+  local package_path=""
+  local tmp_dir=""
+  local top_dir=""
+  local install_script=""
+
+  [ -n "${package_rel}" ] || fail "Docker 不可用，且当前离线包未内置 Docker 安装包。请先安装 Docker/Compose，或重新打包含 --docker-offline-package。"
+  package_path="${PACKAGE_ROOT}/${package_rel}"
+  [ -f "${package_path}" ] || fail "Docker 离线安装包不存在: ${package_path}"
+
+  require_cmd tar
+  require_cmd mktemp
+  top_dir="$(tar -tzf "${package_path}" | sed -n '1s#/.*##p')"
+  [ -n "${top_dir}" ] || fail "无法解析 Docker 离线安装包顶层目录: ${package_path}"
+
+  tmp_dir="$(mktemp -d)"
+  tar -xzf "${package_path}" -C "${tmp_dir}"
+  install_script="${tmp_dir}/${top_dir}/install.sh"
+  [ -x "${install_script}" ] || fail "Docker 离线安装脚本不可执行: ${install_script}"
+
+  log "未检测到可用 Docker/Compose 环境，开始安装包内 Docker: ${package_rel}"
+  if current_user_is_root; then
+    (cd "${tmp_dir}/${top_dir}" && ./install.sh)
+  else
+    command -v sudo >/dev/null 2>&1 || fail "安装 Docker 需要 root 权限；请使用 root 运行，或安装 sudo。"
+    (cd "${tmp_dir}/${top_dir}" && sudo -E ./install.sh)
+  fi
+  rm -rf "${tmp_dir}"
+}
+
 ensure_docker_ready() {
-  require_cmd docker
-  docker info >/dev/null 2>&1 || fail "Docker 不可用，请先启动 Docker Engine"
+  if docker_runtime_ready; then
+    detect_compose_cmd
+    log "检测到可用 Docker 环境，跳过 Docker 离线安装。"
+    return 0
+  fi
+
+  install_offline_docker_from_bundle
+  if ! docker_runtime_ready; then
+    fail "Docker 离线安装后仍不可用，请检查 docker info 与 docker compose version。"
+  fi
   detect_compose_cmd
 }
 
@@ -2285,7 +2332,7 @@ select_role() {
 }
 
 configure_control_plane() {
-  local default_dir="/opt/streamserver/control-plane"
+  local default_dir="/home/streamserver"
   local default_secret
   local default_password
   local existing_env_file
@@ -2340,7 +2387,7 @@ configure_control_plane() {
 }
 
 configure_worker_host() {
-  local default_dir="/opt/streamserver/worker-host-cpu"
+  local default_dir="/home/streamserver"
   local default_ip
   local agent_labels
   local existing_env_file
@@ -2411,7 +2458,7 @@ configure_worker_host() {
 }
 
 configure_worker_host_gpu() {
-  local default_dir="/opt/streamserver/worker-host-gpu"
+  local default_dir="/home/streamserver"
   local default_ip
   local agent_labels
   local existing_env_file
@@ -2485,7 +2532,7 @@ configure_worker_host_gpu() {
 }
 
 configure_all_in_one_host() {
-  local default_dir="/opt/streamserver/all-in-one-host-cpu"
+  local default_dir="/home/streamserver"
   local default_secret
   local default_password
   local default_ip
@@ -2579,7 +2626,7 @@ configure_all_in_one_host() {
 }
 
 configure_all_in_one_host_gpu() {
-  local default_dir="/opt/streamserver/all-in-one-host-gpu"
+  local default_dir="/home/streamserver"
   local default_secret
   local default_password
   local default_ip

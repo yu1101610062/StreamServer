@@ -7,6 +7,8 @@ SKIP_IMAGES=0
 GPU_SUPPORT=""
 HOST_BINARY_TARGET_TRIPLE="x86_64-unknown-linux-musl"
 BUILD_MUSL_BIN_SCRIPT="${ROOT_DIR}/scripts/build-musl-binaries.sh"
+DOCKER_OFFLINE_PACKAGE="${DOCKER_OFFLINE_PACKAGE:-}"
+DOCKER_OFFLINE_PACKAGE_REL=""
 PREBUILD_UI=1
 ALLOW_MISSING_DESKTOP_INSTALLERS=1
 FRONTEND_SKIP_INSTALL=0
@@ -143,6 +145,7 @@ usage() {
   --allow-missing-installers      本地构建 UI 时允许缺少某个平台安装包，默认行为
   --desktop-source-dir DIR        额外桌面安装包扫描目录，可重复
   --skip-frontend-install         跳过前端 npm ci / npm install 检查
+  --docker-offline-package PATH   内置 Docker/Compose/Buildx 离线安装包；目标机缺 Docker 时安装脚本会自动使用
 
 环境变量:
   APT_MIRROR             默认 http://mirrors.aliyun.com；如显式置空则回退 Debian 官方源，也会作为 media-agent Ubuntu 运行时的默认镜像源。
@@ -159,6 +162,7 @@ usage() {
   POSTGRES_SOURCE_IMAGE  可覆盖 PostgreSQL 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
   ZLM_SOURCE_IMAGE       可覆盖 ZLMediaKit 拉取源；脚本会优先复用本地已有的 linux/amd64 镜像，不存在时才联网拉取。
   PREBUILT_UI_DIR        如设置，直接使用该目录中的前端静态资源，不再本地或通过 Docker 构建前端。
+  DOCKER_OFFLINE_PACKAGE 如设置，等同 --docker-offline-package。
 EOF
 }
 
@@ -227,6 +231,11 @@ parse_args() {
       --skip-frontend-install)
         FRONTEND_SKIP_INSTALL=1
         shift
+        ;;
+      --docker-offline-package)
+        [ "$#" -ge 2 ] || fail "--docker-offline-package 需要参数"
+        DOCKER_OFFLINE_PACKAGE="$2"
+        shift 2
         ;;
       -h|--help)
         usage
@@ -638,6 +647,7 @@ MEDIA_AGENT_GPU_IMAGE=${media_agent_gpu_image_value}
 MEDIA_AGENT_GPU_IMAGE_ARCHIVE=${media_agent_gpu_archive_value}
 ZLM_IMAGE=${zlm_image}
 ZLM_IMAGE_ARCHIVE=images/zlmediakit-linux-amd64.tar
+DOCKER_OFFLINE_PACKAGE_PATH=${DOCKER_OFFLINE_PACKAGE_REL}
 EOF
 }
 
@@ -681,6 +691,29 @@ copy_static_assets() {
     cp -R "${ROOT_DIR}/packaging/offline/templates/all-in-one-host-gpu" "${bundle_root}/templates/all-in-one-host-gpu"
   fi
   cp "${ROOT_DIR}/docs/17-离线部署打包与安装.md" "${bundle_root}/docs/"
+  if [ -f "${ROOT_DIR}/docs/18-现场技术人员部署手册.md" ]; then
+    cp "${ROOT_DIR}/docs/18-现场技术人员部署手册.md" "${bundle_root}/docs/"
+  fi
+}
+
+copy_docker_offline_package() {
+  local bundle_root="$1"
+  local package_name=""
+  local target_dir=""
+
+  DOCKER_OFFLINE_PACKAGE_REL=""
+  if [ -z "${DOCKER_OFFLINE_PACKAGE}" ]; then
+    log "未内置 Docker 离线安装包；目标机需已有可用 Docker/Compose 环境"
+    return 0
+  fi
+
+  [ -f "${DOCKER_OFFLINE_PACKAGE}" ] || fail "Docker 离线安装包不存在: ${DOCKER_OFFLINE_PACKAGE}"
+  package_name="$(basename "${DOCKER_OFFLINE_PACKAGE}")"
+  target_dir="${bundle_root}/tools/docker"
+  mkdir -p "${target_dir}"
+  cp "${DOCKER_OFFLINE_PACKAGE}" "${target_dir}/${package_name}"
+  DOCKER_OFFLINE_PACKAGE_REL="tools/docker/${package_name}"
+  log "已内置 Docker 离线安装包: ${DOCKER_OFFLINE_PACKAGE_REL}"
 }
 
 generate_self_signed_certs() {
@@ -963,6 +996,7 @@ main() {
   fi
 
   copy_static_assets "${bundle_root}" "${GPU_SUPPORT}"
+  copy_docker_offline_package "${bundle_root}"
   generate_self_signed_certs "${bundle_root}"
   write_manifest "${bundle_root}" "${bundle_version}" "${media_core_image}" "${media_agent_image}" "${media_agent_gpu_image}" "${postgres_image}" "${zlm_image}" "${GPU_SUPPORT}" "${bundle_variant}"
   write_build_info "${bundle_root}" "${bundle_name}" "${version}" "${bundle_variant}" "${GPU_SUPPORT}"
