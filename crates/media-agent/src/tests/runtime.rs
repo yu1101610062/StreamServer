@@ -26,6 +26,8 @@ fn test_settings(work_root: &str) -> AgentSettings {
         primary_interface_ip: String::new(),
         output_mount_relative_prefix_mp4: "output".to_string(),
         output_mount_relative_prefix_hls: "output".to_string(),
+        zlm_output_mp4_root: "/data/zlm/www/output/mp4".to_string(),
+        zlm_output_hls_root: "/data/zlm/www/output/hls".to_string(),
         multicast_interface_name: String::new(),
         multicast_interface_ip: String::new(),
         network_mode: "bridge".to_string(),
@@ -245,7 +247,7 @@ fn create_mock_ffprobe_binary_with_video_profile(
     video_extradata_size: Option<u64>,
     audio_extradata_size: Option<u64>,
 ) -> String {
-    let path = root.join("mock-ffprobe.sh");
+    let path = root.join(format!("mock-ffprobe-{}.sh", Uuid::now_v7()));
     let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
             let sample_rate = audio_sample_rate
                 .map(|value| format!(",\"sample_rate\":\"{value}\""))
@@ -299,7 +301,7 @@ fn create_mock_ffprobe_binary_with_audio_streams(
     video_codec_name: &str,
     audio_streams: &[(&str, Option<u32>, Option<u32>, Option<u64>)],
 ) -> String {
-    let path = root.join("mock-ffprobe-multi-audio.sh");
+    let path = root.join(format!("mock-ffprobe-multi-audio-{}.sh", Uuid::now_v7()));
     let audio_streams_json = audio_streams
         .iter()
         .enumerate()
@@ -361,7 +363,7 @@ fn create_recording_mock_ffprobe_binary_with_profile(
     video_extradata_size: Option<u64>,
     audio_extradata_size: Option<u64>,
 ) -> String {
-    let path = root.join("mock-ffprobe-recording.sh");
+    let path = root.join(format!("mock-ffprobe-recording-{}.sh", Uuid::now_v7()));
     let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
         let sample_rate = audio_sample_rate
             .map(|value| format!(",\"sample_rate\":\"{value}\""))
@@ -414,7 +416,7 @@ fn create_slow_mock_ffprobe_binary(
     video_codec_name: &str,
     audio_codec_name: Option<&str>,
 ) -> String {
-    let path = root.join("mock-ffprobe-slow.sh");
+    let path = root.join(format!("mock-ffprobe-slow-{}.sh", Uuid::now_v7()));
     let audio_stream = audio_codec_name.map_or_else(String::new, |codec| {
             format!(
                 r#",
@@ -659,6 +661,28 @@ fn managed_output_dir_falls_back_to_stream_addr_ip() {
         managed_output_dir(&settings, task_id, "mp4"),
         PathBuf::from("/data/zlm/www/output/mp4")
             .join("node-10_20_30_40-mp4")
+            .join(task_id.to_string())
+    );
+}
+
+#[test]
+fn managed_output_dir_uses_configured_output_roots() {
+    let mut settings = test_settings("/tmp/work");
+    settings.primary_interface_ip = "172.17.13.196".to_string();
+    settings.zlm_output_mp4_root = "/opt/streamserver/worker/data/zlm/www/output/mp4".to_string();
+    settings.zlm_output_hls_root = "/opt/streamserver/worker/data/zlm/www/output/hls".to_string();
+    let task_id = Uuid::nil();
+
+    assert_eq!(
+        managed_output_dir(&settings, task_id, "mp4"),
+        PathBuf::from("/opt/streamserver/worker/data/zlm/www/output/mp4")
+            .join("node-172_17_13_196-mp4")
+            .join(task_id.to_string())
+    );
+    assert_eq!(
+        managed_output_dir(&settings, task_id, "hls"),
+        PathBuf::from("/opt/streamserver/worker/data/zlm/www/output/hls")
+            .join("node-172_17_13_196-hls")
             .join(task_id.to_string())
     );
 }

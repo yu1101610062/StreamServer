@@ -23,6 +23,8 @@ use crate::runtime::{
 
 use super::*;
 
+const TEST_ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
+
 fn sample_spec() -> TaskSpec {
     TaskSpec {
         task_type: TaskType::StreamIngest,
@@ -328,7 +330,11 @@ fn running_cleanup_deletes_only_safe_old_segments() {
         },
     ];
 
-    let candidates = collect_running_cleanup_candidates(&observations, &[handle]);
+    let mut settings = AgentSettings::default();
+    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
+    settings.zlm_output_hls_root = temp_root.join("hls").to_string_lossy().to_string();
+    let layout = ArtifactCleanupLayout::from_settings(&settings);
+    let candidates = collect_running_cleanup_candidates(&observations, &[handle], &layout);
     let candidate_paths = candidates
         .iter()
         .map(|candidate| candidate.path.clone())
@@ -386,8 +392,8 @@ fn reject_only_stop_action_targets_only_artifact_tasks_on_volume() {
     let no_output_task = Uuid::now_v7();
     let observations = [BucketObservation {
         bucket: ArtifactBucket::Mp4,
-        root: PathBuf::from(ZLM_OUTPUT_MP4_ROOT),
-        node_dir: PathBuf::from(ZLM_OUTPUT_MP4_ROOT).join("node-test-mp4"),
+        root: PathBuf::from(TEST_ZLM_OUTPUT_MP4_ROOT),
+        node_dir: PathBuf::from(TEST_ZLM_OUTPUT_MP4_ROOT).join("node-test-mp4"),
         device_id: 1,
         disk_percent: 95.0,
     }];
@@ -403,7 +409,7 @@ fn reject_only_stop_action_targets_only_artifact_tasks_on_volume() {
             state: RuntimeState::Running,
             command_line: None,
             outputs: vec![format!(
-                "{ZLM_OUTPUT_MP4_ROOT}/node-test-mp4/{artifact_task}/out.mp4"
+                "{TEST_ZLM_OUTPUT_MP4_ROOT}/node-test-mp4/{artifact_task}/out.mp4"
             )],
             metadata: json!({
                 "lease_token": "lease-artifact",

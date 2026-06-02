@@ -564,6 +564,8 @@ if [ -x "${ROOT}/runtime/ffmpeg/gpu/bin/ffmpeg" ]; then
   check_runtime_binary "ffmpeg gpu" "${ROOT}/runtime/ffmpeg/gpu/bin/ffmpeg" "${ROOT}/runtime/ffmpeg/gpu/lib" -version
   check_runtime_binary "ffprobe gpu" "${ROOT}/runtime/ffmpeg/gpu/bin/ffprobe" "${ROOT}/runtime/ffmpeg/gpu/lib" -version
   run_shell "ffmpeg gpu encoder check" "'${ROOT}/runtime/ffmpeg/gpu/lib/ld-linux-x86-64.so.2' --library-path '${ROOT}/runtime/ffmpeg/gpu/lib' '${ROOT}/runtime/ffmpeg/gpu/bin/ffmpeg' -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc && '${ROOT}/runtime/ffmpeg/gpu/lib/ld-linux-x86-64.so.2' --library-path '${ROOT}/runtime/ffmpeg/gpu/lib' '${ROOT}/runtime/ffmpeg/gpu/bin/ffmpeg' -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc"
+  run_shell "ffmpeg gpu h264_nvenc encode smoke" "command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null && '${ROOT}/runtime/ffmpeg/gpu/lib/ld-linux-x86-64.so.2' --library-path '${ROOT}/runtime/ffmpeg/gpu/lib' '${ROOT}/runtime/ffmpeg/gpu/bin/ffmpeg' -v error -hide_banner -nostdin -f lavfi -i testsrc2=size=640x360:rate=15 -t 1 -c:v h264_nvenc -an -f null -"
+  run_shell "ffmpeg gpu hevc_nvenc encode smoke" "command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null && '${ROOT}/runtime/ffmpeg/gpu/lib/ld-linux-x86-64.so.2' --library-path '${ROOT}/runtime/ffmpeg/gpu/lib' '${ROOT}/runtime/ffmpeg/gpu/bin/ffmpeg' -v error -hide_banner -nostdin -f lavfi -i testsrc2=size=640x360:rate=15 -t 1 -c:v hevc_nvenc -an -f null -"
 fi
 
 section "ZLMediaKit Runtime"
@@ -842,10 +844,10 @@ EOF
       -c "select name, coalesce(default_version, '') from pg_available_extensions order by name;" \
       >"${tmp}/actual-extensions.tsv" || return 1
     if ! diff -u "${tmp}/expected-extensions.tsv" "${tmp}/actual-extensions.tsv"; then
-      echo "pg_available_extensions does not match Docker-source extension manifest"
+      echo "pg_available_extensions does not match runtime-source extension manifest"
       return 1
     fi
-    echo "pg_available_extensions matches Docker-source extension manifest"
+    echo "pg_available_extensions matches runtime-source extension manifest"
 
     extension_so_count=0
     unresolved_extension_so_count=0

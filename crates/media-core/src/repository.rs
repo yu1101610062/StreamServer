@@ -1146,7 +1146,7 @@ impl TaskRepository {
             join media_nodes n on n.id = ta.node_id
             join tasks t on t.id = rf.task_id
             where 1 = 1
-              and rf.file_path like '/data/zlm/www/output/%'
+              and rf.file_path like '%/data/zlm/www/output/%'
             "#,
         );
         apply_record_filters(&mut builder, &filter);
@@ -1195,7 +1195,7 @@ impl TaskRepository {
             join media_nodes n on n.id = ta.node_id
             join tasks t on t.id = rf.task_id
             where rf.task_id = $1
-              and rf.file_path like '/data/zlm/www/output/%'
+              and rf.file_path like '%/data/zlm/www/output/%'
             order by coalesce(rf.start_time, rf.created_at) desc, rf.id desc
             "#,
         )
@@ -1236,7 +1236,7 @@ impl TaskRepository {
             join tasks t on t.id = ta.task_id
             join media_nodes n on n.id = ta.node_id
             where 1 = 1
-              and ta.file_path like '/data/zlm/www/output/%'
+              and ta.file_path like '%/data/zlm/www/output/%'
             "#,
         );
         apply_file_artifact_filters(&mut builder, &filter);
@@ -1460,7 +1460,7 @@ impl TaskRepository {
             join tasks t on t.id = ta.task_id
             join media_nodes n on n.id = ta.node_id
             where ta.task_id = $1
-              and ta.file_path like '/data/zlm/www/output/%'
+              and ta.file_path like '%/data/zlm/www/output/%'
             order by created_at desc, id desc
             "#,
         )
@@ -5160,7 +5160,7 @@ impl TaskRepository {
 
     async fn count_record_files(&self, filter: &RecordListFilter) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from record_files rf join task_attempts ta on ta.id = rf.attempt_id join media_nodes n on n.id = ta.node_id join tasks t on t.id = rf.task_id where 1 = 1 and rf.file_path like '/data/zlm/www/output/%'",
+            "select count(*) as total from record_files rf join task_attempts ta on ta.id = rf.attempt_id join media_nodes n on n.id = ta.node_id join tasks t on t.id = rf.task_id where 1 = 1 and rf.file_path like '%/data/zlm/www/output/%'",
         );
         apply_record_filters(&mut builder, filter);
 
@@ -5174,7 +5174,7 @@ impl TaskRepository {
         filter: &FileArtifactListFilter,
     ) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id join media_nodes n on n.id = ta.node_id where 1 = 1 and ta.file_path like '/data/zlm/www/output/%'",
+            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id join media_nodes n on n.id = ta.node_id where 1 = 1 and ta.file_path like '%/data/zlm/www/output/%'",
         );
         apply_file_artifact_filters(&mut builder, filter);
 
@@ -7219,10 +7219,10 @@ fn apply_media_upload_asset_filters<'a>(
     }
 }
 
-const ZLM_HTTP_ROOT: &str = "/data/zlm/www";
-const ZLM_OUTPUT_HTTP_ROOT: &str = "/data/zlm/www/output";
-const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
-const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
+const ZLM_HTTP_ROOT_SEGMENT: &str = "/data/zlm/www";
+const ZLM_OUTPUT_HTTP_ROOT_SEGMENT: &str = "/data/zlm/www/output";
+const ZLM_OUTPUT_MP4_RELATIVE_ROOT: &str = "output/mp4";
+const ZLM_OUTPUT_HLS_RELATIVE_ROOT: &str = "output/hls";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedOutputBucket {
@@ -7272,10 +7272,41 @@ fn relative_path_under_root<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     path.strip_prefix(root)?.strip_prefix('/')
 }
 
+fn zlm_http_root_in_path(path: &str) -> Option<&str> {
+    for (index, _) in path.match_indices(ZLM_HTTP_ROOT_SEGMENT) {
+        let end = index + ZLM_HTTP_ROOT_SEGMENT.len();
+        let suffix = &path[end..];
+        if suffix.is_empty() || suffix.starts_with('/') {
+            return Some(&path[..end]);
+        }
+    }
+    None
+}
+
+fn relative_path_under_zlm_http_root(path: &str) -> Option<&str> {
+    let root = zlm_http_root_in_path(path)?;
+    relative_path_under_root(path, root)
+}
+
+fn relative_path_under_output_root<'a>(
+    path: &'a str,
+    bucket: ManagedOutputBucket,
+) -> Option<&'a str> {
+    let relative = relative_path_under_zlm_http_root(path)?;
+    let root = match bucket {
+        ManagedOutputBucket::Mp4 => ZLM_OUTPUT_MP4_RELATIVE_ROOT,
+        ManagedOutputBucket::Hls => ZLM_OUTPUT_HLS_RELATIVE_ROOT,
+    };
+    if relative == root {
+        return Some("");
+    }
+    relative_path_under_root(relative, root)
+}
+
 fn task_id_from_managed_output_path(path: &str) -> Option<Uuid> {
     let normalized = normalized_absolute_path(path).ok()?;
-    let relative = relative_path_under_root(&normalized, ZLM_OUTPUT_MP4_ROOT)
-        .or_else(|| relative_path_under_root(&normalized, ZLM_OUTPUT_HLS_ROOT))?;
+    let relative = relative_path_under_output_root(&normalized, ManagedOutputBucket::Mp4)
+        .or_else(|| relative_path_under_output_root(&normalized, ManagedOutputBucket::Hls))?;
     let mut segments = relative.split('/').filter(|segment| !segment.is_empty());
     let _node_dir = segments.next()?;
     Uuid::parse_str(segments.next()?).ok()
@@ -7362,31 +7393,34 @@ fn validate_task_callback_url(spec: &TaskSpec) -> Result<(), RepoError> {
 
 fn relative_http_url_from_path(file_path: &str) -> Result<String, RepoError> {
     let normalized = normalized_absolute_path(file_path)?;
-    let relative = relative_path_under_root(&normalized, ZLM_HTTP_ROOT).ok_or_else(|| {
-        validation_error("publish.url", "output path must be under /data/zlm/www")
+    let relative = relative_path_under_zlm_http_root(&normalized).ok_or_else(|| {
+        validation_error("publish.url", "output path must be under */data/zlm/www")
     })?;
     Ok(format!("/{}", relative.trim_start_matches('/')))
 }
 
 fn managed_output_bucket_from_path(path: &str) -> Option<ManagedOutputBucket> {
-    if path == ZLM_OUTPUT_MP4_ROOT || relative_path_under_root(path, ZLM_OUTPUT_MP4_ROOT).is_some()
-    {
+    if relative_path_under_output_root(path, ManagedOutputBucket::Mp4).is_some() {
         return Some(ManagedOutputBucket::Mp4);
     }
-    if path == ZLM_OUTPUT_HLS_ROOT || relative_path_under_root(path, ZLM_OUTPUT_HLS_ROOT).is_some()
-    {
+    if relative_path_under_output_root(path, ManagedOutputBucket::Hls).is_some() {
         return Some(ManagedOutputBucket::Hls);
     }
     None
 }
 
-fn visible_root_for_bucket(bucket: ManagedOutputBucket, prefixes: &OutputMountPrefixes) -> String {
+fn visible_root_for_bucket(
+    path: &str,
+    bucket: ManagedOutputBucket,
+    prefixes: &OutputMountPrefixes,
+) -> Option<String> {
+    let zlm_http_root = zlm_http_root_in_path(path)?;
     let relative_prefix = prefixes.relative_prefix_for_bucket(bucket);
-    if relative_prefix.is_empty() {
-        ZLM_HTTP_ROOT.to_string()
+    Some(if relative_prefix.is_empty() {
+        zlm_http_root.to_string()
     } else {
-        format!("{ZLM_HTTP_ROOT}/{relative_prefix}")
-    }
+        format!("{zlm_http_root}/{relative_prefix}")
+    })
 }
 
 fn external_relative_path_from_normalized(
@@ -7394,7 +7428,7 @@ fn external_relative_path_from_normalized(
     prefixes: &OutputMountPrefixes,
 ) -> Option<String> {
     let bucket = managed_output_bucket_from_path(path)?;
-    let visible_root = visible_root_for_bucket(bucket, prefixes);
+    let visible_root = visible_root_for_bucket(path, bucket, prefixes)?;
     if path == visible_root {
         return Some("/".to_string());
     }
@@ -7419,7 +7453,7 @@ fn externalize_managed_path(
     );
     Err(validation_error(
         field,
-        format!("must be under {ZLM_OUTPUT_HTTP_ROOT}"),
+        format!("must be under *{ZLM_OUTPUT_HTTP_ROOT_SEGMENT}"),
     ))
 }
 
@@ -7524,8 +7558,8 @@ fn is_hls_playlist_record_path(file_path: &str) -> bool {
     let Ok(normalized) = normalized_absolute_path(file_path) else {
         return false;
     };
-    let in_record_root = normalized == ZLM_OUTPUT_HLS_ROOT
-        || relative_path_under_root(&normalized, ZLM_OUTPUT_HLS_ROOT).is_some();
+    let in_record_root =
+        relative_path_under_output_root(&normalized, ManagedOutputBucket::Hls).is_some();
     in_record_root
         && Path::new(&normalized)
             .extension()

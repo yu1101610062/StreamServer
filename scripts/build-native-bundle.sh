@@ -10,11 +10,16 @@ NATIVE_VARIANT=""
 PREBUILT_UI_DIR="${PREBUILT_UI_DIR:-}"
 FRONTEND_SKIP_INSTALL=0
 FRONTEND_SOURCE_DIRS=()
+REFRESH_RUNTIME_CACHE=0
+OFFLINE_RUNTIME_CACHE=0
+NO_RUNTIME_CACHE=0
 
 DEFAULT_APT_MIRROR="http://mirrors.aliyun.com"
 DEFAULT_CARGO_REGISTRY_MIRROR="sparse+https://rsproxy.cn/index/"
 DEFAULT_NPM_REGISTRY_MIRROR="https://registry.npmmirror.com"
 DOCKERHUB_MIRROR_HOST="m.daocloud.io"
+NATIVE_RUNTIME_CACHE_DIR="${NATIVE_RUNTIME_CACHE_DIR:-${ROOT_DIR}/.build-cache/native-runtime}"
+NATIVE_RUNTIME_CACHE_EXTRACTOR_VERSION="20260602-1"
 
 log() {
   printf '[native-bundle] %s\n' "$*"
@@ -75,17 +80,22 @@ APT_MIRROR="$(resolve_env_or_default APT_MIRROR "${DEFAULT_APT_MIRROR}")"
 CARGO_REGISTRY_MIRROR="$(resolve_env_or_default CARGO_REGISTRY_MIRROR "${DEFAULT_CARGO_REGISTRY_MIRROR}")"
 NPM_REGISTRY_MIRROR="$(resolve_env_or_default NPM_REGISTRY_MIRROR "${DEFAULT_NPM_REGISTRY_MIRROR}")"
 RUST_BUILDER_IMAGE="$(resolve_env_or_default RUST_BUILDER_IMAGE "$(dockerhub_library_mirror_ref 'rust:1.85-bookworm')")"
-MEDIA_AGENT_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:7.1-ubuntu2404')"
-MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:7.1-nvidia2204')"
+MEDIA_AGENT_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:8.1-ubuntu2404')"
+MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:8.1-nvidia2404')"
 POSTGRES_SOURCE_IMAGE="$(resolve_env_or_default POSTGRES_SOURCE_IMAGE "$(dockerhub_library_mirror_ref 'postgres:18.3')")"
 ZLM_SOURCE_IMAGE="$(resolve_env_or_default ZLM_SOURCE_IMAGE 'zlmediakit/zlmediakit:master@sha256:8b24d1d4a30736b2001e5d78fc46057cb3abf4cae527818f238678826537389f')"
 ZLM_PYTHON_STDLIB_IMAGE="$(resolve_env_or_default ZLM_PYTHON_STDLIB_IMAGE "$(dockerhub_library_mirror_ref 'python:3.12-slim-bookworm')")"
+case "${NATIVE_RUNTIME_CACHE_DIR}" in
+  /*) ;;
+  *) NATIVE_RUNTIME_CACHE_DIR="${ROOT_DIR}/${NATIVE_RUNTIME_CACHE_DIR}" ;;
+esac
 
 usage() {
   cat <<EOF
 用法:
   $(basename "$0") [--output-dir DIR] [--with-gpu|--without-gpu|--control-plane-minimal]
                  [--prebuilt-ui-dir DIR] [--skip-frontend-install] [--desktop-source-dir DIR]
+                 [--refresh-runtime-cache|--offline-runtime-cache|--no-runtime-cache]
 
 说明:
   生成无 Docker 运行时依赖的 StreamServer native 离线包。构建机可以使用 Docker
@@ -96,12 +106,18 @@ usage() {
   --with-gpu                生成 gpu-enabled 包，在 cpu-only 基础上增加 GPU FFmpeg runtime
   --control-plane-minimal   只包含 media-core、streamserver-config 和 UI，数据库使用外部 PostgreSQL
 
+runtime 缓存:
+  --refresh-runtime-cache   忽略已有 runtime 缓存，重新从镜像提取并覆盖缓存
+  --offline-runtime-cache   只允许使用已有 runtime 缓存；缺失或无效时失败，不拉取 runtime 镜像
+  --no-runtime-cache        禁用 runtime 缓存，保持每次从镜像提取的旧行为
+
 环境变量:
   RUST_BUILDER_IMAGE                  默认 ${RUST_BUILDER_IMAGE}
   MEDIA_AGENT_RUNTIME_BASE_IMAGE      默认 ${MEDIA_AGENT_RUNTIME_BASE_IMAGE}
   MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE  默认 ${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}
   POSTGRES_SOURCE_IMAGE               默认 ${POSTGRES_SOURCE_IMAGE}
   ZLM_SOURCE_IMAGE                    默认 ${ZLM_SOURCE_IMAGE}
+  NATIVE_RUNTIME_CACHE_DIR            默认 ${NATIVE_RUNTIME_CACHE_DIR}
 EOF
 }
 
@@ -139,6 +155,18 @@ parse_args() {
         FRONTEND_SOURCE_DIRS+=("$2")
         shift 2
         ;;
+      --refresh-runtime-cache)
+        REFRESH_RUNTIME_CACHE=1
+        shift
+        ;;
+      --offline-runtime-cache)
+        OFFLINE_RUNTIME_CACHE=1
+        shift
+        ;;
+      --no-runtime-cache)
+        NO_RUNTIME_CACHE=1
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -151,6 +179,12 @@ parse_args() {
 
   if [ -z "${NATIVE_VARIANT}" ]; then
     NATIVE_VARIANT="cpu-only"
+  fi
+  if [ "${NO_RUNTIME_CACHE}" -eq 1 ] && { [ "${REFRESH_RUNTIME_CACHE}" -eq 1 ] || [ "${OFFLINE_RUNTIME_CACHE}" -eq 1 ]; }; then
+    fail "--no-runtime-cache 不能与 --refresh-runtime-cache 或 --offline-runtime-cache 同时使用"
+  fi
+  if [ "${REFRESH_RUNTIME_CACHE}" -eq 1 ] && [ "${OFFLINE_RUNTIME_CACHE}" -eq 1 ]; then
+    fail "--refresh-runtime-cache 不能与 --offline-runtime-cache 同时使用"
   fi
 }
 
@@ -227,6 +261,208 @@ pull_linux_amd64_image() {
     return 0
   fi
   fail "拉取镜像失败且本地不存在: ${image}"
+}
+
+checksum_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{ print $1 }'
+  else
+    shasum -a 256 | awk '{ print $1 }'
+  fi
+}
+
+runtime_cache_key() {
+  local kind="$1"
+  local image="$2"
+  shift 2
+  {
+    printf 'kind=%s\n' "${kind}"
+    printf 'image=%s\n' "${image}"
+    printf 'platform=linux/amd64\n'
+    printf 'extractor_version=%s\n' "${NATIVE_RUNTIME_CACHE_EXTRACTOR_VERSION}"
+    while [ "$#" -gt 0 ]; do
+      printf 'arg=%s\n' "$1"
+      shift
+    done
+  } | checksum_stdin
+}
+
+runtime_cache_path() {
+  local kind="$1"
+  local key="$2"
+  printf '%s/%s/%s' "${NATIVE_RUNTIME_CACHE_DIR}" "${kind}" "${key}"
+}
+
+write_runtime_cache_checksums() {
+  local cache_dir="$1"
+  (
+    cd "${cache_dir}/payload"
+    if command -v sha256sum >/dev/null 2>&1; then
+      find . -type f -print | LC_ALL=C sort | while read -r file; do
+        sha256sum "${file#./}"
+      done >"${cache_dir}/SHA256SUMS"
+    else
+      find . -type f -print | LC_ALL=C sort | while read -r file; do
+        shasum -a 256 "${file#./}"
+      done >"${cache_dir}/SHA256SUMS"
+    fi
+  )
+  [ -s "${cache_dir}/SHA256SUMS" ]
+}
+
+runtime_cache_valid() {
+  local cache_dir="$1"
+  [ -d "${cache_dir}/payload" ] || return 1
+  [ -s "${cache_dir}/SHA256SUMS" ] || return 1
+  (
+    cd "${cache_dir}/payload"
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum -c "${cache_dir}/SHA256SUMS" >/dev/null 2>&1
+    else
+      shasum -a 256 -c "${cache_dir}/SHA256SUMS" >/dev/null 2>&1
+    fi
+  )
+}
+
+copy_runtime_from_cache() {
+  local cache_dir="$1"
+  local output_dir="$2"
+  rm -rf "${output_dir}"
+  mkdir -p "${output_dir}"
+  cp -R "${cache_dir}/payload/." "${output_dir}/"
+}
+
+write_runtime_cache_metadata() {
+  local cache_dir="$1"
+  local kind="$2"
+  local image="$3"
+  local key="$4"
+  shift 4
+  {
+    printf 'CACHE_KEY=%s\n' "${key}"
+    printf 'KIND=%s\n' "${kind}"
+    printf 'SOURCE_IMAGE=%s\n' "${image}"
+    printf 'PLATFORM=linux/amd64\n'
+    printf 'EXTRACTOR_VERSION=%s\n' "${NATIVE_RUNTIME_CACHE_EXTRACTOR_VERSION}"
+    printf 'CREATED_AT=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    while [ "$#" -gt 0 ]; do
+      printf 'EXTRACT_ARG=%s\n' "$1"
+      shift
+    done
+  } >"${cache_dir}/metadata.env"
+}
+
+runtime_cache_lock_stale() {
+  local lock_dir="$1"
+  local pid=""
+
+  [ -f "${lock_dir}/pid" ] || return 1
+  pid="$(cat "${lock_dir}/pid" 2>/dev/null || true)"
+  case "${pid}" in
+    ""|*[!0-9]*)
+      return 0
+      ;;
+  esac
+  kill -0 "${pid}" 2>/dev/null && return 1
+  return 0
+}
+
+acquire_runtime_cache_lock() {
+  local lock_dir="$1"
+  local waited=0
+
+  while ! mkdir "${lock_dir}" 2>/dev/null; do
+    if runtime_cache_lock_stale "${lock_dir}"; then
+      log "清理 stale runtime 缓存锁: ${lock_dir}"
+      rm -rf "${lock_dir}"
+      continue
+    fi
+    waited=$((waited + 1))
+    if [ $((waited % 30)) -eq 0 ]; then
+      log "等待 runtime 缓存锁: ${lock_dir}"
+    fi
+    sleep 1
+  done
+  printf '%s\n' "$$" >"${lock_dir}/pid"
+}
+
+release_runtime_cache_lock() {
+  local lock_dir="$1"
+  rm -rf "${lock_dir}"
+}
+
+extract_runtime_with_cache() {
+  local kind="$1"
+  local image="$2"
+  local output_dir="$3"
+  local extractor="$4"
+  shift 4
+  local key cache_dir tmp_dir parent_dir lock_dir
+
+  if [ "${NO_RUNTIME_CACHE}" -eq 1 ]; then
+    pull_linux_amd64_image "${image}"
+    "${extractor}" "${image}" "${output_dir}" "$@"
+    return 0
+  fi
+
+  key="$(runtime_cache_key "${kind}" "${image}" "$@")"
+  cache_dir="$(runtime_cache_path "${kind}" "${key}")"
+  parent_dir="${NATIVE_RUNTIME_CACHE_DIR}/${kind}"
+  lock_dir="${parent_dir}/${key}.lock"
+  mkdir -p "${parent_dir}"
+  acquire_runtime_cache_lock "${lock_dir}"
+
+  if [ "${REFRESH_RUNTIME_CACHE}" -eq 0 ] && runtime_cache_valid "${cache_dir}"; then
+    log "复用 runtime 缓存: ${kind} (${image})"
+    if ! copy_runtime_from_cache "${cache_dir}" "${output_dir}"; then
+      release_runtime_cache_lock "${lock_dir}"
+      fail "runtime 缓存复制失败: ${kind} (${cache_dir})"
+    fi
+    release_runtime_cache_lock "${lock_dir}"
+    return 0
+  fi
+
+  if [ -e "${cache_dir}" ] && [ "${REFRESH_RUNTIME_CACHE}" -eq 0 ]; then
+    log "runtime 缓存无效，将重新提取: ${kind} (${cache_dir})"
+  fi
+
+  if [ "${OFFLINE_RUNTIME_CACHE}" -eq 1 ]; then
+    release_runtime_cache_lock "${lock_dir}"
+    fail "runtime 缓存缺失或无效: ${kind} (${image}); cache=${cache_dir}"
+  fi
+
+  pull_linux_amd64_image "${image}"
+  tmp_dir="$(mktemp -d "${parent_dir}/.tmp.${key}.XXXXXX")"
+  mkdir -p "${tmp_dir}/payload"
+
+  if ! "${extractor}" "${image}" "${tmp_dir}/payload" "$@"; then
+    rm -rf "${tmp_dir}"
+    release_runtime_cache_lock "${lock_dir}"
+    fail "runtime 提取失败: ${kind} (${image})"
+  fi
+
+  if ! write_runtime_cache_metadata "${tmp_dir}" "${kind}" "${image}" "${key}" "$@"; then
+    rm -rf "${tmp_dir}"
+    release_runtime_cache_lock "${lock_dir}"
+    fail "runtime 缓存 metadata 写入失败: ${kind} (${tmp_dir})"
+  fi
+  if ! write_runtime_cache_checksums "${tmp_dir}"; then
+    rm -rf "${tmp_dir}"
+    release_runtime_cache_lock "${lock_dir}"
+    fail "runtime 缓存为空: ${kind} (${image})"
+  fi
+  if ! { rm -rf "${cache_dir}" && mv "${tmp_dir}" "${cache_dir}"; }; then
+    rm -rf "${tmp_dir}"
+    release_runtime_cache_lock "${lock_dir}"
+    fail "runtime 缓存写入失败: ${kind} (${cache_dir})"
+  fi
+  log "已写入 runtime 缓存: ${kind} (${cache_dir})"
+
+  if ! copy_runtime_from_cache "${cache_dir}" "${output_dir}"; then
+    release_runtime_cache_lock "${lock_dir}"
+    fail "runtime 缓存复制失败: ${kind} (${cache_dir})"
+  fi
+  release_runtime_cache_lock "${lock_dir}"
 }
 
 extract_commands_from_image() {
@@ -339,7 +575,6 @@ extract_python_stdlib_runtime() {
     return 0
   fi
 
-  pull_linux_amd64_image "${image}"
   rm -rf "${output_dir}"
   mkdir -p "${output_dir}"
   log "从 ${image} 提取 Python ${python_version} stdlib"
@@ -484,7 +719,9 @@ copy_static_assets() {
   local bundle_root="$1"
   mkdir -p "${bundle_root}/templates/systemd" "${bundle_root}/templates/common" "${bundle_root}/docs"
   cp "${ROOT_DIR}/packaging/native/install.sh" "${bundle_root}/install.sh"
+  cp "${ROOT_DIR}/packaging/native/uninstall.sh" "${bundle_root}/uninstall.sh"
   chmod +x "${bundle_root}/install.sh"
+  chmod +x "${bundle_root}/uninstall.sh"
   cp -R "${ROOT_DIR}/packaging/native/templates/systemd/." "${bundle_root}/templates/systemd/"
   cp -R "${ROOT_DIR}/packaging/native/templates/common/." "${bundle_root}/templates/common/"
   if [ -f "${ROOT_DIR}/docs/18-native-static-deployment.md" ]; then
@@ -611,6 +848,7 @@ resolve_bundle_name() {
 main() {
   local version bundle_version build_date bundle_name_base bundle_name
   local stage_dir bundle_root archive_path binaries_dir
+  local zlm_python_runtime_version=""
   local include_worker="true"
   local include_gpu="false"
   local include_postgres="true"
@@ -653,21 +891,43 @@ main() {
   copy_static_assets "${bundle_root}"
 
   if [ "${include_worker}" = "true" ]; then
-    pull_linux_amd64_image "${MEDIA_AGENT_RUNTIME_BASE_IMAGE}"
-    extract_commands_from_image "${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" "${bundle_root}/runtime/ffmpeg/cpu" ffmpeg ffprobe
-    pull_linux_amd64_image "${ZLM_SOURCE_IMAGE}"
-    extract_zlm_runtime "${ZLM_SOURCE_IMAGE}" "${bundle_root}/runtime/zlm"
-    extract_python_stdlib_runtime "${ZLM_PYTHON_STDLIB_IMAGE}" "${bundle_root}/runtime/zlm/python" "$(zlm_python_version "${bundle_root}/runtime/zlm")"
+    extract_runtime_with_cache \
+      "ffmpeg-cpu" \
+      "${MEDIA_AGENT_RUNTIME_BASE_IMAGE}" \
+      "${bundle_root}/runtime/ffmpeg/cpu" \
+      extract_commands_from_image \
+      ffmpeg ffprobe
+    extract_runtime_with_cache \
+      "zlm" \
+      "${ZLM_SOURCE_IMAGE}" \
+      "${bundle_root}/runtime/zlm" \
+      extract_zlm_runtime
+    zlm_python_runtime_version="$(zlm_python_version "${bundle_root}/runtime/zlm")"
+    if [ -n "${zlm_python_runtime_version}" ]; then
+      extract_runtime_with_cache \
+        "zlm-python-stdlib" \
+        "${ZLM_PYTHON_STDLIB_IMAGE}" \
+        "${bundle_root}/runtime/zlm/python" \
+        extract_python_stdlib_runtime \
+        "${zlm_python_runtime_version}"
+    fi
   fi
 
   if [ "${include_gpu}" = "true" ]; then
-    pull_linux_amd64_image "${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}"
-    extract_commands_from_image "${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" "${bundle_root}/runtime/ffmpeg/gpu" ffmpeg ffprobe
+    extract_runtime_with_cache \
+      "ffmpeg-gpu" \
+      "${MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE}" \
+      "${bundle_root}/runtime/ffmpeg/gpu" \
+      extract_commands_from_image \
+      ffmpeg ffprobe
   fi
 
   if [ "${include_postgres}" = "true" ]; then
-    pull_linux_amd64_image "${POSTGRES_SOURCE_IMAGE}"
-    extract_postgres_runtime "${POSTGRES_SOURCE_IMAGE}" "${bundle_root}/runtime/postgres"
+    extract_runtime_with_cache \
+      "postgres" \
+      "${POSTGRES_SOURCE_IMAGE}" \
+      "${bundle_root}/runtime/postgres" \
+      extract_postgres_runtime
   fi
 
   write_manifest "${bundle_root}" "${bundle_version}" "${include_postgres}" "${include_worker}" "${include_gpu}"

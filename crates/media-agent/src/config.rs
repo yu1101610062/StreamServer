@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -78,6 +80,10 @@ pub struct AgentSettings {
     pub output_mount_relative_prefix_mp4: String,
     #[serde(default = "default_output_mount_relative_prefix")]
     pub output_mount_relative_prefix_hls: String,
+    #[serde(default = "default_zlm_output_mp4_root")]
+    pub zlm_output_mp4_root: String,
+    #[serde(default = "default_zlm_output_hls_root")]
+    pub zlm_output_hls_root: String,
     #[serde(default)]
     pub multicast_interface_name: String,
     #[serde(default)]
@@ -141,6 +147,8 @@ impl Default for AgentSettings {
             primary_interface_ip: String::new(),
             output_mount_relative_prefix_mp4: default_output_mount_relative_prefix(),
             output_mount_relative_prefix_hls: default_output_mount_relative_prefix(),
+            zlm_output_mp4_root: default_zlm_output_mp4_root(),
+            zlm_output_hls_root: default_zlm_output_hls_root(),
             multicast_interface_name: String::new(),
             multicast_interface_ip: String::new(),
             network_mode: default_network_mode(),
@@ -246,6 +254,16 @@ impl Settings {
                 "bridge" | "host" | "macvlan"
             ),
             "AGENT_NETWORK_MODE must be one of bridge/host/macvlan"
+        );
+        anyhow::ensure!(
+            !self.agent.zlm_output_mp4_root.trim().is_empty()
+                && Path::new(self.agent.zlm_output_mp4_root.trim()).is_absolute(),
+            "ZLM_OUTPUT_MP4_ROOT must be an absolute path"
+        );
+        anyhow::ensure!(
+            !self.agent.zlm_output_hls_root.trim().is_empty()
+                && Path::new(self.agent.zlm_output_hls_root.trim()).is_absolute(),
+            "ZLM_OUTPUT_HLS_ROOT must be an absolute path"
         );
         anyhow::ensure!(
             !self.agent.work_root.trim().is_empty(),
@@ -372,6 +390,12 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("OUTPUT_MOUNT_RELATIVE_PREFIX_HLS") {
         settings.agent.output_mount_relative_prefix_hls = value;
+    }
+    if let Some(value) = env("ZLM_OUTPUT_MP4_ROOT") {
+        settings.agent.zlm_output_mp4_root = value;
+    }
+    if let Some(value) = env("ZLM_OUTPUT_HLS_ROOT") {
+        settings.agent.zlm_output_hls_root = value;
     }
     if let Some(value) = env("AGENT_MULTICAST_INTERFACE_NAME") {
         settings.agent.multicast_interface_name = value;
@@ -519,6 +543,14 @@ fn default_max_runtime_slots() -> u32 {
 
 fn default_work_root() -> String {
     "/data/media/work".to_string()
+}
+
+fn default_zlm_output_mp4_root() -> String {
+    "/data/zlm/www/output/mp4".to_string()
+}
+
+fn default_zlm_output_hls_root() -> String {
+    "/data/zlm/www/output/hls".to_string()
 }
 
 fn default_upload_max_bytes() -> u64 {

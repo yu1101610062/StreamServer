@@ -4,14 +4,6 @@ set -euo pipefail
 PACKAGE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 MANIFEST_FILE="${PACKAGE_ROOT}/package-manifest.env"
 
-[ -f "${MANIFEST_FILE}" ] || {
-  echo "缺少 ${MANIFEST_FILE}" >&2
-  exit 1
-}
-
-# shellcheck disable=SC1090
-. "${MANIFEST_FILE}"
-
 CHECK_ONLY=0
 START_AFTER_INSTALL=1
 INSTALL_ROLE=""
@@ -34,6 +26,12 @@ fail() {
 
 require_cmd() {
   command -v "$1" >/dev/null 2>&1 || fail "缺少命令: $1"
+}
+
+load_manifest() {
+  [ -f "${MANIFEST_FILE}" ] || fail "缺少 ${MANIFEST_FILE}"
+  # shellcheck disable=SC1090
+  . "${MANIFEST_FILE}"
 }
 
 usage() {
@@ -165,6 +163,7 @@ ensure_prerequisites() {
   require_cmd openssl
   require_cmd systemctl
   require_cmd sed
+  require_cmd awk
   if ! command -v sha256sum >/dev/null 2>&1; then
     fail "缺少 sha256sum"
   fi
@@ -314,7 +313,14 @@ generate_uuid() {
 }
 
 detect_default_ip() {
-  hostname -I 2>/dev/null | awk '{ print $1 }'
+  local ip_value=""
+  if command -v hostname >/dev/null 2>&1; then
+    ip_value="$(hostname -I 2>/dev/null | awk '{ print $1 }' || true)"
+  fi
+  if [ -z "${ip_value}" ] && command -v ip >/dev/null 2>&1; then
+    ip_value="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
+  fi
+  printf '%s' "${ip_value}"
 }
 
 copy_file_atomically() {
@@ -433,7 +439,7 @@ backup_existing_install() {
   [ -e "${INSTALL_DIR}/.env" ] || return 0
   local backup_dir="${INSTALL_DIR}.backup-$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "${backup_dir}"
-  for item in .env bin ui runtime zlm docs; do
+  for item in .env bin ui runtime zlm docs systemd uninstall.sh; do
     [ -e "${INSTALL_DIR}/${item}" ] || continue
     cp -R "${INSTALL_DIR}/${item}" "${backup_dir}/${item}"
   done
@@ -451,7 +457,9 @@ prepare_layout() {
     "${INSTALL_DIR}/certs/auth" \
     "${INSTALL_DIR}/data/media/work" \
     "${INSTALL_DIR}/data/media/logs" \
-    "${INSTALL_DIR}/data/zlm/www/output" \
+    "${INSTALL_DIR}/data/postgres-run" \
+    "${INSTALL_DIR}/data/zlm/www/output/mp4" \
+    "${INSTALL_DIR}/data/zlm/www/output/hls" \
     "${INSTALL_DIR}/data/zlm/www/record" \
     "${INSTALL_DIR}/data/zlm/www/snap"
 }
@@ -466,6 +474,8 @@ copy_package_assets() {
     install_tree "${PACKAGE_ROOT}/runtime/ffmpeg/${ffmpeg_variant}" "${INSTALL_DIR}/runtime/ffmpeg/${ffmpeg_variant}"
     install_tree "${PACKAGE_ROOT}/runtime/zlm" "${INSTALL_DIR}/runtime/zlm"
     install_tree "${PACKAGE_ROOT}/templates/common" "${INSTALL_DIR}/zlm"
+    [ -f "${INSTALL_DIR}/zlm/zlm.render-config.sh" ] && mv "${INSTALL_DIR}/zlm/zlm.render-config.sh" "${INSTALL_DIR}/zlm/render-config.sh"
+    [ -f "${INSTALL_DIR}/zlm/zlm.config.ini.template" ] && mv "${INSTALL_DIR}/zlm/zlm.config.ini.template" "${INSTALL_DIR}/zlm/config.ini.template"
     chmod +x "${INSTALL_DIR}/zlm/render-config.sh"
     write_runtime_wrapper "${INSTALL_DIR}/bin/ffmpeg" \
       "${INSTALL_DIR}/runtime/ffmpeg/${ffmpeg_variant}/bin/ffmpeg" \
@@ -503,6 +513,12 @@ copy_package_assets() {
   if [ -d "${PACKAGE_ROOT}/docs" ]; then
     install_tree "${PACKAGE_ROOT}/docs" "${INSTALL_DIR}/docs"
   fi
+}
+
+install_uninstaller() {
+  [ -f "${PACKAGE_ROOT}/uninstall.sh" ] || fail "缺少卸载脚本: ${PACKAGE_ROOT}/uninstall.sh"
+  copy_file_atomically "${PACKAGE_ROOT}/uninstall.sh" "${INSTALL_DIR}/uninstall.sh"
+  log "已安装卸载脚本: ${INSTALL_DIR}/uninstall.sh"
 }
 
 write_env_entry() {
@@ -707,6 +723,8 @@ write_env_file() {
     write_env_entry "${env_file}" ZLM_DEFAULT_PEM "${INSTALL_DIR}/runtime/zlm/default.pem"
     write_env_entry "${env_file}" FFMPEG_BIN "${INSTALL_DIR}/bin/ffmpeg"
     write_env_entry "${env_file}" FFPROBE_BIN "${INSTALL_DIR}/bin/ffprobe"
+    write_env_entry "${env_file}" ZLM_OUTPUT_MP4_ROOT "${INSTALL_DIR}/data/zlm/www/output/mp4"
+    write_env_entry "${env_file}" ZLM_OUTPUT_HLS_ROOT "${INSTALL_DIR}/data/zlm/www/output/hls"
     write_env_entry "${env_file}" AGENT_PRIMARY_INTERFACE_NAME "${AGENT_PRIMARY_INTERFACE_NAME}"
     write_env_entry "${env_file}" AGENT_PRIMARY_INTERFACE_IP "${AGENT_PRIMARY_INTERFACE_IP}"
     write_env_entry "${env_file}" AGENT_MULTICAST_INTERFACE_NAME "${AGENT_MULTICAST_INTERFACE_NAME}"
@@ -753,8 +771,8 @@ render_template() {
   fi
   if role_is_gpu "${INSTALL_ROLE}"; then
     gpu_nvidia_pre="ExecStartPre=/usr/bin/nvidia-smi"
-    gpu_h264_pre="ExecStartPre=/bin/sh -c '${INSTALL_DIR}/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc'"
-    gpu_hevc_pre="ExecStartPre=/bin/sh -c '${INSTALL_DIR}/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc'"
+    gpu_h264_pre="ExecStartPre=/bin/sh -c '${INSTALL_DIR}/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc && ${INSTALL_DIR}/bin/ffmpeg -v error -hide_banner -nostdin -f lavfi -i testsrc2=size=640x360:rate=15 -t 1 -c:v h264_nvenc -an -f null -'"
+    gpu_hevc_pre="ExecStartPre=/bin/sh -c '${INSTALL_DIR}/bin/ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_nvenc && ${INSTALL_DIR}/bin/ffmpeg -v error -hide_banner -nostdin -f lavfi -i testsrc2=size=640x360:rate=15 -t 1 -c:v hevc_nvenc -an -f null -'"
   fi
   sed_escape() {
     printf '%s' "$1" | sed 's/[&|]/\\&/g'
@@ -848,10 +866,17 @@ wait_for_postgres() {
 
 ensure_database_exists() {
   [ "${DATABASE_MODE}" = "bundled" ] || return 0
-  PGPASSWORD="${POSTGRES_PASSWORD}" "${INSTALL_DIR}/bin/psql" \
+  local escaped_db_name
+  escaped_db_name="$(printf '%s' "${POSTGRES_DB}" | sed "s/'/''/g")"
+  if PGPASSWORD="${POSTGRES_PASSWORD}" "${INSTALL_DIR}/bin/psql" \
     -h 127.0.0.1 -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}" -d postgres \
-    -v "ON_ERROR_STOP=1" \
-    -c "SELECT 'CREATE DATABASE ${POSTGRES_DB}' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${POSTGRES_DB}')\\gexec" >/dev/null
+    -tAc "SELECT 1 FROM pg_database WHERE datname = '${escaped_db_name}'" \
+    | grep -qx '1'; then
+    return 0
+  fi
+  PGPASSWORD="${POSTGRES_PASSWORD}" "${INSTALL_DIR}/bin/createdb" \
+    -h 127.0.0.1 -p "${POSTGRES_PORT}" -U "${POSTGRES_USER}" \
+    "${POSTGRES_DB}"
 }
 
 bootstrap_local_admin_if_needed() {
@@ -949,6 +974,7 @@ start_services_if_requested() {
 
 main() {
   parse_args "$@"
+  load_manifest
   ensure_prerequisites
   verify_package_checksums
   assert_no_docker_assets
@@ -968,12 +994,14 @@ main() {
   fi
   write_env_file
   write_streamserverctl
+  install_uninstaller
   ensure_service_user
   initialize_postgres_if_needed
   fix_permissions
   install_systemd_units
   start_services_if_requested
   log "安装完成: ${INSTALL_DIR}"
+  log "卸载: ${INSTALL_DIR}/uninstall.sh"
 }
 
 main "$@"

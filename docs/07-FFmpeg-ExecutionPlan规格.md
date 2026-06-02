@@ -84,7 +84,7 @@
 
 - 当选中的视频编码器是 `h264_nvenc`，且输入主视频像素格式为高 bit-depth（如 `yuv420p10le`、`p010le`）时，ExecutionPlan 必须显式追加 `-vf format=yuv420p -pix_fmt yuv420p`，不尝试保留 10-bit。
 - 原因不是平台不希望保真，而是 `H.264 10-bit NVENC` 在现网 GPU/驱动组合上不具备稳定可移植性：
-  - 当前生产基线 `FFmpeg 7.1` 的 `h264_nvenc` 本身不暴露 `high10` profile。
+  - 当前生产基线 `FFmpeg 8.1` 的 `h264_nvenc` 不作为 `high10` profile 的稳定支持面。
   - 即使升级到更新的 FFmpeg / `nv-codec-headers`，在真实设备验证中，`RTX 5080 + driver 595.58.03` 仍会在 `h264_nvenc -profile:v high10` 打开阶段被设备拒绝。
   - 老显卡和不支持的驱动组合更不能假定支持该能力；若直接尝试 10-bit H.264 NVENC，会把任务失败从“可接受的质量回退”升级成“启动即报错”。
 - 因此，平台对 `h264_nvenc` 的策略是“稳定优先”：高 bit-depth 输入统一回落到 `8-bit yuv420p`。

@@ -34,11 +34,6 @@ const MANAGED_ORDER: &[&str] = &[
     "SYSTEMD_AGENT_UNIT",
     "SYSTEMD_ZLM_UNIT",
     "SYSTEMD_POSTGRES_UNIT",
-    "COMPOSE_PROJECT_NAME",
-    "POSTGRES_IMAGE",
-    "MEDIA_CORE_IMAGE",
-    "MEDIA_AGENT_IMAGE",
-    "ZLM_IMAGE",
     "POSTGRES_DB",
     "POSTGRES_USER",
     "POSTGRES_PASSWORD",
@@ -146,7 +141,7 @@ const ACCELERATION_CHOICES: &[ChoiceDef] = &[
     ChoiceDef {
         value: "gpu",
         label: "GPU",
-        help: "需要宿主机显卡驱动和容器显卡运行环境可用。",
+        help: "需要宿主机 NVIDIA 驱动可用。",
     },
 ];
 
@@ -199,19 +194,6 @@ const CLEANUP_STRATEGY_CHOICES: &[ChoiceDef] = &[
         value: "reject_only",
         label: "只拒绝任务",
         help: "磁盘到阈值后不删除文件，只拒绝或停止相关产物任务。",
-    },
-];
-
-const DEPLOY_MODE_CHOICES: &[ChoiceDef] = &[
-    ChoiceDef {
-        value: "docker",
-        label: "Docker",
-        help: "Legacy Docker/Compose 离线部署。",
-    },
-    ChoiceDef {
-        value: "native",
-        label: "Native",
-        help: "无 Docker 运行时部署，服务由 systemd 管理。",
     },
 ];
 
@@ -339,11 +321,11 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 help: "这台机器承担的部署角色，由安装器选择。配置模块只展示，不修改。",
             },
             FieldDef {
-                key: "COMPOSE_PROJECT_NAME",
-                label: "项目名称",
+                key: "INSTANCE_NAME",
+                label: "实例名称",
                 kind: FieldKind::Text,
                 scope: FieldScope::All,
-                help: "用于区分同一台机器上的不同实例。同机多套部署时不要重复；只能使用小写字母、数字、横线 -、下划线 _，并以小写字母或数字开头。",
+                help: "用于区分同一台机器上的不同 native 实例。同机多套部署时不要重复；只能使用字母、数字、横线 -、下划线 _、点 .、@，并以字母或数字开头。",
             },
             FieldDef {
                 key: "POSTGRES_DB",
@@ -692,8 +674,6 @@ enum Picker {
 #[derive(Debug)]
 struct ConfigApp {
     env_path: PathBuf,
-    original_project_name: String,
-    restart_previous_project_name: Option<String>,
     values: BTreeMap<String, String>,
     running_baseline_values: BTreeMap<String, String>,
     interfaces: Vec<NetworkInterface>,
@@ -813,7 +793,6 @@ impl ConfigApp {
         add_existing_interfaces(&mut interfaces, &values);
         apply_defaults(&mut values, &interfaces);
         normalize_storage_mount_host_dirs(&env_path, &mut values);
-        let original_project_name = service_identity(&values);
         let running_baseline_values = if instance_running(&values) {
             values.clone()
         } else {
@@ -821,8 +800,6 @@ impl ConfigApp {
         };
         Ok(Self {
             env_path,
-            original_project_name,
-            restart_previous_project_name: None,
             values,
             running_baseline_values,
             interfaces,
@@ -868,10 +845,6 @@ impl ConfigApp {
         self.values.get(key).cloned().unwrap_or_default()
     }
 
-    fn deploy_mode(&self) -> &str {
-        deploy_mode(&self.values)
-    }
-
     fn set(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         if matches!(key, "INSTALL_ROLE" | "AGENT_ACCELERATION_MODE") {
@@ -907,32 +880,8 @@ impl ConfigApp {
     fn save(&mut self) -> anyhow::Result<()> {
         self.apply_defaults();
         validate_values(&self.values)?;
-        let previous_project_name = self.original_project_name.clone();
         write_env_file(&self.env_path, &self.values)?;
-        let current_project_name = service_identity(&self.values);
-        let service_message = if self.deploy_mode() == "native" {
-            String::new()
-        } else {
-            sync_project_service_name(
-                &self.env_path,
-                &previous_project_name,
-                &current_project_name,
-            )?
-        };
-        if self.deploy_mode() != "native"
-            && !previous_project_name.trim().is_empty()
-            && previous_project_name != current_project_name
-        {
-            if self.restart_previous_project_name.is_none() {
-                self.restart_previous_project_name = Some(previous_project_name);
-            }
-        }
-        self.original_project_name = current_project_name;
-        self.message = if service_message.is_empty() {
-            format!("已写入 {}", self.env_path.display())
-        } else {
-            format!("已写入 {}；{}", self.env_path.display(), service_message)
-        };
+        self.message = format!("已写入 {}", self.env_path.display());
         Ok(())
     }
 
@@ -1258,13 +1207,7 @@ impl ConfigApp {
                 }
                 let install_dir = self.install_dir();
                 validate_instance_dir_for_delete(&install_dir)?;
-                let unit = self.restart_unit_name();
-                let project_names = self.uninstall_project_names();
-                self.uninstall_task = Some(spawn_uninstall_task(
-                    install_dir.clone(),
-                    unit,
-                    project_names,
-                ));
+                self.uninstall_task = Some(spawn_uninstall_task(install_dir.clone()));
                 self.message = format!(
                     "卸载中，正在停止服务并删除实例目录：{}",
                     install_dir.display()
@@ -1294,26 +1237,6 @@ impl ConfigApp {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf()
-    }
-
-    fn uninstall_project_names(&self) -> Vec<String> {
-        if self.deploy_mode() == "native" {
-            return Vec::new();
-        }
-        let mut names = Vec::new();
-        for name in [
-            Some(self.value("COMPOSE_PROJECT_NAME")),
-            Some(self.original_project_name.clone()),
-            self.restart_previous_project_name.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !name.trim().is_empty() && !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        names
     }
 
     fn validate_port_edit(&self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -1375,14 +1298,9 @@ impl ConfigApp {
     }
 
     fn restart_unit_name(&self) -> Option<String> {
-        if self.deploy_mode() == "native" {
-            return native_unit_candidates(&self.values)
-                .into_iter()
-                .find(|unit| Path::new("/etc/systemd/system").join(unit).exists());
-        }
-        let current_project_name = self.value("COMPOSE_PROJECT_NAME");
-        find_existing_unit(&current_project_name)
-            .or_else(|| find_existing_unit(&self.original_project_name))
+        native_unit_candidates(&self.values)
+            .into_iter()
+            .find(|unit| Path::new("/etc/systemd/system").join(unit).exists())
     }
 
     fn handle_restart_confirm_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
@@ -1403,28 +1321,7 @@ impl ConfigApp {
                         "重启服务需要 root 或免密 sudo；N 直接退出，Esc 取消".to_string();
                     return Ok(false);
                 }
-                let project_name = if self.deploy_mode() == "native" {
-                    String::new()
-                } else {
-                    self.value("COMPOSE_PROJECT_NAME")
-                };
-                let previous_project_name = if self.deploy_mode() == "native" {
-                    None
-                } else {
-                    self.restart_previous_project_name.clone()
-                };
-                let install_dir = self
-                    .env_path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
-                self.restart_task = Some(spawn_restart_task(
-                    unit.clone(),
-                    project_name,
-                    previous_project_name,
-                    install_dir,
-                ));
+                self.restart_task = Some(spawn_restart_task(unit.clone()));
                 self.message = format!("重启中，正在检查节点启动状态请稍候：{unit}");
                 Ok(false)
             }
@@ -1441,7 +1338,6 @@ impl ConfigApp {
             Ok(Ok(())) => {
                 let unit = task.unit.clone();
                 self.restart_task = None;
-                self.restart_previous_project_name = None;
                 self.message = format!("已重启服务 {unit}");
                 Ok(true)
             }
@@ -1579,27 +1475,18 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         .unwrap_or_else(|| "./data/zlm/www/output".to_string());
     values.retain(|key, _| !is_hidden_fixed_key(key));
 
-    default_if_missing(values, "DEPLOY_MODE", "docker");
+    values.insert("DEPLOY_MODE".to_string(), "native".to_string());
     default_if_missing(values, "INSTALL_ROLE", "control-plane");
     let role = values.get("INSTALL_ROLE").cloned().unwrap_or_default();
-    if deploy_mode(values) == "native" {
-        if values
-            .get("INSTANCE_NAME")
-            .is_none_or(|value| value.trim().is_empty())
-        {
-            if let Some(project) = role_default_project(&role) {
-                values.insert("INSTANCE_NAME".to_string(), project.to_string());
-            }
-        }
-        default_native_systemd_units(values);
-    } else if values
-        .get("COMPOSE_PROJECT_NAME")
+    if values
+        .get("INSTANCE_NAME")
         .is_none_or(|value| value.trim().is_empty())
     {
         if let Some(project) = role_default_project(&role) {
-            values.insert("COMPOSE_PROJECT_NAME".to_string(), project.to_string());
+            values.insert("INSTANCE_NAME".to_string(), project.to_string());
         }
     }
+    default_native_systemd_units(values);
 
     if values_have_core(values) {
         default_if_missing(values, "POSTGRES_DB", "streamserver");
@@ -1680,14 +1567,13 @@ fn deploy_mode(values: &BTreeMap<String, String>) -> &str {
     values
         .get("DEPLOY_MODE")
         .map(String::as_str)
-        .unwrap_or("docker")
+        .unwrap_or("native")
 }
 
 fn native_unit_basename(values: &BTreeMap<String, String>) -> String {
     let instance_name = values
         .get("INSTANCE_NAME")
         .filter(|value| !value.trim().is_empty())
-        .or_else(|| values.get("COMPOSE_PROJECT_NAME"))
         .map(String::as_str)
         .unwrap_or("streamserver");
     if instance_name.starts_with("ss-") {
@@ -1720,19 +1606,6 @@ fn default_native_systemd_units(values: &mut BTreeMap<String, String>) {
         "SYSTEMD_POSTGRES_UNIT",
         &format!("{unit_base}-postgres.service"),
     );
-}
-
-fn service_identity(values: &BTreeMap<String, String>) -> String {
-    if deploy_mode(values) == "native" {
-        return values
-            .get("INSTANCE_NAME")
-            .cloned()
-            .unwrap_or_else(|| native_unit_basename(values));
-    }
-    values
-        .get("COMPOSE_PROJECT_NAME")
-        .cloned()
-        .unwrap_or_default()
 }
 
 fn sync_primary_interface_followers(values: &mut BTreeMap<String, String>) {
@@ -1870,10 +1743,16 @@ fn default_interface(interfaces: &[NetworkInterface]) -> Option<&NetworkInterfac
     }
     interfaces
         .iter()
-        .find(|interface| {
-            !interface.name.starts_with("docker") && !interface.name.starts_with("br-")
-        })
+        .find(|interface| is_preferred_host_interface(&interface.name))
         .or_else(|| interfaces.first())
+}
+
+fn is_preferred_host_interface(name: &str) -> bool {
+    !name.starts_with("br-")
+        && !name.starts_with("veth")
+        && !name.starts_with("virbr")
+        && !name.starts_with("cni")
+        && name != "lo"
 }
 
 fn detect_default_route_interface() -> Option<NetworkInterface> {
@@ -2017,7 +1896,7 @@ fn values_have_agent(values: &BTreeMap<String, String>) -> bool {
     {
         return install_role_has_agent(Some(role));
     }
-    values.contains_key("MEDIA_AGENT_IMAGE") || values.contains_key("AGENT_NODE_NAME")
+    values.contains_key("AGENT_NODE_NAME")
 }
 
 fn values_have_core(values: &BTreeMap<String, String>) -> bool {
@@ -2027,7 +1906,7 @@ fn values_have_core(values: &BTreeMap<String, String>) -> bool {
     {
         return install_role_has_core(Some(role));
     }
-    values.contains_key("MEDIA_CORE_IMAGE") || values.contains_key("POSTGRES_IMAGE")
+    values.contains_key("POSTGRES_DB") || values.contains_key("CORE_HTTP_PORT")
 }
 
 fn values_have_worker(values: &BTreeMap<String, String>) -> bool {
@@ -2047,93 +1926,21 @@ fn role_default_project(role: &str) -> Option<&'static str> {
     }
 }
 
-fn sync_project_service_name(
-    env_path: &Path,
-    old_project_name: &str,
-    new_project_name: &str,
-) -> anyhow::Result<String> {
-    if old_project_name.trim().is_empty()
-        || new_project_name.trim().is_empty()
-        || old_project_name == new_project_name
-    {
-        return Ok(String::new());
-    }
-
-    if !Path::new("/etc/systemd/system").exists() {
-        return Ok("未检测到 systemd 服务，服务名无需同步".to_string());
-    }
-
-    let old_unit = find_existing_unit(old_project_name);
-    let Some(old_unit) = old_unit else {
-        return Ok("未发现旧 systemd 服务，服务名无需同步".to_string());
-    };
-    let new_unit = preferred_unit_name(new_project_name);
-    if old_unit == new_unit {
-        return Ok(String::new());
-    }
-
-    let old_path = Path::new("/etc/systemd/system").join(&old_unit);
-    let new_path = Path::new("/etc/systemd/system").join(&new_unit);
-    if new_path.exists() {
-        return Ok(format!("服务名未同步：{} 已存在", new_unit));
-    }
-    if !can_run_root_commands() {
-        return Ok("服务名未同步：需要 root 权限".to_string());
-    }
-
-    let install_dir = env_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let _ = run_root_command("systemctl", &["disable", &old_unit]);
-    run_root_command(
-        "mv",
-        &[
-            old_path.to_string_lossy().as_ref(),
-            new_path.to_string_lossy().as_ref(),
-        ],
-    )?;
-    refresh_unit_description(&new_path, install_dir, new_project_name)?;
-    run_root_command("systemctl", &["daemon-reload"])?;
-    run_root_command("systemctl", &["enable", &new_unit])?;
-    Ok(format!("systemd 服务已同步为 {}", new_unit))
-}
-
-fn find_existing_unit(project_name: &str) -> Option<String> {
-    unit_name_candidates(project_name)
-        .into_iter()
-        .find(|unit| Path::new("/etc/systemd/system").join(unit).exists())
-}
-
-fn spawn_restart_task(
-    unit: String,
-    project_name: String,
-    previous_project_name: Option<String>,
-    install_dir: PathBuf,
-) -> RestartTask {
+fn spawn_restart_task(unit: String) -> RestartTask {
     let (sender, receiver) = mpsc::channel();
     let task_unit = unit.clone();
     thread::spawn(move || {
-        let result = restart_and_wait_instance(
-            &task_unit,
-            &project_name,
-            previous_project_name,
-            &install_dir,
-        );
+        let result = restart_and_wait_instance(&task_unit);
         let _ = sender.send(result);
     });
     RestartTask { unit, receiver }
 }
 
-fn spawn_uninstall_task(
-    install_dir: PathBuf,
-    unit: Option<String>,
-    project_names: Vec<String>,
-) -> UninstallTask {
+fn spawn_uninstall_task(install_dir: PathBuf) -> UninstallTask {
     let (sender, receiver) = mpsc::channel();
     let task_install_dir = install_dir.clone();
     thread::spawn(move || {
-        let result = uninstall_instance(&task_install_dir, unit.as_deref(), &project_names);
+        let result = uninstall_instance(&task_install_dir);
         let _ = sender.send(result);
     });
     UninstallTask {
@@ -2142,28 +1949,27 @@ fn spawn_uninstall_task(
     }
 }
 
-fn uninstall_instance(
-    install_dir: &Path,
-    unit: Option<&str>,
-    project_names: &[String],
-) -> anyhow::Result<()> {
+fn uninstall_instance(install_dir: &Path) -> anyhow::Result<()> {
     validate_instance_dir_for_delete(install_dir)?;
 
-    if let Some(unit) = unit {
-        let _ = run_root_command("systemctl", &["stop", unit]);
+    let uninstall_script = install_dir.join("uninstall.sh");
+    if uninstall_script.is_file() {
+        run_root_command(
+            uninstall_script.to_string_lossy().as_ref(),
+            &["--purge", "--yes"],
+        )?;
+        return Ok(());
     }
 
-    for project_name in project_names {
-        let _ = compose_project_down(install_dir, project_name);
+    let env_values = parse_env_file(&install_dir.join(".env"))?;
+    for unit in native_unit_candidates(&env_values) {
+        let _ = run_root_command("systemctl", &["stop", &unit]);
+        let _ = run_root_command("systemctl", &["disable", &unit]);
+        let unit_path = Path::new("/etc/systemd/system").join(&unit);
+        let _ = run_root_command("rm", &["-f", unit_path.to_string_lossy().as_ref()]);
+        let _ = run_root_command("systemctl", &["reset-failed", &unit]);
     }
-
-    if let Some(unit) = unit {
-        let _ = run_root_command("systemctl", &["disable", unit]);
-        let unit_path = Path::new("/etc/systemd/system").join(unit);
-        run_root_command("rm", &["-f", unit_path.to_string_lossy().as_ref()])?;
-        run_root_command("systemctl", &["daemon-reload"])?;
-        let _ = run_root_command("systemctl", &["reset-failed", unit]);
-    }
+    run_root_command("systemctl", &["daemon-reload"])?;
 
     run_root_command("rm", &["-rf", install_dir.to_string_lossy().as_ref()])?;
     Ok(())
@@ -2189,30 +1995,15 @@ fn validate_instance_dir_for_delete(install_dir: &Path) -> anyhow::Result<()> {
         }
     }
     let env_values = parse_env_file(&install_dir.join(".env"))?;
-    if deploy_mode(&env_values) != "native" && !install_dir.join("compose.yml").exists() {
-        bail!(
-            "目录缺少实例标识文件 compose.yml，拒绝删除：{}",
-            install_dir.display()
-        );
+    if deploy_mode(&env_values) != "native" {
+        bail!("不是 native 实例目录，拒绝删除：{}", install_dir.display());
     }
     Ok(())
 }
 
-fn restart_and_wait_instance(
-    unit: &str,
-    project_name: &str,
-    previous_project_name: Option<String>,
-    install_dir: &Path,
-) -> anyhow::Result<()> {
-    if let Some(previous_project_name) = previous_project_name
-        .as_deref()
-        .filter(|previous| *previous != project_name)
-    {
-        compose_project_down(install_dir, previous_project_name)?;
-    }
+fn restart_and_wait_instance(unit: &str) -> anyhow::Result<()> {
     run_root_command("systemctl", &["restart", unit])?;
     wait_for_unit_active(unit, Duration::from_secs(90))?;
-    wait_for_project_running(project_name, Duration::from_secs(90))?;
     Ok(())
 }
 
@@ -2229,71 +2020,10 @@ fn wait_for_unit_active(unit: &str, timeout: Duration) -> anyhow::Result<()> {
     }
 }
 
-fn wait_for_project_running(project_name: &str, timeout: Duration) -> anyhow::Result<()> {
-    if project_name.trim().is_empty() {
-        return Ok(());
-    }
-
-    let started_at = Instant::now();
-    loop {
-        if docker_compose_project_running(project_name) {
-            return Ok(());
-        }
-        if started_at.elapsed() >= timeout {
-            bail!("未检测到项目 {project_name} 的运行中容器");
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn compose_project_down(install_dir: &Path, project_name: &str) -> anyhow::Result<()> {
-    if project_name.trim().is_empty() || !install_dir.join("compose.yml").exists() {
-        return Ok(());
-    }
-
-    if command_success("docker", &["compose", "version"]) {
-        run_command_capture(
-            "docker",
-            &["compose", "-f", "compose.yml", "-p", project_name, "down"],
-            Some(install_dir),
-        )
-        .with_context(|| format!("停止旧项目 {project_name} 失败"))?;
-    } else if command_success("docker-compose", &["version"]) {
-        run_command_capture(
-            "docker-compose",
-            &["-f", "compose.yml", "-p", project_name, "down"],
-            Some(install_dir),
-        )
-        .with_context(|| format!("停止旧项目 {project_name} 失败"))?;
-    } else {
-        bail!("未找到 docker compose 命令，无法停止旧项目 {project_name}");
-    }
-
-    Ok(())
-}
-
 fn instance_running(values: &BTreeMap<String, String>) -> bool {
-    if deploy_mode(values) == "native" {
-        return native_unit_candidates(values)
-            .iter()
-            .any(|unit| unit_is_active(unit));
-    }
-    let project_name = values
-        .get("COMPOSE_PROJECT_NAME")
-        .map(String::as_str)
-        .unwrap_or_default();
-    project_instance_running(project_name)
-}
-
-fn project_instance_running(project_name: &str) -> bool {
-    if project_name.trim().is_empty() {
-        return false;
-    }
-
-    find_existing_unit(project_name)
-        .as_deref()
-        .is_some_and(unit_is_active)
-        || docker_compose_project_running(project_name)
+    native_unit_candidates(values)
+        .iter()
+        .any(|unit| unit_is_active(unit))
 }
 
 fn native_unit_candidates(values: &BTreeMap<String, String>) -> Vec<String> {
@@ -2324,64 +2054,6 @@ fn unit_is_active(unit: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn docker_compose_project_running(project_name: &str) -> bool {
-    let filter = format!("label=com.docker.compose.project={project_name}");
-    let output = Command::new("docker")
-        .args(["ps", "--filter", &filter, "--format", "{{.ID}}"])
-        .output();
-    let Ok(output) = output else {
-        return false;
-    };
-    output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
-}
-
-fn unit_name_candidates(project_name: &str) -> Vec<String> {
-    let safe_name = sanitize_systemd_fragment(project_name);
-    let mut candidates = vec![preferred_unit_name(project_name)];
-    let prefixed = format!("ss-{safe_name}.service");
-    if !candidates.contains(&prefixed) {
-        candidates.push(prefixed);
-    }
-    candidates.push(format!("streamserver-compose-{safe_name}.service"));
-    candidates
-}
-
-fn preferred_unit_name(project_name: &str) -> String {
-    let safe_name = sanitize_systemd_fragment(project_name);
-    if safe_name.starts_with("ss-") {
-        format!("{safe_name}.service")
-    } else {
-        format!("ss-{safe_name}.service")
-    }
-}
-
-fn sanitize_systemd_fragment(value: &str) -> String {
-    let mut output = String::new();
-    let mut last_dash = false;
-    for ch in value.chars() {
-        let mapped = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '@') {
-            ch
-        } else {
-            '-'
-        };
-        if mapped == '-' {
-            if !last_dash {
-                output.push(mapped);
-            }
-            last_dash = true;
-        } else {
-            output.push(mapped);
-            last_dash = false;
-        }
-    }
-    let output = output.trim_matches('-').to_string();
-    if output.is_empty() {
-        "ss".to_string()
-    } else {
-        output
-    }
-}
-
 fn can_run_root_commands() -> bool {
     is_root()
         || Command::new("sudo")
@@ -2407,13 +2079,6 @@ fn run_root_command(program: &str, args: &[&str]) -> anyhow::Result<()> {
         sudo_args.extend_from_slice(args);
         run_command_capture("sudo", &sudo_args, None)
     }
-}
-
-fn command_success(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 fn run_command_capture(program: &str, args: &[&str], cwd: Option<&Path>) -> anyhow::Result<()> {
@@ -2444,40 +2109,6 @@ fn run_command_capture(program: &str, args: &[&str], cwd: Option<&Path>) -> anyh
         "{program} {args} exited with status {}: {detail}",
         output.status
     );
-}
-
-fn refresh_unit_description(
-    unit_path: &Path,
-    install_dir: &Path,
-    project_name: &str,
-) -> anyhow::Result<()> {
-    let Ok(contents) = fs::read_to_string(unit_path) else {
-        return Ok(());
-    };
-    let mut next = String::new();
-    for line in contents.lines() {
-        if line.starts_with("Description=") {
-            next.push_str(&format!("Description=StreamServer ({project_name})\n"));
-        } else if line.starts_with("WorkingDirectory=") {
-            next.push_str(&format!("WorkingDirectory={}\n", install_dir.display()));
-        } else {
-            next.push_str(line);
-            next.push('\n');
-        }
-    }
-    let temp_path = std::env::temp_dir().join(format!("{}.tmp", preferred_unit_name(project_name)));
-    fs::write(&temp_path, next)?;
-    run_root_command(
-        "install",
-        &[
-            "-m",
-            "644",
-            temp_path.to_string_lossy().as_ref(),
-            unit_path.to_string_lossy().as_ref(),
-        ],
-    )?;
-    let _ = fs::remove_file(temp_path);
-    Ok(())
 }
 
 fn generate_uuid() -> String {
@@ -2512,7 +2143,7 @@ fn required_text_field(key: &str) -> bool {
     matches!(
         key,
         "INSTALL_ROLE"
-            | "COMPOSE_PROJECT_NAME"
+            | "INSTANCE_NAME"
             | "POSTGRES_DB"
             | "POSTGRES_USER"
             | "CORE_HTTP_HOST"
@@ -2531,12 +2162,15 @@ fn required_text_field(key: &str) -> bool {
 }
 
 fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
-    validate_choice(values, "DEPLOY_MODE", DEPLOY_MODE_CHOICES)?;
     if deploy_mode(values) != "native" {
-        if let Some(value) = values.get("COMPOSE_PROJECT_NAME") {
-            validate_compose_project_name(value)?;
-        }
+        bail!("DEPLOY_MODE must be native");
     }
+    validate_instance_name(
+        values
+            .get("INSTANCE_NAME")
+            .map(String::as_str)
+            .unwrap_or_default(),
+    )?;
 
     let role = values
         .get("INSTALL_ROLE")
@@ -2607,29 +2241,29 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
 }
 
 fn validate_text_edit(key: &str, value: &str) -> anyhow::Result<()> {
-    if key == "COMPOSE_PROJECT_NAME" {
-        validate_compose_project_name(value)?;
+    if key == "INSTANCE_NAME" {
+        validate_instance_name(value)?;
     }
     Ok(())
 }
 
-fn validate_compose_project_name(value: &str) -> anyhow::Result<()> {
+fn validate_instance_name(value: &str) -> anyhow::Result<()> {
     let value = value.trim();
     if value.is_empty() {
-        bail!("项目名称不能为空");
+        bail!("实例名称不能为空");
     }
     if value.len() > 63 {
-        bail!("项目名称不能超过 63 个字符");
+        bail!("实例名称不能超过 63 个字符");
     }
     let mut chars = value.chars();
     let Some(first) = chars.next() else {
-        bail!("项目名称不能为空");
+        bail!("实例名称不能为空");
     };
-    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
-        bail!("项目名称必须以小写字母或数字开头");
+    if !first.is_ascii_alphanumeric() {
+        bail!("实例名称必须以字母或数字开头");
     }
-    if !chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_')) {
-        bail!("项目名称只能使用小写字母、数字、横线 -、下划线 _");
+    if !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '@')) {
+        bail!("实例名称只能使用字母、数字、横线 -、下划线 _、点 .、@");
     }
     Ok(())
 }
@@ -3729,9 +3363,7 @@ fn format_kib(value: &str) -> String {
 
 fn env_comment(key: &str) -> Option<&'static str> {
     match key {
-        "DEPLOY_MODE" => {
-            Some("部署模式，docker 为 legacy Compose，native 为 systemd 无 Docker 运行时。")
-        }
+        "DEPLOY_MODE" => Some("部署模式，固定为 native，由 systemd 管理。"),
         "INSTALL_ROLE" => Some("这台机器的部署角色，由安装器选择，配置模块只展示。"),
         "INSTANCE_NAME" => Some("native 实例名，用于生成 systemd 服务名。"),
         "SYSTEMD_TARGET" => Some("native 聚合 target。"),
@@ -3739,7 +3371,6 @@ fn env_comment(key: &str) -> Option<&'static str> {
         "SYSTEMD_AGENT_UNIT" => Some("native media-agent systemd 服务名。"),
         "SYSTEMD_ZLM_UNIT" => Some("native ZLMediaKit systemd 服务名。"),
         "SYSTEMD_POSTGRES_UNIT" => Some("native PostgreSQL systemd 服务名。"),
-        "COMPOSE_PROJECT_NAME" => Some("实例项目名；只能使用小写字母、数字、横线 -、下划线 _。"),
         "POSTGRES_DB" => Some("PostgreSQL 数据库名。"),
         "POSTGRES_USER" => Some("PostgreSQL 用户名。"),
         "POSTGRES_PORT" => Some("数据库宿主机端口。"),
@@ -3941,30 +3572,31 @@ mod tests {
     }
 
     #[test]
-    fn validates_compose_project_name_for_docker_compose() {
-        assert!(validate_compose_project_name("streamserver").is_ok());
-        assert!(validate_compose_project_name("ss-aio_cpu1").is_ok());
-        assert!(validate_compose_project_name("StreamServer").is_err());
-        assert!(validate_compose_project_name("-streamserver").is_err());
-        assert!(validate_compose_project_name("stream.server").is_err());
+    fn validates_native_instance_name() {
+        assert!(validate_instance_name("streamserver").is_ok());
+        assert!(validate_instance_name("ss-aio_cpu1").is_ok());
+        assert!(validate_instance_name("StreamServer").is_ok());
+        assert!(validate_instance_name("stream.server@1").is_ok());
+        assert!(validate_instance_name("-streamserver").is_err());
+        assert!(validate_instance_name("stream server").is_err());
     }
 
     #[test]
-    fn keeps_editing_when_project_name_is_invalid() {
+    fn keeps_editing_when_instance_name_is_invalid() {
         let env_path = std::env::temp_dir().join(format!(
-            "streamserver-config-project-name-test-{}.env",
+            "streamserver-config-instance-name-test-{}.env",
             std::process::id()
         ));
         let mut app = ConfigApp::load(env_path).unwrap();
         app.page = Page::Basic;
         app.selected = 1;
-        app.editing = Some("StreamServer".to_string());
+        app.editing = Some("Stream Server".to_string());
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(app.editing.as_deref(), Some("StreamServer"));
-        assert!(app.message.contains("项目名称"));
+        assert_eq!(app.editing.as_deref(), Some("Stream Server"));
+        assert!(app.message.contains("实例名称"));
     }
 
     #[test]
@@ -3975,13 +3607,16 @@ mod tests {
         ));
         let bin_dir = install_dir.join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
-        fs::write(install_dir.join(".env"), "COMPOSE_PROJECT_NAME=test\n").unwrap();
-        fs::write(install_dir.join("compose.yml"), "services: {}\n").unwrap();
+        fs::write(
+            install_dir.join(".env"),
+            "DEPLOY_MODE=native\nINSTANCE_NAME=test\n",
+        )
+        .unwrap();
         fs::write(bin_dir.join("streamserver-config"), "").unwrap();
 
         assert!(validate_instance_dir_for_delete(&install_dir).is_ok());
 
-        fs::remove_file(install_dir.join("compose.yml")).unwrap();
+        fs::write(install_dir.join(".env"), "DEPLOY_MODE=legacy\n").unwrap();
         assert!(validate_instance_dir_for_delete(&install_dir).is_err());
         let _ = fs::remove_dir_all(&install_dir);
     }

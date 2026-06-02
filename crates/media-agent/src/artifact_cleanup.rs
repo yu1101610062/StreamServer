@@ -29,8 +29,6 @@ use crate::{
     runtime::{LocalExecutor, LocalRuntimeRegistry, StopTaskRequest},
 };
 
-const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
-const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
 const CLEANUP_HYSTERESIS_PERCENT: f64 = 5.0;
 const CLEANUP_RECENT_WRITE_GRACE_PERIOD: Duration = Duration::from_secs(60);
 const RUNNING_SEGMENT_RETAIN_COUNT: usize = 2;
@@ -50,10 +48,10 @@ impl ArtifactBucket {
         }
     }
 
-    fn root(self) -> &'static str {
+    fn root<'a>(self, settings: &'a AgentSettings) -> &'a str {
         match self {
-            Self::Mp4 => ZLM_OUTPUT_MP4_ROOT,
-            Self::Hls => ZLM_OUTPUT_HLS_ROOT,
+            Self::Mp4 => settings.zlm_output_mp4_root.as_str(),
+            Self::Hls => settings.zlm_output_hls_root.as_str(),
         }
     }
 }
@@ -193,11 +191,17 @@ impl ArtifactCleanupLayout {
     fn from_settings(settings: &AgentSettings) -> Self {
         let mut buckets = HashMap::new();
         for bucket in [ArtifactBucket::Mp4, ArtifactBucket::Hls] {
-            let root = PathBuf::from(bucket.root());
+            let root = PathBuf::from(bucket.root(settings));
             let node_dir = root.join(artifact_node_dir_name(settings, bucket));
             buckets.insert(bucket, ArtifactBucketLayout { root, node_dir });
         }
         Self { buckets }
+    }
+
+    fn bucket_for_path(&self, path: &Path) -> Option<ArtifactBucket> {
+        self.buckets
+            .iter()
+            .find_map(|(bucket, layout)| path.starts_with(&layout.root).then_some(*bucket))
     }
 }
 
@@ -485,8 +489,11 @@ impl ArtifactCleanupManager {
         }
 
         if metric_percent >= target_percent {
-            let running_candidates =
-                collect_running_cleanup_candidates(observations, active_handles);
+            let running_candidates = collect_running_cleanup_candidates(
+                observations,
+                active_handles,
+                &self.inner.layout,
+            );
             for candidate in running_candidates {
                 if metric_percent < target_percent {
                     break;
@@ -569,7 +576,7 @@ impl ArtifactCleanupManager {
             if matches!(handle.state, RuntimeState::Exited | RuntimeState::Stopping) {
                 continue;
             }
-            let handle_buckets = artifact_buckets_for_runtime_handle(handle);
+            let handle_buckets = artifact_buckets_for_runtime_handle(handle, &self.inner.layout);
             if handle_buckets.is_disjoint(&volume_buckets) {
                 continue;
             }
@@ -813,6 +820,7 @@ fn collect_cleanup_candidates(
 fn collect_running_cleanup_candidates(
     observations: &[BucketObservation],
     active_handles: &[RuntimeHandle],
+    layout: &ArtifactCleanupLayout,
 ) -> Vec<RunningCleanupCandidate> {
     let active_by_task_id = active_handles
         .iter()
@@ -855,7 +863,7 @@ fn collect_running_cleanup_candidates(
             let Some(handle) = active_by_task_id.get(&task_id).copied() else {
                 continue;
             };
-            let handle_buckets = artifact_buckets_for_runtime_handle(handle);
+            let handle_buckets = artifact_buckets_for_runtime_handle(handle, layout);
             if !handle_buckets.contains(&observation.bucket) {
                 continue;
             }
@@ -1032,7 +1040,10 @@ fn normalize_existing_or_lexical_path(path: &Path) -> PathBuf {
     })
 }
 
-fn artifact_buckets_for_runtime_handle(handle: &RuntimeHandle) -> HashSet<ArtifactBucket> {
+fn artifact_buckets_for_runtime_handle(
+    handle: &RuntimeHandle,
+    layout: &ArtifactCleanupLayout,
+) -> HashSet<ArtifactBucket> {
     let mut buckets = HashSet::new();
     if let Some(spec) = handle
         .metadata
@@ -1043,25 +1054,26 @@ fn artifact_buckets_for_runtime_handle(handle: &RuntimeHandle) -> HashSet<Artifa
         buckets.extend(artifact_buckets_for_task_spec(&spec));
     }
     for output in &handle.outputs {
-        add_bucket_for_path(output, &mut buckets);
+        add_bucket_for_path(output, &mut buckets, layout);
     }
     if let Some(recording) = handle.metadata.get("recording") {
         for key in ["root_path_mp4", "root_path_hls"] {
             if let Some(path) = recording.get(key).and_then(Value::as_str) {
-                add_bucket_for_path(path, &mut buckets);
+                add_bucket_for_path(path, &mut buckets, layout);
             }
         }
     }
     buckets
 }
 
-fn add_bucket_for_path(path: &str, buckets: &mut HashSet<ArtifactBucket>) {
+fn add_bucket_for_path(
+    path: &str,
+    buckets: &mut HashSet<ArtifactBucket>,
+    layout: &ArtifactCleanupLayout,
+) {
     let path = Path::new(path);
-    if path.starts_with(ZLM_OUTPUT_MP4_ROOT) {
-        buckets.insert(ArtifactBucket::Mp4);
-    }
-    if path.starts_with(ZLM_OUTPUT_HLS_ROOT) {
-        buckets.insert(ArtifactBucket::Hls);
+    if let Some(bucket) = layout.bucket_for_path(path) {
+        buckets.insert(bucket);
     }
 }
 

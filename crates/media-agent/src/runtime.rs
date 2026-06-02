@@ -3139,8 +3139,6 @@ fn should_use_managed_process_for_record_only_live_ingest(spec: &TaskSpec) -> bo
         && !spec.expose.any_playback_enabled()
 }
 
-const ZLM_OUTPUT_MP4_ROOT: &str = "/data/zlm/www/output/mp4";
-const ZLM_OUTPUT_HLS_ROOT: &str = "/data/zlm/www/output/hls";
 const DEFAULT_REALTIME_MP4_RECORD_SEGMENT_SEC: u32 = 7_200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3175,10 +3173,10 @@ impl ManagedOutputBucket {
         }
     }
 
-    fn root(self) -> &'static str {
+    fn root<'a>(self, settings: &'a AgentSettings) -> &'a str {
         match self {
-            Self::Mp4 => ZLM_OUTPUT_MP4_ROOT,
-            Self::Hls => ZLM_OUTPUT_HLS_ROOT,
+            Self::Mp4 => settings.zlm_output_mp4_root.as_str(),
+            Self::Hls => settings.zlm_output_hls_root.as_str(),
         }
     }
 }
@@ -3288,7 +3286,7 @@ fn managed_output_dir(settings: &AgentSettings, task_id: Uuid, format: &str) -> 
         managed_output_node_token(settings),
         bucket.as_str()
     );
-    PathBuf::from(bucket.root())
+    PathBuf::from(bucket.root(settings))
         .join(node_dir)
         .join(task_id.to_string())
 }

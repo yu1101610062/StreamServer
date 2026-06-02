@@ -209,10 +209,34 @@ fn relative_http_url_from_path_uses_web_root_directly() {
 }
 
 #[test]
+fn relative_http_url_from_path_accepts_install_dir_web_root() {
+    let url = relative_http_url_from_path(
+        "/opt/streamserver/worker/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
+    )
+    .expect("relative url should build");
+
+    assert_eq!(url, "/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4");
+}
+
+#[test]
 fn absolute_http_url_from_file_path_uses_node_stream_base() {
     let url = absolute_http_url_from_file_path(
         "http://192.168.1.10:8081",
         "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
+    )
+    .expect("record url should build");
+
+    assert_eq!(
+        url,
+        "http://192.168.1.10:8081/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
+    );
+}
+
+#[test]
+fn absolute_http_url_from_file_path_accepts_install_dir_web_root() {
+    let url = absolute_http_url_from_file_path(
+        "http://192.168.1.10:8081",
+        "/opt/streamserver/worker/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",
     )
     .expect("record url should build");
 
@@ -249,6 +273,42 @@ fn externalize_managed_path_strips_mount_roots() {
 }
 
 #[test]
+fn externalize_managed_path_accepts_install_dir_output_root() {
+    let prefixes = OutputMountPrefixes {
+        mp4: "output".to_string(),
+        hls: "output".to_string(),
+    };
+
+    assert_eq!(
+        externalize_managed_path(
+            "/opt/streamserver/worker/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index.m3u8",
+            "file_path",
+            &prefixes,
+        )
+        .expect("hls path should externalize"),
+        "/hls/node-192_168_1_10-hls/task-1/index.m3u8"
+    );
+}
+
+#[test]
+fn externalize_managed_path_accepts_exact_bucket_root() {
+    let prefixes = OutputMountPrefixes {
+        mp4: "output".to_string(),
+        hls: "output".to_string(),
+    };
+
+    assert_eq!(
+        externalize_managed_path(
+            "/opt/streamserver/worker/data/zlm/www/output/mp4",
+            "folder",
+            &prefixes,
+        )
+        .expect("bucket root should externalize"),
+        "/mp4"
+    );
+}
+
+#[test]
 fn absolute_http_url_from_relative_accepts_relative_paths() {
     let url = absolute_http_url_from_relative(
         "http://worker.example:8081",
@@ -265,6 +325,9 @@ fn absolute_http_url_from_relative_accepts_relative_paths() {
 fn is_hls_playlist_record_path_accepts_record_root_m3u8_only() {
     assert!(is_hls_playlist_record_path(
         "/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index.m3u8"
+    ));
+    assert!(is_hls_playlist_record_path(
+        "/opt/streamserver/worker/data/zlm/www/output/hls/node-192_168_1_10-hls/task-1/index.m3u8"
     ));
     assert!(!is_hls_playlist_record_path(
         "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4"
