@@ -100,6 +100,7 @@ usage() {
 说明:
   生成无 Docker 运行时依赖的 StreamServer native 离线包。构建机可以使用 Docker
   builder 和 Docker 镜像提取运行时资产；目标机安装运行不需要 Docker。
+  未指定包变体时，脚本会在交互终端中询问要生成 CPU、GPU 还是 control-plane-minimal 包。
 
 包变体:
   --without-gpu             生成 cpu-only 包，包含 CPU FFmpeg、ZLMediaKit、随包 PostgreSQL runtime
@@ -121,6 +122,14 @@ runtime 缓存:
 EOF
 }
 
+set_native_variant() {
+  local variant="$1"
+  if [ -n "${NATIVE_VARIANT}" ] && [ "${NATIVE_VARIANT}" != "${variant}" ]; then
+    fail "只能指定一个 native 包变体，当前已选择 ${NATIVE_VARIANT}，不能再选择 ${variant}"
+  fi
+  NATIVE_VARIANT="${variant}"
+}
+
 parse_args() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -130,15 +139,15 @@ parse_args() {
         shift 2
         ;;
       --with-gpu)
-        NATIVE_VARIANT="gpu-enabled"
+        set_native_variant "gpu-enabled"
         shift
         ;;
       --without-gpu)
-        NATIVE_VARIANT="cpu-only"
+        set_native_variant "cpu-only"
         shift
         ;;
       --control-plane-minimal)
-        NATIVE_VARIANT="control-plane-minimal"
+        set_native_variant "control-plane-minimal"
         shift
         ;;
       --prebuilt-ui-dir)
@@ -177,15 +186,45 @@ parse_args() {
     esac
   done
 
-  if [ -z "${NATIVE_VARIANT}" ]; then
-    NATIVE_VARIANT="cpu-only"
-  fi
   if [ "${NO_RUNTIME_CACHE}" -eq 1 ] && { [ "${REFRESH_RUNTIME_CACHE}" -eq 1 ] || [ "${OFFLINE_RUNTIME_CACHE}" -eq 1 ]; }; then
     fail "--no-runtime-cache 不能与 --refresh-runtime-cache 或 --offline-runtime-cache 同时使用"
   fi
   if [ "${REFRESH_RUNTIME_CACHE}" -eq 1 ] && [ "${OFFLINE_RUNTIME_CACHE}" -eq 1 ]; then
     fail "--refresh-runtime-cache 不能与 --offline-runtime-cache 同时使用"
   fi
+}
+
+prompt_native_variant() {
+  local choice
+  [ -n "${NATIVE_VARIANT}" ] && return 0
+  if [ ! -t 0 ]; then
+    fail "未指定 native 包变体；非交互环境请显式传 --without-gpu、--with-gpu 或 --control-plane-minimal"
+  fi
+
+  printf '%s\n' "请选择要构建的 native 包变体:" >&2
+  printf '%s\n' "  1) cpu-only              CPU 版本，包含 CPU FFmpeg、ZLMediaKit、PostgreSQL runtime" >&2
+  printf '%s\n' "  2) gpu-enabled           GPU 版本，在 CPU runtime 基础上增加 GPU FFmpeg runtime" >&2
+  printf '%s\n' "  3) control-plane-minimal 只包含控制面、配置工具和 UI，数据库使用外部 PostgreSQL" >&2
+  while true; do
+    read -r -p "请输入 1/2/3 或 cpu/gpu/minimal: " choice || fail "读取 native 包变体失败"
+    case "${choice}" in
+      1|cpu|CPU|cpu-only|without-gpu|--without-gpu)
+        NATIVE_VARIANT="cpu-only"
+        return 0
+        ;;
+      2|gpu|GPU|gpu-enabled|with-gpu|--with-gpu)
+        NATIVE_VARIANT="gpu-enabled"
+        return 0
+        ;;
+      3|minimal|control-plane-minimal|--control-plane-minimal)
+        NATIVE_VARIANT="control-plane-minimal"
+        return 0
+        ;;
+      *)
+        printf '%s\n' "无效选择: ${choice}" >&2
+        ;;
+    esac
+  done
 }
 
 ensure_tools() {
@@ -797,7 +836,7 @@ builder_arch=$(uname -m)
 git_commit=${commit}
 bundle_variant=${NATIVE_VARIANT}
 target_runtime=docker-free
-verification_required_host=172.17.13.196
+verification_recommended_location=target-server
 EOF
 }
 
@@ -862,6 +901,7 @@ main() {
   local include_postgres="true"
 
   parse_args "$@"
+  prompt_native_variant
   ensure_tools
   prepare_frontend_ui
 
@@ -946,7 +986,7 @@ main() {
 
   log "native 离线包已生成: ${archive_path}"
   log "校验文件已生成: ${archive_path}.sha256"
-  log "下一步必须在 196 上执行: ./scripts/verify-native-bundle-on-196.sh --bundle ${archive_path}"
+  log "推荐下一步在目标服务器上验收: ./scripts/verify-native-bundle-on-target.sh --bundle ${archive_path} --host <target-host>"
 }
 
 main "$@"

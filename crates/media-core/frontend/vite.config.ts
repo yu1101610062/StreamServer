@@ -15,5 +15,6 @@ export default defineConfig({
     emptyOutDir: true,
     assetsDir: "assets",
     sourcemap: false,
+    chunkSizeWarningLimit: 2048,
   },
 });

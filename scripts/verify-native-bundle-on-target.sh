@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE_PATH=""
-HOST="172.17.13.196"
+HOST=""
 SSH_TARGET=""
 SSH_PORT="22"
 SSH_PASSWORD=""
@@ -16,27 +16,27 @@ HTTP_PORT=""
 HTTP_SERVER_PID=""
 
 log() {
-  printf '[verify-196] %s\n' "$*"
+  printf '[verify-target] %s\n' "$*"
 }
 
 fail() {
-  printf '[verify-196] ERROR: %s\n' "$*" >&2
+  printf '[verify-target] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
 usage() {
   cat <<EOF
 用法:
-  $(basename "$0") --bundle PATH [--host 172.17.13.196] [--ssh-target USER@HOST]
+  $(basename "$0") --bundle PATH [--host HOST] [--ssh-target USER@HOST]
                  [--port 22] [--access-file PATH] [--upload-method scp|http]
                  [--http-host HOST] [--http-port PORT]
                  [--remote-dir DIR] [--output-dir DIR]
 
 说明:
-  将 native 离线包上传到 196，在 196 上验证包内业务二进制和第三方运行时组件。
+  将 native 离线包上传到目标 Linux AMD64 服务器，并在目标服务器上验证包内业务二进制和第三方运行时组件。
   验证过程不依赖 Docker；若远端缺少 Docker 也必须能完成。
   若 --access-file 中包含地址/端口/用户/密码字段，脚本会用 expect 进行密码登录；
-  若文件说明使用本地 HTTP 上传，默认会启动本地 HTTP 服务并让 196 远端下载。
+  若文件说明使用本地 HTTP 上传，默认会启动本地 HTTP 服务并让目标服务器远端下载。
 EOF
 }
 
@@ -129,7 +129,7 @@ parse_access_file() {
 
   [ -n "${access_host}" ] && HOST="${access_host}"
   [ -n "${access_port}" ] && SSH_PORT="${access_port}"
-  if [ -n "${access_user}" ] && [ -z "${SSH_TARGET}" ]; then
+  if [ -n "${access_user}" ] && [ -n "${HOST}" ] && [ -z "${SSH_TARGET}" ]; then
     SSH_TARGET="${access_user}@${HOST}"
   fi
   [ -n "${access_password}" ] && SSH_PASSWORD="${access_password}"
@@ -310,6 +310,7 @@ main() {
   esac
 
   if [ -z "${SSH_TARGET}" ]; then
+    [ -n "${HOST}" ] || fail "必须通过 --host、--ssh-target 或 --access-file 指定目标服务器"
     SSH_TARGET="${HOST}"
   fi
   if [ -z "${REMOTE_DIR}" ]; then
@@ -319,23 +320,23 @@ main() {
 
   local bundle_name report_name remote_bundle remote_report status
   bundle_name="$(basename "${BUNDLE_PATH}")"
-  report_name="native-verification-196-$(date '+%Y%m%d-%H%M%S').md"
+  report_name="native-verification-target-$(date '+%Y%m%d-%H%M%S').md"
   remote_bundle="${REMOTE_DIR}/${bundle_name}"
   remote_report="${REMOTE_DIR}/${report_name}"
 
   trap stop_http_server EXIT
 
-  log "确认 196 SSH 目标: ${SSH_TARGET}:${SSH_PORT}"
+  log "确认目标服务器 SSH 目标: ${SSH_TARGET}:${SSH_PORT}"
   ssh_run "set -e; hostname; uname -a; command -v systemctl >/dev/null && echo systemd_tool=present || echo systemd_tool=missing; hostname -I 2>/dev/null || true"
 
   log "准备 native 包到 ${SSH_TARGET}:${remote_bundle}"
   ssh_run "mkdir -p $(shell_quote "${REMOTE_DIR}")"
   if [ "${UPLOAD_METHOD}" = "http" ]; then
-    # 大包优先让 196 主动下载，避免 scp 在弱网下重复握手导致失败。
+    # 大包优先让目标服务器主动下载，避免 scp 在弱网下重复握手导致失败。
     start_http_server
     local bundle_url
     bundle_url="http://${HTTP_HOST}:${HTTP_PORT}/${bundle_name}"
-    log "让 196 从本机 HTTP 下载 native 包"
+    log "让目标服务器从本机 HTTP 下载 native 包"
     ssh_run "curl -fL --retry 3 --connect-timeout 10 -o $(shell_quote "${remote_bundle}") $(shell_quote "${bundle_url}")"
   else
     log "通过 scp 上传 native 包"
@@ -406,7 +407,7 @@ run_shell() {
   fi
 }
 
-append "# StreamServer Native 196 Verification"
+append "# StreamServer Native Target Verification"
 append ""
 append "- verified_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 append "- host: $(hostname)"
@@ -582,7 +583,7 @@ if [ -x "${ROOT}/runtime/zlm/MediaServer" ]; then
     port=\$((23000 + RANDOM % 10000))
     export ZLM_API_SECRET=verify-secret
     export ZLM_HOOK_SHARED_SECRET=verify-secret
-    export ZLM_SERVER_ID=verify-196
+    export ZLM_SERVER_ID=verify-target
     export ZLM_HOOK_BASE=http://127.0.0.1:9/hooks
     export ZLM_API_ALLOW_IP_RANGE='::1,127.0.0.1'
     export ZLM_HTTP_PORT=\${port}

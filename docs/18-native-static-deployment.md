@@ -1,16 +1,19 @@
 # StreamServer Native 无 Docker 运行时部署
 
-本文说明 native 离线包的构建、安装和 196 验收流程。项目运行、安装和现场操作统一走 native 路径；目标机不需要 Docker。
+本文说明 native 离线包的构建、安装和目标服务器验收流程。项目运行、安装和现场操作统一走 native 路径；目标机不需要 Docker。
 
 ## 1. 构建
 
 构建机可以使用 Docker builder 和 Docker 镜像提取 Linux AMD64 运行时资产：
 
 ```bash
+./scripts/build-native-bundle.sh
 ./scripts/build-native-bundle.sh --without-gpu
 ./scripts/build-native-bundle.sh --with-gpu
 ./scripts/build-native-bundle.sh --control-plane-minimal
 ```
+
+未指定 `--without-gpu`、`--with-gpu` 或 `--control-plane-minimal` 时，脚本会在交互终端中询问要构建的包变体。非交互环境必须显式指定包变体。
 
 首次构建会从 runtime 来源镜像提取 FFmpeg、ZLMediaKit、PostgreSQL 等资产，并写入本地缓存目录 `./.build-cache/native-runtime`。后续构建在镜像引用、提取参数和提取器版本一致时会直接复用该缓存，跳过 runtime 镜像拉取和依赖提取步骤。Rust musl builder 也会复用本地 `streamserver-rust-musl-builder:<target>` 镜像。
 
@@ -39,14 +42,14 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 
 默认 FFmpeg runtime 固定为 `8.1` 系列：CPU 包使用 `jrottenberg/ffmpeg:8.1-ubuntu2404`，GPU 包使用 `jrottenberg/ffmpeg:8.1-nvidia2404`。GPU 节点要求 NVIDIA 驱动满足 FFmpeg/NVIDIA Video Codec SDK 13 系列运行时要求，生产基线按 `570+` 驱动准备；Linux 4.x 内核上的 T4/P4 等老卡优先锁定经过现场验证的 R580/R595 生产分支驱动。
 
-## 2. 196 验收
+## 2. 目标服务器验收
 
-构建完成后必须在 196 上验证：
+构建完成后推荐在实际目标服务器上验证：
 
 ```bash
-./scripts/verify-native-bundle-on-196.sh \
+./scripts/verify-native-bundle-on-target.sh \
   --bundle dist/streamserver-native-v0.1.0-linux-amd64-cpu-only-20260602.tar.gz \
-  --access-file docs/196服务器访问方式
+  --host <target-host>
 ```
 
 验证内容包括：
@@ -63,7 +66,7 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 脚本会生成并拉回：
 
 ```text
-dist/native-verification-196-<timestamp>.md
+dist/native-verification-target-<timestamp>.md
 ```
 
 没有该报告，不能认为 native 包通过验收。
