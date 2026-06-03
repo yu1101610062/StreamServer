@@ -769,8 +769,8 @@ copy_static_assets() {
   chmod +x "${bundle_root}/uninstall.sh"
   cp -R "${ROOT_DIR}/packaging/native/templates/systemd/." "${bundle_root}/templates/systemd/"
   cp -R "${ROOT_DIR}/packaging/native/templates/common/." "${bundle_root}/templates/common/"
-  if [ -f "${ROOT_DIR}/docs/18-native-static-deployment.md" ]; then
-    cp "${ROOT_DIR}/docs/18-native-static-deployment.md" "${bundle_root}/docs/"
+  if [ -f "${ROOT_DIR}/docs/zh/08-native-deployment.md" ]; then
+    cp "${ROOT_DIR}/docs/zh/08-native-deployment.md" "${bundle_root}/docs/native-deployment.md"
   fi
 }
 
