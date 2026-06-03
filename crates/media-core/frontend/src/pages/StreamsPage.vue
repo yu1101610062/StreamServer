@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage, ElMessageBox } from "element-plus";
 
 import { nodeApi, streamApi } from "@/shared/api/resources";
-import OpenInVlcLink from "@/shared/components/OpenInVlcLink.vue";
+import MediaLink from "@/shared/components/MediaLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { copyText } from "@/shared/utils/clipboard";
 import { errorMessage, formatBitrateKbps, formatTime, shortId } from "@/shared/utils/format";
@@ -195,13 +195,13 @@ async function closeStream(row: Record<string, unknown>) {
         <el-table-column label="播放地址" min-width="340">
           <template #default="{ row }">
             <div class="stack-inline-links">
-              <OpenInVlcLink
+              <MediaLink
                 v-for="url in row.play_urls"
                 :key="url"
                 :url="url"
               >
                 {{ url }}
-              </OpenInVlcLink>
+              </MediaLink>
             </div>
           </template>
         </el-table-column>

@@ -5,9 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "sync:desktop-installers": "node ../../../scripts/sync-desktop-installers.mjs --allow-missing",
-    "build": "npm run sync:desktop-installers && vite build",
-    "build:web": "vite build",
+    "build": "vite build",
     "preview": "vite preview",
     "typecheck": "vue-tsc --noEmit",
     "test": "vitest run",

@@ -28,7 +28,6 @@ Implemented areas include:
 - FFmpeg execution planning.
 - ZLMediaKit integration.
 - Native Linux AMD64 packaging.
-- Tauri desktop client.
 - Automated Rust and frontend tests.
 
 Areas still being hardened include GPU scheduling closure, production observability, upgrade/rollback, and broader FFmpeg smoke coverage.

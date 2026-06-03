@@ -6,7 +6,7 @@ import { CopyDocument, Delete, Refresh, Upload, UploadFilled } from "@element-pl
 
 import { mediaUploadApi, nodeApi } from "@/shared/api/resources";
 import type { MediaUploadAssetSummary, NodeSummary, UploadMediaResponse } from "@/shared/api/types";
-import OpenInVlcLink from "@/shared/components/OpenInVlcLink.vue";
+import MediaLink from "@/shared/components/MediaLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { copyText } from "@/shared/utils/clipboard";
 import { errorMessage, formatBytes, formatPercent, formatTime, shortId } from "@/shared/utils/format";
@@ -378,9 +378,9 @@ async function deleteAsset(asset: MediaUploadAssetSummary) {
         <el-button :icon="CopyDocument" @click="copyText(uploadResult.httpUrl).then(() => ElMessage.success('已复制 HTTP URL'))">
           复制 HTTP URL
         </el-button>
-        <OpenInVlcLink :url="uploadResult.httpUrl">
+        <MediaLink :url="uploadResult.httpUrl">
           打开文件
-        </OpenInVlcLink>
+        </MediaLink>
       </div>
     </div>
 
@@ -432,7 +432,7 @@ async function deleteAsset(asset: MediaUploadAssetSummary) {
             <template #default="{ row }">
               <el-button link @click="copyText(row.source_url).then(() => ElMessage.success('已复制 Source URL'))">复制路径</el-button>
               <el-button link @click="copyText(row.http_url).then(() => ElMessage.success('已复制 HTTP URL'))">复制 HTTP</el-button>
-              <OpenInVlcLink :url="row.http_url" label="打开" />
+              <MediaLink :url="row.http_url" label="打开" />
               <el-button v-if="row.status === 'active'" link type="danger" @click="deleteAsset(row)">删除</el-button>
             </template>
           </el-table-column>

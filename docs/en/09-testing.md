@@ -42,5 +42,5 @@ Native/release checks:
 - Agent runtime registry and process lifecycle.
 - FFmpeg execution planning and media policy.
 - Recording, HLS, MP4, RTMP, RTSP, and artifact cleanup paths.
-- Frontend shared logic and desktop bridge.
+- Frontend shared logic and media-link behavior.
 - Native bundle layout and target-host verification.

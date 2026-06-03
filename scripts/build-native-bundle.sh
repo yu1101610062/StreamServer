@@ -9,7 +9,6 @@ HOST_BINARY_TARGET_TRIPLE="${HOST_BINARY_TARGET_TRIPLE:-x86_64-unknown-linux-mus
 NATIVE_VARIANT=""
 PREBUILT_UI_DIR="${PREBUILT_UI_DIR:-}"
 FRONTEND_SKIP_INSTALL=0
-FRONTEND_SOURCE_DIRS=()
 REFRESH_RUNTIME_CACHE=0
 OFFLINE_RUNTIME_CACHE=0
 NO_RUNTIME_CACHE=0
@@ -94,7 +93,7 @@ usage() {
   cat <<EOF
 用法:
   $(basename "$0") [--output-dir DIR] [--with-gpu|--without-gpu|--control-plane-minimal]
-                 [--prebuilt-ui-dir DIR] [--skip-frontend-install] [--desktop-source-dir DIR]
+                 [--prebuilt-ui-dir DIR] [--skip-frontend-install]
                  [--refresh-runtime-cache|--offline-runtime-cache|--no-runtime-cache]
 
 说明:
@@ -158,11 +157,6 @@ parse_args() {
       --skip-frontend-install)
         FRONTEND_SKIP_INSTALL=1
         shift
-        ;;
-      --desktop-source-dir)
-        [ "$#" -ge 2 ] || fail "--desktop-source-dir 需要参数"
-        FRONTEND_SOURCE_DIRS+=("$2")
-        shift 2
         ;;
       --refresh-runtime-cache)
         REFRESH_RUNTIME_CACHE=1
@@ -251,7 +245,6 @@ workspace_version() {
 
 prepare_frontend_ui() {
   local frontend_args=()
-  local source_dir
 
   if [ -n "${PREBUILT_UI_DIR}" ]; then
     [ -f "${PREBUILT_UI_DIR}/index.html" ] || fail "PREBUILT_UI_DIR 不是有效前端静态资源目录: ${PREBUILT_UI_DIR}"
@@ -259,14 +252,8 @@ prepare_frontend_ui() {
   fi
 
   require_cmd node
-  frontend_args+=(--allow-missing-installers)
   if [ "${FRONTEND_SKIP_INSTALL}" -eq 1 ]; then
     frontend_args+=(--skip-install)
-  fi
-  if [ "${#FRONTEND_SOURCE_DIRS[@]}" -gt 0 ]; then
-    for source_dir in "${FRONTEND_SOURCE_DIRS[@]}"; do
-      frontend_args+=(--source-dir "${source_dir}")
-    done
   fi
 
   log "构建前端静态资源"

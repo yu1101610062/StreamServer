@@ -5,7 +5,7 @@ import { keepPreviousData, useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 
 import { recordApi } from "@/shared/api/resources";
-import OpenInVlcLink from "@/shared/components/OpenInVlcLink.vue";
+import MediaLink from "@/shared/components/MediaLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { copyText } from "@/shared/utils/clipboard";
 import { formatBytes, formatTime, shortId } from "@/shared/utils/format";
@@ -146,7 +146,7 @@ async function resetFilters() {
               >
                 复制 HTTP 地址
               </el-button>
-              <OpenInVlcLink v-if="row.http_url" :url="row.http_url" label="打开" />
+              <MediaLink v-if="row.http_url" :url="row.http_url" label="打开" />
             </div>
           </template>
         </el-table-column>

@@ -10,7 +10,7 @@ Native Rust Media Control Plane and Edge Agent System
 
 **StreamServer 是一个 Rust native 音视频任务控制面与边缘 Agent 系统。**
 
-它由 `media-core`、`media-agent`、PostgreSQL、FFmpeg、ZLMediaKit、Web Console 和 Tauri Desktop Client 组成，用于编排文件转码、文件转直播、拉流转发、录制、HLS/MP4/MPEGTS/RTMP/RTSP 产物和现场 native 离线部署。`media-core` 负责 API、状态机、调度、幂等、事件、审计和控制面协调；`media-agent` 通过双向 gRPC 流连接 Core，在本机管理 FFmpeg/ZLM runtime，并根据输入媒体 profile、目标封装格式和发布协议生成执行计划。
+它由 `media-core`、`media-agent`、PostgreSQL、FFmpeg、ZLMediaKit 和 Web Console 组成，用于编排文件转码、文件转直播、拉流转发、录制、HLS/MP4/MPEGTS/RTMP/RTSP 产物和现场 native 离线部署。`media-core` 负责 API、状态机、调度、幂等、事件、审计和控制面协调；`media-agent` 通过双向 gRPC 流连接 Core，在本机管理 FFmpeg/ZLM runtime，并根据输入媒体 profile、目标封装格式和发布协议生成执行计划。
 
 项目运行时走 native 路径：目标 Linux AMD64 主机不需要 Docker。Docker 只用于构建阶段提取 FFmpeg、ZLMediaKit、PostgreSQL 等 runtime 资产，最终交付为可离线安装的 tar 包，并由 systemd 托管服务。
 
@@ -23,7 +23,7 @@ Native Rust Media Control Plane and Edge Agent System
 - **幂等与事务一致性**: 任务创建、派发和状态迁移使用 PostgreSQL 事务、行锁、operation request 和事件表。
 - **动态媒体执行计划**: Agent 基于 ffprobe profile 选择 copy、转码、muxer、bitstream filter、发布协议和 fallback 策略。
 - **FFmpeg + ZLMediaKit 编排**: 支持文件处理、直播化、拉流代理、录制、HLS、MP4、MPEGTS、RTMP、Enhanced RTMP、RTSP 等路径。
-- **Web 管理台与桌面客户端**: Vue/Vite 控制台覆盖任务、节点、上传、流、录像、安全和调试页面；Tauri 客户端提供桌面入口和 VLC 打开能力。
+- **Web 管理台**: Vue/Vite 控制台覆盖任务、节点、上传、流、录像、安全和调试页面。
 - **Native 离线交付**: 包含业务二进制、UI、FFmpeg/ZLM/PostgreSQL runtime、安装器、卸载器、配置 TUI 和目标机验证脚本。
 - **自动化测试覆盖**: 覆盖领域状态机、Repository、控制面、Agent runtime、FFmpeg plan、前端共享逻辑和 native bundle 布局。
 
@@ -75,7 +75,6 @@ Web Console / Desktop Client / External API
 | Native bundle | Linux AMD64 native 离线包，目标机无 Docker 运行时依赖 | 已实现 |
 | systemd install | `install.sh`、`uninstall.sh`、service unit 和 `streamserverctl` | 已实现 |
 | Web console | Vue/Vite 管理台 | 已实现 |
-| Desktop client | Tauri 桌面客户端和安装包嵌入流程 | 已实现 |
 | GPU runtime package | GPU FFmpeg runtime 包变体和能力基础 | 已实现 |
 | GPU scheduling closure | GPU 调度闭环、容量模型和生产策略仍需增强 | 增强中 |
 | Production hardening | 安全、可观测性、升级回滚和现场运维继续增强 | 增强中 |
@@ -172,14 +171,6 @@ npm install
 npm run dev
 ```
 
-桌面客户端：
-
-```bash
-cd apps/desktop-client
-npm install
-npm run dev
-```
-
 ### 测试与质量
 
 本项目测试覆盖重点包括：
@@ -190,7 +181,7 @@ npm run dev
 - Repository、callback outbox、ZLM Hook 和鉴权逻辑。
 - Agent runtime registry、进程生命周期、录制控制和产物清理。
 - FFmpeg plan、codec/muxer policy、HLS/MP4/RTMP/RTSP 组合。
-- Web console 共享逻辑和 desktop bridge。
+- Web console 共享逻辑和媒体链接展示。
 - native bundle 布局、目标机验证和 codec smoke matrix。
 
 release/native 验证建议额外执行：
@@ -224,7 +215,6 @@ release/native 验证建议额外执行：
 | Core-Agent gRPC | 已实现 |
 | PostgreSQL persistence | 已实现 |
 | Web console | 已实现 |
-| Desktop client | 已实现 |
 | Native bundle | 已实现 |
 | Automated tests | 已实现 |
 | WebM output policy | 当前保守关闭输出目标 |
@@ -246,7 +236,7 @@ MIT
 
 **StreamServer is a native Rust media control-plane and edge-agent system.**
 
-It combines `media-core`, `media-agent`, PostgreSQL, FFmpeg, ZLMediaKit, a Vue/Vite web console, and a Tauri desktop client into an orchestration platform for media workloads. The Core service handles APIs, task state machines, scheduling, idempotency, events, auditing, and control-plane coordination. The Agent connects to Core through a bidirectional gRPC stream, manages local FFmpeg/ZLM runtimes, and builds execution plans from input media profiles, target containers, and publishing protocols.
+It combines `media-core`, `media-agent`, PostgreSQL, FFmpeg, ZLMediaKit, and a Vue/Vite web console into an orchestration platform for media workloads. The Core service handles APIs, task state machines, scheduling, idempotency, events, auditing, and control-plane coordination. The Agent connects to Core through a bidirectional gRPC stream, manages local FFmpeg/ZLM runtimes, and builds execution plans from input media profiles, target containers, and publishing protocols.
 
 The runtime path is native. Target Linux AMD64 hosts do not require Docker. Docker is only used during the build phase to extract runtime assets. The final deliverable is an offline tarball installed as systemd services.
 
@@ -259,7 +249,7 @@ The runtime path is native. Target Linux AMD64 hosts do not require Docker. Dock
 - **Idempotency and consistency**: task creation, dispatching, and transitions use PostgreSQL transactions, row locks, operation requests, and event storage.
 - **Dynamic media execution planning**: ffprobe-based profile analysis drives copy/transcode, muxer, bitstream filter, protocol, and fallback decisions.
 - **FFmpeg + ZLMediaKit orchestration**: file transcoding, file-to-live, stream relay, recording, HLS, MP4, MPEGTS, RTMP, Enhanced RTMP, and RTSP paths.
-- **Web and desktop clients**: a Vue/Vite console plus a Tauri client for desktop integration.
+- **Web console**: a Vue/Vite management UI for tasks, nodes, uploads, streams, recordings, security, and debugging.
 - **Offline native delivery**: business binaries, UI assets, FFmpeg/ZLM/PostgreSQL runtime, installer, uninstaller, config TUI, and verification scripts.
 - **Automated tests**: domain, repository, control plane, Agent runtime, FFmpeg plans, frontend shared logic, and native bundle layout.
 
@@ -295,7 +285,6 @@ Web Console / Desktop Client / External API
 | Native bundle | Linux AMD64 offline bundle without Docker runtime dependency | Implemented |
 | systemd install | Installer, uninstaller, service units, and `streamserverctl` | Implemented |
 | Web console | Vue/Vite management UI | Implemented |
-| Desktop client | Tauri desktop client | Implemented |
 | GPU scheduling closure | GPU capacity and scheduling loop still need hardening | In progress |
 | Production hardening | Security, observability, upgrade, and rollback continue to evolve | In progress |
 
@@ -377,7 +366,7 @@ Start with [docs/README.md](docs/README.md). Key English docs:
 
 ### Project Status
 
-The core control loop, Agent runtime, gRPC control plane, PostgreSQL persistence, web console, desktop client, native packaging, and automated tests are implemented. The current hardening focus is GPU scheduling closure, production observability, security posture, upgrade/rollback, and broader real FFmpeg smoke coverage.
+The core control loop, Agent runtime, gRPC control plane, PostgreSQL persistence, web console, native packaging, and automated tests are implemented. The current hardening focus is GPU scheduling closure, production observability, security posture, upgrade/rollback, and broader real FFmpeg smoke coverage.
 
 ### Development Note
 
