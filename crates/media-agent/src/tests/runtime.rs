@@ -1,4 +1,5 @@
 use super::*;
+use crate::runtime_stop::{StaleAttemptCleanupContext, cleanup_stale_attempt_runtimes};
 use std::os::unix::process::ExitStatusExt;
 
 fn test_settings(work_root: &str) -> AgentSettings {
@@ -357,7 +358,15 @@ fn create_slow_mock_ffprobe_binary(
     audio_codec_name: Option<&str>,
 ) -> String {
     let audio_streams = audio_codec_name
-        .map(|codec| vec![mock_audio_stream(None, codec, Some(48_000), Some(2), Some(2))])
+        .map(|codec| {
+            vec![mock_audio_stream(
+                None,
+                codec,
+                Some(48_000),
+                Some(2),
+                Some(2),
+            )]
+        })
         .unwrap_or_default();
 
     register_mock_ffprobe_binary(
@@ -2643,7 +2652,12 @@ fn build_stream_ingest_fast_record_plan_uses_configured_hls_segment_default() {
 
 #[test]
 fn build_stream_ingest_fast_record_plan_generates_mp4_and_hls_outputs_for_both_format() {
-    let settings = test_settings("/tmp/work");
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-fast-record-both-{}", Uuid::now_v7()));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin = create_mock_ffprobe_binary(&temp_root, "h264", Some("aac"));
     let request = StartTaskRequest {
         task_id: Uuid::nil(),
         attempt_no: 1,
@@ -2694,6 +2708,73 @@ fn build_stream_ingest_fast_record_plan_generates_mp4_and_hls_outputs_for_both_f
             .windows(2)
             .any(|window| window == ["-hls_time", "8"])
     );
+    let mp4_output = plan
+        .outputs
+        .iter()
+        .find(|output| output.ends_with(".mp4"))
+        .expect("mp4 output should exist");
+    let hls_output = plan
+        .outputs
+        .iter()
+        .find(|output| output.ends_with(".m3u8"))
+        .expect("hls output should exist");
+    let mp4_target_position = plan
+        .args
+        .iter()
+        .position(|arg| arg == mp4_output)
+        .expect("mp4 target should be present");
+    let hls_muxer_position = plan
+        .args
+        .windows(2)
+        .position(|window| window == ["-f", "hls"])
+        .expect("hls muxer should be present");
+    let hls_target_position = plan
+        .args
+        .iter()
+        .position(|arg| arg == hls_output)
+        .expect("hls target should be present");
+    let video_map_positions: Vec<_> = plan
+        .args
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| (window == ["-map", "0:v?"]).then_some(index))
+        .collect();
+    let audio_map_positions: Vec<_> = plan
+        .args
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| (window == ["-map", "0:1"]).then_some(index))
+        .collect();
+    let video_codec_positions: Vec<_> = plan
+        .args
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| (window == ["-c:v", "copy"]).then_some(index))
+        .collect();
+    let audio_codec_positions: Vec<_> = plan
+        .args
+        .windows(2)
+        .enumerate()
+        .filter_map(|(index, window)| (window == ["-c:a", "copy"]).then_some(index))
+        .collect();
+
+    assert_eq!(video_map_positions.len(), 2);
+    assert_eq!(audio_map_positions.len(), 2);
+    assert_eq!(video_codec_positions.len(), 2);
+    assert_eq!(audio_codec_positions.len(), 2);
+    assert!(video_codec_positions[0] < video_map_positions[0]);
+    assert!(audio_codec_positions[0] < audio_map_positions[0]);
+    assert!(video_map_positions[0] < mp4_target_position);
+    assert!(audio_map_positions[0] < mp4_target_position);
+    assert!(mp4_target_position < video_codec_positions[1]);
+    assert!(video_codec_positions[1] < video_map_positions[1]);
+    assert!(mp4_target_position < audio_codec_positions[1]);
+    assert!(audio_codec_positions[1] < audio_map_positions[1]);
+    assert!(mp4_target_position < video_map_positions[1]);
+    assert!(video_map_positions[1] < hls_muxer_position);
+    assert!(mp4_target_position < audio_map_positions[1]);
+    assert!(audio_map_positions[1] < hls_muxer_position);
+    assert!(hls_muxer_position < hls_target_position);
     match &plan.success_check {
         SuccessCheck::FilesExist(paths) => {
             assert_eq!(paths.len(), 2);
@@ -2710,6 +2791,8 @@ fn build_stream_ingest_fast_record_plan_generates_mp4_and_hls_outputs_for_both_f
         }
         other => panic!("expected FilesExist success check, got {other:?}"),
     }
+
+    let _ = fs::remove_dir_all(temp_root);
 }
 
 #[test]
@@ -3715,6 +3798,14 @@ fn build_file_transcode_plan_copy_or_transcode_copies_opus_when_mkv_allows_it() 
     let spec = parse_task_spec(&request).expect("spec should parse");
     let plan = build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
 
+    assert_eq!(plan.outputs.len(), 1);
+    assert!(plan.outputs[0].ends_with(".mkv"));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-f", "matroska"])
+    );
+    assert!(!plan.args.windows(2).any(|window| window == ["-f", "mkv"]));
     assert!(
         plan.args
             .windows(2)
@@ -3728,6 +3819,96 @@ fn build_file_transcode_plan_copy_or_transcode_copies_opus_when_mkv_allows_it() 
     assert!(!plan.args.windows(2).any(|window| window == ["-c:a", "aac"]));
 
     let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn build_file_transcode_plan_maps_matroska_format_to_mkv_extension_and_matroska_muxer() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-copy-transcode-matroska-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+
+    let mut settings = test_settings("/tmp/work");
+    settings.ffprobe_bin =
+        create_mock_ffprobe_binary_with_format(&temp_root, "matroska", "h264", Some("opus"));
+
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": "test-matroska-opus-copy",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.mkv"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "format": "matroska"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let plan = build_file_transcode_plan(&settings, &request, &spec).expect("plan should build");
+
+    assert_eq!(plan.outputs.len(), 1);
+    assert!(plan.outputs[0].ends_with(".mkv"));
+    assert!(
+        plan.args
+            .windows(2)
+            .any(|window| window == ["-f", "matroska"])
+    );
+    assert!(!plan.args.windows(2).any(|window| window == ["-f", "mkv"]));
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn build_file_transcode_plan_rejects_webm_output_format() {
+    let settings = test_settings("/tmp/work");
+    let request = StartTaskRequest {
+        task_id: Uuid::nil(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": "test-webm-output-rejected",
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.mp4"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file",
+                "format": "webm"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: "lease".to_string(),
+        trace_context: None,
+        session_epoch: 1,
+    };
+
+    let spec = parse_task_spec(&request).expect("spec should parse");
+    let error =
+        build_file_transcode_plan(&settings, &request, &spec).expect_err("plan should fail");
+
+    assert!(matches!(
+        error,
+        ExecutorError::InvalidRequest(message) if message.contains("publish.format=webm")
+    ));
 }
 
 #[test]
@@ -5744,16 +5925,23 @@ async fn stale_attempt_cleanup_signals_lower_registry_attempt() {
             },
         );
 
-    executor.cleanup_stale_attempt_runtimes(&StartTaskRequest {
-        task_id,
-        attempt_no: 2,
-        task_type: TaskType::FileTranscode,
-        resolved_spec: Value::Null,
-        execution_mode: "managed".to_string(),
-        lease_token: "new-lease".to_string(),
-        trace_context: None,
-        session_epoch: 1,
-    });
+    cleanup_stale_attempt_runtimes(
+        StaleAttemptCleanupContext {
+            settings: &executor.settings,
+            registry: &executor.registry,
+            runtimes: &executor.runtimes,
+        },
+        &StartTaskRequest {
+            task_id,
+            attempt_no: 2,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: Value::Null,
+            execution_mode: "managed".to_string(),
+            lease_token: "new-lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        },
+    );
 
     let status = timeout(Duration::from_secs(2), async {
         loop {
@@ -5808,16 +5996,23 @@ async fn stale_attempt_cleanup_signals_lower_persisted_attempt() {
     persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
         .expect("runtime state should persist");
 
-    executor.cleanup_stale_attempt_runtimes(&StartTaskRequest {
-        task_id,
-        attempt_no: 2,
-        task_type: TaskType::FileTranscode,
-        resolved_spec: Value::Null,
-        execution_mode: "managed".to_string(),
-        lease_token: "new-lease".to_string(),
-        trace_context: None,
-        session_epoch: 1,
-    });
+    cleanup_stale_attempt_runtimes(
+        StaleAttemptCleanupContext {
+            settings: &executor.settings,
+            registry: &executor.registry,
+            runtimes: &executor.runtimes,
+        },
+        &StartTaskRequest {
+            task_id,
+            attempt_no: 2,
+            task_type: TaskType::FileTranscode,
+            resolved_spec: Value::Null,
+            execution_mode: "managed".to_string(),
+            lease_token: "new-lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        },
+    );
 
     let status = timeout(Duration::from_secs(2), async {
         loop {

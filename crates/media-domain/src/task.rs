@@ -689,6 +689,18 @@ impl TaskSpec {
                 "must be provided",
             ));
         }
+        if self
+            .publish
+            .format
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|format| format.eq_ignore_ascii_case("webm"))
+        {
+            issues.push(ValidationIssue::new(
+                "publish.format",
+                "webm output is temporarily disabled; upload webm inputs remain supported",
+            ));
+        }
 
         if let Some(duration_sec) = self.record.duration_sec {
             if !self.record.enabled.unwrap_or(false) {

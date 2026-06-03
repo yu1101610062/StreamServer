@@ -560,6 +560,24 @@ fn validate_allows_file_transcode_with_http_mp4_vod_input() {
 }
 
 #[test]
+fn validate_rejects_webm_publish_output_format() {
+    let mut task = sample_task(TaskType::FileTranscode);
+    task.input.kind = Some(InputKind::File);
+    task.input.source_mode = Some(SourceMode::Vod);
+    task.input.url = Some("input.mp4".to_string());
+    task.publish.kind = Some(PublishTargetKind::File);
+    task.publish.format = Some("webm".to_string());
+
+    let error = task.validate().expect_err("validation should fail");
+
+    assert!(
+        error.issues.iter().any(|issue| {
+            issue.field == "publish.format" && issue.message.contains("webm output")
+        })
+    );
+}
+
+#[test]
 fn validate_allows_file_transcode_with_ftp_vod_input() {
     let task = TaskSpec {
         task_type: TaskType::FileTranscode,

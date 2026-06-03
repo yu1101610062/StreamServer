@@ -73,7 +73,6 @@ export const PUBLISH_FORMATS: OptionItem[] = [
   { value: "rtp_mpegts", label: "RTP MPEGTS" },
   { value: "matroska", label: "Matroska / MKV" },
   { value: "mov", label: "MOV" },
-  { value: "webm", label: "WebM" },
 ];
 
 export const START_MODES: OptionItem[] = [

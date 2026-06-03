@@ -8,6 +8,7 @@ mod config;
 mod control_plane;
 mod error;
 mod repository;
+mod repository_paths;
 mod scheduler;
 mod telemetry;
 mod ui;

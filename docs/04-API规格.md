@@ -187,6 +187,7 @@
 - `publish.kind=file`：
   - 输出路径由平台托管生成，不能通过 `publish.url` 指定目录或文件名
   - `stream_bridge(file)` 产物落到 `/data/zlm/www/output/mp4/node-<node-ip>-mp4/<task-id>/HHMMSS[-NN].ext`
+  - 输出封装格式当前支持 `mp4`、`flv`、`mpegts`、`rtp_mpegts`、`matroska`/`mkv`、`mov`、`hls`；`webm` 可作为上传输入文件，但暂不作为输出目标格式开放
 - `publish.kind=rtmp_push`：
   - `publish.url` 必填，且必须是完整的 `rtmp://` 或 `rtmps://` 目标地址
   - `publish.format` 留空或填 `flv`；其他格式不允许

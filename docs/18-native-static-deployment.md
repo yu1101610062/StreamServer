@@ -63,6 +63,14 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 - 随包 PostgreSQL 模式下 36 个官方工具的 wrapper/version 检查，以及 `pg_dump`/`pg_restore`/`pg_dumpall`、管理工具、`pg_controldata`/`pg_checksums`/`pg_resetwal`、SSL 客户端证书认证、复杂 `pg_hba.conf`、WAL/PITR、`pg_basebackup`、物理复制、逻辑复制、`pg_recvlogical`、业务迁移 smoke；不执行压力读写或基准负载
 - FFmpeg、ZLMediaKit、PostgreSQL smoke test；GPU 包还会在有 GPU runtime 时执行 `h264_nvenc` 与 `hevc_nvenc` 实际编码 smoke test
 
+release/native 验证还应在目标 runtime 上执行 codec matrix，覆盖 MP4、HLS、Matroska/MKV、FLV、双输出和 WebM 拒绝路径：
+
+```bash
+FFMPEG_BIN=/opt/streamserver/<role>/runtime/ffmpeg/bin/ffmpeg \
+FFPROBE_BIN=/opt/streamserver/<role>/runtime/ffmpeg/bin/ffprobe \
+./scripts/smoke-codec-matrix.sh
+```
+
 脚本会生成并拉回：
 
 ```text

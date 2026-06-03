@@ -1,0 +1,169 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
+
+use media_domain::{RuntimeHandle, RuntimeState, WorkerKind};
+use serde_json::Value;
+use uuid::Uuid;
+
+#[derive(Debug, Clone)]
+pub struct LocalRuntimeRegistry {
+    inner: Arc<RwLock<RuntimeRegistryState>>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeRegistryState {
+    by_runtime_id: HashMap<Uuid, RuntimeHandle>,
+    by_task_attempt: HashMap<(Uuid, i32), Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RuntimeStateCounts {
+    pub running: u32,
+    pub starting: u32,
+    pub stopping: u32,
+    pub orphaned: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AdoptFilter {
+    pub session_epoch: u64,
+    pub runtimes: Vec<AdoptRuntimeFilter>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdoptRuntimeFilter {
+    pub task_id: Uuid,
+    pub attempt_no: i32,
+    pub lease_token: String,
+    pub worker_kind: WorkerKind,
+}
+
+impl LocalRuntimeRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RuntimeRegistryState::default())),
+        }
+    }
+
+    pub fn track(&self, handle: RuntimeHandle) {
+        let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
+        let key = (handle.task_id, handle.attempt_no);
+        if let Some(previous_runtime_id) = runtimes.by_task_attempt.insert(key, handle.runtime_id) {
+            if previous_runtime_id != handle.runtime_id {
+                runtimes.by_runtime_id.remove(&previous_runtime_id);
+            }
+        }
+        runtimes.by_runtime_id.insert(handle.runtime_id, handle);
+    }
+
+    pub fn remove(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
+        let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
+        let removed = runtimes.by_runtime_id.remove(&runtime_id)?;
+        runtimes
+            .by_task_attempt
+            .remove(&(removed.task_id, removed.attempt_no));
+        Some(removed)
+    }
+
+    pub fn update(
+        &self,
+        runtime_id: Uuid,
+        update: impl FnOnce(&mut RuntimeHandle),
+    ) -> Option<RuntimeHandle> {
+        let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
+        let handle = runtimes.by_runtime_id.get_mut(&runtime_id)?;
+        update(handle);
+        Some(handle.clone())
+    }
+
+    pub fn get(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        runtimes.by_runtime_id.get(&runtime_id).cloned()
+    }
+
+    pub fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        let runtime_id = runtimes.by_task_attempt.get(&(task_id, attempt_no))?;
+        runtimes.by_runtime_id.get(runtime_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub fn count(&self) -> usize {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        runtimes.by_runtime_id.len()
+    }
+
+    pub fn state_counts(&self) -> RuntimeStateCounts {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        let mut counts = RuntimeStateCounts::default();
+        for handle in runtimes.by_runtime_id.values() {
+            match handle.state {
+                RuntimeState::Pending | RuntimeState::Starting => {
+                    counts.starting = counts.starting.saturating_add(1);
+                }
+                RuntimeState::Running => {
+                    counts.running = counts.running.saturating_add(1);
+                }
+                RuntimeState::Stopping => {
+                    counts.stopping = counts.stopping.saturating_add(1);
+                }
+                RuntimeState::Orphaned => {
+                    counts.orphaned = counts.orphaned.saturating_add(1);
+                }
+                RuntimeState::Exited => {}
+            }
+        }
+        counts
+    }
+
+    pub fn snapshots(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        runtimes
+            .by_runtime_id
+            .values()
+            .filter(|handle| filter.matches(handle))
+            .cloned()
+            .collect()
+    }
+
+    pub fn active_handles(&self) -> Vec<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
+        runtimes
+            .by_runtime_id
+            .values()
+            .filter(|handle| handle.state != RuntimeState::Exited)
+            .cloned()
+            .collect()
+    }
+}
+
+impl Default for LocalRuntimeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdoptFilter {
+    pub(crate) fn matches(&self, handle: &RuntimeHandle) -> bool {
+        if self.runtimes.is_empty() {
+            return false;
+        }
+
+        self.runtimes.iter().any(|runtime| {
+            runtime.task_id == handle.task_id
+                && runtime.attempt_no == handle.attempt_no
+                && runtime.worker_kind == handle.worker_kind
+                && runtime.lease_token == runtime_lease_token(handle).unwrap_or_default()
+        })
+    }
+}
+
+fn runtime_lease_token(handle: &RuntimeHandle) -> Option<String> {
+    handle
+        .metadata
+        .get("lease_token")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}

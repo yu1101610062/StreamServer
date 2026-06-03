@@ -176,7 +176,7 @@ const STREAM_SCHEMA_ENUM = ["rtsp", "rtmp", "http_ts", "http_fmp4", "hls"];
 const AUTH_MODE_ENUM = ["disabled", "external_jwt", "local_password"];
 const ROLE_ENUM = ["admin", "operator", "viewer"];
 const NETWORK_MODE_ENUM = ["host", "bridge"];
-const COMMON_PUBLISH_FORMAT_ENUM = ["系统默认", "mp4", "flv", "mpegts", "rtp_mpegts", "matroska", "mov", "webm"];
+const COMMON_PUBLISH_FORMAT_ENUM = ["系统默认", "mp4", "flv", "mpegts", "rtp_mpegts", "matroska", "mkv", "mov", "hls"];
 
 interface FieldMeta {
   description: string;
@@ -327,7 +327,7 @@ function fieldMeta(path: string): FieldMeta | null {
     { test: (value) => value === "publish.ttl", meta: { description: "多播 TTL；`rtmp_push` 不支持。" } },
     {
       test: (value) => value === "publish.format",
-      meta: { description: "输出封装格式；文件输出留空时默认 MP4，组播输出按目标自动选择合适封装格式，`rtmp_push` 固定使用 FLV。", enumValues: COMMON_PUBLISH_FORMAT_ENUM },
+      meta: { description: "输出封装格式；文件输出留空时默认 MP4，`mkv` 与 `matroska` 等价且输出扩展名为 `.mkv`，`webm` 暂不作为输出目标开放；组播输出按目标自动选择合适封装格式，`rtmp_push` 固定使用 FLV。", enumValues: COMMON_PUBLISH_FORMAT_ENUM },
     },
     { test: (value) => value === "record", meta: { description: "录制设置。" } },
     { test: (value) => value === "record.enabled", meta: { description: "是否启用录制。对 `stream_ingest` 的 VOD 输入，录制模式会由 expose 自动判定。" } },
