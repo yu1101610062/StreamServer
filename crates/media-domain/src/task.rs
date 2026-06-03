@@ -1321,7 +1321,7 @@ impl RecordSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecoverySpec {
     #[serde(default)]
     pub policy: Option<RecoveryPolicy>,
@@ -1331,17 +1331,6 @@ pub struct RecoverySpec {
     pub backoff: Option<BackoffPolicy>,
     #[serde(default)]
     pub max_consecutive_failures: Option<u32>,
-}
-
-impl Default for RecoverySpec {
-    fn default() -> Self {
-        Self {
-            policy: None,
-            resume_mode: None,
-            backoff: None,
-            max_consecutive_failures: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

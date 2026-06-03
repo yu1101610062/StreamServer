@@ -5,9 +5,11 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, RwLock, atomic::AtomicBool},
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -33,13 +35,195 @@ use crate::{
         update_companion_recording_metadata,
     },
     runtime_monitors::spawn_startup_probe_monitor,
-    runtime_persistence::persist_runtime_state,
+    runtime_persistence::{
+        RUNTIME_COMMAND_FILE, RUNTIME_PID_FILE, RUNTIME_STATE_FILE,
+        persist_runtime_state as persist_runtime_state_to_disk,
+    },
     runtime_plan::{CompanionProcessPlan, build_process_plan, prepare_plan_paths},
-    runtime_process::{ManagedRuntime, RuntimeSlotPermit},
+    runtime_process::{
+        ManagedRuntime, ProcessIdentity, RuntimeSlotPermit, configure_new_process_group,
+        remove_managed_runtime, schedule_force_kill_processes_if_running, signal_process,
+    },
     runtime_process_exit::{ProcessExitMonitorContext, spawn_process_exit_monitor},
     runtime_process_monitors::spawn_companion_process_monitor,
     runtime_registry::LocalRuntimeRegistry,
 };
+
+const START_ROLLBACK_FORCE_KILL_DELAY: Duration = Duration::from_millis(250);
+
+type PersistRuntimeStateHook =
+    dyn Fn(&Path, &RuntimeHandle, &SuccessCheck) -> Result<(), ExecutorError> + Send + Sync;
+type AfterRuntimeInsertHook = dyn Fn(&RuntimeHandle) -> Result<(), ExecutorError> + Send + Sync;
+type AfterCompanionSpawnHook =
+    dyn Fn(&RuntimeHandle, i32) -> Result<(), ExecutorError> + Send + Sync;
+
+#[derive(Clone)]
+pub(crate) struct ManagedProcessStartHooks {
+    persist_runtime_state: Arc<PersistRuntimeStateHook>,
+    after_runtime_insert: Arc<AfterRuntimeInsertHook>,
+    after_companion_spawn: Arc<AfterCompanionSpawnHook>,
+}
+
+impl Default for ManagedProcessStartHooks {
+    fn default() -> Self {
+        Self {
+            persist_runtime_state: Arc::new(persist_runtime_state_to_disk),
+            after_runtime_insert: Arc::new(|_| Ok(())),
+            after_companion_spawn: Arc::new(|_, _| Ok(())),
+        }
+    }
+}
+
+impl ManagedProcessStartHooks {
+    fn persist_runtime_state(
+        &self,
+        work_dir: &Path,
+        handle: &RuntimeHandle,
+        success_check: &SuccessCheck,
+    ) -> Result<(), ExecutorError> {
+        (self.persist_runtime_state)(work_dir, handle, success_check)
+    }
+
+    fn after_runtime_insert(&self, handle: &RuntimeHandle) -> Result<(), ExecutorError> {
+        (self.after_runtime_insert)(handle)
+    }
+
+    fn after_companion_spawn(
+        &self,
+        handle: &RuntimeHandle,
+        companion_pid: i32,
+    ) -> Result<(), ExecutorError> {
+        (self.after_companion_spawn)(handle, companion_pid)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_persist_runtime_state(
+        persist_runtime_state: impl Fn(
+            &Path,
+            &RuntimeHandle,
+            &SuccessCheck,
+        ) -> Result<(), ExecutorError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            persist_runtime_state: Arc::new(persist_runtime_state),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_runtime_insert(
+        after_runtime_insert: impl Fn(&RuntimeHandle) -> Result<(), ExecutorError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            after_runtime_insert: Arc::new(after_runtime_insert),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_companion_spawn(
+        after_companion_spawn: impl Fn(&RuntimeHandle, i32) -> Result<(), ExecutorError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            after_companion_spawn: Arc::new(after_companion_spawn),
+            ..Self::default()
+        }
+    }
+}
+
+pub(crate) struct RuntimeStartRollback {
+    runtime_id: Uuid,
+    work_dir: PathBuf,
+    registry: LocalRuntimeRegistry,
+    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    processes: Vec<ProcessIdentity>,
+    armed: bool,
+}
+
+impl RuntimeStartRollback {
+    pub(crate) fn new(
+        runtime_id: Uuid,
+        work_dir: PathBuf,
+        process: ProcessIdentity,
+        registry: LocalRuntimeRegistry,
+        runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    ) -> Self {
+        Self {
+            runtime_id,
+            work_dir,
+            registry,
+            runtimes,
+            processes: vec![process],
+            armed: true,
+        }
+    }
+
+    pub(crate) fn add_companion_process(&mut self, companion_process: ProcessIdentity) {
+        if !self
+            .processes
+            .iter()
+            .any(|process| process.pid == companion_process.pid)
+        {
+            self.processes.push(companion_process);
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    fn cleanup_persisted_runtime_files(&self) {
+        for file_name in [RUNTIME_STATE_FILE, RUNTIME_PID_FILE, RUNTIME_COMMAND_FILE] {
+            let _ = fs::remove_file(self.work_dir.join(file_name));
+        }
+    }
+}
+
+impl Drop for RuntimeStartRollback {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let mut processes = self.processes.clone();
+        if let Some(runtime) = remove_managed_runtime(&self.runtimes, self.runtime_id) {
+            if let Some(process) = runtime
+                .process
+                .filter(|process| !processes.iter().any(|known| known.pid == process.pid))
+            {
+                processes.push(process);
+            }
+            for companion_process in runtime.companion_processes {
+                if !processes
+                    .iter()
+                    .any(|known| known.pid == companion_process.pid)
+                {
+                    processes.push(companion_process);
+                }
+            }
+        }
+        let _ = self.registry.remove(self.runtime_id);
+        self.cleanup_persisted_runtime_files();
+
+        for process in &processes {
+            let _ = signal_process(process, libc::SIGTERM);
+        }
+        schedule_force_kill_processes_if_running(
+            processes,
+            START_ROLLBACK_FORCE_KILL_DELAY,
+            "runtime_start_rollback",
+        );
+    }
+}
 
 pub(crate) struct ManagedProcessStartContext<'a> {
     pub(crate) settings: &'a AgentSettings,
@@ -50,6 +234,7 @@ pub(crate) struct ManagedProcessStartContext<'a> {
     pub(crate) zlm_server_id: Option<String>,
     pub(crate) capability_hints: RuntimeCapabilityHints,
     pub(crate) restart_executor: ManagedProcessExecutor,
+    pub(crate) hooks: ManagedProcessStartHooks,
 }
 
 pub(crate) fn start_process_task(
@@ -66,6 +251,7 @@ pub(crate) fn start_process_task(
         zlm_server_id,
         capability_hints,
         restart_executor,
+        hooks,
     } = context;
 
     let plan = build_process_plan(settings, request, capability_hints)?;
@@ -78,6 +264,7 @@ pub(crate) fn start_process_task(
         .current_dir(&plan.work_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_new_process_group(&mut child);
 
     let mut child = child
         .spawn()
@@ -86,9 +273,17 @@ pub(crate) fn start_process_task(
         .id()
         .map(|pid| pid as i32)
         .ok_or_else(|| ExecutorError::ProcessSpawn("spawned child has no pid".to_string()))?;
+    let process = ProcessIdentity::spawned_process_group(pid);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let runtime_id = Uuid::now_v7();
+    let mut rollback = RuntimeStartRollback::new(
+        runtime_id,
+        plan.work_dir.clone(),
+        process,
+        registry.clone(),
+        runtimes.clone(),
+    );
     let stop_requested = Arc::new(AtomicBool::new(false));
     let require_stream_online = plan.startup_probe.is_some();
     let companion_recording_metadata = plan
@@ -111,6 +306,7 @@ pub(crate) fn start_process_task(
         "recording": plan.recording,
         "managed_file_output_kind": plan.managed_file_output_kind,
         "companion_recording": companion_recording_metadata,
+        "process": process,
     });
     if let Some(protocol) = plan.internal_ingress_protocol.as_deref() {
         metadata["internal_ingress_protocol"] = json!(protocol);
@@ -129,20 +325,24 @@ pub(crate) fn start_process_task(
         outputs: plan.outputs.clone(),
         metadata,
     };
+    hooks.persist_runtime_state(&plan.work_dir, &handle, &plan.success_check)?;
+
+    {
+        let mut runtimes = runtimes.write().expect("runtime map lock poisoned");
+        runtimes.insert(
+            runtime_id,
+            ManagedRuntime {
+                process: Some(process),
+                companion_processes: Vec::new(),
+                _slot_permit: slot_permit,
+                stop_requested: stop_requested.clone(),
+                suppress_companion_events: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+    hooks.after_runtime_insert(&handle)?;
+
     registry.track(handle.clone());
-    persist_runtime_state(&plan.work_dir, &handle, &plan.success_check)?;
-
-    runtimes.write().expect("runtime map lock poisoned").insert(
-        runtime_id,
-        ManagedRuntime {
-            pid: Some(pid),
-            companion_pids: Vec::new(),
-            _slot_permit: slot_permit,
-            stop_requested: stop_requested.clone(),
-            suppress_companion_events: Arc::new(AtomicBool::new(false)),
-        },
-    );
-
     spawn_process_stream_readers(
         ProcessStreamReaderContext {
             runtime_id,
@@ -165,6 +365,8 @@ pub(crate) fn start_process_task(
                 registry: registry.clone(),
                 runtimes: runtimes.clone(),
                 events: events.clone(),
+                rollback: &mut rollback,
+                hooks: hooks.clone(),
             },
             companion_plan,
         )?;
@@ -188,7 +390,7 @@ pub(crate) fn start_process_task(
                 runtime.state = RuntimeState::Running;
             })
             .unwrap_or_else(|| handle.clone());
-        persist_runtime_state(&plan.work_dir, &running_handle, &plan.success_check)?;
+        hooks.persist_runtime_state(&plan.work_dir, &running_handle, &plan.success_check)?;
         let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
             task_id: running_handle.task_id,
             attempt_no: running_handle.attempt_no,
@@ -221,6 +423,7 @@ pub(crate) fn start_process_task(
         child,
     );
 
+    rollback.disarm();
     Ok(handle)
 }
 
@@ -236,6 +439,8 @@ pub(crate) fn initial_companion_recording_metadata(companion: &CompanionProcessP
     json!(CompanionProcessMetadata {
         kind: companion.kind,
         pid: None,
+        pgid: None,
+        pid_start_time: None,
         output_target: companion.output_target.clone(),
         outputs: companion.outputs.clone(),
         command_line: Some(render_command_line(&companion.executable, &companion.args,)),
@@ -293,7 +498,7 @@ pub(crate) fn spawn_process_stream_readers(
     }
 }
 
-pub(crate) struct CompanionRecordingStartContext {
+pub(crate) struct CompanionRecordingStartContext<'a> {
     pub(crate) runtime_id: Uuid,
     pub(crate) handle: RuntimeHandle,
     pub(crate) work_dir: PathBuf,
@@ -301,6 +506,8 @@ pub(crate) struct CompanionRecordingStartContext {
     pub(crate) registry: LocalRuntimeRegistry,
     pub(crate) runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     pub(crate) events: RuntimeEventSink,
+    pub(crate) rollback: &'a mut RuntimeStartRollback,
+    pub(crate) hooks: ManagedProcessStartHooks,
 }
 
 pub(crate) fn start_companion_recording_process(
@@ -315,6 +522,8 @@ pub(crate) fn start_companion_recording_process(
         registry,
         runtimes,
         events,
+        rollback,
+        hooks,
     } = context;
 
     let companion_command_line =
@@ -325,6 +534,7 @@ pub(crate) fn start_companion_recording_process(
         .current_dir(&companion_plan.work_dir)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
+    configure_new_process_group(&mut companion_child);
 
     match companion_child.spawn() {
         Ok(mut companion_child) => {
@@ -337,22 +547,28 @@ pub(crate) fn start_companion_recording_process(
                             "spawned companion child has no pid".to_string(),
                         )
                     })?;
+            let companion_process = ProcessIdentity::spawned_process_group(companion_pid);
+            rollback.add_companion_process(companion_process);
+            hooks.after_companion_spawn(&handle, companion_pid)?;
             let updated_handle = registry
                 .update(runtime_id, |runtime| {
                     update_companion_recording_metadata(runtime, |companion| {
                         companion.pid = Some(companion_pid);
+                        companion.pgid = companion_process.pgid;
+                        companion.pid_start_time = companion_process.pid_start_time;
                         companion.command_line = Some(companion_command_line.clone());
                         companion.state = CompanionProcessState::Running;
                         companion.error = None;
                     });
                 })
                 .unwrap_or_else(|| handle.clone());
-            persist_runtime_state(&work_dir, &updated_handle, &success_check)?;
-            runtimes
-                .write()
-                .expect("runtime map lock poisoned")
-                .entry(runtime_id)
-                .and_modify(|runtime| runtime.companion_pids.push(companion_pid));
+            hooks.persist_runtime_state(&work_dir, &updated_handle, &success_check)?;
+            {
+                let mut runtimes = runtimes.write().expect("runtime map lock poisoned");
+                runtimes
+                    .entry(runtime_id)
+                    .and_modify(|runtime| runtime.companion_processes.push(companion_process));
+            }
 
             if let Some(stderr) = companion_child.stderr.take() {
                 let events = events.clone();
@@ -398,7 +614,7 @@ pub(crate) fn start_companion_recording_process(
                     });
                 })
                 .unwrap_or_else(|| handle.clone());
-            let _ = persist_runtime_state(&work_dir, &updated_handle, &success_check);
+            let _ = hooks.persist_runtime_state(&work_dir, &updated_handle, &success_check);
             let _ = events.send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
             let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: updated_handle.task_id,

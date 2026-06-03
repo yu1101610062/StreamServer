@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::{
     OutputMountPrefixes, RepoError, TaskRepository, absolute_http_url_from_file_path,
-    externalize_managed_path, validation_error,
+    externalize_http_visible_path, validation_error,
 };
 
 impl TaskRepository {
@@ -45,7 +45,7 @@ impl TaskRepository {
             join media_nodes n on n.id = ta.node_id
             join tasks t on t.id = rf.task_id
             where 1 = 1
-              and rf.file_path like '%/data/zlm/www/output/%'
+              and rf.file_path like '%/data/zlm/www/%'
             "#,
         );
         apply_record_filters(&mut builder, &filter);
@@ -94,7 +94,7 @@ impl TaskRepository {
             join media_nodes n on n.id = ta.node_id
             join tasks t on t.id = rf.task_id
             where rf.task_id = $1
-              and rf.file_path like '%/data/zlm/www/output/%'
+              and rf.file_path like '%/data/zlm/www/%'
             order by coalesce(rf.start_time, rf.created_at) desc, rf.id desc
             "#,
         )
@@ -135,7 +135,7 @@ impl TaskRepository {
             join tasks t on t.id = ta.task_id
             join media_nodes n on n.id = ta.node_id
             where 1 = 1
-              and ta.file_path like '%/data/zlm/www/output/%'
+              and ta.file_path like '%/data/zlm/www/%'
             "#,
         );
         apply_file_artifact_filters(&mut builder, &filter);
@@ -359,7 +359,7 @@ impl TaskRepository {
             join tasks t on t.id = ta.task_id
             join media_nodes n on n.id = ta.node_id
             where ta.task_id = $1
-              and ta.file_path like '%/data/zlm/www/output/%'
+              and ta.file_path like '%/data/zlm/www/%'
             order by created_at desc, id desc
             "#,
         )
@@ -373,7 +373,7 @@ impl TaskRepository {
 
     async fn count_record_files(&self, filter: &RecordListFilter) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from record_files rf join task_attempts ta on ta.id = rf.attempt_id join media_nodes n on n.id = ta.node_id join tasks t on t.id = rf.task_id where 1 = 1 and rf.file_path like '%/data/zlm/www/output/%'",
+            "select count(*) as total from record_files rf join task_attempts ta on ta.id = rf.attempt_id join media_nodes n on n.id = ta.node_id join tasks t on t.id = rf.task_id where 1 = 1 and rf.file_path like '%/data/zlm/www/%'",
         );
         apply_record_filters(&mut builder, filter);
 
@@ -387,7 +387,7 @@ impl TaskRepository {
         filter: &FileArtifactListFilter,
     ) -> Result<u64, RepoError> {
         let mut builder = QueryBuilder::<Postgres>::new(
-            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id join media_nodes n on n.id = ta.node_id where 1 = 1 and ta.file_path like '%/data/zlm/www/output/%'",
+            "select count(*) as total from transcode_artifacts ta join tasks t on t.id = ta.task_id join media_nodes n on n.id = ta.node_id where 1 = 1 and ta.file_path like '%/data/zlm/www/%'",
         );
         apply_file_artifact_filters(&mut builder, filter);
 
@@ -458,7 +458,7 @@ impl RecordFileSummary {
             vhost: row.try_get("vhost")?,
             app: row.try_get("app")?,
             stream: row.try_get("stream")?,
-            file_path: externalize_managed_path(raw_file_path, "file_path", &prefixes)?,
+            file_path: externalize_http_visible_path(raw_file_path, "file_path", &prefixes)?,
             http_url: absolute_http_url_from_file_path(agent_stream_addr, raw_file_path),
             file_size: row.try_get("file_size")?,
             time_len: row.try_get("time_len")?,
@@ -537,7 +537,7 @@ impl FileArtifactSummary {
             attempt_id: row.try_get("attempt_id")?,
             node_id: row.try_get("node_id")?,
             file_name: row.try_get("file_name")?,
-            file_path: externalize_managed_path(raw_file_path, "file_path", &prefixes)?,
+            file_path: externalize_http_visible_path(raw_file_path, "file_path", &prefixes)?,
             http_url: absolute_http_url_from_file_path(agent_stream_addr, raw_file_path)
                 .ok_or_else(|| {
                     validation_error(

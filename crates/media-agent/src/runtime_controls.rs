@@ -28,17 +28,18 @@ use crate::{
     runtime_io::attempt_work_dir,
     runtime_metadata::{
         StreamBinding, emit_recording_control_event, live_relay_recording_from_handle,
-        resolved_spec_from_handle, runtime_lease_token, stream_binding_from_handle, stream_online,
+        process_identity_from_handle, resolved_spec_from_handle, runtime_lease_token,
+        stream_binding_from_handle, stream_online,
     },
     runtime_persistence::{persist_runtime_state, success_check_from_handle},
-    runtime_process::{ManagedRuntime, schedule_force_kill_if_running, signal_pid},
+    runtime_process::{ManagedRuntime, schedule_force_kill_if_running, signal_process},
     runtime_recording::{
         LiveRelayRecording, build_manual_live_relay_recording, mark_recording_completion,
         mark_recording_started, recording_config_matches,
     },
     runtime_registry::LocalRuntimeRegistry,
     runtime_zlm::{
-        build_close_stream_params, call_zlm_api,
+        build_close_stream_params, call_zlm_api, close_zlm_rtp_server,
         start_live_relay_recording as zlm_start_live_relay_recording,
         stop_live_relay_recording as zlm_stop_live_relay_recording,
     },
@@ -375,13 +376,7 @@ pub(crate) async fn close_rtp_receive(
                 "rtp_receive runtime is missing rtp_stream_id metadata".to_string(),
             )
         })?;
-    let _ = call_zlm_api(
-        ctx.http_client,
-        ctx.settings,
-        "/index/api/closeRtpServer",
-        &[("stream_id".to_string(), stream_id)],
-    )
-    .await?;
+    close_zlm_rtp_server(ctx.http_client, ctx.settings, &stream_id).await?;
     Ok(())
 }
 
@@ -398,17 +393,17 @@ pub(crate) async fn request_live_relay_record_duration_stop(
     http_client: &Client,
     runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
 ) -> Result<RecordDurationStopAction, ExecutorError> {
-    if let Some(pid) = handle.pid {
-        signal_pid(pid, libc::SIGTERM)
+    if let Some(process) = process_identity_from_handle(handle) {
+        signal_process(&process, libc::SIGTERM)
             .map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
         schedule_force_kill_if_running(
             handle.runtime_id,
-            vec![pid],
+            vec![process],
             runtimes.clone(),
             RECORD_DURATION_FORCE_KILL_DELAY,
             "record_duration_reached",
         );
-        Ok(RecordDurationStopAction::SignalProcess { pid })
+        Ok(RecordDurationStopAction::SignalProcess { pid: process.pid })
     } else {
         call_zlm_api(
             http_client,
@@ -457,11 +452,11 @@ pub(crate) fn maybe_spawn_manual_recording_duration_timer(
         let Some(handle) = registry.get(runtime_id) else {
             return;
         };
-        if !runtimes
-            .read()
-            .expect("runtime map lock poisoned")
-            .contains_key(&runtime_id)
-        {
+        let runtime_still_tracked = {
+            let runtimes = runtimes.read().expect("runtime map lock poisoned");
+            runtimes.contains_key(&runtime_id)
+        };
+        if !runtime_still_tracked {
             return;
         }
         let Some(current) = live_relay_recording_from_handle(&handle) else {

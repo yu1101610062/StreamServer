@@ -54,6 +54,9 @@ const CONTROL_BUFFER: usize = 32;
 const CONTROL_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const LOG_NOTIFICATION_BUFFER: usize = 128;
 const START_TASK_CONCURRENCY_LIMIT: usize = 4;
+const STOP_TASK_CONCURRENCY_LIMIT: usize = 8;
+const RECORDING_CONTROL_CONCURRENCY_LIMIT: usize = 4;
+const ADOPT_ORPHANS_CONCURRENCY_LIMIT: usize = 1;
 
 #[derive(Clone)]
 pub struct AgentController {
@@ -66,6 +69,9 @@ pub struct AgentController {
     runtime_priority_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
     runtime_log_batches: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
     start_task_permits: Arc<Semaphore>,
+    stop_task_permits: Arc<Semaphore>,
+    recording_control_permits: Arc<Semaphore>,
+    adopt_orphans_permits: Arc<Semaphore>,
     session_epoch: Arc<AtomicU64>,
 }
 
@@ -100,6 +106,11 @@ impl AgentController {
             runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
             runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
             start_task_permits: Arc::new(Semaphore::new(START_TASK_CONCURRENCY_LIMIT)),
+            stop_task_permits: Arc::new(Semaphore::new(STOP_TASK_CONCURRENCY_LIMIT)),
+            recording_control_permits: Arc::new(Semaphore::new(
+                RECORDING_CONTROL_CONCURRENCY_LIMIT,
+            )),
+            adopt_orphans_permits: Arc::new(Semaphore::new(ADOPT_ORPHANS_CONCURRENCY_LIMIT)),
             session_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -336,10 +347,12 @@ impl AgentController {
                     .await?;
             }
             media_rpc::control_plane::core_envelope::Payload::StopTask(command) => {
-                self.handle_stop_task(sender, command).await?;
+                self.handle_stop_task(sender, command, session_epoch)
+                    .await?;
             }
             media_rpc::control_plane::core_envelope::Payload::TaskRecordingControl(command) => {
-                self.handle_task_recording_control(sender, command).await?;
+                self.handle_task_recording_control(sender, command, session_epoch)
+                    .await?;
             }
         }
 
@@ -452,56 +465,84 @@ impl AgentController {
             return Ok(());
         }
 
-        let adopted = self.executor.adopt_orphans(&AdoptFilter {
-            session_epoch,
-            runtimes: runtimes.clone(),
-        });
-        let adopted_keys = adopted
-            .iter()
-            .map(|handle| {
-                (
-                    handle.task_id,
-                    handle.attempt_no,
-                    handle.worker_kind,
-                    handle
-                        .metadata
-                        .get("lease_token")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-            })
-            .collect::<std::collections::HashSet<_>>();
+        let sender = sender.clone();
+        let executor = self.executor.clone();
+        let adopt_orphans_permits = self.adopt_orphans_permits.clone();
+        let session_guard = self.session_epoch.clone();
 
-        for runtime in runtimes {
-            let key = (
-                runtime.task_id,
-                runtime.attempt_no,
-                runtime.worker_kind,
-                runtime.lease_token.clone(),
-            );
-            if adopted_keys.contains(&key) {
-                continue;
+        tokio::spawn(async move {
+            let Ok(_permit) = adopt_orphans_permits.acquire_owned().await else {
+                return;
+            };
+            if !session_is_current(&session_guard, session_epoch) {
+                return;
             }
-            send_task_event(
-                sender,
-                runtime.task_id,
-                runtime.attempt_no,
-                runtime.lease_token,
-                "orphaned",
-                "warn",
-                "authorized runtime was not found locally",
-                json!({
-                    "worker_kind": runtime.worker_kind,
-                    "reason": "runtime_not_found",
-                }),
-            )
-            .await?;
-        }
 
-        for handle in adopted {
-            send_task_snapshot(sender, &handle).await?;
-        }
+            let adopted = executor
+                .adopt_orphans(AdoptFilter {
+                    session_epoch,
+                    runtimes: runtimes.clone(),
+                })
+                .await;
+            if !session_is_current(&session_guard, session_epoch) {
+                return;
+            }
+
+            let adopted_keys = adopted
+                .iter()
+                .map(|handle| {
+                    (
+                        handle.task_id,
+                        handle.attempt_no,
+                        handle.worker_kind,
+                        handle
+                            .metadata
+                            .get("lease_token")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect::<std::collections::HashSet<_>>();
+
+            for runtime in runtimes {
+                if !session_is_current(&session_guard, session_epoch) {
+                    return;
+                }
+                let key = (
+                    runtime.task_id,
+                    runtime.attempt_no,
+                    runtime.worker_kind,
+                    runtime.lease_token.clone(),
+                );
+                if adopted_keys.contains(&key) {
+                    continue;
+                }
+                let _ = send_task_event(
+                    &sender,
+                    runtime.task_id,
+                    runtime.attempt_no,
+                    runtime.lease_token,
+                    "orphaned",
+                    "warn",
+                    "authorized runtime was not found locally",
+                    json!({
+                        "worker_kind": runtime.worker_kind,
+                        "reason": "runtime_not_found",
+                    }),
+                )
+                .await;
+            }
+
+            for handle in adopted {
+                if !session_is_current(&session_guard, session_epoch)
+                    || runtime_session_epoch(&handle) != session_epoch
+                {
+                    return;
+                }
+                let _ = send_task_snapshot(&sender, &handle).await;
+            }
+        });
 
         Ok(())
     }
@@ -529,6 +570,9 @@ impl AgentController {
             }
 
             if let Err(error) = artifact_cleanup.ensure_task_start_allowed(&request.resolved_spec) {
+                if !session_is_current(&session_guard, request.session_epoch) {
+                    return;
+                }
                 let handle = rejected_runtime_handle(&request);
                 let _ = send_task_event(
                     &sender,
@@ -548,8 +592,21 @@ impl AgentController {
                 return;
             }
 
-            match executor.start_task(&request) {
+            match executor.start_task(request.clone()).await {
                 Ok(handle) => {
+                    if !session_is_current(&session_guard, request.session_epoch) {
+                        let _ = executor
+                            .stop_task(StopTaskRequest {
+                                task_id: request.task_id,
+                                attempt_no: request.attempt_no,
+                                lease_token: request.lease_token.clone(),
+                                reason: "stale_session_replaced".to_string(),
+                                grace_period_sec: 0,
+                                force_after_sec: 1,
+                            })
+                            .await;
+                        return;
+                    }
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
@@ -563,15 +620,7 @@ impl AgentController {
                         }),
                     )
                     .await;
-                    if session_guard.load(Ordering::SeqCst) != request.session_epoch {
-                        let _ = executor.stop_task(&StopTaskRequest {
-                            task_id: request.task_id,
-                            attempt_no: request.attempt_no,
-                            lease_token: request.lease_token.clone(),
-                            reason: "stale_session_replaced".to_string(),
-                            grace_period_sec: 0,
-                            force_after_sec: 1,
-                        });
+                    if !session_is_current(&session_guard, request.session_epoch) {
                         return;
                     }
                     let _ = send_task_event(
@@ -588,9 +637,16 @@ impl AgentController {
                         }),
                     )
                     .await;
-                    let _ = send_task_snapshot(&sender, &handle).await;
+                    if session_is_current(&session_guard, request.session_epoch)
+                        && runtime_session_epoch(&handle) == request.session_epoch
+                    {
+                        let _ = send_task_snapshot(&sender, &handle).await;
+                    }
                 }
                 Err(error) => {
+                    if !session_is_current(&session_guard, request.session_epoch) {
+                        return;
+                    }
                     let handle = rejected_runtime_handle(&request);
                     let _ = send_task_event(
                         &sender,
@@ -618,48 +674,73 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
         command: StopTask,
+        session_epoch: u64,
     ) -> anyhow::Result<()> {
         let request = parse_stop_task(command)?;
-        match self.executor.stop_task(&request) {
-            Ok(()) => {
-                send_task_event(
-                    sender,
-                    request.task_id,
-                    request.attempt_no,
-                    request.lease_token.clone(),
-                    "stopping",
-                    "info",
-                    "stop request accepted",
-                    json!({
-                        "reason": request.reason,
-                        "grace_period_sec": request.grace_period_sec,
-                        "force_after_sec": request.force_after_sec,
-                    }),
-                )
-                .await?;
-                if let Some(handle) = self
-                    .runtime_registry
-                    .find_by_task_attempt(request.task_id, request.attempt_no)
-                {
-                    send_task_snapshot(sender, &handle).await?;
+        let sender = sender.clone();
+        let executor = self.executor.clone();
+        let runtime_registry = self.runtime_registry.clone();
+        let stop_task_permits = self.stop_task_permits.clone();
+        let session_guard = self.session_epoch.clone();
+
+        tokio::spawn(async move {
+            let Ok(_permit) = stop_task_permits.acquire_owned().await else {
+                return;
+            };
+            if !session_is_current(&session_guard, session_epoch) {
+                return;
+            }
+
+            match executor.stop_task(request.clone()).await {
+                Ok(()) => {
+                    if !session_is_current(&session_guard, session_epoch) {
+                        return;
+                    }
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        request.lease_token.clone(),
+                        "stopping",
+                        "info",
+                        "stop request accepted",
+                        json!({
+                            "reason": request.reason,
+                            "grace_period_sec": request.grace_period_sec,
+                            "force_after_sec": request.force_after_sec,
+                        }),
+                    )
+                    .await;
+                    if let Some(handle) =
+                        runtime_registry.find_by_task_attempt(request.task_id, request.attempt_no)
+                    {
+                        if session_is_current(&session_guard, session_epoch)
+                            && runtime_session_epoch(&handle) == session_epoch
+                        {
+                            let _ = send_task_snapshot(&sender, &handle).await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    if !session_is_current(&session_guard, session_epoch) {
+                        return;
+                    }
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        request.lease_token.clone(),
+                        "stop_rejected",
+                        "error",
+                        error.to_string(),
+                        json!({
+                            "reason": request.reason,
+                        }),
+                    )
+                    .await;
                 }
             }
-            Err(error) => {
-                send_task_event(
-                    sender,
-                    request.task_id,
-                    request.attempt_no,
-                    request.lease_token.clone(),
-                    "stop_rejected",
-                    "error",
-                    error.to_string(),
-                    json!({
-                        "reason": request.reason,
-                    }),
-                )
-                .await?;
-            }
-        }
+        });
 
         Ok(())
     }
@@ -668,30 +749,52 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
         command: TaskRecordingControl,
+        session_epoch: u64,
     ) -> anyhow::Result<()> {
         let request = parse_task_recording_control(command)?;
-        match self.executor.set_task_recording(&request) {
-            Ok(handle) => {
-                send_task_snapshot(sender, &handle).await?;
+        let sender = sender.clone();
+        let executor = self.executor.clone();
+        let recording_control_permits = self.recording_control_permits.clone();
+        let session_guard = self.session_epoch.clone();
+
+        tokio::spawn(async move {
+            let Ok(_permit) = recording_control_permits.acquire_owned().await else {
+                return;
+            };
+            if !session_is_current(&session_guard, session_epoch) {
+                return;
             }
-            Err(error) => {
-                send_task_event(
-                    sender,
-                    request.task_id,
-                    request.attempt_no,
-                    request.lease_token.clone(),
-                    "recording_control_failed",
-                    "error",
-                    error.to_string(),
-                    json!({
-                        "command_id": request.command_id,
-                        "action": recording_control_action_name(request.action),
-                        "reason": request.reason,
-                    }),
-                )
-                .await?;
+
+            match executor.set_task_recording(request.clone()).await {
+                Ok(handle) => {
+                    if session_is_current(&session_guard, session_epoch)
+                        && runtime_session_epoch(&handle) == session_epoch
+                    {
+                        let _ = send_task_snapshot(&sender, &handle).await;
+                    }
+                }
+                Err(error) => {
+                    if !session_is_current(&session_guard, session_epoch) {
+                        return;
+                    }
+                    let _ = send_task_event(
+                        &sender,
+                        request.task_id,
+                        request.attempt_no,
+                        request.lease_token.clone(),
+                        "recording_control_failed",
+                        "error",
+                        error.to_string(),
+                        json!({
+                            "command_id": request.command_id,
+                            "action": recording_control_action_name(request.action),
+                            "reason": request.reason,
+                        }),
+                    )
+                    .await;
+                }
             }
-        }
+        });
 
         Ok(())
     }
@@ -745,6 +848,10 @@ impl AgentController {
             output_mount_relative_prefix_hls,
         })
     }
+}
+
+fn session_is_current(session_guard: &Arc<AtomicU64>, session_epoch: u64) -> bool {
+    session_guard.load(Ordering::SeqCst) == session_epoch
 }
 
 async fn send_capability_snapshot(
@@ -1206,7 +1313,346 @@ async fn recv_runtime_log_batch(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_http_base_url, parse_http_addr_port};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    use crate::runtime::ExecutorError;
+    use chrono::Utc;
+    use media_domain::{RuntimeState, WorkerKind};
+    use tokio::{
+        sync::{Mutex as TokioMutex, oneshot},
+        time::{Duration as TokioDuration, timeout},
+    };
+
+    struct TestExecutor {
+        start_gate: TokioMutex<Option<oneshot::Receiver<()>>>,
+        stop_gate: TokioMutex<Option<oneshot::Receiver<()>>>,
+        recording_gate: TokioMutex<Option<oneshot::Receiver<()>>>,
+        adopt_gate: TokioMutex<Option<oneshot::Receiver<()>>>,
+        adopt_result: TokioMutex<Vec<RuntimeHandle>>,
+        start_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+        recording_calls: AtomicUsize,
+        adopt_calls: AtomicUsize,
+        adopt_active: AtomicUsize,
+        max_adopt_active: AtomicUsize,
+    }
+
+    impl Default for TestExecutor {
+        fn default() -> Self {
+            Self {
+                start_gate: TokioMutex::new(None),
+                stop_gate: TokioMutex::new(None),
+                recording_gate: TokioMutex::new(None),
+                adopt_gate: TokioMutex::new(None),
+                adopt_result: TokioMutex::new(Vec::new()),
+                start_calls: AtomicUsize::new(0),
+                stop_calls: AtomicUsize::new(0),
+                recording_calls: AtomicUsize::new(0),
+                adopt_calls: AtomicUsize::new(0),
+                adopt_active: AtomicUsize::new(0),
+                max_adopt_active: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TestExecutor {
+        async fn block_start(&self) -> oneshot::Sender<()> {
+            install_gate(&self.start_gate).await
+        }
+
+        async fn block_stop(&self) -> oneshot::Sender<()> {
+            install_gate(&self.stop_gate).await
+        }
+
+        async fn block_recording(&self) -> oneshot::Sender<()> {
+            install_gate(&self.recording_gate).await
+        }
+
+        async fn block_adopt(&self) -> oneshot::Sender<()> {
+            install_gate(&self.adopt_gate).await
+        }
+    }
+
+    #[tonic::async_trait]
+    impl LocalExecutor for TestExecutor {
+        async fn start_task(
+            &self,
+            request: StartTaskRequest,
+        ) -> Result<RuntimeHandle, ExecutorError> {
+            self.start_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            wait_gate(&self.start_gate).await;
+            Ok(test_handle(
+                request.task_id,
+                request.attempt_no,
+                request.lease_token,
+                request.task_type.default_worker_kind(),
+                request.session_epoch,
+            ))
+        }
+
+        async fn stop_task(&self, _request: StopTaskRequest) -> Result<(), ExecutorError> {
+            self.stop_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            wait_gate(&self.stop_gate).await;
+            Ok(())
+        }
+
+        async fn set_task_recording(
+            &self,
+            request: TaskRecordingControlRequest,
+        ) -> Result<RuntimeHandle, ExecutorError> {
+            self.recording_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            wait_gate(&self.recording_gate).await;
+            Ok(test_handle(
+                request.task_id,
+                request.attempt_no,
+                request.lease_token,
+                WorkerKind::ZlmProxy,
+                1,
+            ))
+        }
+
+        async fn adopt_orphans(&self, _filter: AdoptFilter) -> Vec<RuntimeHandle> {
+            self.adopt_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            let active = self
+                .adopt_active
+                .fetch_add(1, AtomicOrdering::SeqCst)
+                .saturating_add(1);
+            record_max(&self.max_adopt_active, active);
+            wait_gate(&self.adopt_gate).await;
+            self.adopt_active.fetch_sub(1, AtomicOrdering::SeqCst);
+            self.adopt_result.lock().await.clone()
+        }
+    }
+
+    async fn install_gate(gate: &TokioMutex<Option<oneshot::Receiver<()>>>) -> oneshot::Sender<()> {
+        let (tx, rx) = oneshot::channel();
+        *gate.lock().await = Some(rx);
+        tx
+    }
+
+    async fn wait_gate(gate: &TokioMutex<Option<oneshot::Receiver<()>>>) {
+        let gate = { gate.lock().await.take() };
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+    }
+
+    fn record_max(max: &AtomicUsize, value: usize) {
+        let mut current = max.load(AtomicOrdering::SeqCst);
+        while value > current {
+            match max.compare_exchange(
+                current,
+                value,
+                AtomicOrdering::SeqCst,
+                AtomicOrdering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    async fn wait_for_counter(counter: &AtomicUsize, expected: usize) {
+        timeout(TokioDuration::from_millis(500), async {
+            loop {
+                if counter.load(AtomicOrdering::SeqCst) >= expected {
+                    break;
+                }
+                tokio::time::sleep(TokioDuration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("counter should reach expected value");
+    }
+
+    fn test_controller(executor: Arc<TestExecutor>) -> AgentController {
+        let agent = crate::config::AgentSettings {
+            ffmpeg_bin: "true".to_string(),
+            zlm_api_base: String::new(),
+            work_root: ".".to_string(),
+            zlm_output_mp4_root: "/tmp/streamserver-control-plane-test/mp4".to_string(),
+            zlm_output_hls_root: "/tmp/streamserver-control-plane-test/hls".to_string(),
+            artifact_cleanup: crate::config::AgentArtifactCleanupSettings {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let settings = Settings {
+            environment: "test".to_string(),
+            logging: crate::config::LoggingSettings::default(),
+            agent,
+        };
+        let runtime_registry = LocalRuntimeRegistry::new();
+        let (_runtime_priority_tx, runtime_priority_rx) = mpsc::unbounded_channel();
+        let (_runtime_log_tx, runtime_log_rx) = mpsc::channel(LOG_NOTIFICATION_BUFFER);
+        let executor: Arc<dyn LocalExecutor> = executor;
+        let artifact_cleanup = ArtifactCleanupManager::with_executor(
+            &settings.agent,
+            runtime_registry.clone(),
+            Some(executor.clone()),
+        );
+
+        AgentController {
+            settings: Arc::new(settings),
+            node_id: Uuid::now_v7(),
+            capability_probe: CapabilityProbe::new().expect("capability probe should build"),
+            runtime_registry,
+            artifact_cleanup,
+            executor,
+            runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
+            runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
+            start_task_permits: Arc::new(Semaphore::new(START_TASK_CONCURRENCY_LIMIT)),
+            stop_task_permits: Arc::new(Semaphore::new(STOP_TASK_CONCURRENCY_LIMIT)),
+            recording_control_permits: Arc::new(Semaphore::new(
+                RECORDING_CONTROL_CONCURRENCY_LIMIT,
+            )),
+            adopt_orphans_permits: Arc::new(Semaphore::new(ADOPT_ORPHANS_CONCURRENCY_LIMIT)),
+            session_epoch: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn test_handle(
+        task_id: Uuid,
+        attempt_no: i32,
+        lease_token: String,
+        worker_kind: WorkerKind,
+        session_epoch: u64,
+    ) -> RuntimeHandle {
+        RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id,
+            attempt_no,
+            worker_kind,
+            pid: Some(1),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Running,
+            command_line: None,
+            outputs: Vec::new(),
+            metadata: json!({
+                "lease_token": lease_token,
+                "session_epoch": session_epoch,
+            }),
+        }
+    }
+
+    fn sender_pair() -> (mpsc::Sender<AgentEnvelope>, mpsc::Receiver<AgentEnvelope>) {
+        mpsc::channel(CONTROL_BUFFER)
+    }
+
+    async fn recv_agent_envelope(receiver: &mut mpsc::Receiver<AgentEnvelope>) -> AgentEnvelope {
+        timeout(TokioDuration::from_millis(500), receiver.recv())
+            .await
+            .expect("agent envelope should be sent")
+            .expect("sender should stay open")
+    }
+
+    async fn assert_no_agent_envelope(receiver: &mut mpsc::Receiver<AgentEnvelope>) {
+        assert!(
+            timeout(TokioDuration::from_millis(100), receiver.recv())
+                .await
+                .is_err(),
+            "stale session should not send an agent envelope"
+        );
+    }
+
+    fn event_type(envelope: &AgentEnvelope) -> Option<&str> {
+        match envelope.payload.as_ref()? {
+            media_rpc::control_plane::agent_envelope::Payload::TaskEvent(event) => {
+                Some(event.event_type.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    fn is_heartbeat(envelope: &AgentEnvelope) -> bool {
+        matches!(
+            envelope.payload.as_ref(),
+            Some(media_rpc::control_plane::agent_envelope::Payload::Heartbeat(_))
+        )
+    }
+
+    fn stop_envelope(task_id: Uuid) -> CoreEnvelope {
+        CoreEnvelope {
+            payload: Some(media_rpc::control_plane::core_envelope::Payload::StopTask(
+                StopTask {
+                    task_id: task_id.to_string(),
+                    attempt_no: 1,
+                    reason: "test".to_string(),
+                    grace_period_sec: 1,
+                    force_after_sec: 2,
+                    lease_token: "lease".to_string(),
+                },
+            )),
+        }
+    }
+
+    fn recording_envelope(task_id: Uuid) -> CoreEnvelope {
+        CoreEnvelope {
+            payload: Some(
+                media_rpc::control_plane::core_envelope::Payload::TaskRecordingControl(
+                    TaskRecordingControl {
+                        task_id: task_id.to_string(),
+                        attempt_no: 1,
+                        lease_token: "lease".to_string(),
+                        action: "start".to_string(),
+                        record_config_json: "{}".to_string(),
+                        reason: "test".to_string(),
+                        command_id: Uuid::now_v7().to_string(),
+                    },
+                ),
+            ),
+        }
+    }
+
+    fn adopt_envelope(task_id: Uuid) -> CoreEnvelope {
+        CoreEnvelope {
+            payload: Some(
+                media_rpc::control_plane::core_envelope::Payload::AdoptOrphans(AdoptOrphans {
+                    runtimes: vec![media_rpc::control_plane::ReclaimRuntime {
+                        task_id: task_id.to_string(),
+                        attempt_no: 1,
+                        lease_token: "lease".to_string(),
+                        worker_kind: WorkerKind::ZlmProxy.as_str().to_string(),
+                    }],
+                }),
+            ),
+        }
+    }
+
+    fn start_envelope(task_id: Uuid) -> CoreEnvelope {
+        CoreEnvelope {
+            payload: Some(media_rpc::control_plane::core_envelope::Payload::StartTask(
+                StartTask {
+                    task_id: task_id.to_string(),
+                    attempt_no: 1,
+                    task_type: "stream_ingest".to_string(),
+                    resolved_spec_json: json!({
+                        "type": "stream_ingest",
+                        "name": "test",
+                        "input": {
+                            "kind": "rtsp",
+                            "source_mode": "live",
+                            "url": "rtsp://127.0.0.1/live"
+                        },
+                        "stream": {
+                            "app": "live",
+                            "name": "test"
+                        },
+                        "record": {
+                            "enabled": false
+                        }
+                    })
+                    .to_string(),
+                    execution_mode: "managed".to_string(),
+                    lease_token: "lease".to_string(),
+                    trace_context: String::new(),
+                },
+            )),
+        }
+    }
 
     #[test]
     fn agent_http_base_url_uses_stream_host_and_http_addr_port() {
@@ -1227,5 +1673,202 @@ mod tests {
     #[test]
     fn parse_http_addr_port_rejects_missing_port() {
         assert!(parse_http_addr_port("0.0.0.0").is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_task_job_does_not_block_runtime_notifications() {
+        let executor = Arc::new(TestExecutor::default());
+        let release_stop = executor.block_stop().await;
+        let controller = test_controller(executor.clone());
+        let (sender, mut receiver) = sender_pair();
+        let task_id = Uuid::now_v7();
+
+        timeout(
+            TokioDuration::from_millis(100),
+            controller.handle_core_envelope(&sender, stop_envelope(task_id), 1),
+        )
+        .await
+        .expect("stop handler should return immediately")
+        .expect("stop handler should succeed");
+        wait_for_counter(&executor.stop_calls, 1).await;
+
+        controller
+            .forward_runtime_notification(
+                &sender,
+                RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                    task_id,
+                    attempt_no: 1,
+                    lease_token: "lease".to_string(),
+                    session_epoch: 1,
+                    event_type: "runtime_notification".to_string(),
+                    event_level: "info".to_string(),
+                    message: "runtime notification forwarded".to_string(),
+                    payload: json!({}),
+                }),
+                1,
+            )
+            .await
+            .expect("runtime notification should forward");
+
+        let envelope = recv_agent_envelope(&mut receiver).await;
+        assert_eq!(event_type(&envelope), Some("runtime_notification"));
+        let _ = release_stop.send(());
+    }
+
+    #[tokio::test]
+    async fn recording_job_does_not_block_heartbeat_path() {
+        let executor = Arc::new(TestExecutor::default());
+        let release_recording = executor.block_recording().await;
+        let controller = test_controller(executor.clone());
+        let (sender, mut receiver) = sender_pair();
+        let task_id = Uuid::now_v7();
+
+        timeout(
+            TokioDuration::from_millis(100),
+            controller.handle_core_envelope(&sender, recording_envelope(task_id), 1),
+        )
+        .await
+        .expect("recording handler should return immediately")
+        .expect("recording handler should succeed");
+        wait_for_counter(&executor.recording_calls, 1).await;
+
+        let mut sampler = HeartbeatSampler::new(".", 2, None);
+        controller
+            .send_heartbeat(&sender, &mut sampler)
+            .await
+            .expect("heartbeat should send while recording job is blocked");
+        let envelope = recv_agent_envelope(&mut receiver).await;
+        assert!(is_heartbeat(&envelope));
+        let _ = release_recording.send(());
+    }
+
+    #[tokio::test]
+    async fn adopt_job_does_not_block_later_core_commands() {
+        let executor = Arc::new(TestExecutor::default());
+        let release_adopt = executor.block_adopt().await;
+        let controller = test_controller(executor.clone());
+        let (sender, _receiver) = sender_pair();
+        let task_id = Uuid::now_v7();
+
+        controller
+            .handle_core_envelope(&sender, adopt_envelope(task_id), 1)
+            .await
+            .expect("adopt handler should succeed");
+        wait_for_counter(&executor.adopt_calls, 1).await;
+
+        timeout(
+            TokioDuration::from_millis(100),
+            controller.handle_core_envelope(&sender, stop_envelope(task_id), 1),
+        )
+        .await
+        .expect("later stop handler should enter while adopt job is blocked")
+        .expect("stop handler should succeed");
+        wait_for_counter(&executor.stop_calls, 1).await;
+        let _ = release_adopt.send(());
+    }
+
+    #[tokio::test]
+    async fn adopt_jobs_are_limited_to_one_active_executor_call() {
+        let executor = Arc::new(TestExecutor::default());
+        let release_adopt = executor.block_adopt().await;
+        let controller = test_controller(executor.clone());
+        let (sender, _receiver) = sender_pair();
+
+        controller
+            .handle_core_envelope(&sender, adopt_envelope(Uuid::now_v7()), 1)
+            .await
+            .expect("first adopt handler should succeed");
+        controller
+            .handle_core_envelope(&sender, adopt_envelope(Uuid::now_v7()), 1)
+            .await
+            .expect("second adopt handler should succeed");
+        wait_for_counter(&executor.adopt_calls, 1).await;
+        tokio::time::sleep(TokioDuration::from_millis(50)).await;
+
+        assert_eq!(executor.adopt_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(executor.max_adopt_active.load(AtomicOrdering::SeqCst), 1);
+        let _ = release_adopt.send(());
+    }
+
+    #[tokio::test]
+    async fn stale_session_jobs_do_not_send_old_events() {
+        let executor = Arc::new(TestExecutor::default());
+        let controller = test_controller(executor.clone());
+        let (sender, mut receiver) = sender_pair();
+        let release_stop = executor.block_stop().await;
+
+        controller
+            .handle_core_envelope(&sender, stop_envelope(Uuid::now_v7()), 1)
+            .await
+            .expect("stop handler should succeed");
+        wait_for_counter(&executor.stop_calls, 1).await;
+        controller.session_epoch.store(2, Ordering::SeqCst);
+        let _ = release_stop.send(());
+        assert_no_agent_envelope(&mut receiver).await;
+
+        let executor = Arc::new(TestExecutor::default());
+        let controller = test_controller(executor.clone());
+        let (sender, mut receiver) = sender_pair();
+        let release_recording = executor.block_recording().await;
+
+        controller
+            .handle_core_envelope(&sender, recording_envelope(Uuid::now_v7()), 1)
+            .await
+            .expect("recording handler should succeed");
+        wait_for_counter(&executor.recording_calls, 1).await;
+        controller.session_epoch.store(2, Ordering::SeqCst);
+        let _ = release_recording.send(());
+        assert_no_agent_envelope(&mut receiver).await;
+
+        let executor = Arc::new(TestExecutor::default());
+        let controller = test_controller(executor.clone());
+        let (sender, mut receiver) = sender_pair();
+        let release_adopt = executor.block_adopt().await;
+
+        controller
+            .handle_core_envelope(&sender, adopt_envelope(Uuid::now_v7()), 1)
+            .await
+            .expect("adopt handler should succeed");
+        wait_for_counter(&executor.adopt_calls, 1).await;
+        controller.session_epoch.store(2, Ordering::SeqCst);
+        let _ = release_adopt.send(());
+        assert_no_agent_envelope(&mut receiver).await;
+
+        let executor = Arc::new(TestExecutor::default());
+        let controller = test_controller(executor.clone());
+        let (sender, mut receiver) = sender_pair();
+        let release_start = executor.block_start().await;
+
+        controller
+            .handle_core_envelope(&sender, start_envelope(Uuid::now_v7()), 1)
+            .await
+            .expect("start handler should succeed");
+        wait_for_counter(&executor.start_calls, 1).await;
+        controller.session_epoch.store(2, Ordering::SeqCst);
+        let _ = release_start.send(());
+        wait_for_counter(&executor.stop_calls, 1).await;
+        assert_no_agent_envelope(&mut receiver).await;
+    }
+
+    #[test]
+    fn runtime_command_job_semaphores_match_expected_limits() {
+        let controller = test_controller(Arc::new(TestExecutor::default()));
+
+        assert_eq!(
+            controller.start_task_permits.available_permits(),
+            START_TASK_CONCURRENCY_LIMIT
+        );
+        assert_eq!(
+            controller.stop_task_permits.available_permits(),
+            STOP_TASK_CONCURRENCY_LIMIT
+        );
+        assert_eq!(
+            controller.recording_control_permits.available_permits(),
+            RECORDING_CONTROL_CONCURRENCY_LIMIT
+        );
+        assert_eq!(
+            controller.adopt_orphans_permits.available_permits(),
+            ADOPT_ORPHANS_CONCURRENCY_LIMIT
+        );
     }
 }

@@ -359,12 +359,12 @@ async fn insert_running_stream_task(
           id, task_id, attempt_no, node_id, worker_kind, status,
           pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
           rtp_port, exit_code, failure_code, failure_reason,
-          checkpoint_json, started_at, ended_at, created_at
+          checkpoint_json, started_at, ended_at, created_at, lease_token
         ) values (
           $1, $2, 1, $3, 'zlm_proxy'::worker_kind, 'RUNNING'::attempt_status,
           null, null, 'rtsp', '__defaultVhost__', $4, $5,
           null, null, null, null,
-          null, $6, null, $6
+          null, $6, null, $6, 'lease-1'
         )
         "#,
     )
@@ -384,6 +384,14 @@ async fn insert_running_stream_task(
         ) values (
           $1, $2, $3, $4, $5, 'rtsp', '__defaultVhost__', $6, $7, null, null, null, $8
         )
+        on conflict (server_id, schema, vhost, app, stream) do update
+          set task_id = excluded.task_id,
+              attempt_id = excluded.attempt_id,
+              node_id = excluded.node_id,
+              zlm_proxy_key = excluded.zlm_proxy_key,
+              zlm_pusher_key = excluded.zlm_pusher_key,
+              rtp_stream_id = excluded.rtp_stream_id,
+              created_at = excluded.created_at
         "#,
     )
     .bind(Uuid::now_v7())
@@ -717,12 +725,12 @@ async fn insert_running_transcode_task(
           id, task_id, attempt_no, node_id, worker_kind, status,
           pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
           rtp_port, exit_code, failure_code, failure_reason,
-          checkpoint_json, started_at, ended_at, created_at
+          checkpoint_json, started_at, ended_at, created_at, lease_token
         ) values (
           $1, $2, 1, $3, 'ffmpeg'::worker_kind, 'RUNNING'::attempt_status,
           null, null, null, null, null, null,
           null, null, null, null,
-          null, $4, null, $4
+          null, $4, null, $4, 'lease-1'
         )
         "#,
     )
@@ -769,12 +777,12 @@ async fn insert_running_bridge_task(
           id, task_id, attempt_no, node_id, worker_kind, status,
           pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
           rtp_port, exit_code, failure_code, failure_reason,
-          checkpoint_json, started_at, ended_at, created_at
+          checkpoint_json, started_at, ended_at, created_at, lease_token
         ) values (
           $1, $2, 1, $3, 'ffmpeg'::worker_kind, 'RUNNING'::attempt_status,
           null, null, null, null, null, null,
           null, null, null, null,
-          null, $4, null, $4
+          null, $4, null, $4, 'lease-1'
         )
         "#,
     )
@@ -821,12 +829,12 @@ async fn insert_running_ingest_task(
           id, task_id, attempt_no, node_id, worker_kind, status,
           pid, zlm_key, zlm_schema, zlm_vhost, zlm_app, zlm_stream,
           rtp_port, exit_code, failure_code, failure_reason,
-          checkpoint_json, started_at, ended_at, created_at
+          checkpoint_json, started_at, ended_at, created_at, lease_token
         ) values (
           $1, $2, 1, $3, 'ffmpeg'::worker_kind, 'RUNNING'::attempt_status,
           null, null, null, null, null, null,
           null, null, null, null,
-          null, $4, null, $4
+          null, $4, null, $4, 'lease-1'
         )
         "#,
     )
@@ -1405,6 +1413,14 @@ async fn stop_task_is_idempotent_when_task_is_already_stopping_via_api() -> anyh
     let attempt_id = Uuid::now_v7();
     let node_id = Uuid::now_v7();
     let payload = sample_create_task_payload("manual");
+    let repository = TaskRepository::new(db.pool.clone());
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
 
     sqlx::query(
         r#"
@@ -2168,6 +2184,9 @@ async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<
     )
     .await?;
     let media_seen_at = Utc::now() - chrono::Duration::seconds(40);
+    let stored_media_seen_at =
+        DateTime::<Utc>::from_timestamp_micros(media_seen_at.timestamp_micros())
+            .expect("test timestamp should be representable");
     repository
         .record_media_server_seen(node_id, &server_id, media_seen_at)
         .await?;
@@ -2201,7 +2220,7 @@ async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<
         .into_iter()
         .find(|candidate| candidate.id == node_id)
         .expect("node should exist");
-    assert_eq!(node.media_last_seen_at, Some(media_seen_at));
+    assert_eq!(node.media_last_seen_at, Some(stored_media_seen_at));
     assert!(!node.media_alive);
     assert!(node.control_connected);
     assert!(node.healthy);
@@ -2335,11 +2354,11 @@ async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::
     let node_id = Uuid::now_v7();
     upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-01",
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true,
             "enable_rtmp": true,
             "enable_http_ts": true,
@@ -2476,11 +2495,11 @@ async fn list_streams_uses_current_node_stream_ports() -> anyhow::Result<()> {
     )
     .await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-ports",
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true,
             "enable_rtmp": true,
             "enable_http_ts": true,
@@ -2546,11 +2565,11 @@ async fn list_streams_collapses_duplicate_bindings_for_same_logical_stream() -> 
     let node_id = Uuid::now_v7();
     upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-01",
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true,
             "enable_rtmp": true,
             "enable_http_ts": true,
@@ -2675,11 +2694,11 @@ async fn list_streams_returns_fallback_entries_when_runtime_lookup_fails() -> an
     )
     .await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-runtime-down",
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {},
+        "expose": {},
         "record": {"enabled": false},
         "recovery": {},
         "schedule": {"start_mode": "immediate"},
@@ -2720,7 +2739,7 @@ async fn create_task_rejects_invalid_callback_url() -> anyhow::Result<()> {
     let app = build_app(test_app_state(db.pool.clone()));
     let payload = json!({
         "name": "relay-camera-01",
-        "type": "live_relay",
+        "type": "stream_ingest",
         "priority": 50,
         "common": {
             "created_by": "alice",
@@ -2730,7 +2749,7 @@ async fn create_task_rejects_invalid_callback_url() -> anyhow::Result<()> {
             "kind": "rtsp",
             "url": "rtsp://camera.example/live"
         },
-        "publish": {
+        "expose": {
             "enable_rtsp": true
         },
         "record": {
@@ -2781,11 +2800,11 @@ async fn callback_dispatcher_waits_for_record_artifact_before_first_terminal_cal
     .await?;
     let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-01",
         "common": {"created_by": "tester", "callback_url": callback_url},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true,
             "enable_http_ts": true
         },
@@ -2931,11 +2950,11 @@ async fn callback_dispatcher_delivers_running_status_callback() -> anyhow::Resul
     .await?;
     let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-01",
         "common": {"created_by": "tester", "callback_url": callback_url},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true,
             "enable_http_ts": true
         },
@@ -3330,6 +3349,32 @@ async fn task_events_endpoint_externalizes_record_file_paths() -> anyhow::Result
             },
         )
         .await?;
+    let attempt_id: Uuid =
+        sqlx::query_scalar("select id from task_attempts where task_id = $1 and attempt_no = 1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        r#"
+        insert into task_events (
+          id, task_id, attempt_id, attempt_no, source, event_type, event_level,
+          payload, created_at
+        ) values (
+          $1, $2, $3, 1, 'zlm_hook'::event_source, 'record_file_persisted', 'info',
+          $4, $5
+        )
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(task_id)
+    .bind(attempt_id)
+    .bind(json!({
+        "file_path": "/data/zlm/www/record/live/camera01/clip.mp4",
+        "folder": "/data/zlm/www/record/live/camera01"
+    }))
+    .bind(Utc::now() + chrono::Duration::milliseconds(1))
+    .execute(&db.pool)
+    .await?;
 
     let app = build_app(test_app_state(db.pool.clone()));
     let response = app
@@ -3376,11 +3421,11 @@ async fn running_status_callback_is_not_duplicated_after_delivery() -> anyhow::R
     .await?;
     let (callback_url, calls, callback_handle) = spawn_callback_stub(StatusCode::OK).await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-01",
         "common": {"created_by": "tester", "callback_url": callback_url},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true
         },
         "record": {"enabled": false},
@@ -4098,12 +4143,20 @@ async fn record_agent_snapshot_ignores_missing_attempt_without_sql_error() -> an
         )
         .await?;
 
-    let event_count: i64 =
-        sqlx::query_scalar("select count(*) from task_events where task_id = $1")
-            .bind(task_id)
-            .fetch_one(&db.pool)
-            .await?;
-    assert_eq!(event_count, 0);
+    let snapshot_event_count: i64 = sqlx::query_scalar(
+        "select count(*) from task_events where task_id = $1 and event_type = 'task_snapshot'",
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(snapshot_event_count, 0);
+    let stale_event_count: i64 = sqlx::query_scalar(
+        "select count(*) from task_events where task_id = $1 and event_type = 'stale_agent_message'",
+    )
+    .bind(task_id)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(stale_event_count, 1);
 
     db.cleanup().await?;
     Ok(())
@@ -4588,12 +4641,19 @@ async fn terminal_callback_uses_normal_settle_delay_for_tasks_without_expected_a
         chrono::Duration::seconds(30),
     ));
     let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
     let resolved_spec = json!({
         "type": "stream_ingest",
         "name": "relay-camera-01",
         "common": {"created_by": "tester", "callback_url": "http://example.invalid/callback"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {
+        "expose": {
             "enable_rtsp": true,
             "enable_http_ts": true
         },
@@ -4907,6 +4967,10 @@ async fn late_record_hook_without_stream_binding_backfills_record_and_artifact_c
 
     let first_calls = wait_for_callback_count(&calls, 1).await?;
     assert_eq!(first_calls[0].1["reason"], json!("terminal_state"));
+    sqlx::query("delete from stream_bindings where task_id = $1")
+        .bind(task_id)
+        .execute(&db.pool)
+        .await?;
     let binding_count: i64 =
         sqlx::query_scalar("select count(*) from stream_bindings where task_id = $1")
             .bind(task_id)
@@ -5253,11 +5317,11 @@ async fn list_streams_omits_stale_entries_when_runtime_lookup_succeeds() -> anyh
     let node_id = Uuid::now_v7();
     upsert_test_node(&repository, node_id, &zlm_base, "http://stream.example").await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera",
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {},
+        "expose": {},
         "record": {"enabled": false},
         "recovery": {},
         "schedule": {"start_mode": "immediate"},
@@ -5311,11 +5375,11 @@ async fn list_streams_omits_terminal_and_non_current_attempt_bindings() -> anyho
     )
     .await?;
     let resolved_spec = json!({
-        "type": "live_relay",
+        "type": "stream_ingest",
         "name": "relay-camera-stale",
         "common": {"created_by": "tester"},
         "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
-        "publish": {},
+        "expose": {},
         "record": {"enabled": false},
         "recovery": {},
         "schedule": {"start_mode": "immediate"},

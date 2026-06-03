@@ -53,6 +53,28 @@ StreamServer 文档分为三层：
 - [ZLM/FFmpeg 重构补充](./zh/optimization-reports/04-zlm-ffmpeg-refactor-addendum.md)
 - [ZLM 流接入矩阵](./zh/optimization-reports/05-zlm-ingest-matrix.md)
 - [Agent 录像清理](./zh/optimization-reports/06-agent-recording-cleanup.md)
+- Runtime/process 前置硬化任务：
+  - [P01 LocalExecutor async 化](./zh/optimization-reports/07-runtime-process-p01-async-local-executor.md)
+  - [P02 控制面 runtime 命令 job 化](./zh/optimization-reports/08-runtime-process-p02-control-plane-runtime-jobs.md)
+  - [P03 adopt_orphans async 化与有界并发探测](./zh/optimization-reports/09-runtime-process-p03-async-bounded-adopt.md)
+  - [P04 ManagedProcess 启动 rollback guard](./zh/optimization-reports/10-runtime-process-p04-process-start-rollback.md)
+  - [P05 ZLM 启动 rollback](./zh/optimization-reports/11-runtime-process-p05-zlm-start-rollback.md)
+  - [P06 runtime 持久化原子写入](./zh/optimization-reports/12-runtime-process-p06-atomic-runtime-persistence.md)
+  - [P07 锁边界审计](./zh/optimization-reports/13-runtime-process-p07-lock-boundary-audit.md)
+  - [P08 进程组和 PID 防护](./zh/optimization-reports/14-runtime-process-p08-process-group-pid-guards.md)
+- RuntimeManager actor 迁移任务：
+  - [P01 RuntimeReadModel 抽象](./zh/optimization-reports/15-runtime-manager-p01-read-model.md)
+  - [P02 façade actor 外壳](./zh/optimization-reports/16-runtime-manager-p02-facade-actor.md)
+  - [P03 调度与 session_epoch 搬进 manager](./zh/optimization-reports/17-runtime-manager-p03-scheduling-session.md)
+  - [P04 RuntimeManagerState mirror](./zh/optimization-reports/18-runtime-manager-p04-state-mirror.md)
+  - [P05 ManagedProcess start outcome 化](./zh/optimization-reports/19-runtime-manager-p05-managed-process-start-outcome.md)
+  - [P06 ZLM start outcome 化](./zh/optimization-reports/20-runtime-manager-p06-zlm-start-outcome.md)
+  - [P07 monitor internal event 化](./zh/optimization-reports/21-runtime-manager-p07-monitor-internal-events.md)
+  - [P08 stop_task actor 化](./zh/optimization-reports/22-runtime-manager-p08-stop-actor.md)
+  - [P09 recording control actor 化](./zh/optimization-reports/23-runtime-manager-p09-recording-actor.md)
+  - [P10 adopt/recovery actor 化](./zh/optimization-reports/24-runtime-manager-p10-adopt-recovery-actor.md)
+  - [P11 删除 LocalRuntimeRegistry 写路径](./zh/optimization-reports/25-runtime-manager-p11-remove-registry-writes.md)
+  - [P12 API、测试与文档收尾](./zh/optimization-reports/26-runtime-manager-p12-api-test-doc-cleanup.md)
 
 ### ADR
 

@@ -2,7 +2,9 @@
 
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use media_domain::{RuntimeHandle, RuntimeState};
@@ -19,6 +21,8 @@ use crate::{
 pub(crate) const RUNTIME_STATE_FILE: &str = "runtime.json";
 pub(crate) const RUNTIME_PID_FILE: &str = "runtime.pid";
 pub(crate) const RUNTIME_COMMAND_FILE: &str = "runtime.cmd";
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PersistedRuntimeState {
@@ -46,7 +50,7 @@ pub(crate) fn persist_runtime_state(
     };
     let state_json = serde_json::to_vec_pretty(&state)
         .map_err(|error| ExecutorError::ProcessSpawn(error.to_string()))?;
-    fs::write(work_dir.join(RUNTIME_STATE_FILE), state_json).map_err(|error| {
+    atomic_write(&work_dir.join(RUNTIME_STATE_FILE), &state_json).map_err(|error| {
         ExecutorError::ProcessSpawn(format!(
             "failed to write runtime state {}: {error}",
             work_dir.join(RUNTIME_STATE_FILE).display()
@@ -55,7 +59,7 @@ pub(crate) fn persist_runtime_state(
 
     let pid_path = work_dir.join(RUNTIME_PID_FILE);
     if let Some(pid) = handle.pid {
-        fs::write(&pid_path, pid.to_string()).map_err(|error| {
+        atomic_write(&pid_path, pid.to_string().as_bytes()).map_err(|error| {
             ExecutorError::ProcessSpawn(format!(
                 "failed to write runtime pid {}: {error}",
                 pid_path.display()
@@ -67,7 +71,7 @@ pub(crate) fn persist_runtime_state(
 
     let command_path = work_dir.join(RUNTIME_COMMAND_FILE);
     if let Some(command_line) = handle.command_line.as_deref() {
-        fs::write(&command_path, command_line).map_err(|error| {
+        atomic_write(&command_path, command_line.as_bytes()).map_err(|error| {
             ExecutorError::ProcessSpawn(format!(
                 "failed to write runtime command {}: {error}",
                 command_path.display()
@@ -78,6 +82,49 @@ pub(crate) fn persist_runtime_state(
     }
 
     Ok(())
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("target path has no file name: {}", path.display()),
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp_path = parent.join(tmp_name);
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        if let Ok(parent_dir) = fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    result
 }
 
 pub(crate) fn success_check_from_handle(handle: &RuntimeHandle) -> SuccessCheck {

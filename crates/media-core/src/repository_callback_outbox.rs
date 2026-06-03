@@ -502,7 +502,7 @@ impl TaskRepository {
             return Ok(());
         }
 
-        let terminal_callback_delivered: bool = sqlx::query_scalar(
+        let terminal_callback_active: bool = sqlx::query_scalar(
             r#"
             select exists (
               select 1
@@ -511,7 +511,7 @@ impl TaskRepository {
                  and attempt_no = $2
                  and event_type = 'task.completed'
                  and reason = 'terminal_state'
-                 and status = 'delivered'
+                 and status in ('pending', 'retrying', 'delivered')
             )
             "#,
         )
@@ -519,7 +519,7 @@ impl TaskRepository {
         .bind(attempt_no)
         .fetch_one(&mut **tx)
         .await?;
-        if !terminal_callback_delivered {
+        if !terminal_callback_active {
             return Ok(());
         }
 

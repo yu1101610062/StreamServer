@@ -33,7 +33,9 @@ use crate::{
         task_runtime_mode_from_handle, task_type_from_handle,
     },
     runtime_process::{ManagedRuntime, RuntimeSlotLimiter},
-    runtime_process_start::{ManagedProcessStartContext, start_process_task},
+    runtime_process_start::{
+        ManagedProcessStartContext, ManagedProcessStartHooks, start_process_task,
+    },
     runtime_registry::LocalRuntimeRegistry,
     runtime_zlm::{build_close_stream_params, call_zlm_api, wait_for_zlm_api_ready},
 };
@@ -73,6 +75,7 @@ pub(crate) async fn restart_process_task_after_failure(
             zlm_server_id: ctx.zlm_server_id,
             capability_hints: ctx.capability_hints,
             restart_executor: ctx.restart_executor,
+            hooks: ManagedProcessStartHooks::default(),
         },
         &request,
         slot_permit,

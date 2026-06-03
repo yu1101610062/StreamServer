@@ -101,8 +101,10 @@ use serde_json::json;
 #[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
+pub(crate) use crate::repository_paths::externalize_managed_path;
 pub(crate) use crate::repository_paths::{
-    OutputMountPrefixes, absolute_http_url_from_file_path, externalize_managed_path,
+    OutputMountPrefixes, absolute_http_url_from_file_path, externalize_http_visible_path,
     externalize_path_fields_in_payload, is_hls_playlist_record_path, relative_http_url_from_path,
     task_id_from_managed_output_path,
 };

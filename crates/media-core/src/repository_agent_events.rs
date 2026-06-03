@@ -202,6 +202,20 @@ impl TaskRepository {
                     .bind(event.attempt_no)
                     .execute(&mut *tx)
                     .await?;
+                    sqlx::query(
+                        r#"
+                        update task_attempts
+                           set status = 'ORPHANED'::attempt_status,
+                               node_id = $1
+                         where task_id = $2
+                           and attempt_no = $3
+                        "#,
+                    )
+                    .bind(node_id)
+                    .bind(event.task_id)
+                    .bind(event.attempt_no)
+                    .execute(&mut *tx)
+                    .await?;
                 } else if matches!(
                     ownership.task_status,
                     TaskStatus::Dispatching

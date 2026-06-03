@@ -62,13 +62,13 @@ pub(crate) fn prepare_start_task(
     }
 
     let key = (request.task_id, request.attempt_no);
-    if ctx
-        .stop_intents
-        .read()
-        .expect("stop intents lock poisoned")
-        .get(&key)
-        .is_some_and(|intent| intent.lease_token == request.lease_token)
-    {
+    let stop_already_requested = {
+        let stop_intents = ctx.stop_intents.read().expect("stop intents lock poisoned");
+        stop_intents
+            .get(&key)
+            .is_some_and(|intent| intent.lease_token == request.lease_token)
+    };
+    if stop_already_requested {
         return Err(ExecutorError::InvalidRequest(format!(
             "stop already requested for {}/{}",
             request.task_id, request.attempt_no

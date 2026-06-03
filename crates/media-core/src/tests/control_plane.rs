@@ -907,6 +907,9 @@ async fn dispatch_task_rolls_back_when_agent_channel_is_closed() -> anyhow::Resu
     let _session_id = service
         .bootstrap_session(&sample_registration(node_id), sender)
         .await?;
+    service
+        .update_session_load(node_id, &sample_heartbeat(0, 0.0))
+        .await?;
     drop(receiver);
 
     let error = service
@@ -1383,6 +1386,12 @@ async fn dispatch_task_reserves_slots_to_reduce_burst_skew() -> anyhow::Result<(
     let _second_session = service
         .bootstrap_session(&sample_registration(second_node), second_sender)
         .await?;
+    service
+        .update_session_load(first_node, &sample_heartbeat(0, 0.0))
+        .await?;
+    service
+        .update_session_load(second_node, &sample_heartbeat(0, 0.0))
+        .await?;
 
     service.dispatch_task(first_task.id).await?;
     service.dispatch_task(second_task.id).await?;
@@ -1420,6 +1429,9 @@ async fn close_session_marks_dispatching_task_reclaiming_before_retry() -> anyho
     let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
     let session_id = service
         .bootstrap_session(&sample_registration(node_id), sender)
+        .await?;
+    service
+        .update_session_load(node_id, &sample_heartbeat(0, 0.0))
         .await?;
 
     service.dispatch_task(task.id).await?;
@@ -1485,6 +1497,9 @@ async fn close_session_marks_running_task_reclaiming_until_timeout_retry() -> an
     let (sender, _receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
     let session_id = service
         .bootstrap_session(&sample_registration(node_id), sender)
+        .await?;
+    service
+        .update_session_load(node_id, &sample_heartbeat(0, 0.0))
         .await?;
 
     service.dispatch_task(task.id).await?;

@@ -1,6 +1,15 @@
 use super::*;
+use crate::runtime_process_start::{
+    CompanionRecordingStartContext, ManagedProcessStartContext, ManagedProcessStartHooks,
+    RuntimeStartRollback, start_companion_recording_process, start_process_task,
+};
 use crate::runtime_stop::{StaleAttemptCleanupContext, cleanup_stale_attempt_runtimes};
-use std::os::unix::process::ExitStatusExt;
+use crate::runtime_zlm_start::{
+    RuntimeZlmStartContext, RuntimeZlmStartHooks,
+    start_live_relay_task as start_zlm_live_relay_task,
+    start_rtp_receive_task as start_zlm_rtp_receive_task,
+};
+use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
 
 fn test_settings(work_root: &str) -> AgentSettings {
     AgentSettings {
@@ -75,6 +84,228 @@ fn build_file_to_live_plan_with_capability_hints(
 
 fn success_exit_status() -> std::process::ExitStatus {
     ExitStatusExt::from_raw(0)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn create_trapping_sleep_script(script_path: &Path, pid_path: &Path, term_path: &Path) -> String {
+    let script = format!(
+        "#!/bin/sh\n\
+         pid_file={}\n\
+         term_file={}\n\
+         printf '%s\\n' \"$$\" > \"$pid_file\"\n\
+         child_pid=\n\
+         term_handler() {{\n\
+           printf '%s\\n' term >> \"$term_file\"\n\
+           if [ -n \"$child_pid\" ]; then kill \"$child_pid\" 2>/dev/null || true; fi\n\
+           exit 143\n\
+         }}\n\
+         trap term_handler TERM INT\n\
+         while :; do\n\
+           sleep 1 &\n\
+           child_pid=$!\n\
+           wait \"$child_pid\"\n\
+         done\n",
+        shell_single_quote(script_path_to_str(pid_path)),
+        shell_single_quote(script_path_to_str(term_path)),
+    );
+    fs::write(script_path, script).expect("test script should be written");
+    let mut permissions = fs::metadata(script_path)
+        .expect("test script metadata should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(script_path, permissions).expect("test script should be executable");
+    script_path_to_str(script_path).to_string()
+}
+
+fn create_group_child_script(
+    script_path: &Path,
+    pid_path: &Path,
+    child_pid_path: &Path,
+    term_path: &Path,
+) -> String {
+    let script = format!(
+        "#!/bin/sh\n\
+         pid_file={}\n\
+         child_pid_file={}\n\
+         term_file={}\n\
+         printf '%s\\n' \"$$\" > \"$pid_file\"\n\
+         sleep 60 &\n\
+         child_pid=$!\n\
+         printf '%s\\n' \"$child_pid\" > \"$child_pid_file\"\n\
+         term_handler() {{\n\
+           printf '%s\\n' term >> \"$term_file\"\n\
+           exit 143\n\
+         }}\n\
+         trap term_handler TERM INT\n\
+         wait \"$child_pid\"\n",
+        shell_single_quote(script_path_to_str(pid_path)),
+        shell_single_quote(script_path_to_str(child_pid_path)),
+        shell_single_quote(script_path_to_str(term_path)),
+    );
+    fs::write(script_path, script).expect("test script should be written");
+    let mut permissions = fs::metadata(script_path)
+        .expect("test script metadata should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(script_path, permissions).expect("test script should be executable");
+    script_path_to_str(script_path).to_string()
+}
+
+fn script_path_to_str(path: &Path) -> &str {
+    path.to_str().expect("test path should be utf-8")
+}
+
+async fn wait_for_path(path: &Path, reason: &'static str) {
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if path.exists() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(reason);
+}
+
+async fn wait_for_pid_exit(pid: i32, reason: &'static str) {
+    timeout(Duration::from_secs(3), async move {
+        loop {
+            if !crate::runtime_process::is_pid_running(pid) {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(reason);
+}
+
+fn wait_for_path_blocking(path: &Path) {
+    for _ in 0..100 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn rollback_file_transcode_request(name: &str) -> StartTaskRequest {
+    StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::FileTranscode,
+        resolved_spec: json!({
+            "type": "file_transcode",
+            "name": name,
+            "common": {"created_by": "tester"},
+            "input": {"kind": "file", "url": "input.mp4"},
+            "process": {"mode": "copy_or_transcode"},
+            "record": {},
+            "publish": {
+                "kind": "file"
+            },
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: format!("lease-{name}"),
+        trace_context: None,
+        session_epoch: 1,
+    }
+}
+
+fn zlm_live_relay_request(name: &str) -> StartTaskRequest {
+    StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": name,
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "rtsp",
+                "source_mode": "live",
+                "url": "rtsp://camera.example/live"
+            },
+            "stream": {"app": "live", "name": name},
+            "expose": {
+                "enable_rtsp": true,
+                "enable_rtmp": true,
+                "enable_http_ts": false,
+                "enable_http_fmp4": false,
+                "enable_hls": false
+            },
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: format!("lease-{name}"),
+        trace_context: None,
+        session_epoch: 1,
+    }
+}
+
+fn zlm_rtp_request(name: &str) -> StartTaskRequest {
+    StartTaskRequest {
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        task_type: TaskType::StreamIngest,
+        resolved_spec: json!({
+            "type": "stream_ingest",
+            "name": name,
+            "common": {"created_by": "tester"},
+            "input": {
+                "kind": "gb_rtp",
+                "source_mode": "live",
+                "port": 0,
+                "tcp_mode": 0
+            },
+            "record": {"enabled": false},
+            "recovery": {},
+            "schedule": {"start_mode": "immediate"},
+            "resource": {}
+        }),
+        execution_mode: "managed".to_string(),
+        lease_token: format!("lease-{name}"),
+        trace_context: None,
+        session_epoch: 1,
+    }
+}
+
+fn start_managed_process_with_hooks(
+    settings: &AgentSettings,
+    registry: &LocalRuntimeRegistry,
+    runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    events: &RuntimeEventSink,
+    executor: &ManagedProcessExecutor,
+    http_client: &Client,
+    request: &StartTaskRequest,
+    hooks: ManagedProcessStartHooks,
+) -> Result<RuntimeHandle, ExecutorError> {
+    let slot_permit = executor.slot_limiter.try_acquire()?;
+    start_process_task(
+        ManagedProcessStartContext {
+            settings,
+            http_client,
+            registry,
+            runtimes,
+            events,
+            zlm_server_id: None,
+            capability_hints: RuntimeCapabilityHints::default(),
+            restart_executor: executor.clone(),
+            hooks,
+        },
+        request,
+        slot_permit,
+    )
 }
 
 fn continuous_stream_ingest_handle() -> RuntimeHandle {
@@ -1266,8 +1497,8 @@ fn build_multicast_bridge_plan_allocates_managed_file_output_path() {
     assert!(plan.args.iter().any(|arg| arg == "mp4"));
 }
 
-#[test]
-fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
+#[tokio::test]
+async fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
     let temp_root =
         std::env::temp_dir().join(format!("streamserver-runtime-slots-{}", Uuid::now_v7()));
     let registry = LocalRuntimeRegistry::new();
@@ -1303,8 +1534,8 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
         .insert(
             existing_handle.runtime_id,
             ManagedRuntime {
-                pid: existing_handle.pid,
-                companion_pids: Vec::new(),
+                process: existing_handle.pid.map(ProcessIdentity::pid_only),
+                companion_processes: Vec::new(),
                 _slot_permit: executor.slot_limiter.attach_existing(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 suppress_companion_events: Arc::new(AtomicBool::new(false)),
@@ -1336,7 +1567,8 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
     };
 
     let error = executor
-        .start_task(&request)
+        .start_task(request)
+        .await
         .expect_err("exhausted slots should reject the task before spawn");
     assert!(matches!(
         error,
@@ -1346,8 +1578,8 @@ fn start_task_rejects_when_max_runtime_slots_are_exhausted() {
     let _ = fs::remove_dir_all(temp_root);
 }
 
-#[test]
-fn start_task_releases_slot_after_spawn_failure() {
+#[tokio::test]
+async fn start_task_releases_slot_after_spawn_failure() {
     let temp_root = std::env::temp_dir().join(format!(
         "streamserver-runtime-slot-release-{}",
         Uuid::now_v7()
@@ -1389,7 +1621,8 @@ fn start_task_releases_slot_after_spawn_failure() {
     };
 
     let first = executor
-        .start_task(&request)
+        .start_task(request.clone())
+        .await
         .expect_err("spawn failure should bubble up");
     assert!(!matches!(
         first,
@@ -1397,7 +1630,8 @@ fn start_task_releases_slot_after_spawn_failure() {
     ));
 
     let second = executor
-        .start_task(&request)
+        .start_task(request)
+        .await
         .expect_err("slot should be released after failed spawn");
     assert!(!matches!(
         second,
@@ -1407,8 +1641,1128 @@ fn start_task_releases_slot_after_spawn_failure() {
     let _ = fs::remove_dir_all(temp_root);
 }
 
-#[test]
-fn start_task_is_idempotent_for_same_attempt_and_lease() {
+#[tokio::test]
+async fn managed_process_start_rollback_signals_child_after_initial_persist_failure() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-start-rollback-persist-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let primary_pid_path = temp_root.join("primary.pid");
+    let script = create_trapping_sleep_script(
+        &temp_root.join("ffmpeg-sleep.sh"),
+        &primary_pid_path,
+        &temp_root.join("primary.term"),
+    );
+
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.max_runtime_slots = 1;
+    settings.ffmpeg_bin = script;
+    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = rollback_file_transcode_request("rollback-persist");
+
+    let error = start_managed_process_with_hooks(
+        &settings,
+        &registry,
+        &executor.runtimes,
+        &events,
+        &executor,
+        &http_client,
+        &request,
+        ManagedProcessStartHooks::with_persist_runtime_state({
+            let primary_pid_path = primary_pid_path.clone();
+            move |_, _, _| {
+                wait_for_path_blocking(&primary_pid_path);
+                Err(ExecutorError::ProcessSpawn(
+                    "injected persist failure".to_string(),
+                ))
+            }
+        }),
+    )
+    .expect_err("persist failure should bubble up");
+    match error {
+        ExecutorError::ProcessSpawn(message) => {
+            assert!(message.contains("injected persist failure"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    wait_for_path(
+        &temp_root.join("primary.term"),
+        "rollback should signal primary child",
+    )
+    .await;
+    assert!(
+        registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .is_none()
+    );
+    assert!(
+        executor
+            .runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .is_empty()
+    );
+    assert!(scan_persisted_runtimes(temp_root.to_string_lossy().as_ref()).is_empty());
+    let reacquired = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("rollback should release slot permit");
+    drop(reacquired);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn managed_process_start_rollback_cleans_runtime_map_after_insert_failure() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-start-rollback-insert-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let primary_pid_path = temp_root.join("primary.pid");
+    let script = create_trapping_sleep_script(
+        &temp_root.join("ffmpeg-sleep.sh"),
+        &primary_pid_path,
+        &temp_root.join("primary.term"),
+    );
+
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.max_runtime_slots = 1;
+    settings.ffmpeg_bin = script;
+    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = rollback_file_transcode_request("rollback-insert");
+
+    let error = start_managed_process_with_hooks(
+        &settings,
+        &registry,
+        &executor.runtimes,
+        &events,
+        &executor,
+        &http_client,
+        &request,
+        ManagedProcessStartHooks::with_after_runtime_insert({
+            let primary_pid_path = primary_pid_path.clone();
+            move |_| {
+                wait_for_path_blocking(&primary_pid_path);
+                Err(ExecutorError::ProcessSpawn(
+                    "injected runtime insert failure".to_string(),
+                ))
+            }
+        }),
+    )
+    .expect_err("post-insert failure should bubble up");
+    match error {
+        ExecutorError::ProcessSpawn(message) => {
+            assert!(
+                message.contains("injected runtime insert failure"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    wait_for_path(
+        &temp_root.join("primary.term"),
+        "rollback should signal inserted child",
+    )
+    .await;
+    assert!(
+        registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .is_none()
+    );
+    assert!(
+        executor
+            .runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .is_empty()
+    );
+    assert!(
+        scan_persisted_runtimes(temp_root.to_string_lossy().as_ref()).is_empty(),
+        "rollback should remove persisted half-initialized runtime state"
+    );
+    let reacquired = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("runtime map cleanup should release slot permit");
+    drop(reacquired);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn companion_start_rollback_signals_primary_and_companion_after_spawn_failure() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-start-rollback-companion-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let primary_pid_path = temp_root.join("primary.pid");
+    let primary_script = create_trapping_sleep_script(
+        &temp_root.join("primary-sleep.sh"),
+        &primary_pid_path,
+        &temp_root.join("primary.term"),
+    );
+    let companion_pid_path = temp_root.join("companion.pid");
+    let companion_script = create_trapping_sleep_script(
+        &temp_root.join("companion-sleep.sh"),
+        &companion_pid_path,
+        &temp_root.join("companion.term"),
+    );
+    let mut primary_child = std::process::Command::new(primary_script)
+        .spawn()
+        .expect("primary child should spawn");
+    let primary_pid = primary_child.id() as i32;
+    wait_for_path_blocking(&primary_pid_path);
+
+    let runtime_id = Uuid::now_v7();
+    let task_id = Uuid::now_v7();
+    let work_dir = temp_root.join(task_id.to_string()).join("attempt-1");
+    fs::create_dir_all(&work_dir).expect("work dir should exist");
+    let registry = LocalRuntimeRegistry::new();
+    let runtimes = Arc::new(RwLock::new(HashMap::new()));
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let handle = RuntimeHandle {
+        runtime_id,
+        task_id,
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(primary_pid),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Starting,
+        command_line: Some("primary".to_string()),
+        outputs: Vec::new(),
+        metadata: json!({"task_type": "stream_ingest", "lease_token": "lease"}),
+    };
+    registry.track(handle.clone());
+    runtimes.write().expect("runtime map lock poisoned").insert(
+        runtime_id,
+        ManagedRuntime {
+            process: Some(ProcessIdentity::pid_only(primary_pid)),
+            companion_processes: Vec::new(),
+            _slot_permit: RuntimeSlotPermit::unbounded(),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            suppress_companion_events: Arc::new(AtomicBool::new(false)),
+        },
+    );
+    let companion_pid = Arc::new(RwLock::new(None));
+    let hooks = ManagedProcessStartHooks::with_after_companion_spawn({
+        let companion_pid = companion_pid.clone();
+        let companion_pid_path = companion_pid_path.clone();
+        move |_, pid| {
+            wait_for_path_blocking(&companion_pid_path);
+            *companion_pid.write().expect("companion pid lock poisoned") = Some(pid);
+            Err(ExecutorError::ProcessSpawn(
+                "injected companion failure".to_string(),
+            ))
+        }
+    });
+    let mut rollback = RuntimeStartRollback::new(
+        runtime_id,
+        work_dir.clone(),
+        ProcessIdentity::pid_only(primary_pid),
+        registry.clone(),
+        runtimes.clone(),
+    );
+
+    let error = start_companion_recording_process(
+        CompanionRecordingStartContext {
+            runtime_id,
+            handle: handle.clone(),
+            work_dir: work_dir.clone(),
+            success_check: SuccessCheck::ProcessExit,
+            registry: registry.clone(),
+            runtimes: runtimes.clone(),
+            events: events.clone(),
+            rollback: &mut rollback,
+            hooks,
+        },
+        crate::runtime_plan::CompanionProcessPlan {
+            executable: companion_script,
+            args: Vec::new(),
+            work_dir,
+            output_target: temp_root
+                .join("companion-output.mp4")
+                .to_string_lossy()
+                .to_string(),
+            outputs: Vec::new(),
+            success_check: SuccessCheck::ProcessExit,
+            kind: CompanionProcessKind::StreamIngestMp4Record,
+        },
+    )
+    .expect_err("companion hook failure should bubble up");
+    assert!(matches!(
+        error,
+        ExecutorError::ProcessSpawn(message) if message.contains("injected companion failure")
+    ));
+    let captured_companion_pid = companion_pid
+        .read()
+        .expect("companion pid lock poisoned")
+        .expect("companion pid should be captured");
+    drop(rollback);
+
+    wait_for_path(
+        &temp_root.join("primary.term"),
+        "rollback should signal primary",
+    )
+    .await;
+    wait_for_path(
+        &temp_root.join("companion.term"),
+        "rollback should signal companion",
+    )
+    .await;
+    let status = primary_child
+        .wait()
+        .expect("primary child status should be readable");
+    assert!(!status.success());
+    assert!(
+        registry
+            .find_by_task_attempt(handle.task_id, handle.attempt_no)
+            .is_none()
+    );
+    assert!(
+        runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .is_empty()
+    );
+    let _ = crate::runtime_process::signal_pid(captured_companion_pid, libc::SIGKILL);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn managed_process_start_success_disarms_rollback_guard() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-start-rollback-success-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let script = create_trapping_sleep_script(
+        &temp_root.join("ffmpeg-sleep.sh"),
+        &temp_root.join("primary.pid"),
+        &temp_root.join("primary.term"),
+    );
+
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.ffmpeg_bin = script;
+    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = rollback_file_transcode_request("rollback-success");
+
+    let handle = start_managed_process_with_hooks(
+        &settings,
+        &registry,
+        &executor.runtimes,
+        &events,
+        &executor,
+        &http_client,
+        &request,
+        ManagedProcessStartHooks::default(),
+    )
+    .expect("successful start should return a handle");
+
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !temp_root.join("primary.term").exists(),
+        "disarmed rollback guard should not signal successful process"
+    );
+    assert!(
+        registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .is_some()
+    );
+    assert!(
+        executor
+            .runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .contains_key(&handle.runtime_id)
+    );
+
+    if let Some(pid) = handle.pid {
+        let _ = crate::runtime_process::signal_pid(pid, libc::SIGTERM);
+    }
+    wait_for_path(
+        &temp_root.join("primary.term"),
+        "cleanup should signal successful process",
+    )
+    .await;
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn managed_process_start_records_process_group_identity() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-process-identity-{}", Uuid::now_v7()));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let script = create_trapping_sleep_script(
+        &temp_root.join("ffmpeg-sleep.sh"),
+        &temp_root.join("primary.pid"),
+        &temp_root.join("primary.term"),
+    );
+
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.ffmpeg_bin = script;
+    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = rollback_file_transcode_request("process-identity");
+
+    let handle = start_managed_process_with_hooks(
+        &settings,
+        &registry,
+        &executor.runtimes,
+        &events,
+        &executor,
+        &http_client,
+        &request,
+        ManagedProcessStartHooks::default(),
+    )
+    .expect("process should start");
+    wait_for_path(&temp_root.join("primary.pid"), "process should write pid").await;
+
+    let pid = handle.pid.expect("managed process should have pid");
+    let runtime = executor
+        .runtimes
+        .read()
+        .expect("runtime map lock poisoned")
+        .get(&handle.runtime_id)
+        .cloned()
+        .expect("runtime should be tracked");
+    let process = runtime
+        .process
+        .expect("runtime should record process identity");
+    assert_eq!(process.pid, pid);
+    assert_eq!(process.pgid, Some(pid));
+    assert_eq!(process_group_id(pid), Some(pid));
+    assert_eq!(process.pid_start_time, linux_pid_start_time(pid));
+
+    let persisted = scan_persisted_runtimes(temp_root.to_string_lossy().as_ref());
+    let persisted = persisted
+        .iter()
+        .find(|state| state.handle.runtime_id == handle.runtime_id)
+        .expect("persisted runtime should exist");
+    assert_eq!(
+        persisted.handle.metadata["process"]["pid"].as_i64(),
+        Some(i64::from(pid))
+    );
+    assert_eq!(
+        persisted.handle.metadata["process"]["pgid"].as_i64(),
+        Some(i64::from(pid))
+    );
+    assert!(
+        persisted.handle.metadata["process"]["pid_start_time"]
+            .as_u64()
+            .is_some()
+    );
+
+    let _ = crate::runtime_process::signal_process(&process, libc::SIGTERM);
+    wait_for_path(
+        &temp_root.join("primary.term"),
+        "cleanup should signal process group",
+    )
+    .await;
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn stop_task_signals_managed_process_group_children() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-process-group-stop-{}",
+        Uuid::now_v7()
+    ));
+    fs::create_dir_all(&temp_root).expect("temp root should exist");
+    let child_pid_path = temp_root.join("child.pid");
+    let script = create_group_child_script(
+        &temp_root.join("ffmpeg-group-child.sh"),
+        &temp_root.join("primary.pid"),
+        &child_pid_path,
+        &temp_root.join("primary.term"),
+    );
+
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.ffmpeg_bin = script;
+    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = rollback_file_transcode_request("process-group-stop");
+
+    let handle = start_managed_process_with_hooks(
+        &settings,
+        &registry,
+        &executor.runtimes,
+        &events,
+        &executor,
+        &http_client,
+        &request,
+        ManagedProcessStartHooks::default(),
+    )
+    .expect("process should start");
+    wait_for_path(&child_pid_path, "child pid should be written").await;
+    let child_pid = fs::read_to_string(&child_pid_path)
+        .expect("child pid should be readable")
+        .trim()
+        .parse::<i32>()
+        .expect("child pid should parse");
+    assert!(crate::runtime_process::is_pid_running(child_pid));
+
+    executor
+        .stop_task(StopTaskRequest {
+            task_id: request.task_id,
+            attempt_no: request.attempt_no,
+            lease_token: request.lease_token.clone(),
+            reason: "process_group_stop_test".to_string(),
+            grace_period_sec: 0,
+            force_after_sec: 1,
+        })
+        .await
+        .expect("stop should succeed");
+
+    wait_for_path(
+        &temp_root.join("primary.term"),
+        "stop should signal primary process",
+    )
+    .await;
+    wait_for_pid_exit(
+        handle.pid.expect("managed process should have pid"),
+        "primary process should exit",
+    )
+    .await;
+    wait_for_pid_exit(child_pid, "process group child should exit").await;
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn force_kill_skips_pid_start_time_mismatch() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep should spawn");
+    let pid = child.id() as i32;
+    let start_time = linux_pid_start_time(pid).expect("linux start time should be readable");
+    schedule_force_kill_processes_if_running(
+        vec![ProcessIdentity {
+            pid,
+            pgid: None,
+            pid_start_time: Some(start_time.saturating_add(1)),
+        }],
+        Duration::from_millis(20),
+        "pid_start_time_mismatch_test",
+    );
+
+    sleep(Duration::from_millis(150)).await;
+    assert!(
+        crate::runtime_process::is_pid_running(pid),
+        "mismatched start time must skip force kill"
+    );
+    let _ = crate::runtime_process::signal_pid(pid, libc::SIGTERM);
+    let _ = child.wait();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zlm_live_relay_start_rollback_closes_proxy_after_persist_failure() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn add_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("addStreamProxy".to_string(), params));
+        Json(json!({"code": 0, "data": {"key": "proxy-rollback-1"}}))
+    }
+
+    async fn del_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("delStreamProxy".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    async fn close_streams(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("close_streams".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/addStreamProxy", get(add_stream_proxy))
+        .route("/index/api/delStreamProxy", get(del_stream_proxy))
+        .route("/index/api/close_streams", get(close_streams))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-zlm-rollback-proxy-{}",
+        Uuid::now_v7()
+    ));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.max_runtime_slots = 1;
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = zlm_live_relay_request("rollback-proxy");
+    let slot_permit = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("slot should be acquired");
+
+    let error = start_zlm_live_relay_task(
+        RuntimeZlmStartContext {
+            settings: &settings,
+            http_client: &http_client,
+            registry: &registry,
+            runtimes: &executor.runtimes,
+            events: &events,
+            zlm_server_id: None,
+            hooks: RuntimeZlmStartHooks::with_persist_runtime_state(|_, _, _| {
+                Err(ExecutorError::ProcessSpawn(
+                    "injected zlm persist failure".to_string(),
+                ))
+            }),
+        },
+        &request,
+        slot_permit,
+    )
+    .await
+    .expect_err("injected persist failure should bubble up");
+    match error {
+        ExecutorError::ProcessSpawn(message) => {
+            assert!(
+                message.contains("injected zlm persist failure"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let captured = calls.lock().await.clone();
+    assert_eq!(
+        captured
+            .iter()
+            .map(|call| call.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["addStreamProxy", "delStreamProxy", "close_streams"]
+    );
+    assert_eq!(
+        captured[1].1.get("key").map(String::as_str),
+        Some("proxy-rollback-1")
+    );
+    assert_eq!(
+        captured[2].1.get("stream").map(String::as_str),
+        Some("rollback-proxy")
+    );
+    assert!(
+        registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .is_none()
+    );
+    assert!(
+        executor
+            .runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .is_empty()
+    );
+    assert!(scan_persisted_runtimes(temp_root.to_string_lossy().as_ref()).is_empty());
+    let reacquired = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("rollback should release slot permit");
+    drop(reacquired);
+
+    server.abort();
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zlm_rtp_start_rollback_closes_rtp_server_after_registry_failure() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn open_rtp_server(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("openRtpServer".to_string(), params));
+        Json(json!({"code": 0, "port": 31000}))
+    }
+
+    async fn close_rtp_server(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("closeRtpServer".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/openRtpServer", get(open_rtp_server))
+        .route("/index/api/closeRtpServer", get(close_rtp_server))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-zlm-rollback-rtp-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.max_runtime_slots = 1;
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = zlm_rtp_request("rollback-rtp");
+    let slot_permit = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("slot should be acquired");
+
+    let error = start_zlm_rtp_receive_task(
+        RuntimeZlmStartContext {
+            settings: &settings,
+            http_client: &http_client,
+            registry: &registry,
+            runtimes: &executor.runtimes,
+            events: &events,
+            zlm_server_id: None,
+            hooks: RuntimeZlmStartHooks::with_after_registry_track(|_| {
+                Err(ExecutorError::ProcessSpawn(
+                    "injected zlm registry failure".to_string(),
+                ))
+            }),
+        },
+        &request,
+        slot_permit,
+    )
+    .await
+    .expect_err("injected post-registry failure should bubble up");
+    match error {
+        ExecutorError::ProcessSpawn(message) => {
+            assert!(
+                message.contains("injected zlm registry failure"),
+                "{message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+
+    let captured = calls.lock().await.clone();
+    assert_eq!(
+        captured
+            .iter()
+            .map(|call| call.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["openRtpServer", "closeRtpServer"]
+    );
+    assert!(
+        captured[1]
+            .1
+            .get("stream_id")
+            .is_some_and(|stream_id| stream_id.ends_with("-1"))
+    );
+    assert!(
+        registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .is_none()
+    );
+    assert!(
+        executor
+            .runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .is_empty()
+    );
+    assert!(scan_persisted_runtimes(temp_root.to_string_lossy().as_ref()).is_empty());
+    let reacquired = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("rollback should release slot permit");
+    drop(reacquired);
+
+    server.abort();
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zlm_start_rollback_keeps_original_error_when_cleanup_fails() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn add_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("addStreamProxy".to_string(), params));
+        Json(json!({"code": 0, "data": {"key": "proxy-cleanup-fails"}}))
+    }
+
+    async fn del_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("delStreamProxy".to_string(), params));
+        Json(json!({"code": -1, "msg": "delete failed"}))
+    }
+
+    async fn close_streams(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("close_streams".to_string(), params));
+        Json(json!({"code": -1, "msg": "close failed"}))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/addStreamProxy", get(add_stream_proxy))
+        .route("/index/api/delStreamProxy", get(del_stream_proxy))
+        .route("/index/api/close_streams", get(close_streams))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-zlm-cleanup-error-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry, events.clone());
+    let http_client = Client::new();
+    let request = zlm_live_relay_request("cleanup-error");
+    let slot_permit = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("slot should be acquired");
+
+    let error = start_zlm_live_relay_task(
+        RuntimeZlmStartContext {
+            settings: &settings,
+            http_client: &http_client,
+            registry: &executor.registry,
+            runtimes: &executor.runtimes,
+            events: &events,
+            zlm_server_id: None,
+            hooks: RuntimeZlmStartHooks::with_after_runtime_insert(|_| {
+                Err(ExecutorError::ProcessSpawn(
+                    "original zlm commit failure".to_string(),
+                ))
+            }),
+        },
+        &request,
+        slot_permit,
+    )
+    .await
+    .expect_err("original error should bubble up");
+    match error {
+        ExecutorError::ProcessSpawn(message) => {
+            assert!(message.contains("original zlm commit failure"), "{message}");
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    let captured = calls.lock().await.clone();
+    assert_eq!(
+        captured
+            .iter()
+            .map(|call| call.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["addStreamProxy", "delStreamProxy", "close_streams"]
+    );
+
+    server.abort();
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zlm_live_relay_start_success_does_not_rollback_created_proxy() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{net::TcpListener, sync::Mutex};
+
+    #[derive(Clone)]
+    struct StubState {
+        calls: Arc<Mutex<Vec<(String, HashMap<String, String>)>>>,
+    }
+
+    async fn add_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("addStreamProxy".to_string(), params));
+        Json(json!({"code": 0, "data": {"key": "proxy-success"}}))
+    }
+
+    async fn del_stream_proxy(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("delStreamProxy".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    async fn close_streams(
+        State(state): State<StubState>,
+        Query(params): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        state
+            .calls
+            .lock()
+            .await
+            .push(("close_streams".to_string(), params));
+        Json(json!({"code": 0}))
+    }
+
+    async fn get_media_list() -> Json<Value> {
+        Json(json!({
+            "code": 0,
+            "data": [{
+                "schema": "rtsp",
+                "vhost": "__defaultVhost__",
+                "app": "live",
+                "stream": "success-proxy"
+            }]
+        }))
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/index/api/addStreamProxy", get(add_stream_proxy))
+        .route("/index/api/delStreamProxy", get(del_stream_proxy))
+        .route("/index/api/close_streams", get(close_streams))
+        .route("/index/api/getMediaList", get(get_media_list))
+        .with_state(StubState {
+            calls: calls.clone(),
+        });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener should bind");
+    let addr = listener.local_addr().expect("listener addr should exist");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("stub server should run");
+    });
+
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-zlm-success-proxy-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, mut priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let mut settings = test_settings(temp_root.to_string_lossy().as_ref());
+    settings.zlm_api_base = format!("http://{addr}");
+    settings.zlm_api_secret = "secret".to_string();
+    let events = RuntimeEventSink::new(priority_tx, log_tx);
+    let executor = ManagedProcessExecutor::new(settings.clone(), registry.clone(), events.clone());
+    let http_client = Client::new();
+    let request = zlm_live_relay_request("success-proxy");
+    let slot_permit = executor
+        .slot_limiter
+        .try_acquire()
+        .expect("slot should be acquired");
+
+    let handle = start_zlm_live_relay_task(
+        RuntimeZlmStartContext {
+            settings: &settings,
+            http_client: &http_client,
+            registry: &registry,
+            runtimes: &executor.runtimes,
+            events: &events,
+            zlm_server_id: None,
+            hooks: RuntimeZlmStartHooks::default(),
+        },
+        &request,
+        slot_permit,
+    )
+    .await
+    .expect("ZLM proxy start should succeed");
+
+    let event = priority_rx
+        .try_recv()
+        .expect("start should emit zlm_proxy_created");
+    let RuntimeNotification::TaskEvent(event) = event else {
+        panic!("expected zlm_proxy_created event");
+    };
+    assert_eq!(event.event_type, "zlm_proxy_created");
+    assert!(
+        registry
+            .find_by_task_attempt(request.task_id, request.attempt_no)
+            .is_some()
+    );
+    assert!(
+        executor
+            .runtimes
+            .read()
+            .expect("runtime map lock poisoned")
+            .contains_key(&handle.runtime_id)
+    );
+    sleep(Duration::from_millis(50)).await;
+    let captured = calls.lock().await.clone();
+    assert!(captured.iter().any(|call| call.0 == "addStreamProxy"));
+    assert!(
+        !captured
+            .iter()
+            .any(|call| call.0 == "delStreamProxy" || call.0 == "close_streams")
+    );
+
+    server.abort();
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test]
+async fn start_task_is_idempotent_for_same_attempt_and_lease() {
     let temp_root = std::env::temp_dir().join(format!(
         "streamserver-runtime-idempotent-{}",
         Uuid::now_v7()
@@ -1463,7 +2817,8 @@ fn start_task_is_idempotent_for_same_attempt_and_lease() {
     };
 
     let returned = executor
-        .start_task(&request)
+        .start_task(request)
+        .await
         .expect("same attempt and lease should reuse existing handle");
     assert_eq!(returned, existing);
 }
@@ -5305,8 +6660,8 @@ async fn startup_probe_monitor_starts_managed_live_recording_without_keyframe_wa
     runtimes.write().expect("runtime map lock poisoned").insert(
         runtime_id,
         ManagedRuntime {
-            pid: Some(child.id() as i32),
-            companion_pids: Vec::new(),
+            process: Some(ProcessIdentity::pid_only(child.id() as i32)),
+            companion_processes: Vec::new(),
             _slot_permit: RuntimeSlotPermit::unbounded(),
             stop_requested: Arc::new(AtomicBool::new(false)),
             suppress_companion_events: Arc::new(AtomicBool::new(false)),
@@ -5628,8 +6983,8 @@ async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
         .insert(
             runtime_id,
             ManagedRuntime {
-                pid: Some(child.id() as i32),
-                companion_pids: Vec::new(),
+                process: Some(ProcessIdentity::pid_only(child.id() as i32)),
+                companion_processes: Vec::new(),
                 _slot_permit: RuntimeSlotPermit::unbounded(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 suppress_companion_events: Arc::new(AtomicBool::new(false)),
@@ -5637,7 +6992,7 @@ async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
         );
 
     executor
-        .stop_task(&StopTaskRequest {
+        .stop_task(StopTaskRequest {
             task_id,
             attempt_no: 1,
             lease_token: "lease".to_string(),
@@ -5645,6 +7000,7 @@ async fn stop_task_stops_managed_live_relay_recording_before_closing_stream() {
             grace_period_sec: 0,
             force_after_sec: 0,
         })
+        .await
         .expect("stop should succeed");
 
     let status = child.wait().expect("sleep should exit after SIGTERM");
@@ -5719,6 +7075,203 @@ fn scan_persisted_runtimes_reads_runtime_state_files() {
     assert_eq!(scanned.len(), 1);
     assert_eq!(scanned[0].handle.task_id, handle.task_id);
     assert_eq!(scanned[0].success_check, SuccessCheck::ProcessExit);
+    assert_eq!(
+        fs::read_to_string(work_dir.join(RUNTIME_PID_FILE)).expect("pid file should exist"),
+        handle.pid.expect("handle should have pid").to_string()
+    );
+    assert_eq!(
+        fs::read_to_string(work_dir.join(RUNTIME_COMMAND_FILE)).expect("command file should exist"),
+        handle
+            .command_line
+            .as_deref()
+            .expect("handle should have command line")
+    );
+    let persisted: PersistedRuntimeState = serde_json::from_slice(
+        &fs::read(work_dir.join(RUNTIME_STATE_FILE)).expect("state file should exist"),
+    )
+    .expect("runtime state should decode");
+    assert_eq!(persisted.handle.runtime_id, handle.runtime_id);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn atomic_write_failure_keeps_existing_runtime_state() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-runtime-atomic-failure-{}",
+        Uuid::now_v7()
+    ));
+    let work_dir = temp_root.join("task").join("attempt-1");
+    let handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(std::process::id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Running,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+        metadata: json!({"task_type": "file_to_live", "lease_token": "lease"}),
+    };
+    persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
+        .expect("initial runtime state should persist");
+    let state_path = work_dir.join(RUNTIME_STATE_FILE);
+    let original = fs::read(&state_path).expect("original state should exist");
+    let mut permissions = fs::metadata(&work_dir)
+        .expect("work dir metadata should exist")
+        .permissions();
+    let original_mode = permissions.mode();
+    permissions.set_mode(0o555);
+    fs::set_permissions(&work_dir, permissions).expect("work dir should become read-only");
+
+    let result = atomic_write(&state_path, br#"{"not":"a runtime state"}"#);
+
+    let mut permissions = fs::metadata(&work_dir)
+        .expect("work dir metadata should exist")
+        .permissions();
+    permissions.set_mode(original_mode);
+    fs::set_permissions(&work_dir, permissions).expect("work dir permissions should restore");
+    assert!(
+        result.is_err(),
+        "read-only directory should reject temp write"
+    );
+    assert_eq!(
+        fs::read(&state_path).expect("state file should still exist"),
+        original
+    );
+    let persisted: PersistedRuntimeState =
+        serde_json::from_slice(&original).expect("original runtime state should still decode");
+    assert_eq!(persisted.handle.task_id, handle.task_id);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn scan_persisted_runtimes_ignores_atomic_tmp_files() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-runtime-tmp-scan-{}", Uuid::now_v7()));
+    let work_dir = temp_root.join("task").join("attempt-1");
+    let handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(std::process::id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Running,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+        metadata: json!({"task_type": "file_to_live", "lease_token": "lease"}),
+    };
+    persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
+        .expect("runtime state should persist");
+    fs::write(
+        work_dir.join(format!("{RUNTIME_STATE_FILE}.tmp.leftover")),
+        br#"{"handle":null}"#,
+    )
+    .expect("tmp state should be written");
+
+    let scanned = scan_persisted_runtimes(temp_root.to_string_lossy().as_ref());
+
+    assert_eq!(scanned.len(), 1);
+    assert_eq!(scanned[0].handle.runtime_id, handle.runtime_id);
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[test]
+fn persist_runtime_state_removes_stale_pid_and_command_files_when_absent() {
+    let temp_root = std::env::temp_dir().join(format!(
+        "streamserver-runtime-no-pid-cmd-{}",
+        Uuid::now_v7()
+    ));
+    let work_dir = temp_root.join("task").join("attempt-1");
+    let mut handle = RuntimeHandle {
+        runtime_id: Uuid::now_v7(),
+        task_id: Uuid::now_v7(),
+        attempt_no: 1,
+        worker_kind: WorkerKind::Ffmpeg,
+        pid: Some(std::process::id() as i32),
+        started_at: Utc::now(),
+        last_progress_at: None,
+        state: RuntimeState::Running,
+        command_line: Some("ffmpeg -re -i input".to_string()),
+        outputs: vec!["rtmp://127.0.0.1/live/stream".to_string()],
+        metadata: json!({"task_type": "file_to_live", "lease_token": "lease"}),
+    };
+    persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
+        .expect("runtime with pid and command should persist");
+    assert!(work_dir.join(RUNTIME_PID_FILE).exists());
+    assert!(work_dir.join(RUNTIME_COMMAND_FILE).exists());
+
+    handle.pid = None;
+    handle.command_line = None;
+    persist_runtime_state(&work_dir, &handle, &SuccessCheck::ProcessExit)
+        .expect("runtime without pid and command should persist");
+
+    assert!(!work_dir.join(RUNTIME_PID_FILE).exists());
+    assert!(!work_dir.join(RUNTIME_COMMAND_FILE).exists());
+    let persisted: PersistedRuntimeState = serde_json::from_slice(
+        &fs::read(work_dir.join(RUNTIME_STATE_FILE)).expect("state file should exist"),
+    )
+    .expect("runtime state should decode");
+    assert!(persisted.handle.pid.is_none());
+    assert!(persisted.handle.command_line.is_none());
+
+    let _ = fs::remove_dir_all(temp_root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_executor_control_paths_work_on_current_thread_runtime() {
+    let temp_root =
+        std::env::temp_dir().join(format!("streamserver-current-thread-{}", Uuid::now_v7()));
+    let registry = LocalRuntimeRegistry::new();
+    let (priority_tx, _priority_rx) = mpsc::unbounded_channel();
+    let (log_tx, _log_rx) = mpsc::channel(8);
+    let executor = ManagedProcessExecutor::new(
+        test_settings(temp_root.to_string_lossy().as_ref()),
+        registry,
+        RuntimeEventSink::new(priority_tx, log_tx),
+    );
+    let task_id = Uuid::now_v7();
+
+    executor
+        .stop_task(StopTaskRequest {
+            task_id,
+            attempt_no: 1,
+            lease_token: "lease".to_string(),
+            reason: "test".to_string(),
+            grace_period_sec: 0,
+            force_after_sec: 0,
+        })
+        .await
+        .expect("missing runtime stop should still be accepted");
+
+    let recording_error = executor
+        .set_task_recording(TaskRecordingControlRequest {
+            task_id,
+            attempt_no: 1,
+            lease_token: "lease".to_string(),
+            action: RecordingControlAction::Start,
+            record: None,
+            reason: "test".to_string(),
+            command_id: "current-thread-record".to_string(),
+        })
+        .await
+        .expect_err("missing runtime recording control should be rejected");
+    assert!(matches!(
+        recording_error,
+        ExecutorError::RuntimeNotFound {
+            task_id: missing_task_id,
+            attempt_no: 1,
+        } if missing_task_id == task_id
+    ));
+
+    let adopted = executor.adopt_orphans(AdoptFilter::default()).await;
+    assert!(adopted.is_empty());
 
     let _ = fs::remove_dir_all(temp_root);
 }
@@ -5756,15 +7309,17 @@ async fn adopt_orphans_tracks_persisted_runtime() {
         RuntimeEventSink::new(priority_tx, log_tx),
     );
 
-    let adopted = executor.adopt_orphans(&AdoptFilter {
-        session_epoch: 1,
-        runtimes: vec![AdoptRuntimeFilter {
-            task_id: handle.task_id,
-            attempt_no: handle.attempt_no,
-            lease_token: "lease".to_string(),
-            worker_kind: WorkerKind::Ffmpeg,
-        }],
-    });
+    let adopted = executor
+        .adopt_orphans(AdoptFilter {
+            session_epoch: 1,
+            runtimes: vec![AdoptRuntimeFilter {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: "lease".to_string(),
+                worker_kind: WorkerKind::Ffmpeg,
+            }],
+        })
+        .await;
 
     assert_eq!(adopted.len(), 1);
     assert_eq!(adopted[0].state, RuntimeState::Orphaned);
@@ -5774,7 +7329,7 @@ async fn adopt_orphans_tracks_persisted_runtime() {
             .is_some()
     );
     let follow_up = executor
-        .start_task(&StartTaskRequest {
+        .start_task(StartTaskRequest {
             task_id: Uuid::now_v7(),
             attempt_no: 1,
             task_type: TaskType::FileTranscode,
@@ -5798,6 +7353,7 @@ async fn adopt_orphans_tracks_persisted_runtime() {
             trace_context: None,
             session_epoch: 1,
         })
+        .await
         .expect_err("adopted runtime should consume a slot");
     assert!(matches!(
         follow_up,
@@ -5844,23 +7400,25 @@ async fn adopt_orphans_emits_adopted_for_active_registry_runtime() {
         .insert(
             handle.runtime_id,
             ManagedRuntime {
-                pid: handle.pid,
-                companion_pids: Vec::new(),
+                process: handle.pid.map(ProcessIdentity::pid_only),
+                companion_processes: Vec::new(),
                 _slot_permit: RuntimeSlotPermit::unbounded(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 suppress_companion_events: Arc::new(AtomicBool::new(false)),
             },
         );
 
-    let adopted = executor.adopt_orphans(&AdoptFilter {
-        session_epoch: 7,
-        runtimes: vec![AdoptRuntimeFilter {
-            task_id: handle.task_id,
-            attempt_no: handle.attempt_no,
-            lease_token: "lease".to_string(),
-            worker_kind: WorkerKind::Ffmpeg,
-        }],
-    });
+    let adopted = executor
+        .adopt_orphans(AdoptFilter {
+            session_epoch: 7,
+            runtimes: vec![AdoptRuntimeFilter {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: "lease".to_string(),
+                worker_kind: WorkerKind::Ffmpeg,
+            }],
+        })
+        .await;
 
     assert_eq!(adopted.len(), 1);
     assert_eq!(runtime_session_epoch(&adopted[0]), 7);
@@ -5917,8 +7475,8 @@ async fn stale_attempt_cleanup_signals_lower_registry_attempt() {
         .insert(
             runtime_id,
             ManagedRuntime {
-                pid: Some(child.id() as i32),
-                companion_pids: Vec::new(),
+                process: Some(ProcessIdentity::pid_only(child.id() as i32)),
+                companion_processes: Vec::new(),
                 _slot_permit: RuntimeSlotPermit::unbounded(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 suppress_companion_events: Arc::new(AtomicBool::new(false)),

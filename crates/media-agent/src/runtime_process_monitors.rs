@@ -29,15 +29,18 @@ use crate::{
     },
     runtime_persistence::persist_runtime_state,
     runtime_plan::CompanionProcessPlan,
-    runtime_process::{ManagedRuntime, is_pid_running, remove_managed_runtime},
+    runtime_process::{ManagedRuntime, ProcessIdentity, is_pid_running, remove_managed_runtime},
     runtime_recovery::classify_adopted_exit,
     runtime_registry::LocalRuntimeRegistry,
 };
 
-pub(crate) async fn wait_for_companion_pids_exit(pids: &[i32], timeout_after_signal: Duration) {
+pub(crate) async fn wait_for_companion_pids_exit(
+    processes: &[ProcessIdentity],
+    timeout_after_signal: Duration,
+) {
     let started_at = Instant::now();
     loop {
-        if pids.iter().all(|pid| !is_pid_running(*pid)) {
+        if processes.iter().all(|process| !is_pid_running(process.pid)) {
             return;
         }
         if started_at.elapsed() >= timeout_after_signal {
@@ -67,7 +70,9 @@ pub(crate) fn spawn_companion_process_monitor(
             let Some(runtime) = runtimes_guard.get_mut(&runtime_id) else {
                 return;
             };
-            runtime.companion_pids.retain(|pid| *pid != companion_pid);
+            runtime
+                .companion_processes
+                .retain(|process| process.pid != companion_pid);
             (
                 runtime.stop_requested.load(Ordering::Relaxed),
                 runtime.suppress_companion_events.load(Ordering::Relaxed),
@@ -156,7 +161,9 @@ pub(crate) fn spawn_adopted_companion_process_monitor(
                 if is_pid_running(companion_pid) {
                     continue;
                 }
-                runtime.companion_pids.retain(|pid| *pid != companion_pid);
+                runtime
+                    .companion_processes
+                    .retain(|process| process.pid != companion_pid);
                 (
                     runtime.stop_requested.load(Ordering::Relaxed),
                     runtime.suppress_companion_events.load(Ordering::Relaxed),
@@ -242,15 +249,16 @@ pub(crate) fn spawn_adopted_runtime_monitor(
             let Some(runtime) = runtime else {
                 return;
             };
-            let Some(pid) = runtime.pid else {
+            let Some(process) = runtime.process else {
                 return;
             };
+            let pid = process.pid;
             let stop_requested = runtime.stop_requested.load(Ordering::Relaxed);
             if is_pid_running(pid) {
                 if stop_requested {
                     let waited_since =
                         stop_requested_wait_started_at.get_or_insert_with(Instant::now);
-                    let should_log = last_stop_requested_running_log_at.map_or(true, |logged_at| {
+                    let should_log = last_stop_requested_running_log_at.is_none_or(|logged_at| {
                         logged_at.elapsed() >= STOP_REQUESTED_STILL_RUNNING_LOG_INTERVAL
                     });
                     if should_log {

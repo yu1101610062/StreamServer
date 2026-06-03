@@ -49,7 +49,7 @@ impl ArtifactBucket {
         }
     }
 
-    fn root<'a>(self, settings: &'a AgentSettings) -> &'a str {
+    fn root(self, settings: &AgentSettings) -> &str {
         match self {
             Self::Mp4 => settings.zlm_output_mp4_root.as_str(),
             Self::Hls => settings.zlm_output_hls_root.as_str(),
@@ -97,6 +97,18 @@ struct ArtifactCleanupState {
     buckets: HashMap<ArtifactBucket, ArtifactBucketState>,
     max_disk_percent: Option<f64>,
     last_refresh_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug)]
+struct ArtifactCleanupRefresh {
+    state: ArtifactCleanupState,
+    stop_requests: Vec<ArtifactCleanupStopRequest>,
+}
+
+#[derive(Debug, Clone)]
+struct ArtifactCleanupStopRequest {
+    request: StopTaskRequest,
+    reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -238,7 +250,10 @@ impl ArtifactCleanupManager {
     pub async fn refresh_now(&self) {
         let this = self.clone();
         match tokio::task::spawn_blocking(move || this.refresh_blocking()).await {
-            Ok(next_state) => self.apply_state(next_state),
+            Ok(refresh) => {
+                self.apply_state(refresh.state);
+                self.stop_active_artifact_tasks(refresh.stop_requests).await;
+            }
             Err(error) => warn!(error = %error, "artifact cleanup refresh task panicked"),
         }
     }
@@ -310,8 +325,9 @@ impl ArtifactCleanupManager {
         Ok(())
     }
 
-    fn refresh_blocking(&self) -> ArtifactCleanupState {
+    fn refresh_blocking(&self) -> ArtifactCleanupRefresh {
         let mut next_state = ArtifactCleanupState::default();
+        let mut stop_requests = Vec::new();
         let mut observed = Vec::new();
 
         for bucket in [ArtifactBucket::Mp4, ArtifactBucket::Hls] {
@@ -365,10 +381,12 @@ impl ArtifactCleanupManager {
                                 "artifact volume usage {:.1}% exceeds threshold {:.1}%",
                                 disk_percent, threshold
                             );
-                            self.stop_active_artifact_tasks_for_volume(
-                                &observations,
-                                &active_handles,
-                                &reason,
+                            stop_requests.extend(
+                                self.stop_requests_for_active_artifact_tasks_for_volume(
+                                    &observations,
+                                    &active_handles,
+                                    &reason,
+                                ),
                             );
                             blocked_reason = Some(reason);
                         }
@@ -420,7 +438,10 @@ impl ArtifactCleanupManager {
         }
 
         next_state.last_refresh_at = Some(Utc::now());
-        next_state
+        ArtifactCleanupRefresh {
+            state: next_state,
+            stop_requests,
+        }
     }
 
     fn cleanup_volume_by_disk(
@@ -560,23 +581,17 @@ impl ArtifactCleanupManager {
         }
     }
 
-    fn stop_active_artifact_tasks_for_volume(
+    fn stop_requests_for_active_artifact_tasks_for_volume(
         &self,
         observations: &[BucketObservation],
         active_handles: &[RuntimeHandle],
         reason: &str,
-    ) {
-        let Some(executor) = self.inner.executor.as_ref() else {
-            warn!(
-                bucket_count = observations.len(),
-                "artifact cleanup cannot stop active tasks because no executor is attached"
-            );
-            return;
-        };
+    ) -> Vec<ArtifactCleanupStopRequest> {
         let volume_buckets = observations
             .iter()
             .map(|observation| observation.bucket)
             .collect::<HashSet<_>>();
+        let mut stop_requests = Vec::new();
 
         for handle in active_handles {
             if matches!(handle.state, RuntimeState::Exited | RuntimeState::Stopping) {
@@ -603,19 +618,41 @@ impl ArtifactCleanupManager {
                 grace_period_sec: 0,
                 force_after_sec: 5,
             };
-            match executor.stop_task(&request) {
+            stop_requests.push(ArtifactCleanupStopRequest {
+                request,
+                reason: reason.to_string(),
+            });
+        }
+
+        stop_requests
+    }
+
+    async fn stop_active_artifact_tasks(&self, stop_requests: Vec<ArtifactCleanupStopRequest>) {
+        if stop_requests.is_empty() {
+            return;
+        }
+        let Some(executor) = self.inner.executor.as_ref().cloned() else {
+            warn!(
+                task_count = stop_requests.len(),
+                "artifact cleanup cannot stop active tasks because no executor is attached"
+            );
+            return;
+        };
+
+        for stop_request in stop_requests {
+            match executor.stop_task(stop_request.request.clone()).await {
                 Ok(()) => {
                     warn!(
-                        task_id = %handle.task_id,
-                        attempt_no = handle.attempt_no,
-                        reason,
+                        task_id = %stop_request.request.task_id,
+                        attempt_no = stop_request.request.attempt_no,
+                        reason = %stop_request.reason,
                         "artifact cleanup stopped active task after disk threshold was exceeded"
                     );
                 }
                 Err(error) => {
                     warn!(
-                        task_id = %handle.task_id,
-                        attempt_no = handle.attempt_no,
+                        task_id = %stop_request.request.task_id,
+                        attempt_no = stop_request.request.attempt_no,
                         error = %error,
                         "artifact cleanup failed to stop active task after disk threshold was exceeded"
                     );
@@ -1135,8 +1172,8 @@ fn sample_disk(path: &Path) -> io::Result<DiskSample> {
     }
 
     let stat = unsafe { stat.assume_init() };
-    let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
-    let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
+    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
     if total == 0 {
         return Ok(DiskSample { percent_used: 0.0 });
     }

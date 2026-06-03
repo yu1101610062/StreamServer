@@ -51,7 +51,7 @@ impl ManagedOutputBucket {
         }
     }
 
-    fn root<'a>(self, settings: &'a AgentSettings) -> &'a str {
+    fn root(self, settings: &AgentSettings) -> &str {
         match self {
             Self::Mp4 => settings.zlm_output_mp4_root.as_str(),
             Self::Hls => settings.zlm_output_hls_root.as_str(),

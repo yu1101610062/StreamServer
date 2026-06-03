@@ -17,6 +17,7 @@ use crate::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
     runtime_outputs::ManagedFileOutputKind,
+    runtime_process::{ProcessIdentity, linux_pid_start_time},
     runtime_recording::{LiveRelayRecording, should_start_live_relay_recording},
 };
 
@@ -49,6 +50,10 @@ pub(crate) enum CompanionProcessState {
 pub(crate) struct CompanionProcessMetadata {
     pub(crate) kind: CompanionProcessKind,
     pub(crate) pid: Option<i32>,
+    #[serde(default)]
+    pub(crate) pgid: Option<i32>,
+    #[serde(default)]
+    pub(crate) pid_start_time: Option<u64>,
     pub(crate) output_target: String,
     pub(crate) outputs: Vec<String>,
     #[serde(default)]
@@ -162,6 +167,15 @@ pub(crate) fn rtp_server_from_handle(handle: &RuntimeHandle) -> Option<RtpServer
         .get("rtp_server")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+pub(crate) fn process_identity_from_handle(handle: &RuntimeHandle) -> Option<ProcessIdentity> {
+    handle
+        .metadata
+        .get("process")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .or_else(|| handle.pid.map(ProcessIdentity::pid_only))
 }
 
 pub(crate) fn live_relay_recording_from_handle(
@@ -479,6 +493,19 @@ pub(crate) fn companion_recording_from_handle(
         .get("companion_recording")
         .cloned()
         .and_then(|value| serde_json::from_value::<CompanionProcessMetadata>(value).ok())
+}
+
+pub(crate) fn companion_process_identity_from_metadata(
+    companion: &CompanionProcessMetadata,
+) -> Option<ProcessIdentity> {
+    let pid = companion.pid?;
+    Some(ProcessIdentity {
+        pid,
+        pgid: companion.pgid,
+        pid_start_time: companion
+            .pid_start_time
+            .or_else(|| linux_pid_start_time(pid)),
+    })
 }
 
 pub(crate) fn update_companion_recording_metadata(

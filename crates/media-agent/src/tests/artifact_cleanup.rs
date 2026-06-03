@@ -14,6 +14,7 @@ use media_domain::{
     TaskSpec, TaskType, WorkerKind,
 };
 use serde_json::json;
+use tonic::async_trait;
 use uuid::Uuid;
 
 use crate::runtime::{
@@ -330,9 +331,11 @@ fn running_cleanup_deletes_only_safe_old_segments() {
         },
     ];
 
-    let mut settings = AgentSettings::default();
-    settings.zlm_output_mp4_root = temp_root.join("mp4").to_string_lossy().to_string();
-    settings.zlm_output_hls_root = temp_root.join("hls").to_string_lossy().to_string();
+    let settings = AgentSettings {
+        zlm_output_mp4_root: temp_root.join("mp4").to_string_lossy().to_string(),
+        zlm_output_hls_root: temp_root.join("hls").to_string_lossy().to_string(),
+        ..Default::default()
+    };
     let layout = ArtifactCleanupLayout::from_settings(&settings);
     let candidates = collect_running_cleanup_candidates(&observations, &[handle], &layout);
     let candidate_paths = candidates
@@ -358,24 +361,25 @@ struct RecordingExecutor {
     stops: Mutex<Vec<StopTaskRequest>>,
 }
 
+#[async_trait]
 impl LocalExecutor for RecordingExecutor {
-    fn start_task(&self, _request: &StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
+    async fn start_task(&self, _request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
         Err(ExecutorError::InvalidRequest("unused".to_string()))
     }
 
-    fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError> {
-        self.stops.lock().expect("stops lock").push(request.clone());
+    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
+        self.stops.lock().expect("stops lock").push(request);
         Ok(())
     }
 
-    fn set_task_recording(
+    async fn set_task_recording(
         &self,
-        _request: &TaskRecordingControlRequest,
+        _request: TaskRecordingControlRequest,
     ) -> Result<RuntimeHandle, ExecutorError> {
         Err(ExecutorError::InvalidRequest("unused".to_string()))
     }
 
-    fn adopt_orphans(&self, _filter: &AdoptFilter) -> Vec<RuntimeHandle> {
+    async fn adopt_orphans(&self, _filter: AdoptFilter) -> Vec<RuntimeHandle> {
         Vec::new()
     }
 }
@@ -448,10 +452,13 @@ fn reject_only_stop_action_targets_only_artifact_tasks_on_volume() {
         },
     ];
 
-    manager.stop_active_artifact_tasks_for_volume(&observations, &handles, "threshold");
+    let stops = manager.stop_requests_for_active_artifact_tasks_for_volume(
+        &observations,
+        &handles,
+        "threshold",
+    );
 
-    let stops = executor.stops.lock().expect("stops lock");
     assert_eq!(stops.len(), 1);
-    assert_eq!(stops[0].task_id, artifact_task);
-    assert_eq!(stops[0].reason, DISK_THRESHOLD_STOP_REASON);
+    assert_eq!(stops[0].request.task_id, artifact_task);
+    assert_eq!(stops[0].request.reason, DISK_THRESHOLD_STOP_REASON);
 }

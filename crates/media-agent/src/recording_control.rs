@@ -13,6 +13,9 @@ pub(crate) struct RecordingControlGuard {
 }
 
 impl RecordingControlGuard {
+    // The guard represents the in-flight recording command only; the
+    // StdMutexGuard is dropped before returning, so this value may live across
+    // awaits without holding the mutex.
     pub(crate) fn acquire(
         active: Arc<StdMutex<HashSet<Uuid>>>,
         runtime_id: Uuid,

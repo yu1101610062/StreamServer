@@ -10,9 +10,11 @@ use uuid::Uuid;
 use crate::repository::{RepoError, validation_error};
 
 const ZLM_HTTP_ROOT_SEGMENT: &str = "/data/zlm/www";
+#[cfg(test)]
 const ZLM_OUTPUT_HTTP_ROOT_SEGMENT: &str = "/data/zlm/www/output";
 const ZLM_OUTPUT_MP4_RELATIVE_ROOT: &str = "output/mp4";
 const ZLM_OUTPUT_HLS_RELATIVE_ROOT: &str = "output/hls";
+const ZLM_RECORD_RELATIVE_ROOT: &str = "record";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManagedOutputBucket {
@@ -73,6 +75,7 @@ pub(crate) fn relative_http_url_from_path(file_path: &str) -> Result<String, Rep
     Ok(format!("/{}", relative.trim_start_matches('/')))
 }
 
+#[cfg(test)]
 pub(crate) fn externalize_managed_path(
     path: &str,
     field: &'static str,
@@ -92,6 +95,21 @@ pub(crate) fn externalize_managed_path(
         field,
         format!("must be under *{ZLM_OUTPUT_HTTP_ROOT_SEGMENT}"),
     ))
+}
+
+pub(crate) fn externalize_http_visible_path(
+    path: &str,
+    field: &'static str,
+    prefixes: &OutputMountPrefixes,
+) -> Result<String, RepoError> {
+    let normalized = normalized_absolute_path(path)?;
+    if let Some(relative) = external_relative_path_from_normalized(&normalized, prefixes) {
+        return Ok(relative);
+    }
+    let relative = relative_path_under_zlm_http_root(&normalized).ok_or_else(|| {
+        validation_error(field, format!("must be under *{ZLM_HTTP_ROOT_SEGMENT}"))
+    })?;
+    Ok(format!("/{}", relative.trim_start_matches('/')))
 }
 
 pub(crate) fn externalize_path_fields_in_payload(
@@ -148,8 +166,9 @@ pub(crate) fn is_hls_playlist_record_path(file_path: &str) -> bool {
     let Ok(normalized) = normalized_absolute_path(file_path) else {
         return false;
     };
-    let in_record_root =
-        relative_path_under_output_root(&normalized, ManagedOutputBucket::Hls).is_some();
+    let in_record_root = relative_path_under_output_root(&normalized, ManagedOutputBucket::Hls)
+        .is_some()
+        || relative_path_under_record_root(&normalized).is_some();
     in_record_root
         && Path::new(&normalized)
             .extension()
@@ -181,10 +200,7 @@ fn relative_path_under_zlm_http_root(path: &str) -> Option<&str> {
     relative_path_under_root(path, root)
 }
 
-fn relative_path_under_output_root<'a>(
-    path: &'a str,
-    bucket: ManagedOutputBucket,
-) -> Option<&'a str> {
+fn relative_path_under_output_root(path: &str, bucket: ManagedOutputBucket) -> Option<&str> {
     let relative = relative_path_under_zlm_http_root(path)?;
     let root = match bucket {
         ManagedOutputBucket::Mp4 => ZLM_OUTPUT_MP4_RELATIVE_ROOT,
@@ -194,6 +210,14 @@ fn relative_path_under_output_root<'a>(
         return Some("");
     }
     relative_path_under_root(relative, root)
+}
+
+fn relative_path_under_record_root(path: &str) -> Option<&str> {
+    let relative = relative_path_under_zlm_http_root(path)?;
+    if relative == ZLM_RECORD_RELATIVE_ROOT {
+        return Some("");
+    }
+    relative_path_under_root(relative, ZLM_RECORD_RELATIVE_ROOT)
 }
 
 fn normalized_absolute_path(path: &str) -> Result<String, RepoError> {
@@ -270,7 +294,7 @@ fn externalize_path_field_value(
         Value::String(path) if path.trim().is_empty() => Ok(Value::String(path)),
         Value::String(path) => {
             if let Some(prefixes) = prefixes {
-                externalize_managed_path(&path, field, prefixes).map(Value::String)
+                externalize_http_visible_path(&path, field, prefixes).map(Value::String)
             } else {
                 Ok(Value::String(path))
             }

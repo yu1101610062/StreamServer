@@ -19,7 +19,7 @@ use media_domain::{AttemptStatus, TaskStatus, TaskType, WorkerKind};
 
 use crate::repository::{
     AttemptSummary, CallbackOutboxJob, FileArtifactSummary, NodeSummary, RecordFileSummary,
-    StreamListFilter, StreamSummary, TaskDetail, TaskEventSummary, TaskRepository,
+    StreamSummary, TaskDetail, TaskEventSummary, TaskRepository,
 };
 
 const CALLBACK_TICK: Duration = Duration::from_secs(2);
@@ -352,16 +352,7 @@ async fn build_task_completed_callback_payload(
         .into_iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    let streams = repository
-        .list_streams(StreamListFilter {
-            schema: None,
-            app: None,
-            stream: None,
-            task_id: Some(job.task_id),
-            node_id: None,
-            has_viewer: None,
-        })
-        .await?;
+    let streams = repository.list_task_streams(job.task_id).await?;
     let records = repository.list_task_record_files(job.task_id).await?;
     let file_artifacts = repository.list_task_file_artifacts(job.task_id).await?;
 

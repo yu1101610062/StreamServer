@@ -375,12 +375,11 @@ pub(crate) async fn stop_live_relay_for_record_duration_if_reached(
             handle
         });
     let _ = persist_runtime_state(work_dir, &completion_handle, &SuccessCheck::ProcessExit);
-    if let Some(runtime) = runtimes
-        .read()
-        .expect("runtime map lock poisoned")
-        .get(&runtime_id)
-        .cloned()
-    {
+    let runtime = {
+        let runtimes = runtimes.read().expect("runtime map lock poisoned");
+        runtimes.get(&runtime_id).cloned()
+    };
+    if let Some(runtime) = runtime {
         runtime.stop_requested.store(true, Ordering::Relaxed);
     }
     let binding = stream_binding_from_handle(&completion_handle).unwrap_or(StreamBinding {

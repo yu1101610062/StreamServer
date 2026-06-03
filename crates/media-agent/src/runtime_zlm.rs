@@ -98,6 +98,21 @@ pub(crate) async fn zlm_rtp_server_port(
         }))
 }
 
+pub(crate) async fn close_zlm_rtp_server(
+    client: &Client,
+    settings: &AgentSettings,
+    stream_id: &str,
+) -> Result<(), ExecutorError> {
+    let _ = call_zlm_api(
+        client,
+        settings,
+        "/index/api/closeRtpServer",
+        &[("stream_id".to_string(), stream_id.to_string())],
+    )
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn zlm_stream_binding_by_stream_id(
     client: &Client,
     settings: &AgentSettings,

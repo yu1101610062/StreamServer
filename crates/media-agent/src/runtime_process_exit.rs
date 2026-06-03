@@ -33,7 +33,7 @@ use crate::{
         task_runtime_mode_from_handle, task_type_from_handle,
     },
     runtime_persistence::persist_runtime_state,
-    runtime_process::{ManagedRuntime, is_pid_running, remove_managed_runtime, signal_pid},
+    runtime_process::{ManagedRuntime, is_process_running, remove_managed_runtime, signal_process},
     runtime_process_monitors::wait_for_companion_pids_exit,
     runtime_recovery::should_auto_restart_process,
     runtime_registry::LocalRuntimeRegistry,
@@ -71,29 +71,29 @@ pub(crate) fn spawn_process_exit_monitor(
         } = context;
 
         let status = child.wait().await;
-        let (was_stopped, companion_pids) = {
+        let (was_stopped, companion_processes) = {
             let mut runtimes_guard = runtimes.write().expect("runtime map lock poisoned");
             if let Some(runtime) = runtimes_guard.get_mut(&runtime_id) {
                 runtime
                     .suppress_companion_events
                     .store(true, Ordering::Relaxed);
                 let was_stopped = runtime.stop_requested.load(Ordering::Relaxed);
-                let companion_pids = runtime.companion_pids.clone();
-                (was_stopped, companion_pids)
+                let companion_processes = runtime.companion_processes.clone();
+                (was_stopped, companion_processes)
             } else {
                 (stop_requested.load(Ordering::Relaxed), Vec::new())
             }
         };
-        if !companion_pids.is_empty() {
-            for companion_pid in &companion_pids {
-                if is_pid_running(*companion_pid) {
-                    let _ = signal_pid(*companion_pid, libc::SIGTERM);
+        if !companion_processes.is_empty() {
+            for companion_process in &companion_processes {
+                if is_process_running(companion_process) {
+                    let _ = signal_process(companion_process, libc::SIGTERM);
                 }
             }
-            wait_for_companion_pids_exit(&companion_pids, Duration::from_secs(3)).await;
-            for companion_pid in &companion_pids {
-                if is_pid_running(*companion_pid) {
-                    let _ = signal_pid(*companion_pid, libc::SIGKILL);
+            wait_for_companion_pids_exit(&companion_processes, Duration::from_secs(3)).await;
+            for companion_process in &companion_processes {
+                if is_process_running(companion_process) {
+                    let _ = signal_process(companion_process, libc::SIGKILL);
                 }
             }
         }

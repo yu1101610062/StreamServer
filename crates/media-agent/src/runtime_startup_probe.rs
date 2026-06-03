@@ -34,14 +34,14 @@ use crate::{
         clear_source_reconnecting, emit_recording_gap_ended_event,
         emit_recording_gap_started_event, emit_source_reconnecting_event,
         live_relay_recording_from_handle, live_relay_startup_ready, mark_source_reconnecting,
-        resolved_spec_from_handle, runtime_lease_token, should_emit_recording_gap_started,
-        should_emit_source_reconnecting, sticky_reconnect_stream_ingest_from_handle,
-        stream_binding_from_handle, stream_online,
+        process_identity_from_handle, resolved_spec_from_handle, runtime_lease_token,
+        should_emit_recording_gap_started, should_emit_source_reconnecting,
+        sticky_reconnect_stream_ingest_from_handle, stream_binding_from_handle, stream_online,
     },
     runtime_persistence::persist_runtime_state,
     runtime_process::{
-        ManagedRuntime, is_pid_running, runtime_pids, schedule_force_kill_if_running, signal_pid,
-        signal_runtime_pids,
+        ManagedRuntime, ProcessIdentity, is_pid_running, runtime_processes,
+        schedule_force_kill_if_running, signal_process, signal_runtime_processes,
     },
     runtime_recording::{
         mark_recording_completion, mark_recording_failed, recording_elapsed_seconds,
@@ -248,12 +248,14 @@ pub(crate) fn spawn_startup_probe_monitor(
                                 }),
                             }));
                             if fatal {
+                                let process = process_identity_from_handle(&updated_handle)
+                                    .unwrap_or_else(|| ProcessIdentity::pid_only(pid));
                                 let _ =
                                     events.send(RuntimeNotification::TaskSnapshot(updated_handle));
-                                if signal_pid(pid, libc::SIGTERM).is_ok() {
+                                if signal_process(&process, libc::SIGTERM).is_ok() {
                                     schedule_force_kill_if_running(
                                         runtime_id,
-                                        vec![pid],
+                                        vec![process],
                                         runtimes.clone(),
                                         AUTO_STOP_FORCE_KILL_DELAY,
                                         "recording_start_fatal",
@@ -352,12 +354,11 @@ pub(crate) fn spawn_startup_probe_monitor(
                             last_progress_at = ?completion_handle.last_progress_at,
                             "updated runtime metadata after wall-clock recording duration reached"
                         );
-                        if let Some(runtime) = runtimes
-                            .read()
-                            .expect("runtime map lock poisoned")
-                            .get(&runtime_id)
-                            .cloned()
-                        {
+                        let runtime = {
+                            let runtimes = runtimes.read().expect("runtime map lock poisoned");
+                            runtimes.get(&runtime_id).cloned()
+                        };
+                        if let Some(runtime) = runtime {
                             runtime.stop_requested.store(true, Ordering::Relaxed);
                         }
                         match request_live_relay_record_duration_stop(
@@ -541,16 +542,15 @@ pub(crate) fn spawn_startup_probe_monitor(
                         }),
                     }));
                 }
-                if let Some(runtime) = runtimes
-                    .read()
-                    .expect("runtime map lock poisoned")
-                    .get(&runtime_id)
-                    .cloned()
-                {
-                    if signal_runtime_pids(&runtime, libc::SIGTERM).is_ok() {
+                let runtime = {
+                    let runtimes = runtimes.read().expect("runtime map lock poisoned");
+                    runtimes.get(&runtime_id).cloned()
+                };
+                if let Some(runtime) = runtime {
+                    if signal_runtime_processes(&runtime, libc::SIGTERM).is_ok() {
                         schedule_force_kill_if_running(
                             runtime_id,
-                            runtime_pids(&runtime),
+                            runtime_processes(&runtime),
                             runtimes.clone(),
                             AUTO_STOP_FORCE_KILL_DELAY,
                             "startup_probe_timeout",

@@ -27,7 +27,8 @@ use crate::{
     },
     runtime_io::attempt_work_dir,
     runtime_metadata::{
-        companion_recording_from_handle, rtp_stream_id_from_handle, runtime_lease_token,
+        companion_process_identity_from_metadata, companion_recording_from_handle,
+        process_identity_from_handle, rtp_stream_id_from_handle, runtime_lease_token,
         stream_binding_from_handle, task_runtime_mode_from_handle,
     },
     runtime_persistence::{
@@ -35,9 +36,9 @@ use crate::{
     },
     runtime_plan::TaskRuntimeMode,
     runtime_process::{
-        ManagedRuntime, is_pid_running, remove_managed_runtime, runtime_pids,
-        schedule_force_kill_if_running, schedule_force_kill_pids_if_running, signal_pid,
-        signal_runtime_pids,
+        ManagedRuntime, ProcessIdentity, is_pid_running, remove_managed_runtime, runtime_processes,
+        schedule_force_kill_if_running, schedule_force_kill_processes_if_running, signal_process,
+        signal_runtime_processes,
     },
     runtime_registry::LocalRuntimeRegistry,
 };
@@ -62,16 +63,14 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
         }
         handled_attempts.insert((handle.task_id, handle.attempt_no));
 
-        let runtime = ctx
-            .runtimes
-            .read()
-            .expect("runtime map lock poisoned")
-            .get(&handle.runtime_id)
-            .cloned();
+        let runtime = {
+            let runtimes = ctx.runtimes.read().expect("runtime map lock poisoned");
+            runtimes.get(&handle.runtime_id).cloned()
+        };
         if let Some(runtime) = runtime {
             runtime.stop_requested.store(true, Ordering::Relaxed);
-            let pids = runtime_pids(&runtime);
-            if pids.is_empty() {
+            let processes = runtime_processes(&runtime);
+            if processes.is_empty() {
                 continue;
             }
             ctx.registry.update(handle.runtime_id, |runtime| {
@@ -82,10 +81,11 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
                     "replacement_attempt_no": request.attempt_no,
                 });
             });
-            for pid in &pids {
-                if let Err(error) = signal_pid(*pid, libc::SIGTERM) {
+            for process in &processes {
+                if let Err(error) = signal_process(process, libc::SIGTERM) {
                     warn!(
-                        pid,
+                        pid = process.pid,
+                        pgid = ?process.pgid,
                         error = %error,
                         reason = "stale_attempt_replaced",
                         "failed to signal stale runtime process"
@@ -94,7 +94,7 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
             }
             schedule_force_kill_if_running(
                 handle.runtime_id,
-                pids,
+                processes,
                 ctx.runtimes.clone(),
                 STALE_ATTEMPT_FORCE_KILL_DELAY,
                 "stale_attempt_replaced",
@@ -102,8 +102,8 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
             continue;
         }
 
-        let pids = runtime_handle_live_pids(&handle);
-        signal_stale_pids(&pids, "stale_registry_attempt_replaced");
+        let processes = runtime_handle_live_processes(&handle);
+        signal_stale_processes(&processes, "stale_registry_attempt_replaced");
     }
 
     for persisted in scan_persisted_runtimes(&ctx.settings.work_root) {
@@ -112,8 +112,8 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
         {
             continue;
         }
-        let pids = runtime_handle_live_pids(&persisted.handle);
-        signal_stale_pids(&pids, "stale_persisted_attempt_replaced");
+        let processes = runtime_handle_live_processes(&persisted.handle);
+        signal_stale_processes(&processes, "stale_persisted_attempt_replaced");
     }
 }
 
@@ -131,10 +131,13 @@ pub(crate) async fn stop_runtime_task(
     request: &StopTaskRequest,
 ) -> Result<(), ExecutorError> {
     let key = (request.task_id, request.attempt_no);
-    ctx.stop_intents
-        .write()
-        .expect("stop intents lock poisoned")
-        .insert(key, request.clone());
+    {
+        let mut stop_intents = ctx
+            .stop_intents
+            .write()
+            .expect("stop intents lock poisoned");
+        stop_intents.insert(key, request.clone());
+    }
 
     let handle = ctx
         .registry
@@ -153,16 +156,14 @@ pub(crate) async fn stop_runtime_task(
             request.task_id, request.attempt_no
         )));
     }
-    let runtime = ctx
-        .runtimes
-        .read()
-        .expect("runtime map lock poisoned")
-        .get(&handle.runtime_id)
-        .cloned()
-        .ok_or(ExecutorError::RuntimeNotFound {
-            task_id: request.task_id,
-            attempt_no: request.attempt_no,
-        })?;
+    let runtime = {
+        let runtimes = ctx.runtimes.read().expect("runtime map lock poisoned");
+        runtimes.get(&handle.runtime_id).cloned()
+    }
+    .ok_or(ExecutorError::RuntimeNotFound {
+        task_id: request.task_id,
+        attempt_no: request.attempt_no,
+    })?;
 
     runtime.stop_requested.store(true, Ordering::Relaxed);
     let runtime_id = handle.runtime_id;
@@ -188,7 +189,7 @@ pub(crate) async fn stop_runtime_task(
         }
     });
 
-    if runtime.pid.is_some() {
+    if runtime.process.is_some() {
         let managed_live_relay = matches!(
             task_runtime_mode_from_handle(&handle),
             Some(TaskRuntimeMode::ManagedProcess)
@@ -196,7 +197,7 @@ pub(crate) async fn stop_runtime_task(
         if managed_live_relay {
             stop_live_relay_recording_for_handle(&ctx.controls, &handle).await?;
         }
-        signal_runtime_pids(&runtime, libc::SIGTERM)?;
+        signal_runtime_processes(&runtime, libc::SIGTERM)?;
         if managed_live_relay {
             close_live_relay(&ctx.controls, &handle, true).await?;
         }
@@ -277,10 +278,10 @@ pub(crate) async fn stop_runtime_task(
         let _ = persist_runtime_state(&work_dir, &handle, &success_check_from_handle(&handle));
     }
 
-    if runtime.pid.is_some() && force_after_sec > 0 {
+    if runtime.process.is_some() && force_after_sec > 0 {
         schedule_force_kill_if_running(
             runtime_id,
-            runtime_pids(&runtime),
+            runtime_processes(&runtime),
             ctx.runtimes.clone(),
             Duration::from_secs(force_after_sec as u64),
             "stop_task_force_after",
@@ -290,18 +291,20 @@ pub(crate) async fn stop_runtime_task(
     Ok(())
 }
 
-fn runtime_handle_live_pids(handle: &RuntimeHandle) -> Vec<i32> {
-    let mut pids = Vec::new();
-    if let Some(pid) = handle.pid.filter(|pid| is_pid_running(*pid)) {
-        pids.push(pid);
-    }
-    if let Some(companion_pid) = companion_recording_from_handle(handle)
-        .and_then(|companion| companion.pid)
-        .filter(|pid| is_pid_running(*pid))
+fn runtime_handle_live_processes(handle: &RuntimeHandle) -> Vec<ProcessIdentity> {
+    let mut processes = Vec::new();
+    if let Some(process) =
+        process_identity_from_handle(handle).filter(|process| is_pid_running(process.pid))
     {
-        pids.push(companion_pid);
+        processes.push(process);
     }
-    pids
+    if let Some(companion_process) = companion_recording_from_handle(handle)
+        .and_then(|companion| companion_process_identity_from_metadata(&companion))
+        .filter(|process| is_pid_running(process.pid))
+    {
+        processes.push(companion_process);
+    }
+    processes
 }
 
 fn is_stale_attempt_for_request(handle: &RuntimeHandle, request: &StartTaskRequest) -> bool {
@@ -311,19 +314,24 @@ fn is_stale_attempt_for_request(handle: &RuntimeHandle, request: &StartTaskReque
         && runtime_lease_token(handle).unwrap_or_default() != request.lease_token
 }
 
-fn signal_stale_pids(pids: &[i32], reason: &'static str) {
-    if pids.is_empty() {
+fn signal_stale_processes(processes: &[ProcessIdentity], reason: &'static str) {
+    if processes.is_empty() {
         return;
     }
-    for pid in pids {
-        if let Err(error) = signal_pid(*pid, libc::SIGTERM) {
+    for process in processes {
+        if let Err(error) = signal_process(process, libc::SIGTERM) {
             warn!(
-                pid,
+                pid = process.pid,
+                pgid = ?process.pgid,
                 error = %error,
                 reason,
                 "failed to signal stale runtime process"
             );
         }
     }
-    schedule_force_kill_pids_if_running(pids.to_vec(), STALE_ATTEMPT_FORCE_KILL_DELAY, reason);
+    schedule_force_kill_processes_if_running(
+        processes.to_vec(),
+        STALE_ATTEMPT_FORCE_KILL_DELAY,
+        reason,
+    );
 }

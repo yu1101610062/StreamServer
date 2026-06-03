@@ -5,13 +5,13 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     sync::{Arc, Mutex as StdMutex, RwLock},
     time::Duration,
 };
 
 use media_domain::RuntimeHandle;
 use reqwest::Client;
+use tonic::async_trait;
 use uuid::Uuid;
 
 use crate::{
@@ -25,7 +25,8 @@ use crate::{
     runtime_plan::TaskRuntimeMode,
     runtime_process::{ManagedRuntime, RuntimeSlotLimiter, RuntimeSlotPermit},
     runtime_process_start::{
-        ManagedProcessStartContext, start_process_task as start_managed_process_task,
+        ManagedProcessStartContext, ManagedProcessStartHooks,
+        start_process_task as start_managed_process_task,
     },
     runtime_recovery::{
         ProcessRecoveryContext,
@@ -36,24 +37,26 @@ use crate::{
     runtime_start::{RuntimeStartContext, RuntimeStartDecision, prepare_start_task},
     runtime_stop::{RuntimeStopContext, stop_runtime_task},
     runtime_types::{
-        ExecutorError, RuntimeCapabilityHints, StartTaskRequest, StartupProbe, StopTaskRequest,
+        ExecutorError, RuntimeCapabilityHints, StartTaskRequest, StopTaskRequest,
         TaskRecordingControlRequest,
     },
     runtime_zlm::{zlm_rtp_server_port, zlm_stream_online},
     runtime_zlm_start::{
-        RuntimeZlmStartContext, start_live_relay_task as start_zlm_live_relay_task,
+        RuntimeZlmStartContext, RuntimeZlmStartHooks,
+        start_live_relay_task as start_zlm_live_relay_task,
         start_rtp_receive_task as start_zlm_rtp_receive_task,
     },
 };
 
+#[async_trait]
 pub trait LocalExecutor: Send + Sync {
-    fn start_task(&self, request: &StartTaskRequest) -> Result<RuntimeHandle, ExecutorError>;
-    fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError>;
-    fn set_task_recording(
+    async fn start_task(&self, request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError>;
+    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError>;
+    async fn set_task_recording(
         &self,
-        request: &TaskRecordingControlRequest,
+        request: TaskRecordingControlRequest,
     ) -> Result<RuntimeHandle, ExecutorError>;
-    fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle>;
+    async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle>;
     fn set_zlm_server_id(&self, _server_id: String) {}
     fn set_zlm_rtmp_enhanced_enabled(&self, _enabled: Option<bool>) {}
 }
@@ -97,17 +100,23 @@ impl ManagedProcessExecutor {
     }
 
     fn current_zlm_server_id(&self) -> Option<String> {
-        self.zlm_server_id
-            .read()
-            .expect("zlm_server_id lock poisoned")
-            .clone()
+        {
+            let guard = self
+                .zlm_server_id
+                .read()
+                .expect("zlm_server_id lock poisoned");
+            guard.clone()
+        }
     }
 
     fn current_zlm_rtmp_enhanced_enabled(&self) -> Option<bool> {
-        *self
-            .zlm_rtmp_enhanced_enabled
-            .read()
-            .expect("zlm_rtmp_enhanced_enabled lock poisoned")
+        {
+            let guard = self
+                .zlm_rtmp_enhanced_enabled
+                .read()
+                .expect("zlm_rtmp_enhanced_enabled lock poisoned");
+            *guard
+        }
     }
 
     fn control_context(&self) -> RuntimeControlContext<'_> {
@@ -128,6 +137,7 @@ impl ManagedProcessExecutor {
             runtimes: &self.runtimes,
             events: &self.events,
             zlm_server_id: self.current_zlm_server_id(),
+            hooks: RuntimeZlmStartHooks::default(),
         }
     }
 
@@ -148,8 +158,9 @@ impl ManagedProcessExecutor {
     }
 }
 
+#[async_trait]
 impl LocalExecutor for ManagedProcessExecutor {
-    fn start_task(&self, request: &StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
+    async fn start_task(&self, request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
         match prepare_start_task(
             RuntimeStartContext {
                 settings: &self.settings,
@@ -158,20 +169,24 @@ impl LocalExecutor for ManagedProcessExecutor {
                 stop_intents: &self.stop_intents,
                 slot_limiter: &self.slot_limiter,
             },
-            request,
+            &request,
         )? {
             RuntimeStartDecision::Existing(handle) => Ok(handle),
             RuntimeStartDecision::Start { mode, slot_permit } => match mode {
-                TaskRuntimeMode::ZlmProxy => self.start_live_relay_task(request, slot_permit),
-                TaskRuntimeMode::ZlmRtpServer => self.start_rtp_receive_task(request, slot_permit),
-                TaskRuntimeMode::ManagedProcess => self.start_process_task(request, slot_permit),
+                TaskRuntimeMode::ZlmProxy => {
+                    self.start_live_relay_task(&request, slot_permit).await
+                }
+                TaskRuntimeMode::ZlmRtpServer => {
+                    self.start_rtp_receive_task(&request, slot_permit).await
+                }
+                TaskRuntimeMode::ManagedProcess => self.start_process_task(&request, slot_permit),
             },
         }
     }
 
-    fn stop_task(&self, request: &StopTaskRequest) -> Result<(), ExecutorError> {
+    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
         let controls = self.control_context();
-        self.run_sync(stop_runtime_task(
+        stop_runtime_task(
             RuntimeStopContext {
                 settings: &self.settings,
                 registry: &self.registry,
@@ -180,25 +195,32 @@ impl LocalExecutor for ManagedProcessExecutor {
                 stop_intents: &self.stop_intents,
                 controls,
             },
-            request,
-        ))
+            &request,
+        )
+        .await
     }
 
-    fn set_task_recording(
+    async fn set_task_recording(
         &self,
-        request: &TaskRecordingControlRequest,
+        request: TaskRecordingControlRequest,
     ) -> Result<RuntimeHandle, ExecutorError> {
         let controls = self.control_context();
-        self.run_sync(set_runtime_task_recording(
+        set_runtime_task_recording(
             RuntimeRecordingControlContext {
                 controls,
                 recording_controls: self.recording_controls.clone(),
             },
-            request,
-        ))
+            &request,
+        )
+        .await
     }
 
-    fn adopt_orphans(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
+    async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
+        let stream_probe_client = self.http_client.clone();
+        let stream_probe_settings = self.settings.clone();
+        let rtp_probe_client = self.http_client.clone();
+        let rtp_probe_settings = self.settings.clone();
+
         adopt_orphan_runtimes(
             RuntimeAdoptionContext {
                 filter,
@@ -210,34 +232,54 @@ impl LocalExecutor for ManagedProcessExecutor {
                 slot_limiter: self.slot_limiter.clone(),
                 events: self.events.clone(),
             },
-            |request| self.start_task(request).ok(),
-            |startup_probe| {
-                self.zlm_stream_online_blocking(startup_probe)
-                    .unwrap_or(false)
+            |request| async move { self.start_task(request).await.ok() },
+            move |startup_probe| {
+                let client = stream_probe_client.clone();
+                let settings = stream_probe_settings.clone();
+                async move {
+                    zlm_stream_online(&client, &settings, &startup_probe)
+                        .await
+                        .map_err(|error| ExecutorError::ApiCall(error.to_string()))
+                        .unwrap_or(false)
+                }
             },
-            |stream_id| self.rtp_server_port_blocking(stream_id).ok().flatten(),
+            move |stream_id| {
+                let client = rtp_probe_client.clone();
+                let settings = rtp_probe_settings.clone();
+                async move {
+                    zlm_rtp_server_port(&client, &settings, &stream_id)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            },
         )
+        .await
     }
 
     fn set_zlm_server_id(&self, server_id: String) {
         let server_id = server_id.trim().to_string();
-        let mut guard = self
-            .zlm_server_id
-            .write()
-            .expect("zlm_server_id lock poisoned");
-        if server_id.is_empty() {
-            *guard = None;
-        } else {
-            *guard = Some(server_id);
+        {
+            let mut guard = self
+                .zlm_server_id
+                .write()
+                .expect("zlm_server_id lock poisoned");
+            if server_id.is_empty() {
+                *guard = None;
+            } else {
+                *guard = Some(server_id);
+            }
         }
     }
 
     fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
-        let mut guard = self
-            .zlm_rtmp_enhanced_enabled
-            .write()
-            .expect("zlm_rtmp_enhanced_enabled lock poisoned");
-        *guard = enabled;
+        {
+            let mut guard = self
+                .zlm_rtmp_enhanced_enabled
+                .write()
+                .expect("zlm_rtmp_enhanced_enabled lock poisoned");
+            *guard = enabled;
+        }
     }
 }
 
@@ -259,6 +301,7 @@ impl ManagedProcessExecutor {
                     zlm_rtmp_enhanced_enabled: self.current_zlm_rtmp_enhanced_enabled(),
                 },
                 restart_executor: self.clone(),
+                hooks: ManagedProcessStartHooks::default(),
             },
             request,
             slot_permit,
@@ -282,55 +325,19 @@ impl ManagedProcessExecutor {
         cleanup_managed_stream_before_restart_impl(self.process_recovery_context(), handle).await;
     }
 
-    fn start_live_relay_task(
+    async fn start_live_relay_task(
         &self,
         request: &StartTaskRequest,
         slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeHandle, ExecutorError> {
-        self.run_sync(start_zlm_live_relay_task(
-            self.zlm_start_context(),
-            request,
-            slot_permit,
-        ))
+        start_zlm_live_relay_task(self.zlm_start_context(), request, slot_permit).await
     }
 
-    fn start_rtp_receive_task(
+    async fn start_rtp_receive_task(
         &self,
         request: &StartTaskRequest,
         slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeHandle, ExecutorError> {
-        self.run_sync(start_zlm_rtp_receive_task(
-            self.zlm_start_context(),
-            request,
-            slot_permit,
-        ))
-    }
-
-    fn zlm_stream_online_blocking(&self, target: &StartupProbe) -> Result<bool, ExecutorError> {
-        self.run_sync(async {
-            zlm_stream_online(&self.http_client, &self.settings, target)
-                .await
-                .map_err(|error| ExecutorError::ApiCall(error.to_string()))
-        })
-    }
-
-    fn rtp_server_port_blocking(&self, stream_id: &str) -> Result<Option<u16>, ExecutorError> {
-        self.run_sync(async {
-            zlm_rtp_server_port(&self.http_client, &self.settings, stream_id).await
-        })
-    }
-
-    fn run_sync<T>(
-        &self,
-        future: impl Future<Output = Result<T, ExecutorError>>,
-    ) -> Result<T, ExecutorError> {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
-            Err(_) => {
-                let runtime = tokio::runtime::Runtime::new()
-                    .map_err(|error| ExecutorError::ApiCall(error.to_string()))?;
-                runtime.block_on(future)
-            }
-        }
+        start_zlm_rtp_receive_task(self.zlm_start_context(), request, slot_permit).await
     }
 }

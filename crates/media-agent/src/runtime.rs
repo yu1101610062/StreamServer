@@ -88,7 +88,8 @@ pub(crate) use crate::runtime_outputs::{ManagedFileOutputKind, managed_output_di
 pub(crate) use crate::runtime_persistence::scan_persisted_runtimes;
 #[cfg(test)]
 pub(crate) use crate::runtime_persistence::{
-    RUNTIME_COMMAND_FILE, RUNTIME_PID_FILE, RUNTIME_STATE_FILE, persist_runtime_state,
+    PersistedRuntimeState, RUNTIME_COMMAND_FILE, RUNTIME_PID_FILE, RUNTIME_STATE_FILE,
+    atomic_write, persist_runtime_state,
 };
 pub use crate::runtime_persistence::{
     cleanup_persisted_runtime_state, collect_terminal_runtime_replays, is_terminal_runtime_event,
@@ -103,7 +104,10 @@ pub(crate) use crate::runtime_plan::{
 };
 pub(crate) use crate::runtime_plan::{TaskRuntimeMode, task_runtime_mode};
 #[cfg(test)]
-pub(crate) use crate::runtime_process::{ManagedRuntime, RuntimeSlotPermit};
+pub(crate) use crate::runtime_process::{
+    ManagedRuntime, ProcessIdentity, RuntimeSlotPermit, linux_pid_start_time, process_group_id,
+    schedule_force_kill_processes_if_running,
+};
 pub(crate) use crate::runtime_recording::{LiveRelayRecording, ZlmRecordKind};
 #[cfg(test)]
 pub(crate) use crate::runtime_recording::{

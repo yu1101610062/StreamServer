@@ -12,6 +12,9 @@ pub struct LocalRuntimeRegistry {
     inner: Arc<RwLock<RuntimeRegistryState>>,
 }
 
+// The registry keeps the std::sync::RwLock fully internal. Public methods either
+// complete a short synchronous mutation or return cloned snapshots, so callers
+// cannot accidentally hold a registry guard across an async boundary.
 #[derive(Debug, Default)]
 struct RuntimeRegistryState {
     by_runtime_id: HashMap<Uuid, RuntimeHandle>,

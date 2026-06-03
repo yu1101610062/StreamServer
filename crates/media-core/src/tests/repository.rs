@@ -1,4 +1,5 @@
 use super::*;
+use crate::repository_paths::absolute_http_url_from_relative;
 
 #[test]
 fn build_resolved_task_json_applies_request_defaults() {
