@@ -13,8 +13,6 @@ use crate::{
 };
 
 use super::internal_event::{RuntimeGeneration, RuntimeInternalEvent, RuntimeMonitorSnapshot};
-#[cfg(test)]
-use super::state::RuntimeManagerState;
 use super::state::RuntimeOperationId;
 
 // actor command channel 是有界队列，背压点固定在 manager 入口，避免 controller
@@ -40,9 +38,9 @@ pub(crate) struct RuntimeManagerLimits {
 impl Default for RuntimeManagerLimits {
     fn default() -> Self {
         Self {
-            start: 4,
-            stop: 8,
-            recording: 4,
+            start: 8,
+            stop: 16,
+            recording: 12,
             adopt: 1,
         }
     }
@@ -59,10 +57,6 @@ pub(crate) enum RuntimeCommand {
         session_epoch: u64,
         reply: oneshot::Sender<RuntimeManagerRequestOutcome<()>>,
     },
-    StartTask {
-        request: StartTaskRequest,
-        reply: oneshot::Sender<Result<RuntimeHandle, ExecutorError>>,
-    },
     StartTaskInSession {
         session_epoch: u64,
         request: StartTaskRequest,
@@ -77,18 +71,10 @@ pub(crate) enum RuntimeCommand {
         request: StopTaskRequest,
         reply: oneshot::Sender<RuntimeManagerRequestOutcome<Result<(), ExecutorError>>>,
     },
-    SetTaskRecording {
-        request: TaskRecordingControlRequest,
-        reply: oneshot::Sender<Result<RuntimeHandle, ExecutorError>>,
-    },
     SetTaskRecordingInSession {
         session_epoch: u64,
         request: TaskRecordingControlRequest,
         reply: oneshot::Sender<RuntimeManagerRequestOutcome<Result<RuntimeHandle, ExecutorError>>>,
-    },
-    AdoptOrphans {
-        filter: AdoptFilter,
-        reply: oneshot::Sender<Vec<RuntimeHandle>>,
     },
     AdoptOrphansInSession {
         session_epoch: u64,
@@ -105,28 +91,16 @@ pub(crate) enum RuntimeCommand {
     StopTaskFinished {
         operation_id: RuntimeOperationId,
         session_epoch: Option<u64>,
-        generation: Option<RuntimeGeneration>,
+        generation: RuntimeGeneration,
         request: StopTaskRequest,
         reply: Option<RuntimeStopReply>,
         result: Result<RuntimeStopOutcome, ExecutorError>,
-    },
-    SetTaskRecordingFinished {
-        operation_id: RuntimeOperationId,
-        session_epoch: Option<u64>,
-        reply: RuntimeRecordingReply,
-        result: Result<RuntimeHandle, ExecutorError>,
     },
     SetTaskRecordingForManagerFinished {
         runtime_id: uuid::Uuid,
         command_id: String,
         generation: RuntimeGeneration,
         result: Result<RuntimeRecordingOutcome, ExecutorError>,
-    },
-    AdoptOrphansFinished {
-        operation_id: RuntimeOperationId,
-        session_epoch: Option<u64>,
-        reply: RuntimeAdoptReply,
-        handles: Vec<RuntimeHandle>,
     },
     AdoptOrphansForManagerFinished {
         operation_id: RuntimeOperationId,
@@ -152,10 +126,6 @@ pub(crate) enum RuntimeCommand {
         generation: RuntimeGeneration,
         result: RuntimeProcessExitOutcome,
     },
-    #[cfg(test)]
-    InspectState {
-        reply: oneshot::Sender<RuntimeManagerState>,
-    },
     SetZlmServerId {
         server_id: String,
     },
@@ -168,7 +138,6 @@ pub(crate) enum RuntimeCommand {
 
 pub(crate) enum RuntimeStartReply {
     Session(oneshot::Sender<RuntimeManagerRequestOutcome<Result<RuntimeHandle, ExecutorError>>>),
-    Sessionless(oneshot::Sender<Result<RuntimeHandle, ExecutorError>>),
 }
 
 pub(crate) enum RuntimeStopReply {
@@ -178,10 +147,8 @@ pub(crate) enum RuntimeStopReply {
 
 pub(crate) enum RuntimeRecordingReply {
     Session(oneshot::Sender<RuntimeManagerRequestOutcome<Result<RuntimeHandle, ExecutorError>>>),
-    Sessionless(oneshot::Sender<Result<RuntimeHandle, ExecutorError>>),
 }
 
 pub(crate) enum RuntimeAdoptReply {
     Session(oneshot::Sender<RuntimeManagerRequestOutcome<Vec<RuntimeHandle>>>),
-    Sessionless(oneshot::Sender<Vec<RuntimeHandle>>),
 }

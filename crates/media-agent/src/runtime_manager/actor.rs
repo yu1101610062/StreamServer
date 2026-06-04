@@ -8,8 +8,6 @@ use media_domain::{RuntimeHandle, RuntimeState};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-#[cfg(test)]
-use crate::runtime_registry::RuntimeReadModel;
 use crate::{
     runtime::RECORD_DURATION_FORCE_KILL_DELAY,
     runtime_adoption::RuntimeAdoptionOutcome,
@@ -20,8 +18,7 @@ use crate::{
     },
     runtime_events::{RuntimeNotification, runtime_session_epoch},
     runtime_executor::{
-        LocalExecutor, ManagedProcessExecutor, RuntimeBackendSnapshot, RuntimeProcessExitOutcome,
-        RuntimeStartWorkerResult,
+        ManagedProcessExecutor, RuntimeProcessExitOutcome, RuntimeStartWorkerResult,
     },
     runtime_metadata::runtime_lease_token,
     runtime_registry::{AdoptFilter, AdoptRuntimeFilter, RuntimeReadHandle},
@@ -45,7 +42,7 @@ use super::{
 };
 
 pub struct RuntimeManager {
-    executor: RuntimeManagerExecutor,
+    executor: Arc<ManagedProcessExecutor>,
     tx: mpsc::Sender<RuntimeCommand>,
     rx: mpsc::Receiver<RuntimeCommand>,
     // 当前 Core 控制流的会话号。带 session 的控制命令必须匹配它，cleanup/internal 等
@@ -53,8 +50,6 @@ pub struct RuntimeManager {
     active_session_epoch: Option<u64>,
     limits: RuntimeManagerLimits,
     read_handle: RuntimeReadHandle,
-    #[cfg(test)]
-    legacy_read_model: Option<Arc<dyn RuntimeReadModel>>,
     // actor 内的权威 runtime 状态；外部同步读由 read_handle 投影提供。
     state: RuntimeManagerState,
     next_operation_id: u64,
@@ -68,185 +63,9 @@ pub struct RuntimeManager {
     pending_recording_by_runtime: HashMap<uuid::Uuid, RuntimeRecordingCommandKey>,
 }
 
-#[derive(Clone)]
-enum RuntimeManagerExecutor {
-    Local(Arc<dyn LocalExecutor>),
-    Managed(Arc<ManagedProcessExecutor>),
-}
-
-impl RuntimeManagerExecutor {
-    async fn start_task(
-        &self,
-        request: StartTaskRequest,
-    ) -> Result<RuntimeStartWorkerResult, ExecutorError> {
-        match self {
-            Self::Local(executor) => executor
-                .start_task(request)
-                .await
-                .map(RuntimeStartWorkerResult::Committed),
-            Self::Managed(executor) => executor.start_task_for_manager(request).await,
-        }
-    }
-
-    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
-        match self {
-            Self::Local(executor) => executor.stop_task(request).await,
-            Self::Managed(executor) => executor.stop_task(request).await,
-        }
-    }
-
-    fn prepare_stop_for_manager(
-        &self,
-        request: &StopTaskRequest,
-        handle: &RuntimeHandle,
-        generation: RuntimeGeneration,
-        monitor_handle: super::handle::RuntimeMonitorHandle,
-    ) -> Result<RuntimeStopPreparation, ExecutorError> {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not prepare manager stops"),
-            Self::Managed(executor) => {
-                executor.prepare_stop_for_manager(request, handle, generation, monitor_handle)
-            }
-        }
-    }
-
-    async fn run_stop_worker_for_manager(
-        &self,
-        worker: RuntimeStopWorkerRequest,
-    ) -> Result<RuntimeStopOutcome, ExecutorError> {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not run manager stop workers"),
-            Self::Managed(executor) => executor.run_stop_worker_for_manager(worker).await,
-        }
-    }
-
-    async fn set_task_recording(
-        &self,
-        request: TaskRecordingControlRequest,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        match self {
-            Self::Local(executor) => executor.set_task_recording(request).await,
-            Self::Managed(executor) => executor.set_task_recording(request).await,
-        }
-    }
-
-    fn prepare_recording_for_manager(
-        &self,
-        request: &TaskRecordingControlRequest,
-        handle: &RuntimeHandle,
-        generation: RuntimeGeneration,
-        monitor_handle: super::handle::RuntimeMonitorHandle,
-    ) -> Result<RuntimeRecordingPreparation, ExecutorError> {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not prepare manager recording"),
-            Self::Managed(executor) => {
-                executor.prepare_recording_for_manager(request, handle, generation, monitor_handle)
-            }
-        }
-    }
-
-    async fn run_recording_worker_for_manager(
-        &self,
-        worker: RuntimeRecordingWorkerRequest,
-    ) -> Result<RuntimeRecordingOutcome, ExecutorError> {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not run manager recording workers"),
-            Self::Managed(executor) => executor.run_recording_worker_for_manager(worker).await,
-        }
-    }
-
-    async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
-        match self {
-            Self::Local(executor) => executor.adopt_orphans(filter).await,
-            Self::Managed(_) => unreachable!("managed executor uses actor adopt commit"),
-        }
-    }
-
-    async fn prepare_adopt_orphans_for_manager(
-        &self,
-        filter: AdoptFilter,
-    ) -> Vec<RuntimeAdoptionOutcome<RuntimeStartWorkerResult>> {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not prepare manager adoptions"),
-            Self::Managed(executor) => executor.prepare_adopt_orphans_for_manager(filter).await,
-        }
-    }
-
-    fn prepare_existing_adoption_commit(
-        &self,
-        handle: &RuntimeHandle,
-        session_epoch: u64,
-        generation: RuntimeGeneration,
-    ) -> RuntimeMonitorCommit {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not prepare manager adoptions"),
-            Self::Managed(executor) => {
-                executor.prepare_existing_adoption_commit(handle, session_epoch, generation)
-            }
-        }
-    }
-
-    fn apply_adoption_commit(
-        &self,
-        commit: crate::runtime_adoption::RuntimeAdoptionCommit,
-        generation: RuntimeGeneration,
-        monitor_handle: super::handle::RuntimeMonitorHandle,
-    ) -> RuntimeHandle {
-        match self {
-            Self::Local(_) => unreachable!("local executor does not apply manager adoptions"),
-            Self::Managed(executor) => {
-                executor.apply_adoption_commit(commit, generation, monitor_handle)
-            }
-        }
-    }
-
-    fn set_zlm_server_id(&self, server_id: String) {
-        match self {
-            Self::Local(executor) => executor.set_zlm_server_id(server_id),
-            Self::Managed(executor) => executor.set_zlm_server_id(server_id),
-        }
-    }
-
-    fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
-        match self {
-            Self::Local(executor) => executor.set_zlm_rtmp_enhanced_enabled(enabled),
-            Self::Managed(executor) => executor.set_zlm_rtmp_enhanced_enabled(enabled),
-        }
-    }
-
-    fn monitor_snapshot(&self, runtime_id: uuid::Uuid) -> Option<RuntimeBackendSnapshot> {
-        match self {
-            Self::Local(_) => None,
-            Self::Managed(executor) => executor.monitor_snapshot(runtime_id),
-        }
-    }
-
-    fn apply_monitor_commit(&self, commit: RuntimeMonitorCommit) {
-        match self {
-            Self::Local(_) => {}
-            Self::Managed(executor) => executor.apply_monitor_commit(commit),
-        }
-    }
-
-    async fn handle_process_exited(
-        &self,
-        event: super::internal_event::ProcessExitedEvent,
-        current_handle: RuntimeHandle,
-    ) -> Option<RuntimeProcessExitOutcome> {
-        match self {
-            Self::Local(_) => None,
-            Self::Managed(executor) => {
-                Some(executor.handle_process_exited(event, current_handle).await)
-            }
-        }
-    }
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct RuntimeManagerOptions {
     pub(crate) limits: RuntimeManagerLimits,
-    #[cfg(test)]
-    pub(crate) legacy_read_model: Option<Arc<dyn RuntimeReadModel>>,
 }
 
 #[derive(Debug, Default)]
@@ -326,41 +145,8 @@ struct QueuedAdopt {
 }
 
 impl RuntimeManager {
-    #[allow(dead_code)]
-    pub fn spawn(executor: Arc<dyn LocalExecutor>) -> RuntimeManagerHandle {
-        Self::spawn_with_limits(executor, RuntimeManagerLimits::default())
-    }
-
-    pub(crate) fn spawn_with_limits(
-        executor: Arc<dyn LocalExecutor>,
-        limits: RuntimeManagerLimits,
-    ) -> RuntimeManagerHandle {
-        Self::spawn_with_options(
-            executor,
-            RuntimeManagerOptions {
-                limits,
-                #[cfg(test)]
-                legacy_read_model: None,
-            },
-        )
-    }
-
-    pub(crate) fn spawn_with_options(
-        executor: Arc<dyn LocalExecutor>,
-        options: RuntimeManagerOptions,
-    ) -> RuntimeManagerHandle {
-        Self::spawn_with_runtime_executor(RuntimeManagerExecutor::Local(executor), options)
-    }
-
     pub(crate) fn spawn_managed_with_options(
         executor: Arc<ManagedProcessExecutor>,
-        options: RuntimeManagerOptions,
-    ) -> RuntimeManagerHandle {
-        Self::spawn_with_runtime_executor(RuntimeManagerExecutor::Managed(executor), options)
-    }
-
-    fn spawn_with_runtime_executor(
-        executor: RuntimeManagerExecutor,
         options: RuntimeManagerOptions,
     ) -> RuntimeManagerHandle {
         let (tx, rx) = mpsc::channel(RUNTIME_MANAGER_COMMAND_BUFFER);
@@ -373,8 +159,6 @@ impl RuntimeManager {
                 active_session_epoch: None,
                 limits: options.limits,
                 read_handle: read_handle.clone(),
-                #[cfg(test)]
-                legacy_read_model: options.legacy_read_model,
                 state: RuntimeManagerState::default(),
                 next_operation_id: 0,
                 next_generation: 0,
@@ -417,16 +201,6 @@ impl RuntimeManager {
                         RuntimeManagerRequestOutcome::StaleSession
                     };
                     let _ = reply.send(outcome);
-                }
-                RuntimeCommand::StartTask { request, reply } => {
-                    let operation_id = self.begin_operation();
-                    self.queues.start.push_back(QueuedStart {
-                        operation_id,
-                        session_epoch: None,
-                        request,
-                        reply: RuntimeStartReply::Sessionless(reply),
-                    });
-                    self.drain_queues();
                 }
                 RuntimeCommand::StartTaskInSession {
                     session_epoch,
@@ -474,16 +248,6 @@ impl RuntimeManager {
                         let _ = reply.send(RuntimeManagerRequestOutcome::StaleSession);
                     }
                 }
-                RuntimeCommand::SetTaskRecording { request, reply } => {
-                    let operation_id = self.begin_operation();
-                    self.queues.recording.push_back(QueuedRecording {
-                        operation_id,
-                        session_epoch: None,
-                        request,
-                        reply: RuntimeRecordingReply::Sessionless(reply),
-                    });
-                    self.drain_queues();
-                }
                 RuntimeCommand::SetTaskRecordingInSession {
                     session_epoch,
                     request,
@@ -501,16 +265,6 @@ impl RuntimeManager {
                     } else {
                         let _ = reply.send(RuntimeManagerRequestOutcome::StaleSession);
                     }
-                }
-                RuntimeCommand::AdoptOrphans { filter, reply } => {
-                    let operation_id = self.begin_operation();
-                    self.queues.adopt.push_back(QueuedAdopt {
-                        operation_id,
-                        session_epoch: None,
-                        filter,
-                        reply: RuntimeAdoptReply::Sessionless(reply),
-                    });
-                    self.drain_queues();
                 }
                 RuntimeCommand::AdoptOrphansInSession {
                     session_epoch,
@@ -561,16 +315,6 @@ impl RuntimeManager {
                     );
                     self.drain_queues();
                 }
-                RuntimeCommand::SetTaskRecordingFinished {
-                    operation_id,
-                    session_epoch,
-                    reply,
-                    result,
-                } => {
-                    self.active.recording = self.active.recording.saturating_sub(1);
-                    self.finish_recording(operation_id, session_epoch, reply, result);
-                    self.drain_queues();
-                }
                 RuntimeCommand::SetTaskRecordingForManagerFinished {
                     runtime_id,
                     command_id,
@@ -586,16 +330,6 @@ impl RuntimeManager {
                         generation,
                         result,
                     );
-                    self.drain_queues();
-                }
-                RuntimeCommand::AdoptOrphansFinished {
-                    operation_id,
-                    session_epoch,
-                    reply,
-                    handles,
-                } => {
-                    self.active.adopt = self.active.adopt.saturating_sub(1);
-                    self.finish_adopt(operation_id, session_epoch, reply, handles);
                     self.drain_queues();
                 }
                 RuntimeCommand::AdoptOrphansForManagerFinished {
@@ -641,10 +375,6 @@ impl RuntimeManager {
                         .await;
                     self.drain_queues();
                 }
-                #[cfg(test)]
-                RuntimeCommand::InspectState { reply } => {
-                    let _ = reply.send(self.state.clone());
-                }
                 RuntimeCommand::SetZlmServerId { server_id } => {
                     self.executor.set_zlm_server_id(server_id);
                 }
@@ -682,7 +412,7 @@ impl RuntimeManager {
             let tx = self.tx.clone();
             tokio::spawn(async move {
                 let request_for_worker = queued.request.clone();
-                let result = executor.start_task(request_for_worker).await;
+                let result = executor.start_task_for_manager(request_for_worker).await;
                 let _ = tx
                     .send(RuntimeCommand::StartTaskFinished {
                         operation_id: queued.operation_id,
@@ -710,52 +440,26 @@ impl RuntimeManager {
                 }
                 continue;
             }
-            match &self.executor {
-                RuntimeManagerExecutor::Local(_) => {
-                    self.active.stop = self.active.stop.saturating_add(1);
-                    let executor = self.executor.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let request_for_worker = queued.request.clone();
-                        let result = executor
-                            .stop_task(request_for_worker)
-                            .await
-                            .map(|_| RuntimeStopOutcome::ManagedProcessStopAccepted);
-                        let _ = tx
-                            .send(RuntimeCommand::StopTaskFinished {
-                                operation_id: queued.operation_id,
-                                session_epoch: queued.session_epoch,
-                                generation: None,
-                                request: queued.request,
-                                reply: queued.reply,
-                                result,
-                            })
-                            .await;
-                    });
-                }
-                RuntimeManagerExecutor::Managed(_) => {
-                    let Some(prepared) = self.prepare_actor_stop(queued) else {
-                        continue;
-                    };
-                    self.active.stop = self.active.stop.saturating_add(1);
-                    let generation = prepared.generation;
-                    let executor = self.executor.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let result = executor.run_stop_worker_for_manager(prepared.worker).await;
-                        let _ = tx
-                            .send(RuntimeCommand::StopTaskFinished {
-                                operation_id: prepared.operation_id,
-                                session_epoch: prepared.session_epoch,
-                                generation: Some(generation),
-                                request: prepared.request,
-                                reply: prepared.reply,
-                                result,
-                            })
-                            .await;
-                    });
-                }
-            }
+            let Some(prepared) = self.prepare_actor_stop(queued) else {
+                continue;
+            };
+            self.active.stop = self.active.stop.saturating_add(1);
+            let generation = prepared.generation;
+            let executor = self.executor.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let result = executor.run_stop_worker_for_manager(prepared.worker).await;
+                let _ = tx
+                    .send(RuntimeCommand::StopTaskFinished {
+                        operation_id: prepared.operation_id,
+                        session_epoch: prepared.session_epoch,
+                        generation,
+                        request: prepared.request,
+                        reply: prepared.reply,
+                        result,
+                    })
+                    .await;
+            });
         }
     }
 
@@ -771,54 +475,29 @@ impl RuntimeManager {
                 send_recording_reply(queued.reply, RuntimeManagerRequestOutcome::StaleSession);
                 continue;
             }
-            match &self.executor {
-                RuntimeManagerExecutor::Local(_) => {
-                    if self.active.recording >= self.limits.recording {
-                        self.queues.recording.push_front(queued);
-                        break;
-                    }
-                    self.active.recording = self.active.recording.saturating_add(1);
-                    let executor = self.executor.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let result = executor.set_task_recording(queued.request).await;
-                        let _ = tx
-                            .send(RuntimeCommand::SetTaskRecordingFinished {
-                                operation_id: queued.operation_id,
-                                session_epoch: queued.session_epoch,
-                                reply: queued.reply,
-                                result,
-                            })
-                            .await;
-                    });
-                }
-                RuntimeManagerExecutor::Managed(_) => {
-                    if self.active.recording >= self.limits.recording
-                        && !self.recording_can_run_without_capacity(&queued.request)
-                    {
-                        self.queues.recording.push_front(queued);
-                        break;
-                    }
-                    let Some((key, generation, worker)) = self.prepare_actor_recording(queued)
-                    else {
-                        continue;
-                    };
-                    self.active.recording = self.active.recording.saturating_add(1);
-                    let executor = self.executor.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let result = executor.run_recording_worker_for_manager(worker).await;
-                        let _ = tx
-                            .send(RuntimeCommand::SetTaskRecordingForManagerFinished {
-                                runtime_id: key.runtime_id,
-                                command_id: key.command_id,
-                                generation,
-                                result,
-                            })
-                            .await;
-                    });
-                }
+            if self.active.recording >= self.limits.recording
+                && !self.recording_can_run_without_capacity(&queued.request)
+            {
+                self.queues.recording.push_front(queued);
+                break;
             }
+            let Some((key, generation, worker)) = self.prepare_actor_recording(queued) else {
+                continue;
+            };
+            self.active.recording = self.active.recording.saturating_add(1);
+            let executor = self.executor.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let result = executor.run_recording_worker_for_manager(worker).await;
+                let _ = tx
+                    .send(RuntimeCommand::SetTaskRecordingForManagerFinished {
+                        runtime_id: key.runtime_id,
+                        command_id: key.command_id,
+                        generation,
+                        result,
+                    })
+                    .await;
+            });
         }
     }
 
@@ -859,57 +538,36 @@ impl RuntimeManager {
                 send_adopt_reply(queued.reply, RuntimeManagerRequestOutcome::StaleSession);
                 continue;
             }
-            match &self.executor {
-                RuntimeManagerExecutor::Local(_) => {
-                    self.active.adopt = self.active.adopt.saturating_add(1);
-                    let executor = self.executor.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let handles = executor.adopt_orphans(queued.filter).await;
-                        let _ = tx
-                            .send(RuntimeCommand::AdoptOrphansFinished {
-                                operation_id: queued.operation_id,
-                                session_epoch: queued.session_epoch,
-                                reply: queued.reply,
-                                handles,
-                            })
-                            .await;
-                    });
-                }
-                RuntimeManagerExecutor::Managed(_) => {
-                    let (existing, remaining_filter) =
-                        self.prepare_existing_adoptions(&queued.filter);
-                    if remaining_filter.runtimes.is_empty() {
-                        self.finish_adopt_existing_for_manager(
-                            queued.operation_id,
-                            queued.session_epoch,
-                            queued.filter.session_epoch,
-                            queued.reply,
-                            existing,
-                        );
-                        continue;
-                    }
-
-                    self.active.adopt = self.active.adopt.saturating_add(1);
-                    let executor = self.executor.clone();
-                    let tx = self.tx.clone();
-                    tokio::spawn(async move {
-                        let outcomes = executor
-                            .prepare_adopt_orphans_for_manager(remaining_filter)
-                            .await;
-                        let _ = tx
-                            .send(RuntimeCommand::AdoptOrphansForManagerFinished {
-                                operation_id: queued.operation_id,
-                                session_epoch: queued.session_epoch,
-                                adopt_session_epoch: queued.filter.session_epoch,
-                                reply: queued.reply,
-                                existing,
-                                outcomes,
-                            })
-                            .await;
-                    });
-                }
+            let (existing, remaining_filter) = self.prepare_existing_adoptions(&queued.filter);
+            if remaining_filter.runtimes.is_empty() {
+                self.finish_adopt_existing_for_manager(
+                    queued.operation_id,
+                    queued.session_epoch,
+                    queued.filter.session_epoch,
+                    queued.reply,
+                    existing,
+                );
+                continue;
             }
+
+            self.active.adopt = self.active.adopt.saturating_add(1);
+            let executor = self.executor.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let outcomes = executor
+                    .prepare_adopt_orphans_for_manager(remaining_filter)
+                    .await;
+                let _ = tx
+                    .send(RuntimeCommand::AdoptOrphansForManagerFinished {
+                        operation_id: queued.operation_id,
+                        session_epoch: queued.session_epoch,
+                        adopt_session_epoch: queued.filter.session_epoch,
+                        reply: queued.reply,
+                        existing,
+                        outcomes,
+                    })
+                    .await;
+            });
         }
     }
 
@@ -950,7 +608,7 @@ impl RuntimeManager {
             monitor_handle,
         ) {
             Ok(RuntimeStopPreparation::Worker { commit, worker }) => {
-                self.apply_stop_commit(commit, Some(entry.generation));
+                self.apply_stop_commit(commit, entry.generation);
                 Some(PreparedStopWorker {
                     operation_id: queued.operation_id,
                     session_epoch: queued.session_epoch,
@@ -961,10 +619,7 @@ impl RuntimeManager {
                 })
             }
             Ok(RuntimeStopPreparation::AlreadyGone(commit)) => {
-                self.apply_stop_outcome(
-                    Some(entry.generation),
-                    RuntimeStopOutcome::AlreadyGone(commit),
-                );
+                self.apply_stop_outcome(entry.generation, RuntimeStopOutcome::AlreadyGone(commit));
                 self.finish_operation(queued.operation_id);
                 if let Some(reply) = queued.reply {
                     send_stop_reply(reply, RuntimeManagerRequestOutcome::Completed(Ok(())));
@@ -1085,7 +740,7 @@ impl RuntimeManager {
                 None
             }
             Ok(RuntimeRecordingPreparation::Immediate(commit)) => {
-                let result = self.apply_recording_commit(commit, Some(entry.generation));
+                let result = self.apply_recording_commit(commit, entry.generation);
                 self.finish_operation(queued.operation_id);
                 send_recording_reply(
                     queued.reply,
@@ -1097,7 +752,7 @@ impl RuntimeManager {
                 initial_commit,
                 worker,
             }) => {
-                let _ = self.apply_recording_commit(initial_commit, Some(entry.generation));
+                let _ = self.apply_recording_commit(initial_commit, entry.generation);
                 self.pending_recording_by_runtime
                     .insert(key.runtime_id, key.clone());
                 self.pending_recording.insert(
@@ -1129,36 +784,18 @@ impl RuntimeManager {
     }
 
     fn resolve_stop_entry(&mut self, request: &StopTaskRequest) -> Option<RuntimeEntry> {
-        if let Some(entry) = self
-            .state
+        self.state
             .entry_by_task_attempt(request.task_id, request.attempt_no)
-        {
-            return Some(entry.clone());
-        }
-        let snapshot =
-            self.legacy_read_model_find_by_task_attempt(request.task_id, request.attempt_no)?;
-        let generation = self.next_runtime_generation();
-        let runtime_id = snapshot.runtime_id;
-        self.apply_state_handle_with_generation(snapshot, generation);
-        self.state.entry(runtime_id).cloned()
+            .cloned()
     }
 
     fn resolve_recording_entry(
         &mut self,
         request: &TaskRecordingControlRequest,
     ) -> Option<RuntimeEntry> {
-        if let Some(entry) = self
-            .state
+        self.state
             .entry_by_task_attempt(request.task_id, request.attempt_no)
-        {
-            return Some(entry.clone());
-        }
-        let snapshot =
-            self.legacy_read_model_find_by_task_attempt(request.task_id, request.attempt_no)?;
-        let generation = self.next_runtime_generation();
-        let runtime_id = snapshot.runtime_id;
-        self.apply_state_handle_with_generation(snapshot, generation);
-        self.state.entry(runtime_id).cloned()
+            .cloned()
     }
 
     fn prepare_existing_adoptions(
@@ -1195,21 +832,10 @@ impl RuntimeManager {
         &mut self,
         filter: &AdoptRuntimeFilter,
     ) -> Option<RuntimeEntry> {
-        if let Some(entry) = self
-            .state
+        self.state
             .entry_by_task_attempt(filter.task_id, filter.attempt_no)
             .filter(|entry| adopt_filter_matches_handle(filter, &entry.handle))
-        {
-            return Some(entry.clone());
-        }
-
-        let snapshot = self
-            .legacy_read_model_find_by_task_attempt(filter.task_id, filter.attempt_no)
-            .filter(|handle| adopt_filter_matches_handle(filter, handle))?;
-        let generation = self.next_runtime_generation();
-        let runtime_id = snapshot.runtime_id;
-        self.apply_state_handle_with_generation(snapshot, generation);
-        self.state.entry(runtime_id).cloned()
+            .cloned()
     }
 
     async fn finish_start(
@@ -1222,13 +848,17 @@ impl RuntimeManager {
     ) {
         self.finish_operation(operation_id);
         let generation = self.next_runtime_generation();
-        let monitor_handle = result
-            .as_ref()
-            .ok()
-            .and_then(RuntimeStartWorkerResult::runtime_id)
-            .map(|runtime_id| RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation));
         let result = match result {
-            Ok(result) => result.commit(monitor_handle).await,
+            Ok(result) => match result.runtime_id() {
+                Some(runtime_id) => {
+                    let monitor_handle =
+                        RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation);
+                    result.commit(monitor_handle).await
+                }
+                None => Err(ExecutorError::InvalidRequest(
+                    "runtime start result did not include runtime_id".to_string(),
+                )),
+            },
             Err(error) => Err(error),
         };
         let start_succeeded = result.is_ok();
@@ -1268,8 +898,8 @@ impl RuntimeManager {
         &mut self,
         operation_id: RuntimeOperationId,
         session_epoch: Option<u64>,
-        generation: Option<RuntimeGeneration>,
-        request: StopTaskRequest,
+        generation: RuntimeGeneration,
+        _request: StopTaskRequest,
         reply: Option<RuntimeStopReply>,
         result: Result<RuntimeStopOutcome, crate::runtime_types::ExecutorError>,
     ) {
@@ -1281,9 +911,6 @@ impl RuntimeManager {
             }
             Err(error) => Err(error),
         };
-        if generation.is_none() && result.is_ok() {
-            self.apply_stop_result_to_state(&request);
-        }
         let Some(reply) = reply else {
             return;
         };
@@ -1298,11 +925,7 @@ impl RuntimeManager {
         }
     }
 
-    fn apply_stop_outcome(
-        &mut self,
-        generation: Option<RuntimeGeneration>,
-        outcome: RuntimeStopOutcome,
-    ) {
+    fn apply_stop_outcome(&mut self, generation: RuntimeGeneration, outcome: RuntimeStopOutcome) {
         match outcome {
             RuntimeStopOutcome::ManagedProcessStopAccepted => {}
             RuntimeStopOutcome::Terminal(commit) | RuntimeStopOutcome::AlreadyGone(commit) => {
@@ -1311,21 +934,15 @@ impl RuntimeManager {
         }
     }
 
-    fn apply_stop_commit(
-        &mut self,
-        commit: RuntimeMonitorCommit,
-        generation: Option<RuntimeGeneration>,
-    ) {
-        if let Some(expected_generation) = generation {
-            if commit.generation != expected_generation {
-                return;
-            }
-            let Some(entry) = self.state.entry(commit.runtime_id) else {
-                return;
-            };
-            if entry.generation != expected_generation {
-                return;
-            }
+    fn apply_stop_commit(&mut self, commit: RuntimeMonitorCommit, generation: RuntimeGeneration) {
+        if commit.generation != generation {
+            return;
+        }
+        let Some(entry) = self.state.entry(commit.runtime_id) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
         }
         let runtime_id = commit.runtime_id;
         let remove = commit.remove_runtime_entry || commit.handle.state == RuntimeState::Exited;
@@ -1338,28 +955,6 @@ impl RuntimeManager {
             self.assert_state_consistency();
         } else {
             self.apply_state_handle_with_generation(handle, commit_generation);
-        }
-    }
-
-    fn finish_recording(
-        &mut self,
-        operation_id: RuntimeOperationId,
-        session_epoch: Option<u64>,
-        reply: RuntimeRecordingReply,
-        result: Result<RuntimeHandle, crate::runtime_types::ExecutorError>,
-    ) {
-        self.finish_operation(operation_id);
-        if let Ok(handle) = &result {
-            self.apply_state_handle(handle.clone());
-        }
-        if let Some(session_epoch) = session_epoch {
-            if self.is_session_current(session_epoch) {
-                send_recording_reply(reply, RuntimeManagerRequestOutcome::Completed(result));
-            } else {
-                send_recording_reply(reply, RuntimeManagerRequestOutcome::StaleSession);
-            }
-        } else {
-            send_recording_reply(reply, RuntimeManagerRequestOutcome::Completed(result));
         }
     }
 
@@ -1415,7 +1010,7 @@ impl RuntimeManager {
     ) -> Result<RuntimeHandle, crate::runtime_types::ExecutorError> {
         match outcome {
             RuntimeRecordingOutcome::Updated(commit) => {
-                self.apply_recording_commit(commit, Some(generation))
+                self.apply_recording_commit(commit, generation)
             }
             RuntimeRecordingOutcome::Unchanged(handle) => Ok(handle),
         }
@@ -1424,23 +1019,21 @@ impl RuntimeManager {
     fn apply_recording_commit(
         &mut self,
         commit: RuntimeMonitorCommit,
-        generation: Option<RuntimeGeneration>,
+        generation: RuntimeGeneration,
     ) -> Result<RuntimeHandle, crate::runtime_types::ExecutorError> {
-        if let Some(expected_generation) = generation {
-            if commit.generation != expected_generation {
-                return Ok(commit.handle);
-            }
-            let Some(entry) = self.state.entry(commit.runtime_id) else {
-                return Ok(commit.handle);
-            };
-            if entry.generation != expected_generation {
-                return Ok(entry.handle.clone());
-            }
-            if entry.handle.state != RuntimeState::Running
-                && entry.handle.state != RuntimeState::Starting
-            {
-                return Ok(entry.handle.clone());
-            }
+        if commit.generation != generation {
+            return Ok(commit.handle);
+        }
+        let Some(entry) = self.state.entry(commit.runtime_id) else {
+            return Ok(commit.handle);
+        };
+        if entry.generation != generation {
+            return Ok(entry.handle.clone());
+        }
+        if entry.handle.state != RuntimeState::Running
+            && entry.handle.state != RuntimeState::Starting
+        {
+            return Ok(entry.handle.clone());
         }
 
         let handle = commit.handle.clone();
@@ -1464,31 +1057,6 @@ impl RuntimeManager {
             }
         } else {
             RuntimeManagerRequestOutcome::Completed(result)
-        }
-    }
-
-    fn finish_adopt(
-        &mut self,
-        operation_id: RuntimeOperationId,
-        session_epoch: Option<u64>,
-        reply: RuntimeAdoptReply,
-        handles: Vec<RuntimeHandle>,
-    ) {
-        self.finish_operation(operation_id);
-        let handles_with_generations = handles
-            .iter()
-            .cloned()
-            .map(|handle| (handle, self.next_runtime_generation()))
-            .collect::<Vec<_>>();
-        self.apply_state_handles_with_generations(handles_with_generations);
-        if let Some(session_epoch) = session_epoch {
-            if self.is_session_current(session_epoch) {
-                send_adopt_reply(reply, RuntimeManagerRequestOutcome::Completed(handles));
-            } else {
-                send_adopt_reply(reply, RuntimeManagerRequestOutcome::StaleSession);
-            }
-        } else {
-            send_adopt_reply(reply, RuntimeManagerRequestOutcome::Completed(handles));
         }
     }
 
@@ -1546,9 +1114,12 @@ impl RuntimeManager {
                 }
                 RuntimeAdoptionOutcome::Restart(result) => {
                     let generation = self.next_runtime_generation();
-                    let monitor_handle = result.runtime_id().map(|runtime_id| {
-                        RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation)
-                    });
+                    let Some(runtime_id) = result.runtime_id() else {
+                        warn!("failed to commit restarted adopted runtime: missing runtime_id");
+                        continue;
+                    };
+                    let monitor_handle =
+                        RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation);
                     match result.commit(monitor_handle).await {
                         Ok(handle) => {
                             self.apply_start_result_to_state(&handle, generation);
@@ -1577,7 +1148,7 @@ impl RuntimeManager {
                 generation,
             );
             let updated = commit.handle.clone();
-            self.apply_stop_commit(commit, Some(generation));
+            self.apply_stop_commit(commit, generation);
             handles.push(updated);
         }
         handles
@@ -1615,66 +1186,12 @@ impl RuntimeManager {
         self.assert_state_consistency();
     }
 
-    fn apply_state_handles_with_generations(
-        &mut self,
-        handles: Vec<(RuntimeHandle, RuntimeGeneration)>,
-    ) {
-        self.read_handle
-            .apply_handles(handles.iter().map(|(handle, _)| handle.clone()).collect());
-        self.state.apply_handles_with_generation(handles);
-        self.assert_state_consistency();
-    }
-
     fn apply_start_result_to_state(
         &mut self,
         handle: &RuntimeHandle,
         generation: RuntimeGeneration,
     ) {
-        if let Some(snapshot) =
-            self.legacy_read_model_find_by_task_attempt(handle.task_id, handle.attempt_no)
-        {
-            self.read_handle.apply_handle(snapshot.clone());
-            self.state
-                .apply_handle_with_generation(snapshot, generation);
-            self.assert_state_consistency();
-            return;
-        }
         self.apply_state_handle_with_generation(handle.clone(), generation);
-    }
-
-    fn apply_stop_result_to_state(&mut self, request: &StopTaskRequest) {
-        if let Some(handle) =
-            self.legacy_read_model_find_by_task_attempt(request.task_id, request.attempt_no)
-        {
-            self.read_handle.apply_handle(handle.clone());
-            self.state.apply_handle(handle);
-        } else {
-            self.state
-                .remove_by_task_attempt(request.task_id, request.attempt_no);
-            self.read_handle
-                .remove_by_task_attempt(request.task_id, request.attempt_no);
-        }
-        self.assert_state_consistency();
-    }
-
-    fn legacy_read_model_find_by_task_attempt(
-        &self,
-        task_id: uuid::Uuid,
-        attempt_no: i32,
-    ) -> Option<RuntimeHandle> {
-        #[cfg(test)]
-        {
-            self.legacy_read_model
-                .as_ref()
-                .and_then(|legacy_read_model| {
-                    legacy_read_model.find_by_task_attempt(task_id, attempt_no)
-                })
-        }
-        #[cfg(not(test))]
-        {
-            let _ = (task_id, attempt_no);
-            None
-        }
     }
 
     #[cfg(test)]
@@ -1783,10 +1300,7 @@ impl RuntimeManager {
                 let tx = self.tx.clone();
                 let current_handle = entry.handle.clone();
                 tokio::spawn(async move {
-                    let Some(result) = executor.handle_process_exited(event, current_handle).await
-                    else {
-                        return;
-                    };
+                    let result = executor.handle_process_exited(event, current_handle).await;
                     let _ = tx
                         .send(RuntimeCommand::ProcessExitFinished {
                             runtime_id,
@@ -1839,7 +1353,7 @@ impl RuntimeManager {
 
         match result {
             RuntimeProcessExitOutcome::Terminal(commit) => {
-                self.apply_stop_commit(commit, Some(generation));
+                self.apply_stop_commit(commit, generation);
             }
             RuntimeProcessExitOutcome::Restarted {
                 exit_commit,
@@ -1847,13 +1361,16 @@ impl RuntimeManager {
                 emit_starting_event,
             } => {
                 let exited_handle = exit_commit.handle.clone();
-                self.apply_stop_commit(exit_commit, Some(generation));
+                self.apply_stop_commit(exit_commit, generation);
 
                 let restart_generation = self.next_runtime_generation();
                 restart.carry_reconnect_metadata_from(&exited_handle);
-                let monitor_handle = restart.runtime_id().map(|runtime_id| {
-                    RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, restart_generation)
-                });
+                let Some(runtime_id) = restart.runtime_id() else {
+                    warn!("failed to commit recovered runtime: missing runtime_id");
+                    return;
+                };
+                let monitor_handle =
+                    RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, restart_generation);
                 match restart.commit(monitor_handle).await {
                     Ok(handle) => {
                         self.apply_start_result_to_state(&handle, restart_generation);
@@ -2027,11 +1544,6 @@ fn send_start_reply(
         RuntimeStartReply::Session(reply) => {
             let _ = reply.send(outcome);
         }
-        RuntimeStartReply::Sessionless(reply) => {
-            if let RuntimeManagerRequestOutcome::Completed(result) = outcome {
-                let _ = reply.send(result);
-            }
-        }
     }
 }
 
@@ -2061,11 +1573,6 @@ fn send_recording_reply(
         RuntimeRecordingReply::Session(reply) => {
             let _ = reply.send(outcome);
         }
-        RuntimeRecordingReply::Sessionless(reply) => {
-            if let RuntimeManagerRequestOutcome::Completed(result) = outcome {
-                let _ = reply.send(result);
-            }
-        }
     }
 }
 
@@ -2076,11 +1583,6 @@ fn send_adopt_reply(
     match reply {
         RuntimeAdoptReply::Session(reply) => {
             let _ = reply.send(outcome);
-        }
-        RuntimeAdoptReply::Sessionless(reply) => {
-            if let RuntimeManagerRequestOutcome::Completed(handles) = outcome {
-                let _ = reply.send(handles);
-            }
         }
     }
 }

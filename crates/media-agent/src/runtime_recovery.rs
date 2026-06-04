@@ -3,121 +3,32 @@
 //! 这里既包含纯判定逻辑，也承接受管进程异常退出后的恢复动作：等待 ZLM API、
 //! 清理重启前的旧 ZLM stream、重建本地进程 runtime，并延续断流/录制空洞 metadata。
 
-use std::{
-    collections::HashMap,
-    process::ExitStatus,
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::process::ExitStatus;
 
 use media_domain::{RecoveryPolicy, RuntimeHandle, TaskType};
 use reqwest::Client;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
-    runtime::{ExecutorError, RuntimeCapabilityHints, SuccessCheck, TaskRuntimeMode},
-    runtime_events::{
-        RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
-    },
-    runtime_executor::ManagedProcessExecutor,
+    runtime::{SuccessCheck, TaskRuntimeMode},
+    runtime_events::{RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch},
     runtime_metadata::managed_stream_restart_cleanup_binding,
     runtime_metadata::{
         completion_reason_from_handle, continuous_stream_ingest_from_handle,
         fatal_recording_error_from_handle, recovery_policy_from_handle, requires_stream_online,
-        restart_request_from_handle, runtime_lease_token,
-        sticky_reconnect_stream_ingest_from_handle, stop_reason_from_handle, stream_online,
-        task_runtime_mode_from_handle, task_type_from_handle,
+        runtime_lease_token, sticky_reconnect_stream_ingest_from_handle, stop_reason_from_handle,
+        stream_online, task_runtime_mode_from_handle, task_type_from_handle,
     },
-    runtime_process::{ManagedRuntime, RuntimeSlotLimiter},
-    runtime_process_start::{
-        ManagedProcessStartContext, ManagedProcessStartHooks, start_process_task,
-    },
-    runtime_registry::LocalRuntimeRegistry,
-    runtime_zlm::{build_close_stream_params, call_zlm_api, wait_for_zlm_api_ready},
+    runtime_zlm::{build_close_stream_params, call_zlm_api},
 };
 
 pub(crate) const LIVE_STREAM_OFFLINE_GRACE_POLLS: u32 = 3;
 pub(crate) const RTP_SERVER_MISSING_GRACE_POLLS: u32 = 3;
-const PROCESS_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) struct ProcessRecoveryContext<'a> {
     pub(crate) settings: &'a AgentSettings,
     pub(crate) http_client: &'a Client,
-    pub(crate) registry: &'a LocalRuntimeRegistry,
-    pub(crate) runtimes: &'a Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    pub(crate) events: &'a RuntimeEventSink,
-    pub(crate) slot_limiter: &'a Arc<RuntimeSlotLimiter>,
-    pub(crate) zlm_server_id: Option<String>,
-    pub(crate) capability_hints: RuntimeCapabilityHints,
-    pub(crate) restart_executor: ManagedProcessExecutor,
-}
-
-pub(crate) async fn restart_process_task_after_failure(
-    ctx: ProcessRecoveryContext<'_>,
-    exited_handle: &RuntimeHandle,
-    emit_starting_event: bool,
-) -> Result<RuntimeHandle, ExecutorError> {
-    wait_for_zlm_api_ready(ctx.http_client, ctx.settings, PROCESS_RECOVERY_WAIT_TIMEOUT).await;
-
-    let request = restart_request_from_handle(exited_handle)?;
-    let slot_permit = ctx.slot_limiter.try_acquire()?;
-    let mut restarted = start_process_task(
-        ManagedProcessStartContext {
-            settings: ctx.settings,
-            http_client: ctx.http_client,
-            registry: ctx.registry,
-            runtimes: ctx.runtimes,
-            events: ctx.events,
-            zlm_server_id: ctx.zlm_server_id,
-            capability_hints: ctx.capability_hints,
-            restart_executor: ctx.restart_executor,
-            hooks: ManagedProcessStartHooks::default(),
-        },
-        &request,
-        slot_permit,
-    )?;
-    if exited_handle
-        .metadata
-        .get("source_reconnecting")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        restarted = carry_reconnect_metadata(ctx.registry, exited_handle, restarted);
-    }
-    if emit_starting_event {
-        let _ = ctx
-            .events
-            .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-                task_id: restarted.task_id,
-                attempt_no: restarted.attempt_no,
-                lease_token: runtime_lease_token(&restarted).unwrap_or_default(),
-                session_epoch: runtime_session_epoch(&restarted),
-                event_type: "starting".to_string(),
-                event_level: "info".to_string(),
-                message: "runtime handle recreated after local recovery".to_string(),
-                payload: json!({
-                    "runtime_id": restarted.runtime_id,
-                    "worker_kind": restarted.worker_kind,
-                    "recovered": true,
-                }),
-            }));
-    }
-    let _ = ctx
-        .events
-        .send(RuntimeNotification::TaskSnapshot(restarted.clone()));
-    Ok(restarted)
-}
-
-pub(crate) async fn cleanup_managed_stream_before_restart(
-    ctx: ProcessRecoveryContext<'_>,
-    handle: &RuntimeHandle,
-) {
-    let events = ctx.events.clone();
-    for notification in cleanup_managed_stream_before_restart_notifications(ctx, handle).await {
-        let _ = events.send(notification);
-    }
 }
 
 pub(crate) async fn cleanup_managed_stream_before_restart_notifications(
@@ -172,49 +83,6 @@ pub(crate) async fn cleanup_managed_stream_before_restart_notifications(
         }),
     };
     vec![notification]
-}
-
-fn carry_reconnect_metadata(
-    registry: &LocalRuntimeRegistry,
-    exited_handle: &RuntimeHandle,
-    restarted: RuntimeHandle,
-) -> RuntimeHandle {
-    let source_reconnecting = exited_handle
-        .metadata
-        .get("source_reconnecting")
-        .cloned()
-        .unwrap_or(json!(true));
-    let source_reconnect_reason = exited_handle
-        .metadata
-        .get("source_reconnect_reason")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let recording_gap_active = exited_handle
-        .metadata
-        .get("recording_gap_active")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let recording_gap_reason = exited_handle
-        .metadata
-        .get("recording_gap_reason")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let recording_gap_started_at = exited_handle
-        .metadata
-        .get("recording_gap_started_at")
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    registry
-        .update(restarted.runtime_id, |runtime| {
-            runtime.metadata["source_reconnecting"] = source_reconnecting;
-            runtime.metadata["source_reconnect_reason"] = source_reconnect_reason;
-            runtime.metadata["recording_gap_active"] = recording_gap_active;
-            runtime.metadata["recording_gap_reason"] = recording_gap_reason;
-            runtime.metadata["recording_gap_started_at"] = recording_gap_started_at;
-            runtime.metadata["recording_gap_ended_at"] = Value::Null;
-        })
-        .unwrap_or(restarted)
 }
 
 pub(crate) fn should_auto_restart_process(

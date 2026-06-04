@@ -5,21 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-use std::{
-    collections::HashMap,
-    fs,
-    os::unix::process::ExitStatusExt,
-    path::PathBuf,
-    sync::{Mutex as StdMutex, OnceLock},
-};
-
 use media_domain::{InputKind, TaskSpec};
 use serde::Deserialize;
-#[cfg(test)]
-use serde_json::json;
-#[cfg(test)]
-use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
@@ -57,32 +44,6 @@ struct TimedProcessOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
 }
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct MockFfprobeAudioStream {
-    pub(crate) index: Option<u32>,
-    pub(crate) codec_name: String,
-    pub(crate) sample_rate: Option<u32>,
-    pub(crate) channels: Option<u32>,
-    pub(crate) extradata_size: Option<u64>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone)]
-pub(crate) struct MockFfprobeBinary {
-    pub(crate) format_name: String,
-    pub(crate) video_codec_name: String,
-    pub(crate) video_pix_fmt: Option<String>,
-    pub(crate) video_extradata_size: Option<u64>,
-    pub(crate) audio_streams: Vec<MockFfprobeAudioStream>,
-    pub(crate) recorded_args_path: Option<PathBuf>,
-    pub(crate) sleep_ms: u64,
-}
-
-#[cfg(test)]
-static MOCK_FFPROBE_BINARIES: OnceLock<StdMutex<HashMap<String, MockFfprobeBinary>>> =
-    OnceLock::new();
 
 pub(crate) fn probe_input_media_profile(
     settings: &AgentSettings,
@@ -239,91 +200,6 @@ pub(crate) fn probe_primary_video_codec_family(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn register_mock_ffprobe_binary(name: &str, mock: MockFfprobeBinary) -> String {
-    let key = format!("mock-ffprobe://{name}/{}", Uuid::now_v7());
-    MOCK_FFPROBE_BINARIES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("mock ffprobe registry lock poisoned")
-        .insert(key.clone(), mock);
-    key
-}
-
-#[cfg(test)]
-fn run_registered_mock_ffprobe_with_timeout(
-    ffprobe_bin: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Option<Option<TimedProcessOutput>> {
-    let mock = MOCK_FFPROBE_BINARIES
-        .get_or_init(|| StdMutex::new(HashMap::new()))
-        .lock()
-        .expect("mock ffprobe registry lock poisoned")
-        .get(ffprobe_bin)
-        .cloned()?;
-
-    if mock.sleep_ms > 0 && Duration::from_millis(mock.sleep_ms) >= timeout {
-        return Some(None);
-    }
-
-    if let Some(path) = &mock.recorded_args_path {
-        let mut recorded = args.join("\n");
-        recorded.push('\n');
-        let _ = fs::write(path, recorded);
-    }
-
-    let want_json = args.windows(2).any(|window| window == ["-of", "json"]);
-    let stdout = if want_json {
-        let mut streams = Vec::new();
-        let mut video = json!({
-            "codec_type": "video",
-            "codec_name": mock.video_codec_name,
-        });
-        if !mock.audio_streams.is_empty() {
-            video["index"] = json!(0u32);
-        }
-        if let Some(pix_fmt) = mock.video_pix_fmt {
-            video["pix_fmt"] = json!(pix_fmt);
-        }
-        if let Some(extradata_size) = mock.video_extradata_size {
-            video["extradata_size"] = json!(extradata_size);
-        }
-        streams.push(video);
-
-        for (position, stream) in mock.audio_streams.into_iter().enumerate() {
-            let mut audio = json!({
-                "codec_type": "audio",
-                "codec_name": stream.codec_name,
-            });
-            audio["index"] = json!(stream.index.unwrap_or((position + 1) as u32));
-            if let Some(sample_rate) = stream.sample_rate {
-                audio["sample_rate"] = json!(sample_rate.to_string());
-            }
-            if let Some(channels) = stream.channels {
-                audio["channels"] = json!(channels);
-            }
-            if let Some(extradata_size) = stream.extradata_size {
-                audio["extradata_size"] = json!(extradata_size);
-            }
-            streams.push(audio);
-        }
-
-        serde_json::to_vec(&json!({
-            "streams": streams,
-            "format": {"format_name": mock.format_name},
-        }))
-        .ok()?
-    } else {
-        format!("{}\n", mock.video_codec_name).into_bytes()
-    };
-
-    Some(Some(TimedProcessOutput {
-        status: std::process::ExitStatus::from_raw(0),
-        stdout,
-    }))
-}
-
 fn input_probe_timeout_duration(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(
         timeout_ms
@@ -337,11 +213,6 @@ fn run_ffprobe_with_timeout(
     args: &[&str],
     timeout: Duration,
 ) -> Option<TimedProcessOutput> {
-    #[cfg(test)]
-    if let Some(output) = run_registered_mock_ffprobe_with_timeout(ffprobe_bin, args, timeout) {
-        return output;
-    }
-
     // ffprobe can hang on broken streams or unreachable network sources, so poll and kill it.
     let mut child = std::process::Command::new(ffprobe_bin)
         .args(args)

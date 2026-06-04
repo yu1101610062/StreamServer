@@ -3,7 +3,7 @@ use std::{
     ffi::CString,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -14,13 +14,7 @@ use media_domain::{
     TaskSpec, TaskType, WorkerKind,
 };
 use serde_json::json;
-use tonic::async_trait;
 use uuid::Uuid;
-
-use crate::runtime::{
-    AdoptFilter, ExecutorError, LocalExecutor, StartTaskRequest, StopTaskRequest,
-    TaskRecordingControlRequest,
-};
 
 use super::*;
 
@@ -356,41 +350,12 @@ fn running_cleanup_deletes_only_safe_old_segments() {
     let _ = fs::remove_dir_all(temp_root);
 }
 
-#[derive(Debug, Default)]
-struct RecordingExecutor {
-    stops: Mutex<Vec<StopTaskRequest>>,
-}
-
-#[async_trait]
-impl LocalExecutor for RecordingExecutor {
-    async fn start_task(&self, _request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
-        Err(ExecutorError::InvalidRequest("unused".to_string()))
-    }
-
-    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
-        self.stops.lock().expect("stops lock").push(request);
-        Ok(())
-    }
-
-    async fn set_task_recording(
-        &self,
-        _request: TaskRecordingControlRequest,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        Err(ExecutorError::InvalidRequest("unused".to_string()))
-    }
-
-    async fn adopt_orphans(&self, _filter: AdoptFilter) -> Vec<RuntimeHandle> {
-        Vec::new()
-    }
-}
-
 #[test]
 fn reject_only_stop_action_targets_only_artifact_tasks_on_volume() {
-    let executor = Arc::new(RecordingExecutor::default());
     let manager = ArtifactCleanupManager::with_executor(
         &AgentSettings::default(),
         Arc::new(LocalRuntimeRegistry::new()),
-        Some(executor.clone()),
+        None,
     );
     let artifact_task = Uuid::now_v7();
     let no_output_task = Uuid::now_v7();

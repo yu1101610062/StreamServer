@@ -6,8 +6,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
-use media_domain::{RuntimeHandle, RuntimeState};
+use media_domain::RuntimeHandle;
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -254,10 +253,8 @@ pub(crate) async fn read_progress_stream(
     task_id: Uuid,
     attempt_no: i32,
     lease_token: String,
-    registry: LocalRuntimeRegistry,
-    events: RuntimeEventSink,
     require_stream_online: bool,
-    monitor_handle: Option<RuntimeMonitorHandle>,
+    monitor_handle: RuntimeMonitorHandle,
 ) {
     let mut reader = BufReader::new(stdout).lines();
     let mut current = HashMap::<String, String>::new();
@@ -272,39 +269,20 @@ pub(crate) async fn read_progress_stream(
         };
         current.insert(key.to_string(), value.to_string());
         if key == "progress" {
-            let snapshot = if let Some(monitor_handle) = monitor_handle.as_ref() {
-                let Some(snapshot) = monitor_handle.snapshot().await else {
-                    return;
-                };
-                Some(snapshot)
-            } else {
-                None
-            };
-            let fallback_handle = if snapshot.is_none() {
-                registry.get(runtime_id)
-            } else {
-                None
+            let Some(snapshot) = monitor_handle.snapshot().await else {
+                return;
             };
             let stream_online = snapshot
-                .as_ref()
-                .map(|snapshot| &snapshot.handle)
-                .or(fallback_handle.as_ref())
-                .and_then(|runtime| {
-                    runtime
-                        .metadata
-                        .get("stream_online")
-                        .and_then(Value::as_bool)
-                })
+                .handle
+                .metadata
+                .get("stream_online")
+                .and_then(Value::as_bool)
                 .unwrap_or(false);
             if require_stream_online && !stream_online {
                 current.clear();
                 continue;
             }
-            let session_epoch = snapshot
-                .as_ref()
-                .map(|snapshot| runtime_session_epoch(&snapshot.handle))
-                .or_else(|| fallback_handle.as_ref().map(runtime_session_epoch))
-                .unwrap_or_default();
+            let session_epoch = runtime_session_epoch(&snapshot.handle);
             let progress = RuntimeTaskProgress {
                 task_id,
                 attempt_no,
@@ -318,23 +296,15 @@ pub(crate) async fn read_progress_stream(
                 dup_frames: parse_u64(current.get("dup_frames")),
                 drop_frames: parse_u64(current.get("drop_frames")),
             };
-            if let Some(monitor_handle) = monitor_handle.as_ref() {
-                monitor_handle
-                    .send_event(RuntimeInternalEvent::ProgressObserved(
-                        ProgressObservedEvent {
-                            runtime_id,
-                            generation: monitor_handle.generation(),
-                            progress,
-                        },
-                    ))
-                    .await;
-            } else {
-                let _ = registry.update(runtime_id, |runtime| {
-                    runtime.last_progress_at = Some(Utc::now());
-                    runtime.state = RuntimeState::Running;
-                });
-                let _ = events.send(RuntimeNotification::TaskProgress(progress));
-            }
+            monitor_handle
+                .send_event(RuntimeInternalEvent::ProgressObserved(
+                    ProgressObservedEvent {
+                        runtime_id,
+                        generation: monitor_handle.generation(),
+                        progress,
+                    },
+                ))
+                .await;
             current.clear();
         }
     }

@@ -68,17 +68,6 @@ impl LocalRuntimeRegistry {
         }
     }
 
-    pub fn track(&self, handle: RuntimeHandle) {
-        let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
-        let key = (handle.task_id, handle.attempt_no);
-        if let Some(previous_runtime_id) = runtimes.by_task_attempt.insert(key, handle.runtime_id) {
-            if previous_runtime_id != handle.runtime_id {
-                runtimes.by_runtime_id.remove(&previous_runtime_id);
-            }
-        }
-        runtimes.by_runtime_id.insert(handle.runtime_id, handle);
-    }
-
     pub fn remove(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
         let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
         let removed = runtimes.by_runtime_id.remove(&runtime_id)?;
@@ -108,12 +97,6 @@ impl LocalRuntimeRegistry {
         let runtimes = self.inner.read().expect("runtime registry lock poisoned");
         let runtime_id = runtimes.by_task_attempt.get(&(task_id, attempt_no))?;
         runtimes.by_runtime_id.get(runtime_id).cloned()
-    }
-
-    #[cfg(test)]
-    pub fn count(&self) -> usize {
-        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
-        runtimes.by_runtime_id.len()
     }
 
     pub fn state_counts(&self) -> RuntimeStateCounts {
@@ -175,12 +158,6 @@ impl RuntimeReadHandle {
         self.track(handle);
     }
 
-    pub(crate) fn apply_handles(&self, handles: Vec<RuntimeHandle>) {
-        for handle in handles {
-            self.apply_handle(handle);
-        }
-    }
-
     pub(crate) fn remove_runtime_id(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
         let mut runtimes = self.inner.write().expect("runtime read lock poisoned");
         let removed = runtimes.by_runtime_id.remove(&runtime_id)?;
@@ -194,16 +171,6 @@ impl RuntimeReadHandle {
                 .remove(&(removed.task_id, removed.attempt_no));
         }
         Some(removed)
-    }
-
-    pub(crate) fn remove_by_task_attempt(
-        &self,
-        task_id: Uuid,
-        attempt_no: i32,
-    ) -> Option<RuntimeHandle> {
-        let mut runtimes = self.inner.write().expect("runtime read lock poisoned");
-        let runtime_id = runtimes.by_task_attempt.remove(&(task_id, attempt_no))?;
-        runtimes.by_runtime_id.remove(&runtime_id)
     }
 
     fn track(&self, handle: RuntimeHandle) {

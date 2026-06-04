@@ -4,9 +4,6 @@ mod handle;
 mod internal_event;
 mod state;
 
-#[cfg(test)]
-mod tests;
-
 pub use actor::RuntimeManager;
 pub(crate) use actor::RuntimeManagerOptions;
 pub(crate) use command::RuntimeManagerLimits;

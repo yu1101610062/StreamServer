@@ -102,15 +102,6 @@ impl RuntimeManagerState {
         self.recompute_counts();
     }
 
-    pub(crate) fn apply_handles_with_generation(
-        &mut self,
-        handles: Vec<(RuntimeHandle, RuntimeGeneration)>,
-    ) {
-        for (handle, generation) in handles {
-            self.apply_handle_with_generation(handle, generation);
-        }
-    }
-
     pub(crate) fn entry(&self, runtime_id: Uuid) -> Option<&RuntimeEntry> {
         self.by_runtime_id.get(&runtime_id)
     }
@@ -124,40 +115,12 @@ impl RuntimeManagerState {
         self.by_runtime_id.get(runtime_id)
     }
 
-    pub(crate) fn remove_by_task_attempt(&mut self, task_id: Uuid, attempt_no: i32) {
-        if let Some(runtime_id) = self.by_task_attempt.remove(&(task_id, attempt_no)) {
-            self.by_runtime_id.remove(&runtime_id);
-            self.recompute_counts();
-        }
-    }
-
-    #[cfg(test)]
-    pub fn get(&self, runtime_id: Uuid) -> Option<&RuntimeEntry> {
-        self.by_runtime_id.get(&runtime_id)
-    }
-
-    #[cfg(test)]
-    pub fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<&RuntimeEntry> {
-        let runtime_id = self.by_task_attempt.get(&(task_id, attempt_no))?;
-        self.by_runtime_id.get(runtime_id)
-    }
-
-    #[cfg(test)]
-    pub fn state_counts(&self) -> RuntimeStateCounts {
-        self.state_counts
-    }
-
     #[cfg(test)]
     pub fn active_handles(&self) -> Vec<RuntimeHandle> {
         self.by_runtime_id
             .values()
             .map(|entry| entry.handle.clone())
             .collect()
-    }
-
-    #[cfg(test)]
-    pub fn pending_operation_count(&self) -> usize {
-        self.pending_operation_ids.len()
     }
 
     fn remove_handle(&mut self, handle: &RuntimeHandle) {
@@ -277,7 +240,7 @@ impl RuntimeManagerState {
             if !state_by_runtime_id.contains_key(runtime_id) {
                 errors.push(format!("missing state {}", describe_handle(read)));
             }
-            match self.find_by_task_attempt(read.task_id, read.attempt_no) {
+            match self.entry_by_task_attempt(read.task_id, read.attempt_no) {
                 Some(entry) if entry.handle.runtime_id == *runtime_id => {}
                 Some(entry) => errors.push(format!(
                     "state task index diff task_id={} attempt_no={} state runtime_id={} read model runtime_id={} read model state={}",

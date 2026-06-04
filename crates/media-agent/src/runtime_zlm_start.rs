@@ -47,13 +47,11 @@ use crate::{
 type PersistRuntimeStateHook =
     dyn Fn(&Path, &RuntimeHandle, &SuccessCheck) -> Result<(), ExecutorError> + Send + Sync;
 type AfterRuntimeInsertHook = dyn Fn(&RuntimeHandle) -> Result<(), ExecutorError> + Send + Sync;
-type AfterRegistryTrackHook = dyn Fn(&RuntimeHandle) -> Result<(), ExecutorError> + Send + Sync;
 
 #[derive(Clone)]
 pub(crate) struct RuntimeZlmStartHooks {
     persist_runtime_state: Arc<PersistRuntimeStateHook>,
     after_runtime_insert: Arc<AfterRuntimeInsertHook>,
-    after_registry_track: Arc<AfterRegistryTrackHook>,
 }
 
 impl Default for RuntimeZlmStartHooks {
@@ -61,7 +59,6 @@ impl Default for RuntimeZlmStartHooks {
         Self {
             persist_runtime_state: Arc::new(persist_runtime_state_to_disk),
             after_runtime_insert: Arc::new(|_| Ok(())),
-            after_registry_track: Arc::new(|_| Ok(())),
         }
     }
 }
@@ -78,53 +75,6 @@ impl RuntimeZlmStartHooks {
 
     fn after_runtime_insert(&self, handle: &RuntimeHandle) -> Result<(), ExecutorError> {
         (self.after_runtime_insert)(handle)
-    }
-
-    fn after_registry_track(&self, handle: &RuntimeHandle) -> Result<(), ExecutorError> {
-        (self.after_registry_track)(handle)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_persist_runtime_state(
-        persist_runtime_state: impl Fn(
-            &Path,
-            &RuntimeHandle,
-            &SuccessCheck,
-        ) -> Result<(), ExecutorError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            persist_runtime_state: Arc::new(persist_runtime_state),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_after_runtime_insert(
-        after_runtime_insert: impl Fn(&RuntimeHandle) -> Result<(), ExecutorError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            after_runtime_insert: Arc::new(after_runtime_insert),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_after_registry_track(
-        after_registry_track: impl Fn(&RuntimeHandle) -> Result<(), ExecutorError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            after_registry_track: Arc::new(after_registry_track),
-            ..Self::default()
-        }
     }
 }
 
@@ -280,7 +230,6 @@ pub(crate) struct RuntimeZlmStartOutcome {
 struct ZlmStartMonitorPlan {
     settings: AgentSettings,
     http_client: Client,
-    registry: LocalRuntimeRegistry,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     events: RuntimeEventSink,
     notification: RuntimeNotification,
@@ -305,9 +254,8 @@ impl RuntimeZlmStartOutcome {
 
     pub(crate) async fn commit(
         mut self,
-        monitor_handle: Option<RuntimeMonitorHandle>,
+        monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeHandle, ExecutorError> {
-        let manager_commit = monitor_handle.is_some();
         let handle = self.handle.clone();
         let runtime_id = handle.runtime_id;
         {
@@ -321,12 +269,6 @@ impl RuntimeZlmStartOutcome {
         if let Err(error) = self.hooks.after_runtime_insert(&handle) {
             return self.rollback_start_error(error).await;
         }
-        if !manager_commit {
-            self.monitor_plan.registry.track(handle.clone());
-            if let Err(error) = self.hooks.after_registry_track(&handle) {
-                return self.rollback_start_error(error).await;
-            }
-        }
 
         let _ = self
             .monitor_plan
@@ -338,13 +280,10 @@ impl RuntimeZlmStartOutcome {
                 startup_probe,
             } => {
                 spawn_live_relay_monitor(
-                    runtime_id,
                     work_dir.clone(),
                     startup_probe.clone(),
                     self.monitor_plan.settings.clone(),
                     self.monitor_plan.http_client.clone(),
-                    self.monitor_plan.registry.clone(),
-                    self.monitor_plan.runtimes.clone(),
                     self.monitor_plan.events.clone(),
                     monitor_handle.clone(),
                 );
@@ -354,13 +293,10 @@ impl RuntimeZlmStartOutcome {
                 stream_id,
             } => {
                 spawn_rtp_receive_monitor(
-                    runtime_id,
                     work_dir.clone(),
                     stream_id.clone(),
                     self.monitor_plan.settings.clone(),
                     self.monitor_plan.http_client.clone(),
-                    self.monitor_plan.registry.clone(),
-                    self.monitor_plan.runtimes.clone(),
                     self.monitor_plan.events.clone(),
                     monitor_handle.clone(),
                 );
@@ -376,18 +312,6 @@ impl RuntimeZlmStartOutcome {
             .await;
         Err(error)
     }
-}
-
-#[cfg(test)]
-pub(crate) async fn start_live_relay_task_and_commit(
-    ctx: RuntimeZlmStartContext<'_>,
-    request: &StartTaskRequest,
-    slot_permit: Arc<RuntimeSlotPermit>,
-) -> Result<RuntimeHandle, ExecutorError> {
-    start_live_relay_task(ctx, request, slot_permit)
-        .await?
-        .commit(None)
-        .await
 }
 
 pub(crate) async fn start_live_relay_task(
@@ -480,7 +404,6 @@ pub(crate) async fn start_live_relay_task(
         monitor_plan: ZlmStartMonitorPlan {
             settings: ctx.settings.clone(),
             http_client: ctx.http_client.clone(),
-            registry: ctx.registry.clone(),
             runtimes: ctx.runtimes.clone(),
             events: ctx.events.clone(),
             notification: RuntimeNotification::TaskEvent(RuntimeTaskEvent {
@@ -506,18 +429,6 @@ pub(crate) async fn start_live_relay_task(
         },
         hooks: ctx.hooks,
     })
-}
-
-#[cfg(test)]
-pub(crate) async fn start_rtp_receive_task_and_commit(
-    ctx: RuntimeZlmStartContext<'_>,
-    request: &StartTaskRequest,
-    slot_permit: Arc<RuntimeSlotPermit>,
-) -> Result<RuntimeHandle, ExecutorError> {
-    start_rtp_receive_task(ctx, request, slot_permit)
-        .await?
-        .commit(None)
-        .await
 }
 
 pub(crate) async fn start_rtp_receive_task(
@@ -602,7 +513,6 @@ pub(crate) async fn start_rtp_receive_task(
         monitor_plan: ZlmStartMonitorPlan {
             settings: ctx.settings.clone(),
             http_client: ctx.http_client.clone(),
-            registry: ctx.registry.clone(),
             runtimes: ctx.runtimes.clone(),
             events: ctx.events.clone(),
             notification: RuntimeNotification::TaskEvent(RuntimeTaskEvent {

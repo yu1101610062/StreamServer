@@ -181,12 +181,6 @@ pub(crate) fn is_process_running(process: &ProcessIdentity) -> bool {
     true
 }
 
-#[cfg(test)]
-pub(crate) fn process_group_id(pid: i32) -> Option<i32> {
-    let pgid = unsafe { libc::getpgid(pid) };
-    (pgid >= 0).then_some(pgid)
-}
-
 #[cfg(unix)]
 pub(crate) fn configure_new_process_group(command: &mut tokio::process::Command) {
     unsafe {

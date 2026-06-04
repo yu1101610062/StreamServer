@@ -94,6 +94,14 @@ pub struct AgentSettings {
     pub labels: Vec<String>,
     #[serde(default = "default_max_runtime_slots")]
     pub max_runtime_slots: u32,
+    #[serde(default = "default_runtime_manager_start_limit")]
+    pub runtime_manager_start_limit: usize,
+    #[serde(default = "default_runtime_manager_stop_limit")]
+    pub runtime_manager_stop_limit: usize,
+    #[serde(default = "default_runtime_manager_recording_limit")]
+    pub runtime_manager_recording_limit: usize,
+    #[serde(default = "default_runtime_manager_adopt_limit")]
+    pub runtime_manager_adopt_limit: usize,
     #[serde(default = "default_work_root")]
     pub work_root: String,
     #[serde(default = "default_upload_max_bytes")]
@@ -154,6 +162,10 @@ impl Default for AgentSettings {
             network_mode: default_network_mode(),
             labels: Vec::new(),
             max_runtime_slots: default_max_runtime_slots(),
+            runtime_manager_start_limit: default_runtime_manager_start_limit(),
+            runtime_manager_stop_limit: default_runtime_manager_stop_limit(),
+            runtime_manager_recording_limit: default_runtime_manager_recording_limit(),
+            runtime_manager_adopt_limit: default_runtime_manager_adopt_limit(),
             work_root: default_work_root(),
             upload_max_bytes: default_upload_max_bytes(),
             upload_allowed_extensions: default_upload_allowed_extensions(),
@@ -412,6 +424,26 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("AGENT_MAX_RUNTIME_SLOTS") {
         settings.agent.max_runtime_slots = value.parse().unwrap_or(default_max_runtime_slots());
     }
+    if let Some(value) = env("AGENT_RUNTIME_MANAGER_START_LIMIT") {
+        settings.agent.runtime_manager_start_limit = value
+            .parse()
+            .unwrap_or(default_runtime_manager_start_limit());
+    }
+    if let Some(value) = env("AGENT_RUNTIME_MANAGER_STOP_LIMIT") {
+        settings.agent.runtime_manager_stop_limit = value
+            .parse()
+            .unwrap_or(default_runtime_manager_stop_limit());
+    }
+    if let Some(value) = env("AGENT_RUNTIME_MANAGER_RECORDING_LIMIT") {
+        settings.agent.runtime_manager_recording_limit = value
+            .parse()
+            .unwrap_or(default_runtime_manager_recording_limit());
+    }
+    if let Some(value) = env("AGENT_RUNTIME_MANAGER_ADOPT_LIMIT") {
+        settings.agent.runtime_manager_adopt_limit = value
+            .parse()
+            .unwrap_or(default_runtime_manager_adopt_limit());
+    }
     if let Some(value) = env("WORK_ROOT") {
         settings.agent.work_root = value;
     }
@@ -539,6 +571,22 @@ fn default_network_mode() -> String {
 
 fn default_max_runtime_slots() -> u32 {
     0
+}
+
+fn default_runtime_manager_start_limit() -> usize {
+    8
+}
+
+fn default_runtime_manager_stop_limit() -> usize {
+    16
+}
+
+fn default_runtime_manager_recording_limit() -> usize {
+    12
+}
+
+fn default_runtime_manager_adopt_limit() -> usize {
+    1
 }
 
 fn default_work_root() -> String {

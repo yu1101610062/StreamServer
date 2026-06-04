@@ -25,10 +25,10 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 #[cfg(test)]
-use crate::runtime::LocalRuntimeRegistry;
+use crate::runtime_registry::LocalRuntimeRegistry;
 use crate::{
     config::{AgentArtifactCleanupSettings, AgentSettings},
-    runtime::{LocalExecutor, RuntimeReadModel, StopTaskRequest},
+    runtime::{RuntimeManagerHandle, RuntimeReadModel, StopTaskRequest},
 };
 
 const CLEANUP_HYSTERESIS_PERCENT: f64 = 5.0;
@@ -67,7 +67,7 @@ pub struct ArtifactCleanupManager {
 struct ArtifactCleanupManagerInner {
     cleanup: AgentArtifactCleanupSettings,
     runtime_read_model: Arc<dyn RuntimeReadModel>,
-    executor: Option<Arc<dyn LocalExecutor>>,
+    executor: Option<RuntimeManagerHandle>,
     layout: ArtifactCleanupLayout,
     state: RwLock<ArtifactCleanupState>,
 }
@@ -234,7 +234,7 @@ impl ArtifactCleanupManager {
     pub fn with_executor(
         settings: &AgentSettings,
         runtime_read_model: Arc<dyn RuntimeReadModel>,
-        executor: Option<Arc<dyn LocalExecutor>>,
+        executor: Option<RuntimeManagerHandle>,
     ) -> Self {
         let layout = ArtifactCleanupLayout::from_settings(settings);
         let state = ArtifactCleanupState::unknown(&layout);

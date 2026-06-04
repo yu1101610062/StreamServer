@@ -90,13 +90,6 @@ pub(crate) fn stream_online(handle: &RuntimeHandle) -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn live_relay_uses_recording_startup(
-    startup_probe: &StartupProbe,
-    handle: &RuntimeHandle,
-) -> bool {
-    startup_probe.schema.is_none() && live_relay_recording_from_handle(handle).is_some()
-}
-
 pub(crate) fn completion_reason_from_handle(handle: &RuntimeHandle) -> Option<String> {
     handle
         .metadata
@@ -285,24 +278,6 @@ pub(crate) fn clear_source_reconnecting(runtime: &mut RuntimeHandle) {
     }
 }
 
-pub(crate) fn emit_source_reconnecting_event(
-    events: &RuntimeEventSink,
-    handle: &RuntimeHandle,
-    message: impl Into<String>,
-    payload: Value,
-) {
-    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-        task_id: handle.task_id,
-        attempt_no: handle.attempt_no,
-        lease_token: runtime_lease_token(handle).unwrap_or_default(),
-        session_epoch: runtime_session_epoch(handle),
-        event_type: "source_reconnecting".to_string(),
-        event_level: "warn".to_string(),
-        message: message.into(),
-        payload,
-    }));
-}
-
 pub(crate) fn emit_recording_gap_started_event(
     events: &RuntimeEventSink,
     handle: &RuntimeHandle,
@@ -325,55 +300,6 @@ pub(crate) fn emit_recording_gap_started_event(
             }),
         ),
     }));
-}
-
-pub(crate) fn emit_recording_gap_ended_event(
-    events: &RuntimeEventSink,
-    handle: &RuntimeHandle,
-    reason: &str,
-    payload: Value,
-) {
-    if !recording_gap_active(handle) {
-        return;
-    }
-
-    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-        task_id: handle.task_id,
-        attempt_no: handle.attempt_no,
-        lease_token: runtime_lease_token(handle).unwrap_or_default(),
-        session_epoch: runtime_session_epoch(handle),
-        event_type: "recording_gap_ended".to_string(),
-        event_level: "info".to_string(),
-        message: "stream recording gap ended after source reconnected".to_string(),
-        payload: merge_event_payload(
-            payload,
-            json!({
-                "reason": reason,
-                "recording_gap_started_at": handle.metadata.get("recording_gap_started_at").cloned().unwrap_or(Value::Null),
-            }),
-        ),
-    }));
-}
-
-pub(crate) fn emit_recording_control_event(
-    events: &RuntimeEventSink,
-    handle: &RuntimeHandle,
-    event_type: &str,
-    event_level: &str,
-    message: impl Into<String>,
-    recording: &LiveRelayRecording,
-    request: &TaskRecordingControlRequest,
-    payload: Value,
-) {
-    let _ = events.send(recording_control_notification(
-        handle,
-        event_type,
-        event_level,
-        message,
-        recording,
-        request,
-        payload,
-    ));
 }
 
 pub(crate) fn recording_control_notification(

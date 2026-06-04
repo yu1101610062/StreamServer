@@ -1,13 +1,12 @@
 //! Runtime manager worker factory：负责把启停、录制控制、ZLM 启动和进程恢复串接起来。
 //!
-//! 生产控制入口只通过 `RuntimeManagerHandle` 提交状态。这里保留的 direct
-//! `LocalExecutor for ManagedProcessExecutor` 是 legacy/test 兼容路径，用于验证旧合同；
-//! manager 路径只把它当作慢副作用 worker factory。
+//! 生产控制入口只通过 `RuntimeManagerHandle` 提交状态；这里的 executor 只作为
+//! RuntimeManager actor 派发慢副作用 worker 的工厂。
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io,
-    sync::{Arc, Mutex as StdMutex, RwLock, atomic::AtomicBool},
+    sync::{Arc, RwLock, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -15,23 +14,21 @@ use chrono::Utc;
 use media_domain::{RuntimeHandle, RuntimeState, TaskType};
 use reqwest::Client;
 use serde_json::json;
-use tonic::async_trait;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
     runtime_adoption::{
-        RuntimeAdoptionCommit, RuntimeAdoptionContext, RuntimeAdoptionMonitor,
-        RuntimeAdoptionOutcome, RuntimeAdoptionWorkerContext, adopt_orphan_runtimes,
-        adopted_event_notification, prepare_adopt_orphan_runtimes_for_manager,
+        RuntimeAdoptionCommit, RuntimeAdoptionMonitor, RuntimeAdoptionOutcome,
+        RuntimeAdoptionWorkerContext, adopted_event_notification,
+        prepare_adopt_orphan_runtimes_for_manager,
     },
     runtime_artifacts::attach_file_artifact_metadata,
     runtime_controls::{
-        RuntimeControlContext, RuntimeRecordingControlContext, RuntimeRecordingOutcome,
-        RuntimeRecordingPreparation, RuntimeRecordingWorkerRequest,
-        prepare_runtime_recording_for_manager, run_runtime_recording_worker,
-        set_task_recording as set_runtime_task_recording,
+        RuntimeControlContext, RuntimeRecordingOutcome, RuntimeRecordingPreparation,
+        RuntimeRecordingWorkerRequest, prepare_runtime_recording_for_manager,
+        run_runtime_recording_worker,
     },
     runtime_events::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
@@ -58,17 +55,14 @@ use crate::{
         RuntimeStartOutcome as ManagedProcessStartOutcome, prepare_process_start_task,
     },
     runtime_recovery::{
-        ProcessRecoveryContext,
-        cleanup_managed_stream_before_restart as cleanup_managed_stream_before_restart_impl,
-        cleanup_managed_stream_before_restart_notifications,
-        restart_process_task_after_failure as restart_process_task_after_failure_impl,
+        ProcessRecoveryContext, cleanup_managed_stream_before_restart_notifications,
         should_auto_restart_process,
     },
     runtime_registry::{AdoptFilter, LocalRuntimeRegistry},
     runtime_start::{RuntimeStartContext, RuntimeStartDecision, prepare_start_task},
     runtime_stop::{
-        RuntimeStopContext, RuntimeStopOutcome, RuntimeStopPreparation, RuntimeStopWorkerRequest,
-        prepare_runtime_stop_for_manager, run_runtime_stop_worker, stop_runtime_task,
+        RuntimeStopOutcome, RuntimeStopPreparation, RuntimeStopWorkerRequest,
+        prepare_runtime_stop_for_manager, run_runtime_stop_worker,
     },
     runtime_types::{
         ExecutorError, RuntimeCapabilityHints, StartTaskRequest, StopTaskRequest, SuccessCheck,
@@ -81,19 +75,6 @@ use crate::{
         start_rtp_receive_task as prepare_zlm_rtp_receive_start_task,
     },
 };
-
-#[async_trait]
-pub trait LocalExecutor: Send + Sync {
-    async fn start_task(&self, request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError>;
-    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError>;
-    async fn set_task_recording(
-        &self,
-        request: TaskRecordingControlRequest,
-    ) -> Result<RuntimeHandle, ExecutorError>;
-    async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle>;
-    fn set_zlm_server_id(&self, _server_id: String) {}
-    fn set_zlm_rtmp_enhanced_enabled(&self, _enabled: Option<bool>) {}
-}
 
 pub(crate) enum RuntimeStartWorkerResult {
     Committed(RuntimeHandle),
@@ -131,7 +112,7 @@ impl RuntimeStartWorkerResult {
 
     pub(crate) async fn commit(
         self,
-        monitor_handle: Option<RuntimeMonitorHandle>,
+        monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeHandle, ExecutorError> {
         match self {
             Self::Committed(handle) => Ok(handle),
@@ -156,7 +137,7 @@ impl RuntimeStartOutcome {
 
     async fn commit(
         self,
-        monitor_handle: Option<RuntimeMonitorHandle>,
+        monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeHandle, ExecutorError> {
         match self {
             Self::ManagedProcess(outcome) => outcome.commit(monitor_handle),
@@ -179,7 +160,6 @@ pub(crate) struct ManagedProcessExecutor {
     pub(crate) runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     pub(crate) slot_limiter: Arc<RuntimeSlotLimiter>,
     stop_intents: Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
-    recording_controls: Arc<StdMutex<HashSet<Uuid>>>,
     http_client: Client,
     zlm_server_id: Arc<RwLock<Option<String>>>,
     zlm_rtmp_enhanced_enabled: Arc<RwLock<Option<bool>>>,
@@ -201,7 +181,6 @@ impl ManagedProcessExecutor {
             runtimes: Arc::new(RwLock::new(HashMap::new())),
             slot_limiter: Arc::new(RuntimeSlotLimiter::new(max_runtime_slots)),
             stop_intents: Arc::new(RwLock::new(HashMap::new())),
-            recording_controls: Arc::new(StdMutex::new(HashSet::new())),
             http_client: Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
@@ -215,30 +194,6 @@ impl ManagedProcessExecutor {
 
     pub(crate) fn new_for_manager(settings: AgentSettings, events: RuntimeEventSink) -> Self {
         Self::new(settings, LocalRuntimeRegistry::new(), events)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_process_start_hooks(
-        settings: AgentSettings,
-        registry: LocalRuntimeRegistry,
-        events: RuntimeEventSink,
-        process_start_hooks: ManagedProcessStartHooks,
-    ) -> Self {
-        let mut executor = Self::new(settings, registry, events);
-        executor.process_start_hooks = process_start_hooks;
-        executor
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_zlm_start_hooks(
-        settings: AgentSettings,
-        registry: LocalRuntimeRegistry,
-        events: RuntimeEventSink,
-        zlm_start_hooks: RuntimeZlmStartHooks,
-    ) -> Self {
-        let mut executor = Self::new(settings, registry, events);
-        executor.zlm_start_hooks = zlm_start_hooks;
-        executor
     }
 
     fn current_zlm_server_id(&self) -> Option<String> {
@@ -261,13 +216,31 @@ impl ManagedProcessExecutor {
         }
     }
 
+    pub(crate) fn set_zlm_server_id(&self, server_id: String) {
+        let server_id = server_id.trim().to_string();
+        let mut guard = self
+            .zlm_server_id
+            .write()
+            .expect("zlm_server_id lock poisoned");
+        if server_id.is_empty() {
+            *guard = None;
+        } else {
+            *guard = Some(server_id);
+        }
+    }
+
+    pub(crate) fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
+        let mut guard = self
+            .zlm_rtmp_enhanced_enabled
+            .write()
+            .expect("zlm_rtmp_enhanced_enabled lock poisoned");
+        *guard = enabled;
+    }
+
     fn control_context(&self) -> RuntimeControlContext<'_> {
         RuntimeControlContext {
             settings: &self.settings,
             http_client: &self.http_client,
-            registry: &self.registry,
-            runtimes: &self.runtimes,
-            events: &self.events,
         }
     }
 
@@ -287,15 +260,6 @@ impl ManagedProcessExecutor {
         ProcessRecoveryContext {
             settings: &self.settings,
             http_client: &self.http_client,
-            registry: &self.registry,
-            runtimes: &self.runtimes,
-            events: &self.events,
-            slot_limiter: &self.slot_limiter,
-            zlm_server_id: self.current_zlm_server_id(),
-            capability_hints: RuntimeCapabilityHints {
-                zlm_rtmp_enhanced_enabled: self.current_zlm_rtmp_enhanced_enabled(),
-            },
-            restart_executor: self.clone(),
         }
     }
 
@@ -745,122 +709,7 @@ impl ManagedProcessExecutor {
     }
 }
 
-// Legacy direct executor compatibility. Production control-plane code constructs this type only
-// through `RuntimeManager::spawn_managed_with_options`, so registry/runtimes writes below are not
-// the production runtime state source.
-#[async_trait]
-impl LocalExecutor for ManagedProcessExecutor {
-    async fn start_task(&self, request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
-        self.start_task_for_manager(request)
-            .await?
-            .commit(None)
-            .await
-    }
-
-    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
-        let controls = self.control_context();
-        stop_runtime_task(
-            RuntimeStopContext {
-                settings: &self.settings,
-                registry: &self.registry,
-                runtimes: &self.runtimes,
-                events: &self.events,
-                stop_intents: &self.stop_intents,
-                controls,
-            },
-            &request,
-        )
-        .await
-    }
-
-    async fn set_task_recording(
-        &self,
-        request: TaskRecordingControlRequest,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        let controls = self.control_context();
-        set_runtime_task_recording(
-            RuntimeRecordingControlContext {
-                controls,
-                recording_controls: self.recording_controls.clone(),
-            },
-            &request,
-        )
-        .await
-    }
-
-    async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
-        self.adopt_orphans_legacy(filter).await
-    }
-
-    fn set_zlm_server_id(&self, server_id: String) {
-        let server_id = server_id.trim().to_string();
-        {
-            let mut guard = self
-                .zlm_server_id
-                .write()
-                .expect("zlm_server_id lock poisoned");
-            if server_id.is_empty() {
-                *guard = None;
-            } else {
-                *guard = Some(server_id);
-            }
-        }
-    }
-
-    fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
-        {
-            let mut guard = self
-                .zlm_rtmp_enhanced_enabled
-                .write()
-                .expect("zlm_rtmp_enhanced_enabled lock poisoned");
-            *guard = enabled;
-        }
-    }
-}
-
 impl ManagedProcessExecutor {
-    async fn adopt_orphans_legacy(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
-        let stream_probe_client = self.http_client.clone();
-        let stream_probe_settings = self.settings.clone();
-        let rtp_probe_client = self.http_client.clone();
-        let rtp_probe_settings = self.settings.clone();
-
-        adopt_orphan_runtimes(
-            RuntimeAdoptionContext {
-                filter,
-                zlm_server_id: self.current_zlm_server_id(),
-                settings: self.settings.clone(),
-                http_client: self.http_client.clone(),
-                registry: self.registry.clone(),
-                runtimes: self.runtimes.clone(),
-                slot_limiter: self.slot_limiter.clone(),
-                events: self.events.clone(),
-            },
-            |request| async move { self.start_task(request).await.ok() },
-            move |startup_probe| {
-                let client = stream_probe_client.clone();
-                let settings = stream_probe_settings.clone();
-                async move {
-                    zlm_stream_online(&client, &settings, &startup_probe)
-                        .await
-                        .map_err(|error| ExecutorError::ApiCall(error.to_string()))
-                        .unwrap_or(false)
-                }
-            },
-            move |stream_id| {
-                let client = rtp_probe_client.clone();
-                let settings = rtp_probe_settings.clone();
-                async move {
-                    zlm_rtp_server_port(&client, &settings, &stream_id)
-                        .await
-                        .ok()
-                        .flatten()
-                }
-            },
-        )
-        .await
-    }
-
     pub(crate) async fn start_task_for_manager(
         &self,
         request: StartTaskRequest,
@@ -1000,28 +849,21 @@ impl ManagedProcessExecutor {
             match monitor {
                 RuntimeAdoptionMonitor::StartupProbe { startup_probe } => {
                     spawn_startup_probe_monitor(
-                        runtime_id,
                         commit.work_dir.clone(),
                         commit.success_check.clone(),
                         startup_probe,
                         self.settings.clone(),
                         self.http_client.clone(),
-                        self.registry.clone(),
-                        self.runtimes.clone(),
                         self.events.clone(),
-                        Some(monitor_handle.clone()),
+                        monitor_handle.clone(),
                     );
                 }
                 RuntimeAdoptionMonitor::AdoptedRuntime => {
                     spawn_adopted_runtime_monitor(
-                        handle.clone(),
                         process,
                         commit.work_dir.clone(),
                         commit.success_check.clone(),
-                        self.registry.clone(),
-                        self.runtimes.clone(),
-                        self.events.clone(),
-                        Some(monitor_handle.clone()),
+                        monitor_handle.clone(),
                     );
                 }
                 RuntimeAdoptionMonitor::AdoptedCompanion { process, companion } => {
@@ -1031,36 +873,27 @@ impl ManagedProcessExecutor {
                         companion,
                         commit.work_dir.clone(),
                         commit.success_check.clone(),
-                        self.registry.clone(),
-                        self.runtimes.clone(),
-                        self.events.clone(),
-                        Some(monitor_handle.clone()),
+                        monitor_handle.clone(),
                     );
                 }
                 RuntimeAdoptionMonitor::LiveRelay { startup_probe } => {
                     spawn_live_relay_monitor(
-                        runtime_id,
                         commit.work_dir.clone(),
                         startup_probe,
                         self.settings.clone(),
                         self.http_client.clone(),
-                        self.registry.clone(),
-                        self.runtimes.clone(),
                         self.events.clone(),
-                        Some(monitor_handle.clone()),
+                        monitor_handle.clone(),
                     );
                 }
                 RuntimeAdoptionMonitor::RtpReceive { stream_id } => {
                     spawn_rtp_receive_monitor(
-                        runtime_id,
                         commit.work_dir.clone(),
                         stream_id,
                         self.settings.clone(),
                         self.http_client.clone(),
-                        self.registry.clone(),
-                        self.runtimes.clone(),
                         self.events.clone(),
-                        Some(monitor_handle.clone()),
+                        monitor_handle.clone(),
                     );
                 }
             }
@@ -1086,25 +919,11 @@ impl ManagedProcessExecutor {
                 capability_hints: RuntimeCapabilityHints {
                     zlm_rtmp_enhanced_enabled: self.current_zlm_rtmp_enhanced_enabled(),
                 },
-                restart_executor: self.clone(),
                 hooks: self.process_start_hooks.clone(),
             },
             request,
             slot_permit,
         )
-    }
-
-    pub(crate) async fn restart_process_task_after_failure(
-        &self,
-        exited_handle: &RuntimeHandle,
-        emit_starting_event: bool,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        restart_process_task_after_failure_impl(
-            self.process_recovery_context(),
-            exited_handle,
-            emit_starting_event,
-        )
-        .await
     }
 
     pub(crate) async fn restart_process_task_after_failure_for_manager(
@@ -1123,10 +942,6 @@ impl ManagedProcessExecutor {
         self.prepare_process_task_for_manager(&request, slot_permit)
             .map(RuntimeStartOutcome::ManagedProcess)
             .map(RuntimeStartWorkerResult::PendingCommit)
-    }
-
-    pub(crate) async fn cleanup_managed_stream_before_restart(&self, handle: &RuntimeHandle) {
-        cleanup_managed_stream_before_restart_impl(self.process_recovery_context(), handle).await;
     }
 
     async fn start_live_relay_task(

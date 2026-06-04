@@ -1,19 +1,15 @@
 use media_domain::RuntimeHandle;
 use tokio::sync::{mpsc, oneshot};
-use tonic::async_trait;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
-    runtime_executor::LocalExecutor,
     runtime_registry::{AdoptFilter, RuntimeReadHandle},
     runtime_types::{
         ExecutorError, StartTaskRequest, StopTaskRequest, TaskRecordingControlRequest,
     },
 };
 
-#[cfg(test)]
-use super::state::RuntimeManagerState;
 use super::{
     command::{RuntimeCommand, RuntimeManagerRequestOutcome},
     internal_event::{RuntimeGeneration, RuntimeInternalEvent, RuntimeMonitorSnapshot},
@@ -126,13 +122,27 @@ impl RuntimeManagerHandle {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn monitor_handle(
-        &self,
-        runtime_id: Uuid,
-        generation: RuntimeGeneration,
-    ) -> RuntimeMonitorHandle {
-        RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation)
+    pub async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
+        self.send_request(|reply| RuntimeCommand::StopTask { request, reply })
+            .await?
+    }
+
+    pub fn set_zlm_server_id(&self, server_id: String) {
+        if let Err(error) = self
+            .tx
+            .try_send(RuntimeCommand::SetZlmServerId { server_id })
+        {
+            warn!(error = %error, "runtime manager hint command dropped");
+        }
+    }
+
+    pub fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
+        if let Err(error) = self
+            .tx
+            .try_send(RuntimeCommand::SetZlmRtmpEnhancedEnabled { enabled })
+        {
+            warn!(error = %error, "runtime manager hint command dropped");
+        }
     }
 }
 
@@ -151,12 +161,6 @@ impl RuntimeMonitorHandle {
 }
 
 impl RuntimeManagerHandle {
-    #[cfg(test)]
-    pub async fn manager_state(&self) -> Result<RuntimeManagerState, ExecutorError> {
-        self.send_request(|reply| RuntimeCommand::InspectState { reply })
-            .await
-    }
-
     #[allow(dead_code)]
     pub async fn shutdown(&self) {
         if let Err(error) = self.tx.send(RuntimeCommand::Shutdown).await {
@@ -225,64 +229,6 @@ impl RuntimeMonitorHandle {
             .await
         {
             warn!(error = %error, runtime_id = %self.runtime_id, "runtime manager internal event dropped");
-        }
-    }
-}
-
-#[async_trait]
-impl LocalExecutor for RuntimeManagerHandle {
-    async fn start_task(&self, request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
-        self.send_request(|reply| RuntimeCommand::StartTask { request, reply })
-            .await?
-    }
-
-    async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
-        self.send_request(|reply| RuntimeCommand::StopTask { request, reply })
-            .await?
-    }
-
-    async fn set_task_recording(
-        &self,
-        request: TaskRecordingControlRequest,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        self.send_request(|reply| RuntimeCommand::SetTaskRecording { request, reply })
-            .await?
-    }
-
-    async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
-        let (reply, response) = oneshot::channel();
-        if let Err(error) = self
-            .tx
-            .send(RuntimeCommand::AdoptOrphans { filter, reply })
-            .await
-        {
-            warn!(error = %error, "runtime manager command channel closed");
-            return Vec::new();
-        }
-        match response.await {
-            Ok(handles) => handles,
-            Err(error) => {
-                warn!(error = %error, "runtime manager reply channel closed");
-                Vec::new()
-            }
-        }
-    }
-
-    fn set_zlm_server_id(&self, server_id: String) {
-        if let Err(error) = self
-            .tx
-            .try_send(RuntimeCommand::SetZlmServerId { server_id })
-        {
-            warn!(error = %error, "runtime manager hint command dropped");
-        }
-    }
-
-    fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
-        if let Err(error) = self
-            .tx
-            .try_send(RuntimeCommand::SetZlmRtmpEnhancedEnabled { enabled })
-        {
-            warn!(error = %error, "runtime manager hint command dropped");
         }
     }
 }

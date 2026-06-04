@@ -26,7 +26,6 @@ use crate::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, read_log_stream,
         read_progress_stream, runtime_session_epoch,
     },
-    runtime_executor::ManagedProcessExecutor,
     runtime_io::render_command_line,
     runtime_manager::RuntimeMonitorHandle,
     runtime_metadata::{
@@ -93,49 +92,6 @@ impl ManagedProcessStartHooks {
         companion_pid: i32,
     ) -> Result<(), ExecutorError> {
         (self.after_companion_spawn)(handle, companion_pid)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_persist_runtime_state(
-        persist_runtime_state: impl Fn(
-            &Path,
-            &RuntimeHandle,
-            &SuccessCheck,
-        ) -> Result<(), ExecutorError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            persist_runtime_state: Arc::new(persist_runtime_state),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_after_runtime_insert(
-        after_runtime_insert: impl Fn(&RuntimeHandle) -> Result<(), ExecutorError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            after_runtime_insert: Arc::new(after_runtime_insert),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_after_companion_spawn(
-        after_companion_spawn: impl Fn(&RuntimeHandle, i32) -> Result<(), ExecutorError>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            after_companion_spawn: Arc::new(after_companion_spawn),
-            ..Self::default()
-        }
     }
 }
 
@@ -237,7 +193,6 @@ pub(crate) struct ManagedProcessStartContext<'a> {
     pub(crate) events: &'a RuntimeEventSink,
     pub(crate) zlm_server_id: Option<String>,
     pub(crate) capability_hints: RuntimeCapabilityHints,
-    pub(crate) restart_executor: ManagedProcessExecutor,
     pub(crate) hooks: ManagedProcessStartHooks,
 }
 
@@ -264,7 +219,6 @@ struct ManagedProcessMonitorPlan {
     registry: LocalRuntimeRegistry,
     runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     events: RuntimeEventSink,
-    restart_executor: ManagedProcessExecutor,
     child: Option<Child>,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
@@ -333,10 +287,10 @@ impl RuntimeStartOutcome {
 
     pub(crate) fn commit(
         mut self,
-        monitor_handle: Option<RuntimeMonitorHandle>,
+        monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeHandle, ExecutorError> {
-        let manager_commit = monitor_handle.is_some();
         let handle = self.handle.clone();
+        let mut committed_handle = handle.clone();
         let runtime_id = handle.runtime_id;
         {
             let mut runtimes = self
@@ -350,27 +304,15 @@ impl RuntimeStartOutcome {
             self.rollback_and_detach_children();
             return Err(error);
         }
-        if !manager_commit {
-            self.monitor_plan.registry.track(handle.clone());
-        }
 
         for notification in self.monitor_plan.post_commit_notifications.drain(..) {
             let _ = self.monitor_plan.events.send(notification);
         }
 
         if self.monitor_plan.startup_probe.is_none() {
-            let running_handle = if manager_commit {
-                let mut running_handle = handle.clone();
-                running_handle.state = RuntimeState::Running;
-                running_handle
-            } else {
-                self.monitor_plan
-                    .registry
-                    .update(runtime_id, |runtime| {
-                        runtime.state = RuntimeState::Running;
-                    })
-                    .unwrap_or_else(|| handle.clone())
-            };
+            let mut running_handle = handle.clone();
+            running_handle.state = RuntimeState::Running;
+            committed_handle = running_handle.clone();
             if let Err(error) = self.hooks.persist_runtime_state(
                 &self.monitor_plan.work_dir,
                 &running_handle,
@@ -427,14 +369,11 @@ impl RuntimeStartOutcome {
 
         if let Some(startup_probe) = self.monitor_plan.startup_probe.clone() {
             spawn_startup_probe_monitor(
-                runtime_id,
                 self.monitor_plan.work_dir.clone(),
                 self.monitor_plan.success_check.clone(),
                 startup_probe,
                 self.monitor_plan.settings.clone(),
                 self.monitor_plan.http_client.clone(),
-                self.monitor_plan.registry.clone(),
-                self.monitor_plan.runtimes.clone(),
                 self.monitor_plan.events.clone(),
                 monitor_handle.clone(),
             );
@@ -448,22 +387,17 @@ impl RuntimeStartOutcome {
         spawn_process_exit_monitor(
             ProcessExitMonitorContext {
                 runtime_id,
-                wait_handle: handle.clone(),
                 work_dir: self.monitor_plan.work_dir.clone(),
                 output_target: self.monitor_plan.output_target.clone(),
                 success_check: self.monitor_plan.success_check.clone(),
                 stop_requested: self.backend.runtime.stop_requested.clone(),
-                registry: self.monitor_plan.registry.clone(),
-                runtimes: self.monitor_plan.runtimes.clone(),
-                events: self.monitor_plan.events.clone(),
-                restart_executor: self.monitor_plan.restart_executor.clone(),
                 monitor_handle,
             },
             child,
         );
 
         self.rollback.disarm();
-        Ok(handle)
+        Ok(committed_handle)
     }
 
     fn rollback_and_detach_children(&mut self) {
@@ -473,14 +407,6 @@ impl RuntimeStartOutcome {
         }
         spawn_detached_companion_waits(std::mem::take(&mut self.monitor_plan.companions));
     }
-}
-
-pub(crate) fn start_process_task(
-    context: ManagedProcessStartContext<'_>,
-    request: &StartTaskRequest,
-    slot_permit: Arc<RuntimeSlotPermit>,
-) -> Result<RuntimeHandle, ExecutorError> {
-    prepare_process_start_task(context, request, slot_permit)?.commit(None)
 }
 
 pub(crate) fn prepare_process_start_task(
@@ -496,7 +422,6 @@ pub(crate) fn prepare_process_start_task(
         events,
         zlm_server_id,
         capability_hints,
-        restart_executor,
         hooks,
     } = context;
 
@@ -643,7 +568,6 @@ pub(crate) fn prepare_process_start_task(
             registry: registry.clone(),
             runtimes: runtimes.clone(),
             events: events.clone(),
-            restart_executor,
             child: Some(child),
             stdout,
             stderr,
@@ -660,7 +584,7 @@ pub(crate) struct ProcessStreamReaderContext {
     pub(crate) require_stream_online: bool,
     pub(crate) registry: LocalRuntimeRegistry,
     pub(crate) events: RuntimeEventSink,
-    pub(crate) monitor_handle: Option<RuntimeMonitorHandle>,
+    pub(crate) monitor_handle: RuntimeMonitorHandle,
 }
 
 pub(crate) fn initial_companion_recording_metadata(companion: &CompanionProcessPlan) -> Value {
@@ -692,8 +616,6 @@ pub(crate) fn spawn_process_stream_readers(
     } = context;
 
     if let Some(stdout) = stdout {
-        let events = events.clone();
-        let registry = registry.clone();
         let progress_handle = handle.clone();
         let monitor_handle = monitor_handle.clone();
         tokio::spawn(async move {
@@ -703,8 +625,6 @@ pub(crate) fn spawn_process_stream_readers(
                 progress_handle.task_id,
                 progress_handle.attempt_no,
                 runtime_lease_token(&progress_handle).unwrap_or_default(),
-                registry,
-                events,
                 require_stream_online,
                 monitor_handle,
             )
@@ -727,19 +647,6 @@ pub(crate) fn spawn_process_stream_readers(
             .await;
         });
     }
-}
-
-#[cfg(test)]
-pub(crate) struct CompanionRecordingStartContext<'a> {
-    pub(crate) runtime_id: Uuid,
-    pub(crate) handle: RuntimeHandle,
-    pub(crate) work_dir: PathBuf,
-    pub(crate) success_check: SuccessCheck,
-    pub(crate) registry: LocalRuntimeRegistry,
-    pub(crate) runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    pub(crate) events: RuntimeEventSink,
-    pub(crate) rollback: &'a mut RuntimeStartRollback,
-    pub(crate) hooks: ManagedProcessStartHooks,
 }
 
 struct CompanionRecordingPrepareContext<'a> {
@@ -856,7 +763,7 @@ fn start_prepared_companion_monitors(
     handle: &RuntimeHandle,
     monitor_plan: &ManagedProcessMonitorPlan,
     mut companion: PreparedCompanionProcess,
-    monitor_handle: Option<RuntimeMonitorHandle>,
+    monitor_handle: RuntimeMonitorHandle,
 ) {
     if let Some(stderr) = companion.stderr.take() {
         let events = monitor_plan.events.clone();
@@ -885,139 +792,7 @@ fn start_prepared_companion_monitors(
         companion.plan,
         monitor_plan.work_dir.clone(),
         monitor_plan.success_check.clone(),
-        monitor_plan.registry.clone(),
-        monitor_plan.runtimes.clone(),
-        monitor_plan.events.clone(),
         monitor_handle,
         companion.child,
     );
-}
-
-#[cfg(test)]
-pub(crate) fn start_companion_recording_process(
-    context: CompanionRecordingStartContext,
-    companion_plan: CompanionProcessPlan,
-) -> Result<(), ExecutorError> {
-    let CompanionRecordingStartContext {
-        runtime_id,
-        handle,
-        work_dir,
-        success_check,
-        registry,
-        runtimes,
-        events,
-        rollback,
-        hooks,
-    } = context;
-
-    let companion_command_line =
-        render_command_line(&companion_plan.executable, &companion_plan.args);
-    let mut companion_child = Command::new(&companion_plan.executable);
-    companion_child
-        .args(&companion_plan.args)
-        .current_dir(&companion_plan.work_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    configure_new_process_group(&mut companion_child);
-
-    match companion_child.spawn() {
-        Ok(mut companion_child) => {
-            let companion_pid =
-                companion_child
-                    .id()
-                    .map(|value| value as i32)
-                    .ok_or_else(|| {
-                        ExecutorError::ProcessSpawn(
-                            "spawned companion child has no pid".to_string(),
-                        )
-                    })?;
-            let companion_process = ProcessIdentity::spawned_process_group(companion_pid);
-            rollback.add_companion_process(companion_process);
-            hooks.after_companion_spawn(&handle, companion_pid)?;
-            let updated_handle = registry
-                .update(runtime_id, |runtime| {
-                    update_companion_recording_metadata(runtime, |companion| {
-                        companion.pid = Some(companion_pid);
-                        companion.pgid = companion_process.pgid;
-                        companion.pid_start_time = companion_process.pid_start_time;
-                        companion.command_line = Some(companion_command_line.clone());
-                        companion.state = CompanionProcessState::Running;
-                        companion.error = None;
-                    });
-                })
-                .unwrap_or_else(|| handle.clone());
-            hooks.persist_runtime_state(&work_dir, &updated_handle, &success_check)?;
-            {
-                let mut runtimes = runtimes.write().expect("runtime map lock poisoned");
-                runtimes
-                    .entry(runtime_id)
-                    .and_modify(|runtime| runtime.companion_processes.push(companion_process));
-            }
-
-            if let Some(stderr) = companion_child.stderr.take() {
-                let events = events.clone();
-                let recording_log_handle = handle.clone();
-                let registry = registry.clone();
-                tokio::spawn(async move {
-                    read_log_stream(
-                        stderr,
-                        runtime_id,
-                        recording_log_handle.task_id,
-                        recording_log_handle.attempt_no,
-                        runtime_lease_token(&recording_log_handle).unwrap_or_default(),
-                        "recording_stderr".to_string(),
-                        registry,
-                        events,
-                    )
-                    .await;
-                });
-            }
-
-            spawn_companion_process_monitor(
-                runtime_id,
-                handle.task_id,
-                handle.attempt_no,
-                companion_pid,
-                companion_plan,
-                work_dir.clone(),
-                success_check.clone(),
-                registry.clone(),
-                runtimes.clone(),
-                events.clone(),
-                None,
-                companion_child,
-            );
-        }
-        Err(error) => {
-            let message = format!("failed to start stream_ingest mp4 recording sidecar: {error}");
-            let updated_handle = registry
-                .update(runtime_id, |runtime| {
-                    update_companion_recording_metadata(runtime, |companion| {
-                        companion.pid = None;
-                        companion.state = CompanionProcessState::Failed;
-                        companion.error = Some(message.clone());
-                    });
-                })
-                .unwrap_or_else(|| handle.clone());
-            let _ = hooks.persist_runtime_state(&work_dir, &updated_handle, &success_check);
-            let _ = events.send(RuntimeNotification::TaskSnapshot(updated_handle.clone()));
-            let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-                task_id: updated_handle.task_id,
-                attempt_no: updated_handle.attempt_no,
-                lease_token: runtime_lease_token(&updated_handle).unwrap_or_default(),
-                session_epoch: runtime_session_epoch(&updated_handle),
-                event_type: "recording_degraded".to_string(),
-                event_level: "warn".to_string(),
-                message: "mp4 recording sidecar failed to start; continuing without recording"
-                    .to_string(),
-                payload: json!({
-                    "output_target": companion_plan.output_target,
-                    "reason": "recording_sidecar_start_failed",
-                    "error": error.to_string(),
-                }),
-            }));
-        }
-    }
-
-    Ok(())
 }
