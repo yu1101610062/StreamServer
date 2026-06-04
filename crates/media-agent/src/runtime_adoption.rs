@@ -32,7 +32,9 @@ use crate::{
         spawn_live_relay_monitor, spawn_rtp_receive_monitor, spawn_startup_probe_monitor,
     },
     runtime_persistence::{PersistedRuntimeState, persist_runtime_state, scan_persisted_runtimes},
-    runtime_process::{ManagedRuntime, ProcessIdentity, RuntimeSlotLimiter, is_pid_running},
+    runtime_process::{
+        ManagedRuntime, ProcessIdentity, RuntimeSlotLimiter, is_process_running_for_command_line,
+    },
     runtime_process_monitors::{
         spawn_adopted_companion_process_monitor, spawn_adopted_runtime_monitor,
     },
@@ -133,10 +135,14 @@ where
             continue;
         }
 
-        if let Some(pid) = persisted.handle.pid {
-            if !is_pid_running(pid) {
+        if let Some(process) = process_identity_from_handle(&persisted.handle) {
+            if !is_process_running_for_command_line(
+                &process,
+                persisted.handle.command_line.as_deref(),
+            ) {
                 continue;
             }
+            let pid = process.pid;
 
             let handle = mark_orphaned_handle(
                 persisted.handle.clone(),
@@ -144,15 +150,23 @@ where
                 context.zlm_server_id.as_deref(),
             );
             let companion_processes = companion_recording_from_handle(&handle)
-                .and_then(|companion| companion_process_identity_from_metadata(&companion))
-                .filter(|companion_process| is_pid_running(companion_process.pid))
+                .and_then(|companion| {
+                    companion_process_identity_from_metadata(&companion).filter(
+                        |companion_process| {
+                            is_process_running_for_command_line(
+                                companion_process,
+                                companion.command_line.as_deref(),
+                            )
+                        },
+                    )
+                })
                 .into_iter()
                 .collect::<Vec<_>>();
 
             track_adopted_runtime(
                 &context,
                 handle.clone(),
-                process_identity_from_handle(&handle),
+                Some(process),
                 companion_processes.clone(),
             );
             let _ = persist_runtime_state(&persisted.work_dir, &handle, &persisted.success_check);
@@ -197,10 +211,17 @@ where
             if let Some(companion) =
                 companion_recording_from_handle(&handle).filter(|companion| companion.pid.is_some())
             {
-                if let Some(companion_pid) = companion.pid.filter(|value| is_pid_running(*value)) {
+                if let Some(companion_process) =
+                    companion_process_identity_from_metadata(&companion).filter(|process| {
+                        is_process_running_for_command_line(
+                            process,
+                            companion.command_line.as_deref(),
+                        )
+                    })
+                {
                     spawn_adopted_companion_process_monitor(
                         handle.runtime_id,
-                        companion_pid,
+                        companion_process,
                         companion,
                         adopted_work_dir,
                         adopted_success_check,

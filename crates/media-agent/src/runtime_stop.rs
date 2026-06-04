@@ -36,9 +36,9 @@ use crate::{
     },
     runtime_plan::TaskRuntimeMode,
     runtime_process::{
-        ManagedRuntime, ProcessIdentity, is_pid_running, remove_managed_runtime, runtime_processes,
-        schedule_force_kill_if_running, schedule_force_kill_processes_if_running, signal_process,
-        signal_runtime_processes,
+        ManagedRuntime, ProcessIdentity, is_process_running_for_command_line,
+        remove_managed_runtime, runtime_processes, schedule_force_kill_if_running,
+        schedule_force_kill_processes_if_running, signal_process, signal_runtime_processes,
     },
     runtime_registry::LocalRuntimeRegistry,
 };
@@ -293,15 +293,16 @@ pub(crate) async fn stop_runtime_task(
 
 fn runtime_handle_live_processes(handle: &RuntimeHandle) -> Vec<ProcessIdentity> {
     let mut processes = Vec::new();
-    if let Some(process) =
-        process_identity_from_handle(handle).filter(|process| is_pid_running(process.pid))
-    {
+    if let Some(process) = process_identity_from_handle(handle).filter(|process| {
+        is_process_running_for_command_line(process, handle.command_line.as_deref())
+    }) {
         processes.push(process);
     }
-    if let Some(companion_process) = companion_recording_from_handle(handle)
-        .and_then(|companion| companion_process_identity_from_metadata(&companion))
-        .filter(|process| is_pid_running(process.pid))
-    {
+    if let Some(companion_process) = companion_recording_from_handle(handle).and_then(|companion| {
+        companion_process_identity_from_metadata(&companion).filter(|process| {
+            is_process_running_for_command_line(process, companion.command_line.as_deref())
+        })
+    }) {
         processes.push(companion_process);
     }
     processes

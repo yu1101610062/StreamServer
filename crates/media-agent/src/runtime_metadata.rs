@@ -17,7 +17,7 @@ use crate::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
     runtime_outputs::ManagedFileOutputKind,
-    runtime_process::{ProcessIdentity, linux_pid_start_time},
+    runtime_process::ProcessIdentity,
     runtime_recording::{LiveRelayRecording, should_start_live_relay_recording},
 };
 
@@ -175,7 +175,7 @@ pub(crate) fn process_identity_from_handle(handle: &RuntimeHandle) -> Option<Pro
         .get("process")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
-        .or_else(|| handle.pid.map(ProcessIdentity::pid_only))
+        .or_else(|| handle.pid.map(ProcessIdentity::legacy_pid))
 }
 
 pub(crate) fn live_relay_recording_from_handle(
@@ -502,9 +502,7 @@ pub(crate) fn companion_process_identity_from_metadata(
     Some(ProcessIdentity {
         pid,
         pgid: companion.pgid,
-        pid_start_time: companion
-            .pid_start_time
-            .or_else(|| linux_pid_start_time(pid)),
+        pid_start_time: companion.pid_start_time,
     })
 }
 
@@ -520,6 +518,34 @@ pub(crate) fn update_companion_recording_metadata(
     };
     update(&mut companion);
     runtime.metadata["companion_recording"] = json!(companion);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use media_domain::{RuntimeState, WorkerKind};
+    use uuid::Uuid;
+
+    #[test]
+    fn legacy_pid_fallback_keeps_start_time_unknown() {
+        let handle = RuntimeHandle {
+            runtime_id: Uuid::now_v7(),
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            worker_kind: WorkerKind::Ffmpeg,
+            pid: Some(std::process::id() as i32),
+            started_at: Utc::now(),
+            last_progress_at: None,
+            state: RuntimeState::Running,
+            command_line: Some("ffmpeg -hide_banner".to_string()),
+            outputs: Vec::new(),
+            metadata: json!({}),
+        };
+
+        let process = process_identity_from_handle(&handle).expect("legacy pid should map");
+        assert_eq!(process.pid, std::process::id() as i32);
+        assert_eq!(process.pid_start_time, None);
+    }
 }
 
 pub(crate) fn resolved_spec_from_handle(handle: &RuntimeHandle) -> Option<TaskSpec> {

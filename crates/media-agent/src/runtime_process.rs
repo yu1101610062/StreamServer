@@ -2,7 +2,8 @@
 
 use std::{
     collections::HashMap,
-    fs, io,
+    io,
+    path::Path,
     sync::{
         Arc, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
@@ -120,6 +121,14 @@ impl Drop for RuntimeSlotPermit {
 }
 
 impl ProcessIdentity {
+    pub(crate) fn legacy_pid(pid: i32) -> Self {
+        Self {
+            pid,
+            pgid: None,
+            pid_start_time: None,
+        }
+    }
+
     pub(crate) fn pid_only(pid: i32) -> Self {
         Self {
             pid,
@@ -160,7 +169,15 @@ pub(crate) fn is_pid_running(pid: i32) -> bool {
 }
 
 pub(crate) fn is_process_running(process: &ProcessIdentity) -> bool {
-    is_pid_running(process.pid)
+    if !is_pid_running(process.pid) {
+        return false;
+    }
+    if let Some(expected_start_time) = process.pid_start_time {
+        return linux_pid_start_time(process.pid)
+            .map(|current_start_time| current_start_time == expected_start_time)
+            .unwrap_or_else(|| process.pgid.is_some_and(process_group_running));
+    }
+    true
 }
 
 pub(crate) fn process_group_id(pid: i32) -> Option<i32> {
@@ -183,7 +200,7 @@ pub(crate) fn configure_new_process_group(command: &mut tokio::process::Command)
 
 #[cfg(target_os = "linux")]
 pub(crate) fn linux_pid_start_time(pid: i32) -> Option<u64> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parse_linux_proc_stat_start_time(&stat)
 }
 
@@ -202,6 +219,71 @@ pub(crate) fn parse_linux_proc_stat_start_time(stat: &str) -> Option<u64> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn parse_linux_proc_stat_start_time(_stat: &str) -> Option<u64> {
     None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_proc_cmdline(pid: i32) -> Option<Vec<String>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args = bytes
+        .split(|byte| *byte == b'\0')
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect::<Vec<_>>();
+    (!args.is_empty()).then_some(args)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_proc_cmdline(_pid: i32) -> Option<Vec<String>> {
+    None
+}
+
+pub(crate) fn is_process_running_for_command_line(
+    process: &ProcessIdentity,
+    command_line: Option<&str>,
+) -> bool {
+    if !is_process_running(process) {
+        return false;
+    }
+    if process.pid_start_time.is_some() {
+        return true;
+    }
+    command_line
+        .map(|command_line| process_command_line_matches(process.pid, command_line))
+        .unwrap_or(false)
+}
+
+fn process_command_line_matches(pid: i32, expected_command_line: &str) -> bool {
+    linux_proc_cmdline(pid)
+        .map(|actual_args| command_line_matches_args(&actual_args, expected_command_line))
+        .unwrap_or(false)
+}
+
+fn command_line_matches_args(actual_args: &[String], expected_command_line: &str) -> bool {
+    let expected_args = expected_command_line.split_whitespace().collect::<Vec<_>>();
+    let Some((expected_executable, expected_tail)) = expected_args.split_first() else {
+        return false;
+    };
+    let expected_executable_name = file_name(expected_executable);
+
+    actual_args
+        .iter()
+        .enumerate()
+        .filter(|(_, actual)| file_name(actual) == expected_executable_name)
+        .any(|(index, _)| {
+            let actual_tail = &actual_args[index + 1..];
+            actual_tail.len() >= expected_tail.len()
+                && actual_tail
+                    .iter()
+                    .zip(expected_tail.iter())
+                    .all(|(actual, expected)| actual == expected)
+        })
+}
+
+fn file_name(value: &str) -> &str {
+    Path::new(value)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(value)
 }
 
 pub(crate) fn runtime_processes(runtime: &ManagedRuntime) -> Vec<ProcessIdentity> {
@@ -315,7 +397,7 @@ fn process_should_receive_force_kill(
     process
         .pgid
         .map(process_group_running)
-        .unwrap_or_else(|| is_pid_running(process.pid))
+        .unwrap_or_else(|| is_process_running(process))
 }
 
 fn process_group_running(pgid: i32) -> bool {
@@ -348,5 +430,44 @@ pub(crate) fn signal_pid(pid: i32, signal: i32) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_line_match_accepts_ld_linux_argv0_wrapper() {
+        let actual_args = vec![
+            "/home/streamserver/runtime/ffmpeg/cpu/lib/ld-linux-x86-64.so.2".to_string(),
+            "--library-path".to_string(),
+            "/home/streamserver/runtime/ffmpeg/cpu/lib".to_string(),
+            "--argv0".to_string(),
+            "/home/streamserver/bin/ffmpeg".to_string(),
+            "/home/streamserver/runtime/ffmpeg/cpu/bin/ffmpeg".to_string(),
+            "-hide_banner".to_string(),
+            "-nostdin".to_string(),
+            "-i".to_string(),
+            "udp://231.40.1.101:5001?localaddr=192.168.17.110".to_string(),
+            "-f".to_string(),
+            "flv".to_string(),
+            "rtmp://172.17.13.196:1935/preview/test".to_string(),
+        ];
+
+        assert!(command_line_matches_args(
+            &actual_args,
+            "ffmpeg -hide_banner -nostdin -i udp://231.40.1.101:5001?localaddr=192.168.17.110 -f flv rtmp://172.17.13.196:1935/preview/test"
+        ));
+    }
+
+    #[test]
+    fn command_line_match_rejects_unrelated_process() {
+        let actual_args = vec!["kworker/21:0H-kblockd".to_string(), "ignored".to_string()];
+
+        assert!(!command_line_matches_args(
+            &actual_args,
+            "ffmpeg -hide_banner -nostdin -i udp://231.40.1.101:5001"
+        ));
     }
 }

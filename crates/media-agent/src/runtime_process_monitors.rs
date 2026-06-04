@@ -29,7 +29,10 @@ use crate::{
     },
     runtime_persistence::persist_runtime_state,
     runtime_plan::CompanionProcessPlan,
-    runtime_process::{ManagedRuntime, ProcessIdentity, is_pid_running, remove_managed_runtime},
+    runtime_process::{
+        ManagedRuntime, ProcessIdentity, is_process_running, is_process_running_for_command_line,
+        remove_managed_runtime,
+    },
     runtime_recovery::classify_adopted_exit,
     runtime_registry::LocalRuntimeRegistry,
 };
@@ -40,7 +43,7 @@ pub(crate) async fn wait_for_companion_pids_exit(
 ) {
     let started_at = Instant::now();
     loop {
-        if processes.iter().all(|process| !is_pid_running(process.pid)) {
+        if processes.iter().all(|process| !is_process_running(process)) {
             return;
         }
         if started_at.elapsed() >= timeout_after_signal {
@@ -141,7 +144,7 @@ pub(crate) fn spawn_companion_process_monitor(
 
 pub(crate) fn spawn_adopted_companion_process_monitor(
     runtime_id: Uuid,
-    companion_pid: i32,
+    companion_process: ProcessIdentity,
     companion_plan: CompanionProcessMetadata,
     work_dir: PathBuf,
     success_check: SuccessCheck,
@@ -158,12 +161,15 @@ pub(crate) fn spawn_adopted_companion_process_monitor(
                 let Some(runtime) = runtimes_guard.get_mut(&runtime_id) else {
                     return;
                 };
-                if is_pid_running(companion_pid) {
+                if is_process_running_for_command_line(
+                    &companion_process,
+                    companion_plan.command_line.as_deref(),
+                ) {
                     continue;
                 }
                 runtime
                     .companion_processes
-                    .retain(|process| process.pid != companion_pid);
+                    .retain(|process| process.pid != companion_process.pid);
                 (
                     runtime.stop_requested.load(Ordering::Relaxed),
                     runtime.suppress_companion_events.load(Ordering::Relaxed),
@@ -254,7 +260,9 @@ pub(crate) fn spawn_adopted_runtime_monitor(
             };
             let pid = process.pid;
             let stop_requested = runtime.stop_requested.load(Ordering::Relaxed);
-            if is_pid_running(pid) {
+            let current_handle = registry.get(runtime_id).unwrap_or_else(|| handle.clone());
+            if is_process_running_for_command_line(&process, current_handle.command_line.as_deref())
+            {
                 if stop_requested {
                     let waited_since =
                         stop_requested_wait_started_at.get_or_insert_with(Instant::now);
@@ -262,8 +270,6 @@ pub(crate) fn spawn_adopted_runtime_monitor(
                         logged_at.elapsed() >= STOP_REQUESTED_STILL_RUNNING_LOG_INTERVAL
                     });
                     if should_log {
-                        let current_handle =
-                            registry.get(runtime_id).unwrap_or_else(|| handle.clone());
                         warn!(
                             task_id = %current_handle.task_id,
                             attempt_no = current_handle.attempt_no,
