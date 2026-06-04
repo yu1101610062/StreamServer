@@ -224,7 +224,7 @@ release/native 验证建议额外执行：
 
 ### 开发说明
 
-本项目是一个 AI-assisted engineering 项目。项目 owner 负责需求拆解、架构设计、代码审查、测试验收、部署验证和持续重构。详细说明见 [AI-assisted Engineering Notes](docs/zh/12-ai-assisted-development.md)。
+StreamServer 使用 AI 辅助开发流程。项目维护者负责需求、架构、代码审查、测试、部署验证和持续重构。详细说明见 [AI 辅助开发说明](docs/zh/12-ai-assisted-development.md)。
 
 ### 开源许可证与第三方项目
 
@@ -377,7 +377,7 @@ The core control loop, Agent runtime, gRPC control plane, PostgreSQL persistence
 
 ### Development Note
 
-This is an AI-assisted engineering project. The project owner is responsible for requirements, architecture, code review, testing, deployment validation, and iterative refactoring.
+StreamServer is developed with AI-assisted engineering workflows. Project maintainers remain responsible for requirements, architecture, code review, testing, deployment validation, and iterative refactoring.
 
 ### License and Third-party Notices
 

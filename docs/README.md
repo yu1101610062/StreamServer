@@ -36,7 +36,7 @@ StreamServer 文档分为三层：
 | --- | --- |
 | [运维、安全与风险](./zh/10-operations-and-security.md) | 风险清单、上线复核和安全运维关注点 |
 | [研发流程](./zh/11-development-workflow.md) | 模块边界、协作规范和变更规则 |
-| [AI-assisted Engineering Notes](./zh/12-ai-assisted-development.md) | AI 辅助工程的 ownership、review 和验证边界 |
+| [AI 辅助开发说明](./zh/12-ai-assisted-development.md) | 对外说明项目使用 AI 工具辅助开发 |
 | [路线图](./zh/13-roadmap.md) | 当前里程碑、已完成项和后续增强方向 |
 | [产品边界与术语](./zh/14-product-scope-and-terminology.md) | 目标、非目标、角色和术语 |
 | [Web 管理台规格](./zh/15-frontend-console.md) | 页面、字段、状态和前端交互 |
