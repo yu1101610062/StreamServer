@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     io,
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -33,7 +33,9 @@ use crate::{
     runtime_events::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
-    runtime_manager::{ProcessExitedEvent, RuntimeMonitorCommit, RuntimeMonitorHandle},
+    runtime_manager::{
+        ProcessExitedEvent, RuntimeBackendStore, RuntimeMonitorCommit, RuntimeMonitorHandle,
+    },
     runtime_metadata::{
         attach_zlm_server_id, completion_reason_from_handle, continuous_stream_ingest_from_handle,
         fatal_recording_error_from_handle, mark_source_reconnecting, requires_stream_online,
@@ -46,7 +48,7 @@ use crate::{
     },
     runtime_persistence::persist_runtime_state,
     runtime_plan::TaskRuntimeMode,
-    runtime_process::{ManagedRuntime, RuntimeSlotLimiter, RuntimeSlotPermit},
+    runtime_process::{ManagedRuntime, RuntimeSlotPermit},
     runtime_process_monitors::{
         spawn_adopted_companion_process_monitor, spawn_adopted_runtime_monitor,
     },
@@ -58,7 +60,7 @@ use crate::{
         ProcessRecoveryContext, cleanup_managed_stream_before_restart_notifications,
         should_auto_restart_process,
     },
-    runtime_registry::{AdoptFilter, LocalRuntimeRegistry},
+    runtime_registry::AdoptFilter,
     runtime_start::{RuntimeStartContext, RuntimeStartDecision, prepare_start_task},
     runtime_stop::{
         RuntimeStopOutcome, RuntimeStopPreparation, RuntimeStopWorkerRequest,
@@ -77,7 +79,6 @@ use crate::{
 };
 
 pub(crate) enum RuntimeStartWorkerResult {
-    Committed(RuntimeHandle),
     PendingCommit(RuntimeStartOutcome),
 }
 
@@ -95,18 +96,16 @@ pub(crate) enum RuntimeStartOutcome {
     Zlm(RuntimeZlmStartOutcome),
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct RuntimeBackendSnapshot {
-    pub(crate) stop_requested: bool,
-    pub(crate) suppress_companion_events: bool,
-    pub(crate) companion_processes: Vec<crate::runtime_process::ProcessIdentity>,
-}
-
 impl RuntimeStartWorkerResult {
     pub(crate) fn runtime_id(&self) -> Option<Uuid> {
         match self {
-            Self::Committed(handle) => Some(handle.runtime_id),
             Self::PendingCommit(outcome) => Some(outcome.runtime_id()),
+        }
+    }
+
+    pub(crate) fn backend(&self) -> Option<ManagedRuntime> {
+        match self {
+            Self::PendingCommit(outcome) => Some(outcome.backend()),
         }
     }
 
@@ -115,15 +114,13 @@ impl RuntimeStartWorkerResult {
         monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeHandle, ExecutorError> {
         match self {
-            Self::Committed(handle) => Ok(handle),
             Self::PendingCommit(outcome) => outcome.commit(monitor_handle).await,
         }
     }
 
     pub(crate) fn carry_reconnect_metadata_from(&mut self, exited_handle: &RuntimeHandle) {
-        if let Self::PendingCommit(outcome) = self {
-            outcome.carry_reconnect_metadata_from(exited_handle);
-        }
+        let Self::PendingCommit(outcome) = self;
+        outcome.carry_reconnect_metadata_from(exited_handle);
     }
 }
 
@@ -132,6 +129,13 @@ impl RuntimeStartOutcome {
         match self {
             Self::ManagedProcess(outcome) => outcome.runtime_id(),
             Self::Zlm(outcome) => outcome.runtime_id(),
+        }
+    }
+
+    fn backend(&self) -> ManagedRuntime {
+        match self {
+            Self::ManagedProcess(outcome) => outcome.backend(),
+            Self::Zlm(outcome) => outcome.backend(),
         }
     }
 
@@ -155,10 +159,8 @@ impl RuntimeStartOutcome {
 #[derive(Clone)]
 pub(crate) struct ManagedProcessExecutor {
     pub(crate) settings: AgentSettings,
-    pub(crate) registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
-    pub(crate) runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    pub(crate) slot_limiter: Arc<RuntimeSlotLimiter>,
+    backend_store: RuntimeBackendStore,
     stop_intents: Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
     http_client: Client,
     zlm_server_id: Arc<RwLock<Option<String>>>,
@@ -168,18 +170,12 @@ pub(crate) struct ManagedProcessExecutor {
 }
 
 impl ManagedProcessExecutor {
-    pub(crate) fn new(
-        settings: AgentSettings,
-        registry: LocalRuntimeRegistry,
-        events: RuntimeEventSink,
-    ) -> Self {
-        let max_runtime_slots = settings.max_runtime_slots;
+    pub(crate) fn new(settings: AgentSettings, events: RuntimeEventSink) -> Self {
+        let backend_store = RuntimeBackendStore::new(&settings);
         Self {
             settings,
-            registry,
             events,
-            runtimes: Arc::new(RwLock::new(HashMap::new())),
-            slot_limiter: Arc::new(RuntimeSlotLimiter::new(max_runtime_slots)),
+            backend_store,
             stop_intents: Arc::new(RwLock::new(HashMap::new())),
             http_client: Client::builder()
                 .timeout(Duration::from_secs(3))
@@ -193,7 +189,32 @@ impl ManagedProcessExecutor {
     }
 
     pub(crate) fn new_for_manager(settings: AgentSettings, events: RuntimeEventSink) -> Self {
-        Self::new(settings, LocalRuntimeRegistry::new(), events)
+        Self::new(settings, events)
+    }
+
+    pub(crate) fn backend_store(&self) -> RuntimeBackendStore {
+        self.backend_store.clone()
+    }
+
+    pub(crate) fn prepare_start_mode_for_manager(
+        &self,
+        request: &StartTaskRequest,
+    ) -> Result<TaskRuntimeMode, ExecutorError> {
+        match prepare_start_task(
+            RuntimeStartContext {
+                _settings: &self.settings,
+                stop_intents: &self.stop_intents,
+            },
+            request,
+        )? {
+            RuntimeStartDecision::Start { mode } => Ok(mode),
+        }
+    }
+
+    pub(crate) fn acquire_runtime_slot_for_manager(
+        &self,
+    ) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
+        self.backend_store.try_acquire_slot()
     }
 
     fn current_zlm_server_id(&self) -> Option<String> {
@@ -248,8 +269,6 @@ impl ManagedProcessExecutor {
         RuntimeZlmStartContext {
             settings: &self.settings,
             http_client: &self.http_client,
-            registry: &self.registry,
-            runtimes: &self.runtimes,
             events: &self.events,
             zlm_server_id: self.current_zlm_server_id(),
             hooks: self.zlm_start_hooks.clone(),
@@ -263,48 +282,7 @@ impl ManagedProcessExecutor {
         }
     }
 
-    pub(crate) fn monitor_snapshot(&self, runtime_id: Uuid) -> Option<RuntimeBackendSnapshot> {
-        let runtime = {
-            let runtimes = self.runtimes.read().expect("runtime map lock poisoned");
-            runtimes.get(&runtime_id).cloned()
-        }?;
-        Some(RuntimeBackendSnapshot {
-            stop_requested: runtime
-                .stop_requested
-                .load(std::sync::atomic::Ordering::Relaxed),
-            suppress_companion_events: runtime
-                .suppress_companion_events
-                .load(std::sync::atomic::Ordering::Relaxed),
-            companion_processes: runtime.companion_processes,
-        })
-    }
-
     pub(crate) fn apply_monitor_commit(&self, commit: RuntimeMonitorCommit) {
-        if commit.mark_stop_requested.is_some()
-            || commit.suppress_companion_events.is_some()
-            || commit.remove_companion_pid.is_some()
-        {
-            let mut runtimes = self.runtimes.write().expect("runtime map lock poisoned");
-            if let Some(runtime) = runtimes.get_mut(&commit.runtime_id) {
-                if let Some(stop_requested) = commit.mark_stop_requested {
-                    runtime
-                        .stop_requested
-                        .store(stop_requested, std::sync::atomic::Ordering::Relaxed);
-                }
-                if let Some(suppress_companion_events) = commit.suppress_companion_events {
-                    runtime.suppress_companion_events.store(
-                        suppress_companion_events,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
-                if let Some(companion_pid) = commit.remove_companion_pid {
-                    runtime
-                        .companion_processes
-                        .retain(|process| process.pid != companion_pid);
-                }
-            }
-        }
-
         if let Some(persist) = &commit.persist {
             if let Err(error) =
                 persist_runtime_state(&persist.work_dir, &commit.handle, &persist.success_check)
@@ -319,23 +297,20 @@ impl ManagedProcessExecutor {
         for notification in commit.notifications {
             let _ = self.events.send(notification);
         }
-        if commit.remove_backend {
-            let _ =
-                crate::runtime_process::remove_managed_runtime(&self.runtimes, commit.runtime_id);
-        }
     }
 
     pub(crate) fn prepare_stop_for_manager(
         &self,
         request: &StopTaskRequest,
         handle: &RuntimeHandle,
+        runtime: Option<ManagedRuntime>,
         generation: crate::runtime_manager::RuntimeGeneration,
         monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeStopPreparation, ExecutorError> {
         prepare_runtime_stop_for_manager(
             &self.settings,
-            &self.runtimes,
             &self.stop_intents,
+            runtime,
             request,
             handle,
             generation,
@@ -379,6 +354,7 @@ impl ManagedProcessExecutor {
         &self,
         event: ProcessExitedEvent,
         current_handle: RuntimeHandle,
+        restart_slot_permit: Option<Arc<RuntimeSlotPermit>>,
     ) -> RuntimeProcessExitOutcome {
         let mut exited_handle = current_handle;
         exited_handle.state = RuntimeState::Exited;
@@ -469,20 +445,22 @@ impl ManagedProcessExecutor {
                 .await,
             );
 
-            if let Ok(restart) = self
-                .restart_process_task_after_failure_for_manager(&exited_handle)
-                .await
-            {
-                let exit_commit =
-                    RuntimeMonitorCommit::new(exited_handle.clone(), event.generation)
-                        .with_persist(event.work_dir, event.success_check)
-                        .with_notifications(recovery_notifications)
-                        .terminal();
-                return RuntimeProcessExitOutcome::Restarted {
-                    exit_commit,
-                    restart,
-                    emit_starting_event: !sticky_reconnect,
-                };
+            if let Some(slot_permit) = restart_slot_permit {
+                if let Ok(restart) = self
+                    .restart_process_task_after_failure_for_manager(&exited_handle, slot_permit)
+                    .await
+                {
+                    let exit_commit =
+                        RuntimeMonitorCommit::new(exited_handle.clone(), event.generation)
+                            .with_persist(event.work_dir, event.success_check)
+                            .with_notifications(recovery_notifications)
+                            .terminal();
+                    return RuntimeProcessExitOutcome::Restarted {
+                        exit_commit,
+                        restart,
+                        emit_starting_event: !sticky_reconnect,
+                    };
+                }
             }
             pre_terminal_notifications = recovery_notifications;
         }
@@ -713,36 +691,24 @@ impl ManagedProcessExecutor {
     pub(crate) async fn start_task_for_manager(
         &self,
         request: StartTaskRequest,
+        mode: TaskRuntimeMode,
+        slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeStartWorkerResult, ExecutorError> {
-        match prepare_start_task(
-            RuntimeStartContext {
-                settings: &self.settings,
-                registry: &self.registry,
-                runtimes: &self.runtimes,
-                stop_intents: &self.stop_intents,
-                slot_limiter: &self.slot_limiter,
-            },
-            &request,
-        )? {
-            RuntimeStartDecision::Existing(handle) => {
-                Ok(RuntimeStartWorkerResult::Committed(handle))
-            }
-            RuntimeStartDecision::Start { mode, slot_permit } => match mode {
-                TaskRuntimeMode::ZlmProxy => self
-                    .start_live_relay_task(&request, slot_permit)
-                    .await
-                    .map(RuntimeStartOutcome::Zlm)
-                    .map(RuntimeStartWorkerResult::PendingCommit),
-                TaskRuntimeMode::ZlmRtpServer => self
-                    .start_rtp_receive_task(&request, slot_permit)
-                    .await
-                    .map(RuntimeStartOutcome::Zlm)
-                    .map(RuntimeStartWorkerResult::PendingCommit),
-                TaskRuntimeMode::ManagedProcess => self
-                    .prepare_process_task_for_manager(&request, slot_permit)
-                    .map(RuntimeStartOutcome::ManagedProcess)
-                    .map(RuntimeStartWorkerResult::PendingCommit),
-            },
+        match mode {
+            TaskRuntimeMode::ZlmProxy => self
+                .start_live_relay_task(&request, slot_permit)
+                .await
+                .map(RuntimeStartOutcome::Zlm)
+                .map(RuntimeStartWorkerResult::PendingCommit),
+            TaskRuntimeMode::ZlmRtpServer => self
+                .start_rtp_receive_task(&request, slot_permit)
+                .await
+                .map(RuntimeStartOutcome::Zlm)
+                .map(RuntimeStartWorkerResult::PendingCommit),
+            TaskRuntimeMode::ManagedProcess => self
+                .prepare_process_task_for_manager(&request, slot_permit)
+                .map(RuntimeStartOutcome::ManagedProcess)
+                .map(RuntimeStartWorkerResult::PendingCommit),
         }
     }
 
@@ -761,7 +727,13 @@ impl ManagedProcessExecutor {
                 zlm_server_id: self.current_zlm_server_id(),
                 settings: self.settings.clone(),
             },
-            |request| async move { self.start_task_for_manager(request).await.ok() },
+            |request| async move {
+                let mode = self.prepare_start_mode_for_manager(&request).ok()?;
+                let slot_permit = self.acquire_runtime_slot_for_manager().ok()?;
+                self.start_task_for_manager(request, mode, slot_permit)
+                    .await
+                    .ok()
+            },
             move |startup_probe| {
                 let client = stream_probe_client.clone();
                 let settings = stream_probe_settings.clone();
@@ -819,20 +791,6 @@ impl ManagedProcessExecutor {
         let handle = commit.handle.clone();
         let runtime_id = handle.runtime_id;
         let process = commit.backend.process;
-        let companion_processes = commit.backend.companion_processes.clone();
-        {
-            let mut runtimes = self.runtimes.write().expect("runtime map lock poisoned");
-            runtimes.insert(
-                runtime_id,
-                ManagedRuntime {
-                    process,
-                    companion_processes,
-                    _slot_permit: self.slot_limiter.attach_existing(),
-                    stop_requested: Arc::new(AtomicBool::new(false)),
-                    suppress_companion_events: Arc::new(AtomicBool::new(false)),
-                },
-            );
-        }
         if let Err(error) = persist_runtime_state(&commit.work_dir, &handle, &commit.success_check)
         {
             warn!(
@@ -912,8 +870,6 @@ impl ManagedProcessExecutor {
             ManagedProcessStartContext {
                 settings: &self.settings,
                 http_client: &self.http_client,
-                registry: &self.registry,
-                runtimes: &self.runtimes,
                 events: &self.events,
                 zlm_server_id: self.current_zlm_server_id(),
                 capability_hints: RuntimeCapabilityHints {
@@ -929,6 +885,7 @@ impl ManagedProcessExecutor {
     pub(crate) async fn restart_process_task_after_failure_for_manager(
         &self,
         exited_handle: &RuntimeHandle,
+        slot_permit: Arc<RuntimeSlotPermit>,
     ) -> Result<RuntimeStartWorkerResult, ExecutorError> {
         crate::runtime_zlm::wait_for_zlm_api_ready(
             &self.http_client,
@@ -938,7 +895,6 @@ impl ManagedProcessExecutor {
         .await;
 
         let request = crate::runtime_metadata::restart_request_from_handle(exited_handle)?;
-        let slot_permit = self.slot_limiter.try_acquire()?;
         self.prepare_process_task_for_manager(&request, slot_permit)
             .map(RuntimeStartOutcome::ManagedProcess)
             .map(RuntimeStartWorkerResult::PendingCommit)

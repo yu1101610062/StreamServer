@@ -115,8 +115,7 @@ impl RuntimeManagerState {
         self.by_runtime_id.get(runtime_id)
     }
 
-    #[cfg(test)]
-    pub fn active_handles(&self) -> Vec<RuntimeHandle> {
+    pub(crate) fn active_handles(&self) -> Vec<RuntimeHandle> {
         self.by_runtime_id
             .values()
             .map(|entry| entry.handle.clone())

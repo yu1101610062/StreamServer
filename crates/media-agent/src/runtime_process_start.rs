@@ -4,11 +4,10 @@
 //! 登记、stdout/stderr 事件读取、startup probe、退出监控和伴随录制 sidecar 启动。
 
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -40,11 +39,10 @@ use crate::{
     runtime_plan::{CompanionProcessPlan, build_process_plan, prepare_plan_paths},
     runtime_process::{
         ManagedRuntime, ProcessIdentity, RuntimeSlotPermit, configure_new_process_group,
-        remove_managed_runtime, schedule_force_kill_processes_if_running, signal_process,
+        schedule_force_kill_processes_if_running, signal_process,
     },
     runtime_process_exit::{ProcessExitMonitorContext, spawn_process_exit_monitor},
     runtime_process_monitors::spawn_companion_process_monitor,
-    runtime_registry::LocalRuntimeRegistry,
 };
 
 const START_ROLLBACK_FORCE_KILL_DELAY: Duration = Duration::from_millis(250);
@@ -96,27 +94,15 @@ impl ManagedProcessStartHooks {
 }
 
 pub(crate) struct RuntimeStartRollback {
-    runtime_id: Uuid,
     work_dir: PathBuf,
-    registry: LocalRuntimeRegistry,
-    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     processes: Vec<ProcessIdentity>,
     armed: bool,
 }
 
 impl RuntimeStartRollback {
-    pub(crate) fn new(
-        runtime_id: Uuid,
-        work_dir: PathBuf,
-        process: ProcessIdentity,
-        registry: LocalRuntimeRegistry,
-        runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    ) -> Self {
+    pub(crate) fn new(work_dir: PathBuf, process: ProcessIdentity) -> Self {
         Self {
-            runtime_id,
             work_dir,
-            registry,
-            runtimes,
             processes: vec![process],
             armed: true,
         }
@@ -142,24 +128,7 @@ impl RuntimeStartRollback {
         }
         self.armed = false;
 
-        let mut processes = self.processes.clone();
-        if let Some(runtime) = remove_managed_runtime(&self.runtimes, self.runtime_id) {
-            if let Some(process) = runtime
-                .process
-                .filter(|process| !processes.iter().any(|known| known.pid == process.pid))
-            {
-                processes.push(process);
-            }
-            for companion_process in runtime.companion_processes {
-                if !processes
-                    .iter()
-                    .any(|known| known.pid == companion_process.pid)
-                {
-                    processes.push(companion_process);
-                }
-            }
-        }
-        let _ = self.registry.remove(self.runtime_id);
+        let processes = self.processes.clone();
         self.cleanup_persisted_runtime_files();
 
         for process in &processes {
@@ -188,8 +157,6 @@ impl Drop for RuntimeStartRollback {
 pub(crate) struct ManagedProcessStartContext<'a> {
     pub(crate) settings: &'a AgentSettings,
     pub(crate) http_client: &'a Client,
-    pub(crate) registry: &'a LocalRuntimeRegistry,
-    pub(crate) runtimes: &'a Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     pub(crate) events: &'a RuntimeEventSink,
     pub(crate) zlm_server_id: Option<String>,
     pub(crate) capability_hints: RuntimeCapabilityHints,
@@ -216,8 +183,6 @@ struct ManagedProcessMonitorPlan {
     startup_probe: Option<crate::runtime_types::StartupProbe>,
     settings: AgentSettings,
     http_client: Client,
-    registry: LocalRuntimeRegistry,
-    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     events: RuntimeEventSink,
     child: Option<Child>,
     stdout: Option<ChildStdout>,
@@ -248,6 +213,10 @@ fn spawn_detached_companion_waits(companions: Vec<PreparedCompanionProcess>) {
 impl RuntimeStartOutcome {
     pub(crate) fn runtime_id(&self) -> Uuid {
         self.handle.runtime_id
+    }
+
+    pub(crate) fn backend(&self) -> ManagedRuntime {
+        self.backend.runtime.clone()
     }
 
     pub(crate) fn carry_reconnect_metadata_from(&mut self, exited_handle: &RuntimeHandle) {
@@ -292,14 +261,6 @@ impl RuntimeStartOutcome {
         let handle = self.handle.clone();
         let mut committed_handle = handle.clone();
         let runtime_id = handle.runtime_id;
-        {
-            let mut runtimes = self
-                .monitor_plan
-                .runtimes
-                .write()
-                .expect("runtime map lock poisoned");
-            runtimes.insert(runtime_id, self.backend.runtime.clone());
-        }
         if let Err(error) = self.hooks.after_runtime_insert(&handle) {
             self.rollback_and_detach_children();
             return Err(error);
@@ -348,7 +309,6 @@ impl RuntimeStartOutcome {
                 runtime_id,
                 handle: handle.clone(),
                 require_stream_online: self.monitor_plan.require_stream_online,
-                registry: self.monitor_plan.registry.clone(),
                 events: self.monitor_plan.events.clone(),
                 monitor_handle: monitor_handle.clone(),
             },
@@ -417,8 +377,6 @@ pub(crate) fn prepare_process_start_task(
     let ManagedProcessStartContext {
         settings,
         http_client,
-        registry,
-        runtimes,
         events,
         zlm_server_id,
         capability_hints,
@@ -448,13 +406,7 @@ pub(crate) fn prepare_process_start_task(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let runtime_id = Uuid::now_v7();
-    let mut rollback = RuntimeStartRollback::new(
-        runtime_id,
-        plan.work_dir.clone(),
-        process,
-        registry.clone(),
-        runtimes.clone(),
-    );
+    let mut rollback = RuntimeStartRollback::new(plan.work_dir.clone(), process);
     let stop_requested = Arc::new(AtomicBool::new(false));
     let require_stream_online = plan.startup_probe.is_some();
     let companion_recording_metadata = plan
@@ -565,8 +517,6 @@ pub(crate) fn prepare_process_start_task(
             startup_probe: plan.startup_probe.clone(),
             settings: settings.clone(),
             http_client: http_client.clone(),
-            registry: registry.clone(),
-            runtimes: runtimes.clone(),
             events: events.clone(),
             child: Some(child),
             stdout,
@@ -582,7 +532,6 @@ pub(crate) struct ProcessStreamReaderContext {
     pub(crate) runtime_id: Uuid,
     pub(crate) handle: RuntimeHandle,
     pub(crate) require_stream_online: bool,
-    pub(crate) registry: LocalRuntimeRegistry,
     pub(crate) events: RuntimeEventSink,
     pub(crate) monitor_handle: RuntimeMonitorHandle,
 }
@@ -610,7 +559,6 @@ pub(crate) fn spawn_process_stream_readers(
         runtime_id,
         handle,
         require_stream_online,
-        registry,
         events,
         monitor_handle,
     } = context;
@@ -636,12 +584,11 @@ pub(crate) fn spawn_process_stream_readers(
         tokio::spawn(async move {
             read_log_stream(
                 stderr,
-                runtime_id,
                 log_handle.task_id,
                 log_handle.attempt_no,
                 runtime_lease_token(&log_handle).unwrap_or_default(),
+                runtime_session_epoch(&log_handle),
                 "stderr".to_string(),
-                registry,
                 events,
             )
             .await;
@@ -768,16 +715,14 @@ fn start_prepared_companion_monitors(
     if let Some(stderr) = companion.stderr.take() {
         let events = monitor_plan.events.clone();
         let recording_log_handle = handle.clone();
-        let registry = monitor_plan.registry.clone();
         tokio::spawn(async move {
             read_log_stream(
                 stderr,
-                runtime_id,
                 recording_log_handle.task_id,
                 recording_log_handle.attempt_no,
                 runtime_lease_token(&recording_log_handle).unwrap_or_default(),
+                runtime_session_epoch(&recording_log_handle),
                 "recording_stderr".to_string(),
-                registry,
                 events,
             )
             .await;

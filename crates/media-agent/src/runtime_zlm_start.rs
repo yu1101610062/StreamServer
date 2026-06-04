@@ -4,10 +4,9 @@
 //! metadata、写入持久化状态、占用 runtime slot，以及启动后续在线/存活监控。
 
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use chrono::Utc;
@@ -36,8 +35,7 @@ use crate::{
         build_live_relay_api_params, build_live_relay_plan, build_open_rtp_server_params,
         build_rtp_receive_plan, parse_task_spec, prepare_work_dir,
     },
-    runtime_process::{ManagedRuntime, RuntimeSlotPermit, remove_managed_runtime},
-    runtime_registry::LocalRuntimeRegistry,
+    runtime_process::{ManagedRuntime, RuntimeSlotPermit},
     runtime_zlm::{
         build_close_stream_params, call_zlm_api, close_zlm_rtp_server, extract_zlm_local_port,
         extract_zlm_proxy_key,
@@ -91,8 +89,6 @@ enum ZlmStartResource {
 struct ZlmStartRollback {
     runtime_id: Uuid,
     work_dir: PathBuf,
-    registry: LocalRuntimeRegistry,
-    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     resource: ZlmStartResource,
     armed: bool,
 }
@@ -101,33 +97,21 @@ impl ZlmStartRollback {
     fn live_relay(
         runtime_id: Uuid,
         work_dir: PathBuf,
-        registry: LocalRuntimeRegistry,
-        runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
         proxy_key: Option<String>,
         binding: StreamBinding,
     ) -> Self {
         Self {
             runtime_id,
             work_dir,
-            registry,
-            runtimes,
             resource: ZlmStartResource::LiveRelay { proxy_key, binding },
             armed: true,
         }
     }
 
-    fn rtp_server(
-        runtime_id: Uuid,
-        work_dir: PathBuf,
-        registry: LocalRuntimeRegistry,
-        runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-        stream_id: String,
-    ) -> Self {
+    fn rtp_server(runtime_id: Uuid, work_dir: PathBuf, stream_id: String) -> Self {
         Self {
             runtime_id,
             work_dir,
-            registry,
-            runtimes,
             resource: ZlmStartResource::RtpServer { stream_id },
             armed: true,
         }
@@ -138,8 +122,6 @@ impl ZlmStartRollback {
             return;
         }
         self.armed = false;
-        let _ = remove_managed_runtime(&self.runtimes, self.runtime_id);
-        let _ = self.registry.remove(self.runtime_id);
         self.cleanup_persisted_runtime_files();
 
         match &self.resource {
@@ -212,8 +194,6 @@ async fn rollback_zlm_start_error<T>(
 pub(crate) struct RuntimeZlmStartContext<'a> {
     pub(crate) settings: &'a AgentSettings,
     pub(crate) http_client: &'a Client,
-    pub(crate) registry: &'a LocalRuntimeRegistry,
-    pub(crate) runtimes: &'a Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     pub(crate) events: &'a RuntimeEventSink,
     pub(crate) zlm_server_id: Option<String>,
     pub(crate) hooks: RuntimeZlmStartHooks,
@@ -230,7 +210,6 @@ pub(crate) struct RuntimeZlmStartOutcome {
 struct ZlmStartMonitorPlan {
     settings: AgentSettings,
     http_client: Client,
-    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     events: RuntimeEventSink,
     notification: RuntimeNotification,
     kind: ZlmStartMonitorKind,
@@ -252,20 +231,15 @@ impl RuntimeZlmStartOutcome {
         self.handle.runtime_id
     }
 
+    pub(crate) fn backend(&self) -> ManagedRuntime {
+        self.backend.clone()
+    }
+
     pub(crate) async fn commit(
         mut self,
         monitor_handle: RuntimeMonitorHandle,
     ) -> Result<RuntimeHandle, ExecutorError> {
         let handle = self.handle.clone();
-        let runtime_id = handle.runtime_id;
-        {
-            let mut runtimes = self
-                .monitor_plan
-                .runtimes
-                .write()
-                .expect("runtime map lock poisoned");
-            runtimes.insert(runtime_id, self.backend.clone());
-        }
         if let Err(error) = self.hooks.after_runtime_insert(&handle) {
             return self.rollback_start_error(error).await;
         }
@@ -342,8 +316,6 @@ pub(crate) async fn start_live_relay_task(
     let mut rollback = ZlmStartRollback::live_relay(
         runtime_id,
         plan.work_dir.clone(),
-        ctx.registry.clone(),
-        ctx.runtimes.clone(),
         proxy_key.clone(),
         stream_binding.clone(),
     );
@@ -404,7 +376,6 @@ pub(crate) async fn start_live_relay_task(
         monitor_plan: ZlmStartMonitorPlan {
             settings: ctx.settings.clone(),
             http_client: ctx.http_client.clone(),
-            runtimes: ctx.runtimes.clone(),
             events: ctx.events.clone(),
             notification: RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: handle.task_id,
@@ -449,13 +420,8 @@ pub(crate) async fn start_rtp_receive_task(
     .await?;
     let local_port = extract_zlm_local_port(&response).unwrap_or(plan.requested_port);
     let runtime_id = Uuid::now_v7();
-    let mut rollback = ZlmStartRollback::rtp_server(
-        runtime_id,
-        plan.work_dir.clone(),
-        ctx.registry.clone(),
-        ctx.runtimes.clone(),
-        plan.stream_id.clone(),
-    );
+    let mut rollback =
+        ZlmStartRollback::rtp_server(runtime_id, plan.work_dir.clone(), plan.stream_id.clone());
     let rtp_server = RtpServerMetadata {
         stream_id: plan.stream_id.clone(),
         local_port,
@@ -513,7 +479,6 @@ pub(crate) async fn start_rtp_receive_task(
         monitor_plan: ZlmStartMonitorPlan {
             settings: ctx.settings.clone(),
             http_client: ctx.http_client.clone(),
-            runtimes: ctx.runtimes.clone(),
             events: ctx.events.clone(),
             notification: RuntimeNotification::TaskEvent(RuntimeTaskEvent {
                 task_id: handle.task_id,

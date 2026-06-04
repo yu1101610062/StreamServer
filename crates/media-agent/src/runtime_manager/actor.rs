@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io,
     sync::Arc,
 };
 
@@ -21,14 +22,20 @@ use crate::{
         ManagedProcessExecutor, RuntimeProcessExitOutcome, RuntimeStartWorkerResult,
     },
     runtime_metadata::runtime_lease_token,
+    runtime_process::RuntimeSlotPermit,
+    runtime_recovery::should_auto_restart_process,
     runtime_registry::{AdoptFilter, AdoptRuntimeFilter, RuntimeReadHandle},
-    runtime_stop::{RuntimeStopOutcome, RuntimeStopPreparation, RuntimeStopWorkerRequest},
+    runtime_stop::{
+        RuntimeStopOutcome, RuntimeStopPreparation, RuntimeStopWorkerRequest,
+        StaleAttemptCleanupContext, cleanup_stale_attempt_runtimes,
+    },
     runtime_types::{
         ExecutorError, StartTaskRequest, StopTaskRequest, TaskRecordingControlRequest,
     },
 };
 
 use super::{
+    backend::RuntimeBackendStore,
     command::{
         RUNTIME_MANAGER_COMMAND_BUFFER, RuntimeAdoptReply, RuntimeCommand, RuntimeManagerLimits,
         RuntimeManagerRequestOutcome, RuntimeRecordingReply, RuntimeStartReply, RuntimeStopReply,
@@ -49,6 +56,7 @@ pub struct RuntimeManager {
     // sessionless 命令不受连接重建影响。
     active_session_epoch: Option<u64>,
     limits: RuntimeManagerLimits,
+    backend_store: RuntimeBackendStore,
     read_handle: RuntimeReadHandle,
     // actor 内的权威 runtime 状态；外部同步读由 read_handle 投影提供。
     state: RuntimeManagerState,
@@ -91,6 +99,15 @@ struct QueuedStart {
     session_epoch: Option<u64>,
     request: StartTaskRequest,
     reply: RuntimeStartReply,
+}
+
+struct PreparedStartWorker {
+    operation_id: RuntimeOperationId,
+    session_epoch: Option<u64>,
+    request: StartTaskRequest,
+    reply: RuntimeStartReply,
+    mode: crate::runtime_plan::TaskRuntimeMode,
+    slot_permit: Arc<RuntimeSlotPermit>,
 }
 
 struct QueuedStop {
@@ -151,6 +168,7 @@ impl RuntimeManager {
     ) -> RuntimeManagerHandle {
         let (tx, rx) = mpsc::channel(RUNTIME_MANAGER_COMMAND_BUFFER);
         let read_handle = RuntimeReadHandle::new();
+        let backend_store = executor.backend_store();
         tokio::spawn(
             Self {
                 executor,
@@ -158,6 +176,7 @@ impl RuntimeManager {
                 rx,
                 active_session_epoch: None,
                 limits: options.limits,
+                backend_store,
                 read_handle: read_handle.clone(),
                 state: RuntimeManagerState::default(),
                 next_operation_id: 0,
@@ -407,18 +426,23 @@ impl RuntimeManager {
                 send_start_reply(queued.reply, RuntimeManagerRequestOutcome::StaleSession);
                 continue;
             }
+            let Some(prepared) = self.prepare_actor_start(queued) else {
+                continue;
+            };
             self.active.start = self.active.start.saturating_add(1);
             let executor = self.executor.clone();
             let tx = self.tx.clone();
             tokio::spawn(async move {
-                let request_for_worker = queued.request.clone();
-                let result = executor.start_task_for_manager(request_for_worker).await;
+                let request_for_worker = prepared.request.clone();
+                let result = executor
+                    .start_task_for_manager(request_for_worker, prepared.mode, prepared.slot_permit)
+                    .await;
                 let _ = tx
                     .send(RuntimeCommand::StartTaskFinished {
-                        operation_id: queued.operation_id,
-                        session_epoch: queued.session_epoch,
-                        request: queued.request,
-                        reply: queued.reply,
+                        operation_id: prepared.operation_id,
+                        session_epoch: prepared.session_epoch,
+                        request: prepared.request,
+                        reply: prepared.reply,
                         result,
                     })
                     .await;
@@ -571,6 +595,82 @@ impl RuntimeManager {
         }
     }
 
+    fn prepare_actor_start(&mut self, queued: QueuedStart) -> Option<PreparedStartWorker> {
+        if let Some(entry) = self
+            .state
+            .entry_by_task_attempt(queued.request.task_id, queued.request.attempt_no)
+            .cloned()
+        {
+            let existing_lease = runtime_lease_token(&entry.handle).unwrap_or_default();
+            self.finish_operation(queued.operation_id);
+            if existing_lease == queued.request.lease_token {
+                send_start_reply(
+                    queued.reply,
+                    RuntimeManagerRequestOutcome::Completed(Ok(entry.handle.clone())),
+                );
+            } else {
+                send_start_reply(
+                    queued.reply,
+                    RuntimeManagerRequestOutcome::Completed(Err(ExecutorError::InvalidRequest(
+                        format!(
+                            "stale dispatch for {}/{}: lease_token mismatch",
+                            queued.request.task_id, queued.request.attempt_no
+                        ),
+                    ))),
+                );
+            }
+            return None;
+        }
+
+        let mode = match self
+            .executor
+            .prepare_start_mode_for_manager(&queued.request)
+        {
+            Ok(mode) => mode,
+            Err(error) => {
+                self.finish_operation(queued.operation_id);
+                send_start_reply(
+                    queued.reply,
+                    RuntimeManagerRequestOutcome::Completed(Err(error)),
+                );
+                return None;
+            }
+        };
+
+        let stopping_updates = cleanup_stale_attempt_runtimes(
+            StaleAttemptCleanupContext {
+                settings: &self.executor.settings,
+                active_handles: self.state.active_handles(),
+                backend_store: self.backend_store.clone(),
+            },
+            &queued.request,
+        );
+        for handle in stopping_updates {
+            self.apply_state_handle(handle);
+        }
+
+        let slot_permit = match self.backend_store.try_acquire_slot() {
+            Ok(slot_permit) => slot_permit,
+            Err(error) => {
+                self.finish_operation(queued.operation_id);
+                send_start_reply(
+                    queued.reply,
+                    RuntimeManagerRequestOutcome::Completed(Err(error)),
+                );
+                return None;
+            }
+        };
+
+        Some(PreparedStartWorker {
+            operation_id: queued.operation_id,
+            session_epoch: queued.session_epoch,
+            request: queued.request,
+            reply: queued.reply,
+            mode,
+            slot_permit,
+        })
+    }
+
     fn prepare_actor_stop(&mut self, queued: QueuedStop) -> Option<PreparedStopWorker> {
         // manager stop path 的状态提交都发生在 worker 前；worker 只拿到 actor 已验证的
         // backend snapshot/request，不能再写 runtime 状态源。
@@ -601,9 +701,11 @@ impl RuntimeManager {
 
         let monitor_handle =
             RuntimeMonitorHandle::new(self.tx.clone(), entry.handle.runtime_id, entry.generation);
+        let runtime = self.backend_store.get(entry.handle.runtime_id);
         match self.executor.prepare_stop_for_manager(
             &queued.request,
             &entry.handle,
+            runtime,
             entry.generation,
             monitor_handle,
         ) {
@@ -851,9 +953,17 @@ impl RuntimeManager {
         let result = match result {
             Ok(result) => match result.runtime_id() {
                 Some(runtime_id) => {
+                    let backend = result.backend();
+                    if let Some(backend) = backend {
+                        self.backend_store.insert(runtime_id, backend);
+                    }
                     let monitor_handle =
                         RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation);
-                    result.commit(monitor_handle).await
+                    let commit_result = result.commit(monitor_handle).await;
+                    if commit_result.is_err() {
+                        self.backend_store.remove(runtime_id);
+                    }
+                    commit_result
                 }
                 None => Err(ExecutorError::InvalidRequest(
                     "runtime start result did not include runtime_id".to_string(),
@@ -948,7 +1058,7 @@ impl RuntimeManager {
         let remove = commit.remove_runtime_entry || commit.handle.state == RuntimeState::Exited;
         let handle = commit.handle.clone();
         let commit_generation = commit.generation;
-        self.executor.apply_monitor_commit(commit);
+        self.apply_monitor_commit_side_effects(commit);
         if remove {
             self.state.remove_runtime_id(runtime_id);
             self.read_handle.remove_runtime_id(runtime_id);
@@ -1038,7 +1148,7 @@ impl RuntimeManager {
 
         let handle = commit.handle.clone();
         let commit_generation = commit.generation;
-        self.executor.apply_monitor_commit(commit);
+        self.apply_monitor_commit_side_effects(commit);
         self.apply_state_handle_with_generation(handle.clone(), commit_generation);
         Ok(handle)
     }
@@ -1101,11 +1211,14 @@ impl RuntimeManager {
             match outcome {
                 RuntimeAdoptionOutcome::Adopted(commit) => {
                     let generation = self.next_runtime_generation();
-                    let monitor_handle = RuntimeMonitorHandle::new(
-                        self.tx.clone(),
-                        commit.handle.runtime_id,
-                        generation,
+                    let runtime_id = commit.handle.runtime_id;
+                    let backend = self.backend_store.adopted_runtime(
+                        commit.backend.process,
+                        commit.backend.companion_processes.clone(),
                     );
+                    self.backend_store.insert(runtime_id, backend);
+                    let monitor_handle =
+                        RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation);
                     let handle =
                         self.executor
                             .apply_adoption_commit(commit, generation, monitor_handle);
@@ -1118,6 +1231,10 @@ impl RuntimeManager {
                         warn!("failed to commit restarted adopted runtime: missing runtime_id");
                         continue;
                     };
+                    let backend = result.backend();
+                    if let Some(backend) = backend {
+                        self.backend_store.insert(runtime_id, backend);
+                    }
                     let monitor_handle =
                         RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, generation);
                     match result.commit(monitor_handle).await {
@@ -1126,6 +1243,7 @@ impl RuntimeManager {
                             handles.push(handle);
                         }
                         Err(error) => {
+                            self.backend_store.remove(runtime_id);
                             warn!(error = %error, "failed to commit restarted adopted runtime");
                         }
                     }
@@ -1192,6 +1310,11 @@ impl RuntimeManager {
         generation: RuntimeGeneration,
     ) {
         self.apply_state_handle_with_generation(handle.clone(), generation);
+    }
+
+    fn apply_monitor_commit_side_effects(&self, commit: RuntimeMonitorCommit) {
+        self.backend_store.apply_monitor_backend_delta(&commit);
+        self.executor.apply_monitor_commit(commit);
     }
 
     #[cfg(test)]
@@ -1267,7 +1390,7 @@ impl RuntimeManager {
         if entry.generation != generation {
             return None;
         }
-        let backend = self.executor.monitor_snapshot(runtime_id)?;
+        let backend = self.backend_store.snapshot(runtime_id)?;
         Some(RuntimeMonitorSnapshot {
             handle: entry.handle.clone(),
             stop_requested: backend.stop_requested,
@@ -1299,8 +1422,35 @@ impl RuntimeManager {
                 let executor = self.executor.clone();
                 let tx = self.tx.clone();
                 let current_handle = entry.handle.clone();
+                let restart_status = event
+                    .status
+                    .as_ref()
+                    .map(|status| *status)
+                    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.clone()));
+                let restart_slot_permit = if should_auto_restart_process(
+                    &current_handle,
+                    event.was_stopped,
+                    &restart_status,
+                ) {
+                    match self.backend_store.try_acquire_slot() {
+                        Ok(slot_permit) => Some(slot_permit),
+                        Err(error) => {
+                            warn!(
+                                runtime_id = %runtime_id,
+                                generation = generation.value(),
+                                error = %error,
+                                "failed to acquire slot for automatic runtime restart"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 tokio::spawn(async move {
-                    let result = executor.handle_process_exited(event, current_handle).await;
+                    let result = executor
+                        .handle_process_exited(event, current_handle, restart_slot_permit)
+                        .await;
                     let _ = tx
                         .send(RuntimeCommand::ProcessExitFinished {
                             runtime_id,
@@ -1326,7 +1476,7 @@ impl RuntimeManager {
                 let remove =
                     commit.remove_runtime_entry || commit.handle.state == RuntimeState::Exited;
                 let handle = commit.handle.clone();
-                self.executor.apply_monitor_commit(commit);
+                self.apply_monitor_commit_side_effects(commit);
                 if remove {
                     self.state.remove_runtime_id(runtime_id);
                     self.read_handle.remove_runtime_id(runtime_id);
@@ -1369,6 +1519,10 @@ impl RuntimeManager {
                     warn!("failed to commit recovered runtime: missing runtime_id");
                     return;
                 };
+                let backend = restart.backend();
+                if let Some(backend) = backend {
+                    self.backend_store.insert(runtime_id, backend);
+                }
                 let monitor_handle =
                     RuntimeMonitorHandle::new(self.tx.clone(), runtime_id, restart_generation);
                 match restart.commit(monitor_handle).await {
@@ -1404,10 +1558,11 @@ impl RuntimeManager {
                         let commit =
                             RuntimeMonitorCommit::new(recovered.clone(), restart_generation)
                                 .with_notifications(notifications);
-                        self.executor.apply_monitor_commit(commit);
+                        self.apply_monitor_commit_side_effects(commit);
                         self.apply_state_handle_with_generation(recovered, restart_generation);
                     }
                     Err(error) => {
+                        self.backend_store.remove(runtime_id);
                         warn!(error = %error, "failed to commit recovered runtime");
                     }
                 }
@@ -1428,7 +1583,7 @@ impl RuntimeManager {
         handle.state = RuntimeState::Running;
         let commit = RuntimeMonitorCommit::new(handle.clone(), generation)
             .with_notifications(vec![RuntimeNotification::TaskProgress(event.progress)]);
-        self.executor.apply_monitor_commit(commit);
+        self.apply_monitor_commit_side_effects(commit);
         self.apply_state_handle_with_generation(handle, generation);
     }
 
@@ -1483,8 +1638,8 @@ impl RuntimeManager {
             companion.error = event.error.clone();
         });
         let stop_or_suppressed = self
-            .executor
-            .monitor_snapshot(event.runtime_id)
+            .backend_store
+            .snapshot(event.runtime_id)
             .map(|snapshot| snapshot.stop_requested || snapshot.suppress_companion_events)
             .unwrap_or(false);
         let mut notifications = Vec::new();
@@ -1508,7 +1663,7 @@ impl RuntimeManager {
             .with_persist(event.work_dir, event.success_check)
             .with_notifications(notifications);
         commit.remove_companion_pid = Some(event.companion_pid);
-        self.executor.apply_monitor_commit(commit);
+        self.apply_monitor_commit_side_effects(commit);
         self.apply_state_handle_with_generation(handle, generation);
     }
 }

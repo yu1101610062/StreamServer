@@ -1,8 +1,12 @@
 # RuntimeManager P11：删除 LocalRuntimeRegistry 写路径
 
+状态：历史任务，已由 RuntimeManager backend store 收口。
+
 ## 任务目标
 
 在 RuntimeManager 已成为权威状态源后，删除生产路径中的 `LocalRuntimeRegistry` 写依赖和共享 `runtimes` map 写依赖。外部只能通过 `RuntimeManagerHandle` 控制 runtime，通过 read model 查询 runtime。
+
+当前实现中，生产路径不再持有 `LocalRuntimeRegistry`。本地进程句柄、slot permit、stop flag 和 companion process 信息由 RuntimeManager 内部的 backend store 管理；worker 只返回 start/adopt outcome 或 monitor commit，状态和 backend delta 由 actor 统一提交。
 
 ## 前置条件
 
@@ -33,6 +37,8 @@
 ## 验收标准
 
 - production code 中没有 registry track/update/remove 写调用。
+- production start/stop/adopt/monitor/recovery 路径中没有 `LocalRuntimeRegistry` 依赖。
+- `runtimes.write` 只允许出现在 RuntimeManager backend store 内部实现中。
 - read model 是外部唯一同步查询入口。
 - RuntimeManagerState 是唯一权威 runtime 状态。
 - RuntimeManagerHandle 是外部唯一 runtime 控制入口。

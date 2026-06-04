@@ -27,7 +27,9 @@ use crate::{
     runtime_live_relay_events::{
         LiveRelayEventStream, live_relay_stopped_terminal_event, live_relay_terminal_notification,
     },
-    runtime_manager::{RuntimeGeneration, RuntimeMonitorCommit, RuntimeMonitorHandle},
+    runtime_manager::{
+        RuntimeBackendStore, RuntimeGeneration, RuntimeMonitorCommit, RuntimeMonitorHandle,
+    },
     runtime_metadata::{
         clear_source_reconnecting, companion_process_identity_from_metadata,
         companion_recording_from_handle, process_identity_from_handle, rtp_stream_id_from_handle,
@@ -37,51 +39,47 @@ use crate::{
     runtime_plan::TaskRuntimeMode,
     runtime_process::{
         ManagedRuntime, ProcessIdentity, is_process_running_for_command_line, runtime_processes,
-        schedule_force_kill_if_running, schedule_force_kill_processes_if_running,
-        schedule_force_kill_with_monitor_if_running, signal_process, signal_runtime_processes,
+        schedule_force_kill_processes_if_running, schedule_force_kill_with_monitor_if_running,
+        signal_process, signal_runtime_processes,
     },
     runtime_recording::mark_recording_completion,
-    runtime_registry::LocalRuntimeRegistry,
 };
 
 const STALE_ATTEMPT_FORCE_KILL_DELAY: Duration = Duration::from_secs(1);
 
 pub(crate) struct StaleAttemptCleanupContext<'a> {
     pub(crate) settings: &'a AgentSettings,
-    pub(crate) registry: &'a LocalRuntimeRegistry,
-    pub(crate) runtimes: &'a Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    pub(crate) active_handles: Vec<RuntimeHandle>,
+    pub(crate) backend_store: RuntimeBackendStore,
 }
 
 pub(crate) fn cleanup_stale_attempt_runtimes(
     ctx: StaleAttemptCleanupContext<'_>,
     request: &StartTaskRequest,
-) {
-    let active_handles = ctx.registry.active_handles();
+) -> Vec<RuntimeHandle> {
+    let mut stopping_updates = Vec::new();
     let mut handled_attempts = std::collections::HashSet::new();
-    for handle in active_handles {
+    for handle in ctx.active_handles {
         if !is_stale_attempt_for_request(&handle, request) {
             continue;
         }
         handled_attempts.insert((handle.task_id, handle.attempt_no));
 
-        let runtime = {
-            let runtimes = ctx.runtimes.read().expect("runtime map lock poisoned");
-            runtimes.get(&handle.runtime_id).cloned()
-        };
+        let runtime = ctx.backend_store.get(handle.runtime_id);
         if let Some(runtime) = runtime {
             runtime.stop_requested.store(true, Ordering::Relaxed);
             let processes = runtime_processes(&runtime);
             if processes.is_empty() {
                 continue;
             }
-            ctx.registry.update(handle.runtime_id, |runtime| {
-                runtime.state = RuntimeState::Stopping;
-                runtime.last_progress_at = Some(Utc::now());
-                runtime.metadata["stop"] = json!({
-                    "reason": "stale_attempt_replaced",
-                    "replacement_attempt_no": request.attempt_no,
-                });
+            let mut stopping_handle = handle.clone();
+            stopping_handle.state = RuntimeState::Stopping;
+            stopping_handle.last_progress_at = Some(Utc::now());
+            stopping_handle.metadata["stop"] = json!({
+                "reason": "stale_attempt_replaced",
+                "replacement_attempt_no": request.attempt_no,
             });
+            stopping_updates.push(stopping_handle);
             for process in &processes {
                 if let Err(error) = signal_process(process, libc::SIGTERM) {
                     warn!(
@@ -93,10 +91,8 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
                     );
                 }
             }
-            schedule_force_kill_if_running(
-                handle.runtime_id,
+            schedule_force_kill_processes_if_running(
                 processes,
-                ctx.runtimes.clone(),
                 STALE_ATTEMPT_FORCE_KILL_DELAY,
                 "stale_attempt_replaced",
             );
@@ -116,6 +112,7 @@ pub(crate) fn cleanup_stale_attempt_runtimes(
         let processes = runtime_handle_live_processes(&persisted.handle);
         signal_stale_processes(&processes, "stale_persisted_attempt_replaced");
     }
+    stopping_updates
 }
 
 pub(crate) enum RuntimeStopPreparation {
@@ -145,8 +142,8 @@ pub(crate) enum RuntimeStopOutcome {
 
 pub(crate) fn prepare_runtime_stop_for_manager(
     settings: &AgentSettings,
-    runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     stop_intents: &Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
+    runtime: Option<ManagedRuntime>,
     request: &StopTaskRequest,
     handle: &RuntimeHandle,
     generation: RuntimeGeneration,
@@ -158,10 +155,7 @@ pub(crate) fn prepare_runtime_stop_for_manager(
         stop_intents.insert(key, request.clone());
     }
 
-    let Some(runtime) = ({
-        let runtimes = runtimes.read().expect("runtime map lock poisoned");
-        runtimes.get(&handle.runtime_id).cloned()
-    }) else {
+    let Some(runtime) = runtime else {
         return Ok(RuntimeStopPreparation::AlreadyGone(
             runtime_already_gone_commit(settings, handle, generation, request),
         ));

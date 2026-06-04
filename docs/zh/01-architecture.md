@@ -40,7 +40,7 @@
 - `RuntimeManagerState` 是生产唯一 runtime 状态源；heartbeat、cleanup、terminal replay 和 stop snapshot 读取 `RuntimeReadHandle` 同步快照。
 - FFmpeg/ZLM worker 只执行慢副作用，例如进程启动、信号发送、ZLM API、持久化和探测；状态提交、generation 校验和对 Core 的 snapshot/event 发布由 actor 完成。
 - monitor 不直接写本地全局状态；启动链和接管后的 monitor 通过带 `runtime_id + generation` 的 internal event 回到 actor，旧 generation 事件被丢弃。
-- `LocalRuntimeRegistry` 仅保留为测试和 direct legacy 兼容工具，不是生产权威状态源。
+- `LocalRuntimeRegistry` 仅保留为测试 read model 工具，不是生产权威状态源。
 
 ## 4. 默认部署拓扑
 

@@ -16,7 +16,6 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::runtime_manager::{ProgressObservedEvent, RuntimeInternalEvent, RuntimeMonitorHandle};
-use crate::runtime_registry::LocalRuntimeRegistry;
 
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 const MAX_LOG_BATCH_LINES: usize = 64;
@@ -311,14 +310,13 @@ pub(crate) async fn read_progress_stream(
 }
 
 fn flush_log_batch(
-    runtime_id: Uuid,
     task_id: Uuid,
     attempt_no: i32,
     lease_token: &str,
+    session_epoch: u64,
     stream: &str,
     batch: &mut Vec<(String, usize)>,
     source_line_count: &mut usize,
-    registry: &LocalRuntimeRegistry,
     events: &RuntimeEventSink,
 ) {
     if batch.is_empty() {
@@ -339,10 +337,7 @@ fn flush_log_batch(
         task_id,
         attempt_no,
         lease_token: lease_token.to_string(),
-        session_epoch: registry
-            .get(runtime_id)
-            .map(|runtime| runtime_session_epoch(&runtime))
-            .unwrap_or_default(),
+        session_epoch,
         stream: stream.to_string(),
         lines,
         source_line_count: emitted_line_count,
@@ -351,12 +346,11 @@ fn flush_log_batch(
 
 pub(crate) async fn read_log_stream(
     stderr: tokio::process::ChildStderr,
-    runtime_id: Uuid,
     task_id: Uuid,
     attempt_no: i32,
     lease_token: String,
+    session_epoch: u64,
     stream: String,
-    registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
 ) {
     let mut reader = BufReader::new(stderr).lines();
@@ -371,14 +365,13 @@ pub(crate) async fn read_log_stream(
                 Ok(result) => result,
                 Err(_) => {
                     flush_log_batch(
-                        runtime_id,
                         task_id,
                         attempt_no,
                         &lease_token,
+                        session_epoch,
                         &stream,
                         &mut batch,
                         &mut source_line_count,
-                        &registry,
                         &events,
                     );
                     continue;
@@ -410,14 +403,13 @@ pub(crate) async fn read_log_stream(
 
         if batch.len() >= MAX_LOG_BATCH_LINES || source_line_count >= MAX_LOG_BATCH_LINES {
             flush_log_batch(
-                runtime_id,
                 task_id,
                 attempt_no,
                 &lease_token,
+                session_epoch,
                 &stream,
                 &mut batch,
                 &mut source_line_count,
-                &registry,
                 &events,
             );
             continue 'outer;
@@ -425,14 +417,13 @@ pub(crate) async fn read_log_stream(
     }
 
     flush_log_batch(
-        runtime_id,
         task_id,
         attempt_no,
         &lease_token,
+        session_epoch,
         &stream,
         &mut batch,
         &mut source_line_count,
-        &registry,
         &events,
     );
 }

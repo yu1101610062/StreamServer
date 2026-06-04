@@ -1,8 +1,12 @@
 # RuntimeManager P12：API、测试与文档收尾
 
+状态：历史任务，RuntimeManager 当前契约已吸收本任务；日志保留策略另行规划。
+
 ## 任务目标
 
 完成 RuntimeManager actor 迁移后的收尾：清理 API 导出、删除过渡代码、补齐 contract tests、更新架构文档，并确保 runtime 行为与迁移前合同一致。
+
+当前实现中，外部 runtime 控制入口是 `RuntimeManagerHandle`，同步查询入口是 `RuntimeReadHandle`/`RuntimeReadModel`。`ManagedProcessExecutor` 仅作为 RuntimeManager 派发慢副作用 worker 的内部工厂。
 
 ## 前置条件
 
@@ -35,7 +39,7 @@
 ## 验收标准
 
 - `RuntimeManagerState` 是唯一权威 runtime 状态。
-- `RuntimeReadSnapshot` 是外部唯一同步查询入口。
+- `RuntimeReadHandle`/`RuntimeReadModel` 是外部唯一同步查询入口。
 - actor loop 不执行长 await。
 - 所有 internal events 都带 generation。
 - contract tests 与原行为一致。

@@ -7,7 +7,7 @@ use media_domain::{RuntimeHandle, RuntimeState, WorkerKind};
 use serde_json::Value;
 use uuid::Uuid;
 
-/// Legacy in-memory registry retained for tests and direct executor compatibility.
+/// Legacy in-memory registry retained for tests.
 ///
 /// Production runtime reads come from `RuntimeReadHandle`, which is maintained by
 /// `RuntimeManagerState`.
@@ -66,31 +66,6 @@ impl LocalRuntimeRegistry {
         Self {
             inner: Arc::new(RwLock::new(RuntimeRegistryState::default())),
         }
-    }
-
-    pub fn remove(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
-        let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
-        let removed = runtimes.by_runtime_id.remove(&runtime_id)?;
-        runtimes
-            .by_task_attempt
-            .remove(&(removed.task_id, removed.attempt_no));
-        Some(removed)
-    }
-
-    pub fn update(
-        &self,
-        runtime_id: Uuid,
-        update: impl FnOnce(&mut RuntimeHandle),
-    ) -> Option<RuntimeHandle> {
-        let mut runtimes = self.inner.write().expect("runtime registry lock poisoned");
-        let handle = runtimes.by_runtime_id.get_mut(&runtime_id)?;
-        update(handle);
-        Some(handle.clone())
-    }
-
-    pub fn get(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
-        let runtimes = self.inner.read().expect("runtime registry lock poisoned");
-        runtimes.by_runtime_id.get(&runtime_id).cloned()
     }
 
     pub fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle> {

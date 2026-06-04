@@ -47,10 +47,9 @@
 | [22 RuntimeManager P08](./22-runtime-manager-p08-stop-actor.md) | 历史任务 | stop actor 化已进入当前 RuntimeManager 路径。 |
 | [23 RuntimeManager P09](./23-runtime-manager-p09-recording-actor.md) | 历史任务 | recording actor 化已进入当前 RuntimeManager 路径。 |
 | [24 RuntimeManager P10](./24-runtime-manager-p10-adopt-recovery-actor.md) | 历史任务 | adopt/recovery actor 化已进入当前 RuntimeManager 路径。 |
-| [25 RuntimeManager P11](./25-runtime-manager-p11-remove-registry-writes.md) | 待规划 | 仍需规划无 `LocalRuntimeRegistry` / `runtimes` 写调用的收尾实现。 |
-| [26 RuntimeManager P12](./26-runtime-manager-p12-api-test-doc-cleanup.md) | 待规划 | 依赖 P11 完成后再做 API、测试和文档收尾。 |
+| [25 RuntimeManager P11](./25-runtime-manager-p11-remove-registry-writes.md) | 历史任务 | 生产路径 registry/runtimes 写依赖已由 RuntimeManager backend store 收口。 |
+| [26 RuntimeManager P12](./26-runtime-manager-p12-api-test-doc-cleanup.md) | 历史任务 | API、测试和文档收尾已进入当前 RuntimeManager 契约；日志保留另行规划。 |
 
 ## 后续待规划项
 
 - 日志保留规则：`Agent` 本地日志和 Core 日志索引保留周期需要单独设计实现或明确外部运维依赖。
-- RuntimeManager P11/P12：需要规划如何移除生产路径中的 `LocalRuntimeRegistry` / `runtimes` 写调用，并补齐对应 contract tests。

@@ -1,11 +1,10 @@
 //! 运行时进程管理：维护本地进程槽位、托管进程句柄、进程移除以及信号/延迟强杀辅助。
 
 use std::{
-    collections::HashMap,
     io,
     path::Path,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Duration,
@@ -144,16 +143,6 @@ impl ProcessIdentity {
             pgid: Some(pid),
             pid_start_time: linux_pid_start_time(pid),
         }
-    }
-}
-
-pub(crate) fn remove_managed_runtime(
-    runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    runtime_id: Uuid,
-) -> Option<ManagedRuntime> {
-    {
-        let mut runtimes = runtimes.write().expect("runtime map lock poisoned");
-        runtimes.remove(&runtime_id)
     }
 }
 
@@ -300,44 +289,6 @@ pub(crate) fn signal_runtime_processes(
             .map_err(|error| ExecutorError::ProcessSignal(error.to_string()))?;
     }
     Ok(())
-}
-
-pub(crate) fn schedule_force_kill_if_running(
-    runtime_id: Uuid,
-    processes: Vec<ProcessIdentity>,
-    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    delay: Duration,
-    reason: &'static str,
-) {
-    if processes.is_empty() {
-        return;
-    }
-
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        let runtime_still_tracked = {
-            let runtimes = runtimes.read().expect("runtime map lock poisoned");
-            runtimes.contains_key(&runtime_id)
-        };
-        if !runtime_still_tracked {
-            return;
-        }
-
-        for process in processes {
-            if !process_should_receive_force_kill(&process, runtime_id, reason) {
-                continue;
-            }
-            tracing::warn!(
-                runtime_id = %runtime_id,
-                pid = process.pid,
-                pgid = ?process.pgid,
-                delay_sec = delay.as_secs_f64(),
-                reason,
-                "process still running after graceful stop; sending SIGKILL"
-            );
-            let _ = signal_process(&process, libc::SIGKILL);
-        }
-    });
 }
 
 pub(crate) fn schedule_force_kill_with_monitor_if_running(
