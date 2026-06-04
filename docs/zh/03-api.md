@@ -10,9 +10,9 @@
 
 - Base URL: `/api/v1`
 - Content-Type: `application/json`
-- 写接口统一要求 `Idempotency-Key` 请求头
+- 需要幂等保护的业务写接口使用 `Idempotency-Key` 请求头；当前 `POST /tasks` 必填
 - 鉴权方式：`Authorization: Bearer <token>`
-- 若部署配置 `core.auth_enabled = false`，则北向 API 关闭 JWT 鉴权，默认按平台管理员权限放行
+- 若部署配置 `core.auth_mode = "disabled"`，则北向 API 关闭 JWT 鉴权，默认按平台管理员权限放行
 - 时间统一返回 RFC 3339
 
 ### 2.2 幂等规则
@@ -59,12 +59,107 @@
 
 - `AUTH_*`
 - `TASK_*`
-- `TEMPLATE_*`
 - `NODE_*`
 - `ZLM_*`
 - `FFMPEG_*`
 - `VALIDATION_*`
 - `CONFLICT_*`
+
+### 2.5 认证与安全接口
+
+这些接口同样挂在 `/api/v1` 下。
+
+认证模式：
+
+- `core.auth_mode = "local_password"`：启用本地密码登录、刷新令牌、退出和改密码接口。
+- `core.auth_mode = "external_jwt"`：业务接口只验证外部 JWT；本地密码登录接口返回 `403 FORBIDDEN`。
+- `core.auth_mode = "disabled"`：关闭 JWT 鉴权，按平台管理员权限放行。
+- 业务接口在启用鉴权时可使用 `Authorization: Bearer <token>`；未带 Bearer 时，仅允许来源 IP 命中机器 API 白名单的业务请求。机器白名单不授予安全配置权限。
+
+#### `GET /me`
+
+返回当前会话信息：
+
+- `auth_enabled`
+- `auth_mode`
+- `subject`
+- `role`
+- `must_change_password`
+- `permissions`
+- `environment`
+
+#### `POST /auth/login`
+
+仅 `local_password` 模式可用。
+
+请求：
+
+```json
+{
+  "username": "admin",
+  "password": "secret"
+}
+```
+
+返回：
+
+- `access_token`
+- `access_token_expires_at`
+- `refresh_token`
+- `refresh_token_expires_at`
+- `subject`
+- `role`
+- `must_change_password`
+
+#### `POST /auth/refresh`
+
+仅 `local_password` 模式可用。刷新成功后会轮换 refresh token。
+
+```json
+{
+  "refresh_token": "opaque-refresh-token"
+}
+```
+
+#### `POST /auth/logout`
+
+仅 `local_password` 模式可用。撤销指定 refresh token，成功返回 `204 NO CONTENT`。
+
+```json
+{
+  "refresh_token": "opaque-refresh-token"
+}
+```
+
+#### `POST /auth/change-password`
+
+仅 `local_password` 模式可用，要求 Bearer 用户会话；机器白名单调用方不能改密码。成功返回 `204 NO CONTENT`。
+
+```json
+{
+  "current_password": "old-secret",
+  "new_password": "new-secret"
+}
+```
+
+#### `GET /security/machine-allowlist`
+
+返回机器 API 白名单，要求管理员安全配置权限。
+
+#### `PUT /security/machine-allowlist`
+
+整体替换机器 API 白名单，要求管理员安全配置权限。`cidr` 可填写单个 IP，服务端会规范化为 `/32` 或 `/128`。
+
+```json
+{
+  "entries": [
+    {
+      "cidr": "192.168.1.10/32",
+      "description": "ops host"
+    }
+  ]
+}
+```
 
 ## 3. 任务接口
 
@@ -82,7 +177,7 @@
 - 若任务输入可解析出源流地址，Core 优先用该地址匹配在线节点的已上报网卡；节点存在任一同网段网卡即可优先。
 - `input.interface_name` / `publish.interface_name` 用于任务层按网卡名覆盖节点本地绑定策略；运行时在节点本地解析成当前 IPv4。
 - `input.interface_ip` 只用于节点本地收发绑定，不参与源流亲和调度。
-- `multicast_bridge` 的组播输入/输出若未显式指定 `interface_name/interface_ip`，默认使用工作节点安装时配置的组播网卡。
+- `stream_bridge` 组播输入/输出若未显式指定 `interface_name/interface_ip`，默认使用工作节点安装时配置的组播网卡。
 - 同网段优先不是强约束；若没有命中节点，则回落到其他在线节点。
 - 同网段优先级之后，再按节点实时负载排序，先比较 `slot_usage`，再比较 `running_tasks`。
 - 当前只对字面量 IP 生效；若输入 URL 使用域名，则退化为纯负载调度。
@@ -444,32 +539,32 @@ Agent 只读静态文件访问入口，用于预览、下载与排查。
 }
 ```
 
-### 3.6 `GET /tasks/{id}/resolved-spec`
+### 3.7 `GET /tasks/{id}/resolved-spec`
 
 返回冻结后的 `resolved_spec`，用于审计和重放。
 
-### 3.7 `POST /tasks/{id}/start`
+### 3.8 `POST /tasks/{id}/start`
 
 - 允许状态：`CREATED`, `FAILED`, `CANCELED`
 - 成功返回 `202 ACCEPTED`
 
-### 3.8 `POST /tasks/{id}/stop`
+### 3.9 `POST /tasks/{id}/stop`
 
 - 允许状态：`DISPATCHING`, `STARTING`, `RUNNING`, `RECOVERING`, `LOST`
 - 成功返回 `202 ACCEPTED`
 
-### 3.9 `POST /tasks/{id}/cancel`
+### 3.10 `POST /tasks/{id}/cancel`
 
 - 允许状态：`CREATED`, `VALIDATING`, `QUEUED`, `DISPATCHING`, `STARTING`, `RUNNING`, `RECOVERING`
 - 成功返回 `202 ACCEPTED`
 
-### 3.10 `POST /tasks/{id}/retry`
+### 3.11 `POST /tasks/{id}/retry`
 
 - 允许状态：`FAILED`, `LOST`
 - 创建新 Attempt，Task ID 不变
 - 返回新 Attempt 摘要
 
-### 3.11 `POST /tasks/{id}/recording/start`
+### 3.12 `POST /tasks/{id}/recording/start`
 
 - 允许状态：`RUNNING`
 - 仅支持实时源 `stream_ingest`，或已开启播放暴露的离线流分支，且当前 Attempt 已有 ZLM 流绑定
@@ -477,14 +572,14 @@ Agent 只读静态文件访问入口，用于预览、下载与排查。
 - `duration_sec` 表示本次手动录制会话时长，到点只停止录制，不停止任务
 - 成功返回 `202 ACCEPTED`
 
-### 3.12 `POST /tasks/{id}/recording/stop`
+### 3.13 `POST /tasks/{id}/recording/stop`
 
 - 允许状态：`RUNNING`
 - 仅关闭当前 Attempt 的运行中录制，流接入任务继续运行
 - 手动关闭后，断源重连不会自动恢复录制
 - 成功返回 `202 ACCEPTED`
 
-### 3.13 `POST /tasks/{id}/clone`
+### 3.14 `POST /tasks/{id}/clone`
 
 - 允许状态：`SUCCEEDED`, `FAILED`, `CANCELED`, `LOST`
 - 生成新 Task
@@ -549,7 +644,9 @@ Agent 只读静态文件访问入口，用于预览、下载与排查。
 - 仅因 `expose.enable_hls=true` 产生的实时播放 HLS 文件不会进入该接口。
 - `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全关闭时，会进入快录分支；这类输出不会进入 `/records`，而是进入 `/file-artifacts`。
 
-### 5.3 `GET /file-artifacts`
+## 5. 文件与节点接口
+
+### 5.1 `GET /file-artifacts`
 
 支持字段：
 
@@ -579,11 +676,11 @@ Agent 只读静态文件访问入口，用于预览、下载与排查。
 - `artifact_kind` 取值为 `transcode_output`、`bridge_output` 或 `stream_ingest_record`。
 - `http_url` 基于工作节点 `agent_stream_addr` 和 `/data/zlm/www` 下的相对路径生成。
 
-### 5.4 `GET /nodes`
+### 5.2 `GET /nodes`
 
 返回节点健康、能力摘要、当前负载和最近心跳。
 
-### 5.5 `GET /nodes/{id}/heartbeats`
+### 5.3 `GET /nodes/{id}/heartbeats`
 
 返回指定节点最近的 heartbeat 历史样本，默认 `24` 条，最大 `200` 条。
 

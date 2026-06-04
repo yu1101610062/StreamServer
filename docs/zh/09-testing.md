@@ -57,7 +57,7 @@
 - 推流过程中停止任务，FFmpeg 进程被优雅终止。
 - ZLM 重启后触发恢复流程。
 
-### 4.5 `multicast_bridge`
+### 4.5 `stream_bridge` 组播模式
 
 - 组播输入桥接到 ZLM 成功。
 - 持续组播输出成功。

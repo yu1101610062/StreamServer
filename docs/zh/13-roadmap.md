@@ -77,7 +77,7 @@
 - `ExecutionPlan`
 - `file_transcode`
 - `file_to_live`
-- `multicast_bridge`
+- `stream_bridge` 组播模式
 
 完成标准：
 

@@ -177,7 +177,7 @@ CANCELED -> QUEUED     (仅 clone 生成新 Task)
 - 判定成功的标志是 FFmpeg 推流在线且 ZLM 内部流可见。
 - 任一侧丢失都进入 `LOST` 或 `FAILED`。
 
-### 9.4 `multicast_bridge`
+### 9.4 `stream_bridge` 组播模式
 
 - 若模式为输入桥接，成功标志是桥接后的内部流在线。
 - 若模式为持续输出，成功标志是 FFmpeg 已成功发送且输出端无启动错误。

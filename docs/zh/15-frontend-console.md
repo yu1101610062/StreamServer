@@ -284,6 +284,8 @@
 
 | 页面 | 主要接口 |
 | --- | --- |
+| 登录与会话 | `GET /me`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout` |
+| 安全设置 | `POST /auth/change-password`, `GET /security/machine-allowlist`, `PUT /security/machine-allowlist` |
 | 任务中心 | `GET /tasks`, `POST /tasks`, `POST /tasks/{id}/start|stop|cancel|retry|clone` |
 | 任务详情 | `GET /tasks/{id}`, `GET /tasks/{id}/events`, `GET /tasks/{id}/logs`, `GET /tasks/{id}/resolved-spec` |
 | 流中心 | `GET /streams`, `POST /debug/zlm/close-stream` |

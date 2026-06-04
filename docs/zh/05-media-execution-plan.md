@@ -28,7 +28,7 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| `kind` | `file`, `rtsp`, `rtmp`, `hls`, `http_mp4`, `udp_mpegts_multicast`, `rtp_multicast` |
+| `kind` | `file`, `rtsp`, `rtmp`, `hls`, `ftp`, `http_mp4`, `http_flv`, `http_ts`, `udp_mpegts_multicast`, `rtp_multicast`, `gb_rtp` |
 | `url` | 规范化后的输入地址 |
 | `input_options` | 输入级 FFmpeg 参数键值对 |
 | `network_binding` | 本地网卡、`localaddr`、`reuse`、`ttl` 等 |
@@ -36,8 +36,10 @@
 
 约束：
 
-- 组播输入必须显式带出 `interface_ip` 或 `localaddr`。
-- 本地文件路径必须通过 allowlist 校验。
+- `file` 输入的 `url` 是相对 `agent.work_root` 的路径，必须通过路径规范化和 allowlist 校验。
+- URL 型输入包括 `rtsp`、`rtmp`、`hls`、`ftp`、`http_mp4`、`http_flv`、`http_ts`。
+- 组播输入可通过 `interface_name`、`interface_ip` 或 `localaddr` 覆盖节点绑定；未显式指定时使用工作节点配置的组播网卡策略。
+- `gb_rtp` 输入由 ZLM RTP server 承接，必须提供 `port`，可选 `ssrc`、`tcp_mode` 和 `reuse`。
 
 ## 4. 过滤与处理模型
 

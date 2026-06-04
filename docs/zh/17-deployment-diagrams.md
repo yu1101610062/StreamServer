@@ -32,7 +32,7 @@ flowchart LR
     subgraph NodeA["工作节点 A"]
         AAgent["media-agent\n注册/心跳\n能力探测\n本地执行器\norphan adopt"]
         AZLM["ZLMediaKit\n代理/分发/录像\nRTP 接收\nHook 发射"]
-        AFF["FFmpeg / ffprobe\n转码\nfile_to_live\nmulticast_bridge"]
+        AFF["FFmpeg / ffprobe\n转码\nfile_to_live\nstream_bridge 组播"]
         AFS["本地目录\n/data/media/work\n/data/media/logs\n/data/zlm/www"]
     end
 
@@ -313,7 +313,7 @@ flowchart LR
 | RTMP 播放/推流 | 推流端 / 播放端 | 节点 ZLM | `1935` 等 | 由 ZLM 决定 |
 | HTTP-TS/HLS/fMP4 | 浏览器 / 播放端 | 节点 ZLM | `80/443/自定义` | 由 ZLM 决定 |
 | RTP 接收 | 外部发送端 | 节点 ZLM | 动态端口 | `rtp_receive` 打开 |
-| 组播输入/输出 | 节点网卡 | 外部组播网络 | 动态 UDP | `multicast_bridge` 使用 |
+| 组播输入/输出 | 节点网卡 | 外部组播网络 | 动态 UDP | `stream_bridge` 组播模式使用 |
 
 ## 10. 部署建议
 
