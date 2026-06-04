@@ -25,7 +25,7 @@ use media_rpc::control_plane::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, Semaphore, mpsc},
+    sync::{Mutex, mpsc},
     time::{MissedTickBehavior, interval, sleep},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -39,13 +39,16 @@ use crate::{
     config::Settings,
     heartbeat::HeartbeatSampler,
     runtime::{
-        AdoptFilter, AdoptRuntimeFilter, LocalExecutor, LocalRuntimeRegistry,
-        ManagedProcessExecutor, RecordingControlAction, RuntimeEventSink, RuntimeNotification,
-        RuntimeTaskEvent, RuntimeTaskLogBatch, RuntimeTaskProgress, StartTaskRequest,
-        StopTaskRequest, TaskRecordingControlRequest, TerminalRuntimeReplay, bounded_log_batches,
-        cleanup_persisted_runtime_state, collect_terminal_runtime_replays,
-        is_terminal_runtime_event, rejected_runtime_handle, runtime_session_epoch,
+        AdoptFilter, AdoptRuntimeFilter, LocalExecutor, RecordingControlAction, RuntimeEventSink,
+        RuntimeManager, RuntimeManagerHandle, RuntimeManagerRequestOutcome, RuntimeNotification,
+        RuntimeReadHandle, RuntimeReadModel, RuntimeTaskEvent, RuntimeTaskLogBatch,
+        RuntimeTaskProgress, StartTaskRequest, StopTaskRequest, TaskRecordingControlRequest,
+        TerminalRuntimeReplay, bounded_log_batches, cleanup_persisted_runtime_state,
+        collect_terminal_runtime_replays, is_terminal_runtime_event, rejected_runtime_handle,
+        runtime_session_epoch,
     },
+    runtime_executor::ManagedProcessExecutor,
+    runtime_manager::{RuntimeManagerLimits, RuntimeManagerOptions},
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -53,25 +56,17 @@ const CONTROL_BACKOFF: [u64; 5] = [1, 2, 5, 10, 30];
 const CONTROL_BUFFER: usize = 32;
 const CONTROL_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const LOG_NOTIFICATION_BUFFER: usize = 128;
-const START_TASK_CONCURRENCY_LIMIT: usize = 4;
-const STOP_TASK_CONCURRENCY_LIMIT: usize = 8;
-const RECORDING_CONTROL_CONCURRENCY_LIMIT: usize = 4;
-const ADOPT_ORPHANS_CONCURRENCY_LIMIT: usize = 1;
 
 #[derive(Clone)]
 pub struct AgentController {
     settings: Arc<Settings>,
     node_id: Uuid,
     capability_probe: CapabilityProbe,
-    runtime_registry: LocalRuntimeRegistry,
+    runtime_read_handle: RuntimeReadHandle,
     artifact_cleanup: ArtifactCleanupManager,
-    executor: Arc<dyn LocalExecutor>,
+    runtime_manager: RuntimeManagerHandle,
     runtime_priority_events: Arc<Mutex<mpsc::UnboundedReceiver<RuntimeNotification>>>,
     runtime_log_batches: Arc<Mutex<mpsc::Receiver<RuntimeTaskLogBatch>>>,
-    start_task_permits: Arc<Semaphore>,
-    stop_task_permits: Arc<Semaphore>,
-    recording_control_permits: Arc<Semaphore>,
-    adopt_orphans_permits: Arc<Semaphore>,
     session_epoch: Arc<AtomicU64>,
 }
 
@@ -82,35 +77,38 @@ impl AgentController {
         } else {
             Uuid::parse_str(settings.agent.node_id.trim())?
         };
-        let runtime_registry = LocalRuntimeRegistry::new();
         let (runtime_priority_tx, runtime_priority_rx) = mpsc::unbounded_channel();
         let (runtime_log_tx, runtime_log_rx) = mpsc::channel(LOG_NOTIFICATION_BUFFER);
-        let executor = Arc::new(ManagedProcessExecutor::new(
+        let managed_executor = Arc::new(ManagedProcessExecutor::new_for_manager(
             settings.agent.clone(),
-            runtime_registry.clone(),
             RuntimeEventSink::new(runtime_priority_tx, runtime_log_tx),
         ));
+        let runtime_manager: RuntimeManagerHandle = RuntimeManager::spawn_managed_with_options(
+            managed_executor,
+            RuntimeManagerOptions {
+                limits: RuntimeManagerLimits::default(),
+                #[cfg(test)]
+                legacy_read_model: None,
+            },
+        );
+        let runtime_read_handle = runtime_manager.read_handle();
+        let runtime_read_model: Arc<dyn RuntimeReadModel> = Arc::new(runtime_read_handle.clone());
+        let runtime_executor: Arc<dyn LocalExecutor> = Arc::new(runtime_manager.clone());
         let artifact_cleanup = ArtifactCleanupManager::with_executor(
             &settings.agent,
-            runtime_registry.clone(),
-            Some(executor.clone()),
+            runtime_read_model.clone(),
+            Some(runtime_executor),
         );
 
         Ok(Self {
             settings: Arc::new(settings),
             node_id,
             capability_probe: CapabilityProbe::new()?,
-            runtime_registry,
+            runtime_read_handle,
             artifact_cleanup,
-            executor,
+            runtime_manager,
             runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
             runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
-            start_task_permits: Arc::new(Semaphore::new(START_TASK_CONCURRENCY_LIMIT)),
-            stop_task_permits: Arc::new(Semaphore::new(STOP_TASK_CONCURRENCY_LIMIT)),
-            recording_control_permits: Arc::new(Semaphore::new(
-                RECORDING_CONTROL_CONCURRENCY_LIMIT,
-            )),
-            adopt_orphans_permits: Arc::new(Semaphore::new(ADOPT_ORPHANS_CONCURRENCY_LIMIT)),
             session_epoch: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -147,7 +145,9 @@ impl AgentController {
         }
         // session_epoch 用来丢弃上一条连接残留的日志/事件，防止重连后旧任务消息串入新会话。
         let session_epoch = self.session_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.runtime_manager.begin_session(session_epoch).await?;
         let result = self.connect_once_active(session_epoch).await;
+        let _ = self.runtime_manager.end_session(session_epoch).await;
         self.invalidate_session_epoch(session_epoch);
         result
     }
@@ -176,7 +176,7 @@ impl AgentController {
 
         // 注册成功后立即上报能力快照，并回放本地持久化的终态运行时，补齐断线窗口事件。
         let snapshot = self.capability_probe.snapshot(&self.settings.agent).await;
-        self.executor.set_zlm_rtmp_enhanced_enabled(
+        self.runtime_manager.set_zlm_rtmp_enhanced_enabled(
             self.capability_probe
                 .zlm_rtmp_enhanced_enabled(&self.settings.agent)
                 .await,
@@ -252,7 +252,7 @@ impl AgentController {
         // 心跳中的 slot 与清理状态会直接影响 Core 调度，因此这里每次都取实时快照。
         let zlm_alive = self.capability_probe.zlm_alive(&self.settings.agent).await;
         let ffmpeg_alive = binary_available(&self.settings.agent.ffmpeg_bin);
-        let runtime_counts = self.runtime_registry.state_counts();
+        let runtime_counts = self.runtime_read_handle.state_counts();
         let snapshot = sampler.sample(
             runtime_counts.running,
             runtime_counts.starting,
@@ -331,7 +331,7 @@ impl AgentController {
                 ProbeCapabilities {},
             ) => {
                 let snapshot = self.capability_probe.snapshot(&self.settings.agent).await;
-                self.executor.set_zlm_rtmp_enhanced_enabled(
+                self.runtime_manager.set_zlm_rtmp_enhanced_enabled(
                     self.capability_probe
                         .zlm_rtmp_enhanced_enabled(&self.settings.agent)
                         .await,
@@ -363,9 +363,10 @@ impl AgentController {
         &self,
         sender: &mpsc::Sender<AgentEnvelope>,
     ) -> anyhow::Result<()> {
-        for replay in
-            collect_terminal_runtime_replays(&self.settings.agent.work_root, &self.runtime_registry)
-        {
+        for replay in collect_terminal_runtime_replays(
+            &self.settings.agent.work_root,
+            &self.runtime_read_handle,
+        ) {
             self.forward_terminal_runtime_replay(sender, replay).await?;
         }
         Ok(())
@@ -419,6 +420,7 @@ impl AgentController {
                     return Ok(());
                 }
                 send_task_snapshot(sender, &handle).await?;
+                self.runtime_manager.observe_runtime_snapshot(handle);
             }
         }
 
@@ -466,27 +468,26 @@ impl AgentController {
         }
 
         let sender = sender.clone();
-        let executor = self.executor.clone();
-        let adopt_orphans_permits = self.adopt_orphans_permits.clone();
-        let session_guard = self.session_epoch.clone();
+        let runtime_manager = self.runtime_manager.clone();
 
         tokio::spawn(async move {
-            let Ok(_permit) = adopt_orphans_permits.acquire_owned().await else {
-                return;
-            };
-            if !session_is_current(&session_guard, session_epoch) {
-                return;
-            }
-
-            let adopted = executor
-                .adopt_orphans(AdoptFilter {
+            let adopted = match runtime_manager
+                .adopt_orphans_in_session(
                     session_epoch,
-                    runtimes: runtimes.clone(),
-                })
-                .await;
-            if !session_is_current(&session_guard, session_epoch) {
-                return;
-            }
+                    AdoptFilter {
+                        session_epoch,
+                        runtimes: runtimes.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(RuntimeManagerRequestOutcome::Completed(adopted)) => adopted,
+                Ok(RuntimeManagerRequestOutcome::StaleSession) => return,
+                Err(error) => {
+                    warn!(error = %error, "runtime adopt command failed before execution");
+                    return;
+                }
+            };
 
             let adopted_keys = adopted
                 .iter()
@@ -506,9 +507,6 @@ impl AgentController {
                 .collect::<std::collections::HashSet<_>>();
 
             for runtime in runtimes {
-                if !session_is_current(&session_guard, session_epoch) {
-                    return;
-                }
                 let key = (
                     runtime.task_id,
                     runtime.attempt_no,
@@ -535,9 +533,7 @@ impl AgentController {
             }
 
             for handle in adopted {
-                if !session_is_current(&session_guard, session_epoch)
-                    || runtime_session_epoch(&handle) != session_epoch
-                {
+                if runtime_session_epoch(&handle) != session_epoch {
                     return;
                 }
                 let _ = send_task_snapshot(&sender, &handle).await;
@@ -556,22 +552,17 @@ impl AgentController {
         let mut request = parse_start_task(command)?;
         request.session_epoch = session_epoch;
         let sender = sender.clone();
-        let executor = self.executor.clone();
+        let runtime_manager = self.runtime_manager.clone();
         let artifact_cleanup = self.artifact_cleanup.clone();
-        let start_task_permits = self.start_task_permits.clone();
-        let session_guard = self.session_epoch.clone();
 
         tokio::spawn(async move {
-            let Ok(_permit) = start_task_permits.acquire_owned().await else {
-                return;
-            };
-            if session_guard.load(Ordering::SeqCst) != request.session_epoch {
-                return;
-            }
-
             if let Err(error) = artifact_cleanup.ensure_task_start_allowed(&request.resolved_spec) {
-                if !session_is_current(&session_guard, request.session_epoch) {
-                    return;
+                match runtime_manager.check_session(request.session_epoch).await {
+                    Ok(RuntimeManagerRequestOutcome::Completed(())) => {}
+                    Ok(RuntimeManagerRequestOutcome::StaleSession) => return,
+                    Err(check_error) => {
+                        warn!(error = %check_error, "runtime session check failed");
+                    }
                 }
                 let handle = rejected_runtime_handle(&request);
                 let _ = send_task_event(
@@ -592,21 +583,11 @@ impl AgentController {
                 return;
             }
 
-            match executor.start_task(request.clone()).await {
-                Ok(handle) => {
-                    if !session_is_current(&session_guard, request.session_epoch) {
-                        let _ = executor
-                            .stop_task(StopTaskRequest {
-                                task_id: request.task_id,
-                                attempt_no: request.attempt_no,
-                                lease_token: request.lease_token.clone(),
-                                reason: "stale_session_replaced".to_string(),
-                                grace_period_sec: 0,
-                                force_after_sec: 1,
-                            })
-                            .await;
-                        return;
-                    }
+            match runtime_manager
+                .start_task_in_session(request.session_epoch, request.clone())
+                .await
+            {
+                Ok(RuntimeManagerRequestOutcome::Completed(Ok(handle))) => {
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
@@ -620,9 +601,6 @@ impl AgentController {
                         }),
                     )
                     .await;
-                    if !session_is_current(&session_guard, request.session_epoch) {
-                        return;
-                    }
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
@@ -637,16 +615,11 @@ impl AgentController {
                         }),
                     )
                     .await;
-                    if session_is_current(&session_guard, request.session_epoch)
-                        && runtime_session_epoch(&handle) == request.session_epoch
-                    {
+                    if runtime_session_epoch(&handle) == request.session_epoch {
                         let _ = send_task_snapshot(&sender, &handle).await;
                     }
                 }
-                Err(error) => {
-                    if !session_is_current(&session_guard, request.session_epoch) {
-                        return;
-                    }
+                Ok(RuntimeManagerRequestOutcome::Completed(Err(error))) | Err(error) => {
                     let handle = rejected_runtime_handle(&request);
                     let _ = send_task_event(
                         &sender,
@@ -664,6 +637,7 @@ impl AgentController {
                     )
                     .await;
                 }
+                Ok(RuntimeManagerRequestOutcome::StaleSession) => {}
             }
         });
 
@@ -678,24 +652,15 @@ impl AgentController {
     ) -> anyhow::Result<()> {
         let request = parse_stop_task(command)?;
         let sender = sender.clone();
-        let executor = self.executor.clone();
-        let runtime_registry = self.runtime_registry.clone();
-        let stop_task_permits = self.stop_task_permits.clone();
-        let session_guard = self.session_epoch.clone();
+        let runtime_manager = self.runtime_manager.clone();
+        let runtime_read_handle = self.runtime_read_handle.clone();
 
         tokio::spawn(async move {
-            let Ok(_permit) = stop_task_permits.acquire_owned().await else {
-                return;
-            };
-            if !session_is_current(&session_guard, session_epoch) {
-                return;
-            }
-
-            match executor.stop_task(request.clone()).await {
-                Ok(()) => {
-                    if !session_is_current(&session_guard, session_epoch) {
-                        return;
-                    }
+            match runtime_manager
+                .stop_task_in_session(session_epoch, request.clone())
+                .await
+            {
+                Ok(RuntimeManagerRequestOutcome::Completed(Ok(()))) => {
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
@@ -711,20 +676,15 @@ impl AgentController {
                         }),
                     )
                     .await;
-                    if let Some(handle) =
-                        runtime_registry.find_by_task_attempt(request.task_id, request.attempt_no)
+                    if let Some(handle) = runtime_read_handle
+                        .find_by_task_attempt(request.task_id, request.attempt_no)
                     {
-                        if session_is_current(&session_guard, session_epoch)
-                            && runtime_session_epoch(&handle) == session_epoch
-                        {
+                        if runtime_session_epoch(&handle) == session_epoch {
                             let _ = send_task_snapshot(&sender, &handle).await;
                         }
                     }
                 }
-                Err(error) => {
-                    if !session_is_current(&session_guard, session_epoch) {
-                        return;
-                    }
+                Ok(RuntimeManagerRequestOutcome::Completed(Err(error))) | Err(error) => {
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
@@ -739,6 +699,7 @@ impl AgentController {
                     )
                     .await;
                 }
+                Ok(RuntimeManagerRequestOutcome::StaleSession) => {}
             }
         });
 
@@ -753,30 +714,19 @@ impl AgentController {
     ) -> anyhow::Result<()> {
         let request = parse_task_recording_control(command)?;
         let sender = sender.clone();
-        let executor = self.executor.clone();
-        let recording_control_permits = self.recording_control_permits.clone();
-        let session_guard = self.session_epoch.clone();
+        let runtime_manager = self.runtime_manager.clone();
 
         tokio::spawn(async move {
-            let Ok(_permit) = recording_control_permits.acquire_owned().await else {
-                return;
-            };
-            if !session_is_current(&session_guard, session_epoch) {
-                return;
-            }
-
-            match executor.set_task_recording(request.clone()).await {
-                Ok(handle) => {
-                    if session_is_current(&session_guard, session_epoch)
-                        && runtime_session_epoch(&handle) == session_epoch
-                    {
+            match runtime_manager
+                .set_task_recording_in_session(session_epoch, request.clone())
+                .await
+            {
+                Ok(RuntimeManagerRequestOutcome::Completed(Ok(handle))) => {
+                    if runtime_session_epoch(&handle) == session_epoch {
                         let _ = send_task_snapshot(&sender, &handle).await;
                     }
                 }
-                Err(error) => {
-                    if !session_is_current(&session_guard, session_epoch) {
-                        return;
-                    }
+                Ok(RuntimeManagerRequestOutcome::Completed(Err(error))) | Err(error) => {
                     let _ = send_task_event(
                         &sender,
                         request.task_id,
@@ -793,6 +743,7 @@ impl AgentController {
                     )
                     .await;
                 }
+                Ok(RuntimeManagerRequestOutcome::StaleSession) => {}
             }
         });
 
@@ -808,8 +759,9 @@ impl AgentController {
             .zlm_server_id(&self.settings.agent)
             .await
             .unwrap_or_else(|| self.node_id.to_string());
-        self.executor.set_zlm_server_id(zlm_server_id.clone());
-        self.executor.set_zlm_rtmp_enhanced_enabled(
+        self.runtime_manager
+            .set_zlm_server_id(zlm_server_id.clone());
+        self.runtime_manager.set_zlm_rtmp_enhanced_enabled(
             self.capability_probe
                 .zlm_rtmp_enhanced_enabled(&self.settings.agent)
                 .await,
@@ -848,10 +800,6 @@ impl AgentController {
             output_mount_relative_prefix_hls,
         })
     }
-}
-
-fn session_is_current(session_guard: &Arc<AtomicU64>, session_epoch: u64) -> bool {
-    session_guard.load(Ordering::SeqCst) == session_epoch
 }
 
 async fn send_capability_snapshot(
@@ -1466,7 +1414,7 @@ mod tests {
         .expect("counter should reach expected value");
     }
 
-    fn test_controller(executor: Arc<TestExecutor>) -> AgentController {
+    async fn test_controller(executor: Arc<TestExecutor>) -> AgentController {
         let agent = crate::config::AgentSettings {
             ffmpeg_bin: "true".to_string(),
             zlm_api_base: String::new(),
@@ -1484,31 +1432,31 @@ mod tests {
             logging: crate::config::LoggingSettings::default(),
             agent,
         };
-        let runtime_registry = LocalRuntimeRegistry::new();
         let (_runtime_priority_tx, runtime_priority_rx) = mpsc::unbounded_channel();
         let (_runtime_log_tx, runtime_log_rx) = mpsc::channel(LOG_NOTIFICATION_BUFFER);
-        let executor: Arc<dyn LocalExecutor> = executor;
+        let runtime_manager: RuntimeManagerHandle = RuntimeManager::spawn(executor);
+        let runtime_read_handle = runtime_manager.read_handle();
+        let runtime_read_model: Arc<dyn RuntimeReadModel> = Arc::new(runtime_read_handle.clone());
+        runtime_manager
+            .begin_session(1)
+            .await
+            .expect("test runtime manager session should begin");
+        let runtime_executor: Arc<dyn LocalExecutor> = Arc::new(runtime_manager.clone());
         let artifact_cleanup = ArtifactCleanupManager::with_executor(
             &settings.agent,
-            runtime_registry.clone(),
-            Some(executor.clone()),
+            runtime_read_model.clone(),
+            Some(runtime_executor),
         );
 
         AgentController {
             settings: Arc::new(settings),
             node_id: Uuid::now_v7(),
             capability_probe: CapabilityProbe::new().expect("capability probe should build"),
-            runtime_registry,
+            runtime_read_handle,
             artifact_cleanup,
-            executor,
+            runtime_manager,
             runtime_priority_events: Arc::new(Mutex::new(runtime_priority_rx)),
             runtime_log_batches: Arc::new(Mutex::new(runtime_log_rx)),
-            start_task_permits: Arc::new(Semaphore::new(START_TASK_CONCURRENCY_LIMIT)),
-            stop_task_permits: Arc::new(Semaphore::new(STOP_TASK_CONCURRENCY_LIMIT)),
-            recording_control_permits: Arc::new(Semaphore::new(
-                RECORDING_CONTROL_CONCURRENCY_LIMIT,
-            )),
-            adopt_orphans_permits: Arc::new(Semaphore::new(ADOPT_ORPHANS_CONCURRENCY_LIMIT)),
             session_epoch: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -1679,7 +1627,7 @@ mod tests {
     async fn stop_task_job_does_not_block_runtime_notifications() {
         let executor = Arc::new(TestExecutor::default());
         let release_stop = executor.block_stop().await;
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, mut receiver) = sender_pair();
         let task_id = Uuid::now_v7();
 
@@ -1719,7 +1667,7 @@ mod tests {
     async fn recording_job_does_not_block_heartbeat_path() {
         let executor = Arc::new(TestExecutor::default());
         let release_recording = executor.block_recording().await;
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, mut receiver) = sender_pair();
         let task_id = Uuid::now_v7();
 
@@ -1746,7 +1694,7 @@ mod tests {
     async fn adopt_job_does_not_block_later_core_commands() {
         let executor = Arc::new(TestExecutor::default());
         let release_adopt = executor.block_adopt().await;
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, _receiver) = sender_pair();
         let task_id = Uuid::now_v7();
 
@@ -1771,7 +1719,7 @@ mod tests {
     async fn adopt_jobs_are_limited_to_one_active_executor_call() {
         let executor = Arc::new(TestExecutor::default());
         let release_adopt = executor.block_adopt().await;
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, _receiver) = sender_pair();
 
         controller
@@ -1793,7 +1741,7 @@ mod tests {
     #[tokio::test]
     async fn stale_session_jobs_do_not_send_old_events() {
         let executor = Arc::new(TestExecutor::default());
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, mut receiver) = sender_pair();
         let release_stop = executor.block_stop().await;
 
@@ -1802,12 +1750,17 @@ mod tests {
             .await
             .expect("stop handler should succeed");
         wait_for_counter(&executor.stop_calls, 1).await;
+        controller
+            .runtime_manager
+            .end_session(1)
+            .await
+            .expect("test runtime session should end");
         controller.session_epoch.store(2, Ordering::SeqCst);
         let _ = release_stop.send(());
         assert_no_agent_envelope(&mut receiver).await;
 
         let executor = Arc::new(TestExecutor::default());
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, mut receiver) = sender_pair();
         let release_recording = executor.block_recording().await;
 
@@ -1816,12 +1769,17 @@ mod tests {
             .await
             .expect("recording handler should succeed");
         wait_for_counter(&executor.recording_calls, 1).await;
+        controller
+            .runtime_manager
+            .end_session(1)
+            .await
+            .expect("test runtime session should end");
         controller.session_epoch.store(2, Ordering::SeqCst);
         let _ = release_recording.send(());
         assert_no_agent_envelope(&mut receiver).await;
 
         let executor = Arc::new(TestExecutor::default());
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, mut receiver) = sender_pair();
         let release_adopt = executor.block_adopt().await;
 
@@ -1830,12 +1788,17 @@ mod tests {
             .await
             .expect("adopt handler should succeed");
         wait_for_counter(&executor.adopt_calls, 1).await;
+        controller
+            .runtime_manager
+            .end_session(1)
+            .await
+            .expect("test runtime session should end");
         controller.session_epoch.store(2, Ordering::SeqCst);
         let _ = release_adopt.send(());
         assert_no_agent_envelope(&mut receiver).await;
 
         let executor = Arc::new(TestExecutor::default());
-        let controller = test_controller(executor.clone());
+        let controller = test_controller(executor.clone()).await;
         let (sender, mut receiver) = sender_pair();
         let release_start = executor.block_start().await;
 
@@ -1844,31 +1807,14 @@ mod tests {
             .await
             .expect("start handler should succeed");
         wait_for_counter(&executor.start_calls, 1).await;
+        controller
+            .runtime_manager
+            .end_session(1)
+            .await
+            .expect("test runtime session should end");
         controller.session_epoch.store(2, Ordering::SeqCst);
         let _ = release_start.send(());
         wait_for_counter(&executor.stop_calls, 1).await;
         assert_no_agent_envelope(&mut receiver).await;
-    }
-
-    #[test]
-    fn runtime_command_job_semaphores_match_expected_limits() {
-        let controller = test_controller(Arc::new(TestExecutor::default()));
-
-        assert_eq!(
-            controller.start_task_permits.available_permits(),
-            START_TASK_CONCURRENCY_LIMIT
-        );
-        assert_eq!(
-            controller.stop_task_permits.available_permits(),
-            STOP_TASK_CONCURRENCY_LIMIT
-        );
-        assert_eq!(
-            controller.recording_control_permits.available_permits(),
-            RECORDING_CONTROL_CONCURRENCY_LIMIT
-        );
-        assert_eq!(
-            controller.adopt_orphans_permits.available_permits(),
-            ADOPT_ORPHANS_CONCURRENCY_LIMIT
-        );
     }
 }

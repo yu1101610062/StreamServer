@@ -126,6 +126,13 @@
 
 Agent 将其转换为 `task_progress` 事件。
 
+## 8.1 Runtime 提交与监控边界
+
+- ExecutionPlan 渲染和 worker 启动不直接提交全局 runtime 状态；生产路径由 `RuntimeManager` actor 完成 start/stop/record/adopt/recovery 状态提交。
+- startup probe、process exit、live relay、RTP、companion 和 progress monitor 只向 manager 发送 internal event。
+- internal event 必须携带 `runtime_id + generation`；manager 校验当前 generation 后再更新 `RuntimeManagerState`、`RuntimeReadHandle`、本地持久化和对 Core 的 snapshot/event。
+- worker 可以执行 FFmpeg/ZLM API、进程信号、文件持久化、探测等慢操作；actor loop 不执行长 await。
+
 ## 9. 失败分类
 
 | 分类 | 判定 |

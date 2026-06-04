@@ -7,8 +7,17 @@ use media_domain::{RuntimeHandle, RuntimeState, WorkerKind};
 use serde_json::Value;
 use uuid::Uuid;
 
+/// Legacy in-memory registry retained for tests and direct executor compatibility.
+///
+/// Production runtime reads come from `RuntimeReadHandle`, which is maintained by
+/// `RuntimeManagerState`.
 #[derive(Debug, Clone)]
 pub struct LocalRuntimeRegistry {
+    inner: Arc<RwLock<RuntimeRegistryState>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeReadHandle {
     inner: Arc<RwLock<RuntimeRegistryState>>,
 }
 
@@ -41,6 +50,15 @@ pub struct AdoptRuntimeFilter {
     pub attempt_no: i32,
     pub lease_token: String,
     pub worker_kind: WorkerKind,
+}
+
+pub trait RuntimeReadModel: Send + Sync {
+    #[allow(dead_code)]
+    fn state_counts(&self) -> RuntimeStateCounts;
+    fn active_handles(&self) -> Vec<RuntimeHandle>;
+    fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle>;
+    #[allow(dead_code)]
+    fn snapshots(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle>;
 }
 
 impl LocalRuntimeRegistry {
@@ -142,10 +160,165 @@ impl LocalRuntimeRegistry {
     }
 }
 
+impl RuntimeReadHandle {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(RuntimeRegistryState::default())),
+        }
+    }
+
+    pub(crate) fn apply_handle(&self, handle: RuntimeHandle) {
+        if handle.state == RuntimeState::Exited {
+            self.remove_runtime_id(handle.runtime_id);
+            return;
+        }
+        self.track(handle);
+    }
+
+    pub(crate) fn apply_handles(&self, handles: Vec<RuntimeHandle>) {
+        for handle in handles {
+            self.apply_handle(handle);
+        }
+    }
+
+    pub(crate) fn remove_runtime_id(&self, runtime_id: Uuid) -> Option<RuntimeHandle> {
+        let mut runtimes = self.inner.write().expect("runtime read lock poisoned");
+        let removed = runtimes.by_runtime_id.remove(&runtime_id)?;
+        if runtimes
+            .by_task_attempt
+            .get(&(removed.task_id, removed.attempt_no))
+            == Some(&runtime_id)
+        {
+            runtimes
+                .by_task_attempt
+                .remove(&(removed.task_id, removed.attempt_no));
+        }
+        Some(removed)
+    }
+
+    pub(crate) fn remove_by_task_attempt(
+        &self,
+        task_id: Uuid,
+        attempt_no: i32,
+    ) -> Option<RuntimeHandle> {
+        let mut runtimes = self.inner.write().expect("runtime read lock poisoned");
+        let runtime_id = runtimes.by_task_attempt.remove(&(task_id, attempt_no))?;
+        runtimes.by_runtime_id.remove(&runtime_id)
+    }
+
+    fn track(&self, handle: RuntimeHandle) {
+        let mut runtimes = self.inner.write().expect("runtime read lock poisoned");
+        let key = (handle.task_id, handle.attempt_no);
+        if let Some(previous_runtime_id) = runtimes.by_task_attempt.insert(key, handle.runtime_id) {
+            if previous_runtime_id != handle.runtime_id {
+                runtimes.by_runtime_id.remove(&previous_runtime_id);
+            }
+        }
+        runtimes.by_runtime_id.insert(handle.runtime_id, handle);
+    }
+
+    pub fn state_counts(&self) -> RuntimeStateCounts {
+        let runtimes = self.inner.read().expect("runtime read lock poisoned");
+        state_counts_from_handles(runtimes.by_runtime_id.values())
+    }
+
+    pub fn active_handles(&self) -> Vec<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime read lock poisoned");
+        runtimes
+            .by_runtime_id
+            .values()
+            .filter(|handle| handle.state != RuntimeState::Exited)
+            .cloned()
+            .collect()
+    }
+
+    pub fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime read lock poisoned");
+        let runtime_id = runtimes.by_task_attempt.get(&(task_id, attempt_no))?;
+        runtimes.by_runtime_id.get(runtime_id).cloned()
+    }
+
+    pub fn snapshots(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
+        let runtimes = self.inner.read().expect("runtime read lock poisoned");
+        runtimes
+            .by_runtime_id
+            .values()
+            .filter(|handle| filter.matches(handle))
+            .cloned()
+            .collect()
+    }
+}
+
+impl Default for RuntimeReadHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Default for LocalRuntimeRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl RuntimeReadModel for LocalRuntimeRegistry {
+    fn state_counts(&self) -> RuntimeStateCounts {
+        LocalRuntimeRegistry::state_counts(self)
+    }
+
+    fn active_handles(&self) -> Vec<RuntimeHandle> {
+        LocalRuntimeRegistry::active_handles(self)
+    }
+
+    fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle> {
+        LocalRuntimeRegistry::find_by_task_attempt(self, task_id, attempt_no)
+    }
+
+    fn snapshots(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
+        LocalRuntimeRegistry::snapshots(self, filter)
+    }
+}
+
+impl RuntimeReadModel for RuntimeReadHandle {
+    fn state_counts(&self) -> RuntimeStateCounts {
+        RuntimeReadHandle::state_counts(self)
+    }
+
+    fn active_handles(&self) -> Vec<RuntimeHandle> {
+        RuntimeReadHandle::active_handles(self)
+    }
+
+    fn find_by_task_attempt(&self, task_id: Uuid, attempt_no: i32) -> Option<RuntimeHandle> {
+        RuntimeReadHandle::find_by_task_attempt(self, task_id, attempt_no)
+    }
+
+    fn snapshots(&self, filter: &AdoptFilter) -> Vec<RuntimeHandle> {
+        RuntimeReadHandle::snapshots(self, filter)
+    }
+}
+
+fn state_counts_from_handles<'a>(
+    handles: impl Iterator<Item = &'a RuntimeHandle>,
+) -> RuntimeStateCounts {
+    let mut counts = RuntimeStateCounts::default();
+    for handle in handles {
+        match handle.state {
+            RuntimeState::Pending | RuntimeState::Starting => {
+                counts.starting = counts.starting.saturating_add(1);
+            }
+            RuntimeState::Running => {
+                counts.running = counts.running.saturating_add(1);
+            }
+            RuntimeState::Stopping => {
+                counts.stopping = counts.stopping.saturating_add(1);
+            }
+            RuntimeState::Orphaned => {
+                counts.orphaned = counts.orphaned.saturating_add(1);
+            }
+            RuntimeState::Exited => {}
+        }
+    }
+    counts
 }
 
 impl AdoptFilter {

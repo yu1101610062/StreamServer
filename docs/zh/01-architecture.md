@@ -29,10 +29,18 @@
 | 组件 | 主要职责 | 不负责 |
 | --- | --- | --- |
 | `media-core` | API、鉴权、模板、参数解析、调度、恢复、审计、前端后端 | 不直接拉流、不直接编解码 |
-| `media-agent` | 节点执行、能力探测、日志采集、进程接管、NIC 绑定 | 不做租户权限和全局调度 |
+| `media-agent` | 节点执行、能力探测、日志采集、进程接管、NIC 绑定、本地 runtime 状态提交 | 不做租户权限和全局调度 |
 | ZLMediaKit | 实时拉流代理、分发、录制、RTP/GB 接收、Hook 发射 | 不做业务状态机 |
 | FFmpeg/ffprobe | 探测、转码、文件转直播、持续组播输出 | 不承载上层任务语义 |
 | PostgreSQL | 真相库、状态机持久化、租约、事件与审计 | 不做缓存层或消息队列 |
+
+### 3.1 Agent Runtime 状态源
+
+- `media-agent` 内部由 `RuntimeManager` actor 单点接收 start/stop/record/adopt/recovery 命令。
+- `RuntimeManagerState` 是生产唯一 runtime 状态源；heartbeat、cleanup、terminal replay 和 stop snapshot 读取 `RuntimeReadHandle` 同步快照。
+- FFmpeg/ZLM worker 只执行慢副作用，例如进程启动、信号发送、ZLM API、持久化和探测；状态提交、generation 校验和对 Core 的 snapshot/event 发布由 actor 完成。
+- monitor 不直接写本地全局状态；启动链和接管后的 monitor 通过带 `runtime_id + generation` 的 internal event 回到 actor，旧 generation 事件被丢弃。
+- `LocalRuntimeRegistry` 仅保留为测试和 direct legacy 兼容工具，不是生产权威状态源。
 
 ## 4. 默认部署拓扑
 

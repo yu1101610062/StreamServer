@@ -365,7 +365,27 @@ pub(crate) fn emit_recording_control_event(
     request: &TaskRecordingControlRequest,
     payload: Value,
 ) {
-    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+    let _ = events.send(recording_control_notification(
+        handle,
+        event_type,
+        event_level,
+        message,
+        recording,
+        request,
+        payload,
+    ));
+}
+
+pub(crate) fn recording_control_notification(
+    handle: &RuntimeHandle,
+    event_type: &str,
+    event_level: &str,
+    message: impl Into<String>,
+    recording: &LiveRelayRecording,
+    request: &TaskRecordingControlRequest,
+    payload: Value,
+) -> RuntimeNotification {
+    RuntimeNotification::TaskEvent(RuntimeTaskEvent {
         task_id: handle.task_id,
         attempt_no: handle.attempt_no,
         lease_token: runtime_lease_token(handle).unwrap_or_default(),
@@ -389,7 +409,7 @@ pub(crate) fn emit_recording_control_event(
                 "reason": request.reason,
             }),
         ),
-    }));
+    })
 }
 
 pub(crate) fn merge_event_payload(mut base: Value, extra: Value) -> Value {

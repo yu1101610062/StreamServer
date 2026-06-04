@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::runtime::ExecutorError;
+use crate::runtime_manager::RuntimeMonitorHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProcessIdentity {
@@ -140,7 +141,7 @@ impl ProcessIdentity {
     pub(crate) fn spawned_process_group(pid: i32) -> Self {
         Self {
             pid,
-            pgid: process_group_id(pid).filter(|pgid| *pgid == pid),
+            pgid: Some(pid),
             pid_start_time: linux_pid_start_time(pid),
         }
     }
@@ -180,6 +181,7 @@ pub(crate) fn is_process_running(process: &ProcessIdentity) -> bool {
     true
 }
 
+#[cfg(test)]
 pub(crate) fn process_group_id(pid: i32) -> Option<i32> {
     let pgid = unsafe { libc::getpgid(pid) };
     (pgid >= 0).then_some(pgid)
@@ -326,6 +328,40 @@ pub(crate) fn schedule_force_kill_if_running(
         if !runtime_still_tracked {
             return;
         }
+
+        for process in processes {
+            if !process_should_receive_force_kill(&process, runtime_id, reason) {
+                continue;
+            }
+            tracing::warn!(
+                runtime_id = %runtime_id,
+                pid = process.pid,
+                pgid = ?process.pgid,
+                delay_sec = delay.as_secs_f64(),
+                reason,
+                "process still running after graceful stop; sending SIGKILL"
+            );
+            let _ = signal_process(&process, libc::SIGKILL);
+        }
+    });
+}
+
+pub(crate) fn schedule_force_kill_with_monitor_if_running(
+    monitor_handle: RuntimeMonitorHandle,
+    processes: Vec<ProcessIdentity>,
+    delay: Duration,
+    reason: &'static str,
+) {
+    if processes.is_empty() {
+        return;
+    }
+
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if monitor_handle.snapshot().await.is_none() {
+            return;
+        }
+        let runtime_id = monitor_handle.runtime_id();
 
         for process in processes {
             if !process_should_receive_force_kill(&process, runtime_id, reason) {

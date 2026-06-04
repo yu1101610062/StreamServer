@@ -19,10 +19,11 @@ use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
-    runtime::{ExecutorError, StartTaskRequest, SuccessCheck},
+    runtime::{ExecutorError, StartTaskRequest, StartupProbe, SuccessCheck},
     runtime_events::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
+    runtime_manager::RuntimeMonitorHandle,
     runtime_metadata::{
         RtpServerMetadata, StreamBinding, attach_zlm_server_id, runtime_lease_token,
     },
@@ -268,11 +269,132 @@ pub(crate) struct RuntimeZlmStartContext<'a> {
     pub(crate) hooks: RuntimeZlmStartHooks,
 }
 
-pub(crate) async fn start_live_relay_task(
+pub(crate) struct RuntimeZlmStartOutcome {
+    handle: RuntimeHandle,
+    backend: ManagedRuntime,
+    rollback: ZlmStartRollback,
+    monitor_plan: ZlmStartMonitorPlan,
+    hooks: RuntimeZlmStartHooks,
+}
+
+struct ZlmStartMonitorPlan {
+    settings: AgentSettings,
+    http_client: Client,
+    registry: LocalRuntimeRegistry,
+    runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    events: RuntimeEventSink,
+    notification: RuntimeNotification,
+    kind: ZlmStartMonitorKind,
+}
+
+enum ZlmStartMonitorKind {
+    LiveRelay {
+        work_dir: PathBuf,
+        startup_probe: StartupProbe,
+    },
+    RtpReceive {
+        work_dir: PathBuf,
+        stream_id: String,
+    },
+}
+
+impl RuntimeZlmStartOutcome {
+    pub(crate) fn runtime_id(&self) -> Uuid {
+        self.handle.runtime_id
+    }
+
+    pub(crate) async fn commit(
+        mut self,
+        monitor_handle: Option<RuntimeMonitorHandle>,
+    ) -> Result<RuntimeHandle, ExecutorError> {
+        let manager_commit = monitor_handle.is_some();
+        let handle = self.handle.clone();
+        let runtime_id = handle.runtime_id;
+        {
+            let mut runtimes = self
+                .monitor_plan
+                .runtimes
+                .write()
+                .expect("runtime map lock poisoned");
+            runtimes.insert(runtime_id, self.backend.clone());
+        }
+        if let Err(error) = self.hooks.after_runtime_insert(&handle) {
+            return self.rollback_start_error(error).await;
+        }
+        if !manager_commit {
+            self.monitor_plan.registry.track(handle.clone());
+            if let Err(error) = self.hooks.after_registry_track(&handle) {
+                return self.rollback_start_error(error).await;
+            }
+        }
+
+        let _ = self
+            .monitor_plan
+            .events
+            .send(self.monitor_plan.notification.clone());
+        match &self.monitor_plan.kind {
+            ZlmStartMonitorKind::LiveRelay {
+                work_dir,
+                startup_probe,
+            } => {
+                spawn_live_relay_monitor(
+                    runtime_id,
+                    work_dir.clone(),
+                    startup_probe.clone(),
+                    self.monitor_plan.settings.clone(),
+                    self.monitor_plan.http_client.clone(),
+                    self.monitor_plan.registry.clone(),
+                    self.monitor_plan.runtimes.clone(),
+                    self.monitor_plan.events.clone(),
+                    monitor_handle.clone(),
+                );
+            }
+            ZlmStartMonitorKind::RtpReceive {
+                work_dir,
+                stream_id,
+            } => {
+                spawn_rtp_receive_monitor(
+                    runtime_id,
+                    work_dir.clone(),
+                    stream_id.clone(),
+                    self.monitor_plan.settings.clone(),
+                    self.monitor_plan.http_client.clone(),
+                    self.monitor_plan.registry.clone(),
+                    self.monitor_plan.runtimes.clone(),
+                    self.monitor_plan.events.clone(),
+                    monitor_handle.clone(),
+                );
+            }
+        }
+        self.rollback.disarm();
+        Ok(handle)
+    }
+
+    async fn rollback_start_error<T>(&mut self, error: ExecutorError) -> Result<T, ExecutorError> {
+        self.rollback
+            .cleanup(&self.monitor_plan.http_client, &self.monitor_plan.settings)
+            .await;
+        Err(error)
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn start_live_relay_task_and_commit(
     ctx: RuntimeZlmStartContext<'_>,
     request: &StartTaskRequest,
     slot_permit: Arc<RuntimeSlotPermit>,
 ) -> Result<RuntimeHandle, ExecutorError> {
+    start_live_relay_task(ctx, request, slot_permit)
+        .await?
+        .commit(None)
+        .await
+}
+
+pub(crate) async fn start_live_relay_task(
+    ctx: RuntimeZlmStartContext<'_>,
+    request: &StartTaskRequest,
+    slot_permit: Arc<RuntimeSlotPermit>,
+) -> Result<RuntimeZlmStartOutcome, ExecutorError> {
     let spec = parse_task_spec(request)?;
     let plan = build_live_relay_plan(ctx.settings, request, &spec)?;
     prepare_work_dir(&plan.work_dir)?;
@@ -344,63 +466,65 @@ pub(crate) async fn start_live_relay_task(
     {
         return rollback_zlm_start_error(&mut rollback, ctx.http_client, ctx.settings, error).await;
     }
-    {
-        let mut runtimes = ctx.runtimes.write().expect("runtime map lock poisoned");
-        runtimes.insert(
-            runtime_id,
-            ManagedRuntime {
-                process: None,
-                companion_processes: Vec::new(),
-                _slot_permit: slot_permit,
-                stop_requested,
-                suppress_companion_events: Arc::new(AtomicBool::new(false)),
-            },
-        );
-    }
-    if let Err(error) = ctx.hooks.after_runtime_insert(&handle) {
-        return rollback_zlm_start_error(&mut rollback, ctx.http_client, ctx.settings, error).await;
-    }
-    ctx.registry.track(handle.clone());
-    if let Err(error) = ctx.hooks.after_registry_track(&handle) {
-        return rollback_zlm_start_error(&mut rollback, ctx.http_client, ctx.settings, error).await;
-    }
-    let _ = ctx
-        .events
-        .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-            task_id: handle.task_id,
-            attempt_no: handle.attempt_no,
-            lease_token: runtime_lease_token(&handle).unwrap_or_default(),
-            session_epoch: runtime_session_epoch(&handle),
-            event_type: "zlm_proxy_created".to_string(),
-            event_level: "info".to_string(),
-            message: "stream_ingest proxy created in ZLM".to_string(),
-            payload: json!({
-                "runtime_id": handle.runtime_id,
-                "vhost": stream_binding.vhost,
-                "app": stream_binding.app,
-                "stream": stream_binding.stream,
-                "zlm_proxy_key": extract_zlm_proxy_key(&response),
+
+    Ok(RuntimeZlmStartOutcome {
+        handle: handle.clone(),
+        backend: ManagedRuntime {
+            process: None,
+            companion_processes: Vec::new(),
+            _slot_permit: slot_permit,
+            stop_requested,
+            suppress_companion_events: Arc::new(AtomicBool::new(false)),
+        },
+        rollback,
+        monitor_plan: ZlmStartMonitorPlan {
+            settings: ctx.settings.clone(),
+            http_client: ctx.http_client.clone(),
+            registry: ctx.registry.clone(),
+            runtimes: ctx.runtimes.clone(),
+            events: ctx.events.clone(),
+            notification: RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&handle),
+                event_type: "zlm_proxy_created".to_string(),
+                event_level: "info".to_string(),
+                message: "stream_ingest proxy created in ZLM".to_string(),
+                payload: json!({
+                    "runtime_id": handle.runtime_id,
+                    "vhost": stream_binding.vhost,
+                    "app": stream_binding.app,
+                    "stream": stream_binding.stream,
+                    "zlm_proxy_key": proxy_key,
+                }),
             }),
-        }));
-    spawn_live_relay_monitor(
-        runtime_id,
-        plan.work_dir,
-        plan.startup_probe,
-        ctx.settings.clone(),
-        ctx.http_client.clone(),
-        ctx.registry.clone(),
-        ctx.runtimes.clone(),
-        ctx.events.clone(),
-    );
-    rollback.disarm();
-    Ok(handle)
+            kind: ZlmStartMonitorKind::LiveRelay {
+                work_dir: plan.work_dir,
+                startup_probe: plan.startup_probe,
+            },
+        },
+        hooks: ctx.hooks,
+    })
+}
+
+#[cfg(test)]
+pub(crate) async fn start_rtp_receive_task_and_commit(
+    ctx: RuntimeZlmStartContext<'_>,
+    request: &StartTaskRequest,
+    slot_permit: Arc<RuntimeSlotPermit>,
+) -> Result<RuntimeHandle, ExecutorError> {
+    start_rtp_receive_task(ctx, request, slot_permit)
+        .await?
+        .commit(None)
+        .await
 }
 
 pub(crate) async fn start_rtp_receive_task(
     ctx: RuntimeZlmStartContext<'_>,
     request: &StartTaskRequest,
     slot_permit: Arc<RuntimeSlotPermit>,
-) -> Result<RuntimeHandle, ExecutorError> {
+) -> Result<RuntimeZlmStartOutcome, ExecutorError> {
     let spec = parse_task_spec(request)?;
     let plan = build_rtp_receive_plan(ctx.settings, request, &spec)?;
     prepare_work_dir(&plan.work_dir)?;
@@ -464,56 +588,46 @@ pub(crate) async fn start_rtp_receive_task(
     {
         return rollback_zlm_start_error(&mut rollback, ctx.http_client, ctx.settings, error).await;
     }
-    {
-        let mut runtimes = ctx.runtimes.write().expect("runtime map lock poisoned");
-        runtimes.insert(
-            runtime_id,
-            ManagedRuntime {
-                process: None,
-                companion_processes: Vec::new(),
-                _slot_permit: slot_permit,
-                stop_requested,
-                suppress_companion_events: Arc::new(AtomicBool::new(false)),
-            },
-        );
-    }
-    if let Err(error) = ctx.hooks.after_runtime_insert(&handle) {
-        return rollback_zlm_start_error(&mut rollback, ctx.http_client, ctx.settings, error).await;
-    }
-    ctx.registry.track(handle.clone());
-    if let Err(error) = ctx.hooks.after_registry_track(&handle) {
-        return rollback_zlm_start_error(&mut rollback, ctx.http_client, ctx.settings, error).await;
-    }
-    let _ = ctx
-        .events
-        .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-            task_id: handle.task_id,
-            attempt_no: handle.attempt_no,
-            lease_token: runtime_lease_token(&handle).unwrap_or_default(),
-            session_epoch: runtime_session_epoch(&handle),
-            event_type: "rtp_server_opened".to_string(),
-            event_level: "info".to_string(),
-            message: "stream_ingest rtp server opened in ZLM".to_string(),
-            payload: json!({
-                "runtime_id": handle.runtime_id,
-                "rtp_stream_id": handle.metadata["rtp_stream_id"],
-                "requested_port": plan.requested_port,
-                "local_port": local_port,
-                "tcp_mode": plan.tcp_mode,
-                "re_use_port": plan.reuse_port,
-                "ssrc": plan.ssrc,
+
+    Ok(RuntimeZlmStartOutcome {
+        handle: handle.clone(),
+        backend: ManagedRuntime {
+            process: None,
+            companion_processes: Vec::new(),
+            _slot_permit: slot_permit,
+            stop_requested,
+            suppress_companion_events: Arc::new(AtomicBool::new(false)),
+        },
+        rollback,
+        monitor_plan: ZlmStartMonitorPlan {
+            settings: ctx.settings.clone(),
+            http_client: ctx.http_client.clone(),
+            registry: ctx.registry.clone(),
+            runtimes: ctx.runtimes.clone(),
+            events: ctx.events.clone(),
+            notification: RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                task_id: handle.task_id,
+                attempt_no: handle.attempt_no,
+                lease_token: runtime_lease_token(&handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&handle),
+                event_type: "rtp_server_opened".to_string(),
+                event_level: "info".to_string(),
+                message: "stream_ingest rtp server opened in ZLM".to_string(),
+                payload: json!({
+                    "runtime_id": handle.runtime_id,
+                    "rtp_stream_id": handle.metadata["rtp_stream_id"],
+                    "requested_port": plan.requested_port,
+                    "local_port": local_port,
+                    "tcp_mode": plan.tcp_mode,
+                    "re_use_port": plan.reuse_port,
+                    "ssrc": plan.ssrc,
+                }),
             }),
-        }));
-    spawn_rtp_receive_monitor(
-        runtime_id,
-        plan.work_dir,
-        plan.stream_id,
-        ctx.settings.clone(),
-        ctx.http_client.clone(),
-        ctx.registry.clone(),
-        ctx.runtimes.clone(),
-        ctx.events.clone(),
-    );
-    rollback.disarm();
-    Ok(handle)
+            kind: ZlmStartMonitorKind::RtpReceive {
+                work_dir: plan.work_dir,
+                stream_id: plan.stream_id,
+            },
+        },
+        hooks: ctx.hooks,
+    })
 }

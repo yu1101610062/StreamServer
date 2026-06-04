@@ -224,8 +224,10 @@ impl TaskRepository {
         let result = sqlx::query(
             r#"
             update media_nodes
-               set healthy = control_connected and not $4,
+               set healthy = not $4,
+                   control_connected = true,
                    last_seen_at = $1,
+                   control_last_seen_at = $1,
                    updated_at = $2
              where id = $3
             "#,

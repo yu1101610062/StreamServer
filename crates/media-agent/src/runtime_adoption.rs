@@ -44,6 +44,12 @@ use crate::{
 
 const ADOPT_ZLM_PROBE_CONCURRENCY_LIMIT: usize = 8;
 
+pub(crate) struct RuntimeAdoptionWorkerContext {
+    pub(crate) filter: AdoptFilter,
+    pub(crate) zlm_server_id: Option<String>,
+    pub(crate) settings: AgentSettings,
+}
+
 pub(crate) struct RuntimeAdoptionContext {
     pub(crate) filter: AdoptFilter,
     pub(crate) zlm_server_id: Option<String>,
@@ -53,6 +59,42 @@ pub(crate) struct RuntimeAdoptionContext {
     pub(crate) runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     pub(crate) slot_limiter: Arc<RuntimeSlotLimiter>,
     pub(crate) events: RuntimeEventSink,
+}
+
+pub(crate) enum RuntimeAdoptionOutcome<Restart> {
+    Adopted(RuntimeAdoptionCommit),
+    Restart(Restart),
+}
+
+pub(crate) struct RuntimeAdoptionCommit {
+    pub(crate) handle: RuntimeHandle,
+    pub(crate) work_dir: std::path::PathBuf,
+    pub(crate) success_check: crate::runtime::SuccessCheck,
+    pub(crate) backend: RuntimeAdoptionBackend,
+    pub(crate) notifications: Vec<RuntimeNotification>,
+    pub(crate) monitors: Vec<RuntimeAdoptionMonitor>,
+}
+
+pub(crate) struct RuntimeAdoptionBackend {
+    pub(crate) process: Option<ProcessIdentity>,
+    pub(crate) companion_processes: Vec<ProcessIdentity>,
+}
+
+pub(crate) enum RuntimeAdoptionMonitor {
+    StartupProbe {
+        startup_probe: StartupProbe,
+    },
+    AdoptedRuntime,
+    AdoptedCompanion {
+        process: ProcessIdentity,
+        companion: crate::runtime_metadata::CompanionProcessMetadata,
+    },
+    LiveRelay {
+        startup_probe: StartupProbe,
+    },
+    RtpReceive {
+        stream_id: String,
+    },
 }
 
 #[derive(Debug)]
@@ -196,17 +238,20 @@ where
                     context.registry.clone(),
                     context.runtimes.clone(),
                     context.events.clone(),
+                    None,
                 );
             }
             let adopted_work_dir = persisted.work_dir.clone();
             let adopted_success_check = persisted.success_check.clone();
             spawn_adopted_runtime_monitor(
                 handle.clone(),
+                None,
                 persisted.work_dir,
                 persisted.success_check,
                 context.registry.clone(),
                 context.runtimes.clone(),
                 context.events.clone(),
+                None,
             );
             if let Some(companion) =
                 companion_recording_from_handle(&handle).filter(|companion| companion.pid.is_some())
@@ -228,6 +273,7 @@ where
                         context.registry.clone(),
                         context.runtimes.clone(),
                         context.events.clone(),
+                        None,
                     );
                 }
             }
@@ -319,6 +365,254 @@ where
     snapshots
 }
 
+pub(crate) async fn prepare_adopt_orphan_runtimes_for_manager<
+    RestartTask,
+    RestartFuture,
+    StreamOnline,
+    StreamFuture,
+    RtpServerPort,
+    RtpFuture,
+    Restart,
+>(
+    context: RuntimeAdoptionWorkerContext,
+    mut restart_task: RestartTask,
+    zlm_stream_online: StreamOnline,
+    rtp_server_port: RtpServerPort,
+) -> Vec<RuntimeAdoptionOutcome<Restart>>
+where
+    RestartTask: FnMut(StartTaskRequest) -> RestartFuture + Send,
+    RestartFuture: Future<Output = Option<Restart>> + Send,
+    StreamOnline: Fn(StartupProbe) -> StreamFuture + Clone + Send + 'static,
+    StreamFuture: Future<Output = bool> + Send + 'static,
+    RtpServerPort: Fn(String) -> RtpFuture + Clone + Send + 'static,
+    RtpFuture: Future<Output = Option<u16>> + Send + 'static,
+{
+    if context.filter.runtimes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut outcomes = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pending_zlm_adoptions = Vec::new();
+
+    for persisted in scan_persisted_runtimes(&context.settings.work_root) {
+        let key = (persisted.handle.task_id, persisted.handle.attempt_no);
+        if seen.contains(&key) || !context.filter.matches(&persisted.handle) {
+            continue;
+        }
+
+        if let Some(process) = process_identity_from_handle(&persisted.handle) {
+            if !is_process_running_for_command_line(
+                &process,
+                persisted.handle.command_line.as_deref(),
+            ) {
+                continue;
+            }
+            let pid = process.pid;
+            let handle = mark_orphaned_handle(
+                persisted.handle.clone(),
+                context.filter.session_epoch,
+                context.zlm_server_id.as_deref(),
+            );
+            let companion_processes = companion_recording_from_handle(&handle)
+                .and_then(|companion| {
+                    companion_process_identity_from_metadata(&companion).filter(
+                        |companion_process| {
+                            is_process_running_for_command_line(
+                                companion_process,
+                                companion.command_line.as_deref(),
+                            )
+                        },
+                    )
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+
+            let mut monitors = Vec::new();
+            let needs_startup_probe = !stream_online(&handle)
+                || live_relay_recording_from_handle(&handle)
+                    .is_some_and(|recording| should_start_live_relay_recording(&recording));
+            if let Some(startup_probe) =
+                startup_probe_from_handle(&handle).filter(|_| needs_startup_probe)
+            {
+                monitors.push(RuntimeAdoptionMonitor::StartupProbe { startup_probe });
+            }
+            monitors.push(RuntimeAdoptionMonitor::AdoptedRuntime);
+            if let Some(companion) =
+                companion_recording_from_handle(&handle).filter(|companion| companion.pid.is_some())
+            {
+                if let Some(companion_process) =
+                    companion_process_identity_from_metadata(&companion).filter(|process| {
+                        is_process_running_for_command_line(
+                            process,
+                            companion.command_line.as_deref(),
+                        )
+                    })
+                {
+                    monitors.push(RuntimeAdoptionMonitor::AdoptedCompanion {
+                        process: companion_process,
+                        companion,
+                    });
+                }
+            }
+
+            outcomes.push(RuntimeAdoptionOutcome::Adopted(RuntimeAdoptionCommit {
+                handle: handle.clone(),
+                work_dir: persisted.work_dir,
+                success_check: persisted.success_check,
+                backend: RuntimeAdoptionBackend {
+                    process: Some(process),
+                    companion_processes,
+                },
+                notifications: vec![adopted_event_notification(
+                    &handle,
+                    "reattached persisted child process",
+                    json!({
+                        "runtime_id": handle.runtime_id,
+                        "orphaned": true,
+                        "pid": pid,
+                    }),
+                )],
+                monitors,
+            }));
+            seen.insert(key);
+            continue;
+        }
+
+        match task_runtime_mode_from_handle(&persisted.handle) {
+            Some(TaskRuntimeMode::ZlmRtpServer) => {
+                let Some(rtp_server) = rtp_server_from_handle(&persisted.handle) else {
+                    continue;
+                };
+                pending_zlm_adoptions.push(PendingZlmAdoption {
+                    persisted,
+                    probe: ZlmProbe::RtpServer { rtp_server },
+                });
+                continue;
+            }
+            Some(TaskRuntimeMode::ZlmProxy) => {}
+            _ => continue,
+        }
+
+        let Some(startup_probe) = startup_probe_from_handle(&persisted.handle) else {
+            continue;
+        };
+        pending_zlm_adoptions.push(PendingZlmAdoption {
+            persisted,
+            probe: ZlmProbe::ZlmProxy { startup_probe },
+        });
+    }
+
+    let probe_decisions =
+        probe_pending_zlm_adoptions(&pending_zlm_adoptions, zlm_stream_online, rtp_server_port)
+            .await;
+
+    for (pending, decision) in pending_zlm_adoptions
+        .into_iter()
+        .zip(probe_decisions.into_iter())
+    {
+        let key = (
+            pending.persisted.handle.task_id,
+            pending.persisted.handle.attempt_no,
+        );
+        if seen.contains(&key) {
+            continue;
+        }
+
+        match (pending.probe, decision) {
+            (
+                ZlmProbe::RtpServer { rtp_server },
+                Some(ZlmProbeDecision::RtpServer {
+                    local_port: Some(local_port),
+                }),
+            ) => {
+                let handle = build_adopted_rtp_handle(
+                    &context,
+                    &pending.persisted.handle,
+                    &rtp_server,
+                    local_port,
+                );
+                outcomes.push(RuntimeAdoptionOutcome::Adopted(RuntimeAdoptionCommit {
+                    handle: handle.clone(),
+                    work_dir: pending.persisted.work_dir,
+                    success_check: pending.persisted.success_check,
+                    backend: RuntimeAdoptionBackend {
+                        process: None,
+                        companion_processes: Vec::new(),
+                    },
+                    notifications: vec![adopted_event_notification(
+                        &handle,
+                        "reattached persisted stream_ingest rtp runtime",
+                        json!({
+                            "runtime_id": handle.runtime_id,
+                            "orphaned": true,
+                            "rtp_stream_id": rtp_server.stream_id,
+                            "local_port": local_port,
+                            "re_use_port": rtp_server.reuse_port,
+                            "ssrc": rtp_server.ssrc,
+                        }),
+                    )],
+                    monitors: vec![RuntimeAdoptionMonitor::RtpReceive {
+                        stream_id: handle
+                            .metadata
+                            .get("rtp_stream_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    }],
+                }));
+                seen.insert(key);
+                continue;
+            }
+            (
+                ZlmProbe::ZlmProxy { startup_probe },
+                Some(ZlmProbeDecision::ZlmProxy { online: true }),
+            ) => {
+                let handle = build_adopted_zlm_proxy_handle(
+                    &context,
+                    &pending.persisted.handle,
+                    &startup_probe,
+                );
+                outcomes.push(RuntimeAdoptionOutcome::Adopted(RuntimeAdoptionCommit {
+                    handle: handle.clone(),
+                    work_dir: pending.persisted.work_dir,
+                    success_check: pending.persisted.success_check,
+                    backend: RuntimeAdoptionBackend {
+                        process: None,
+                        companion_processes: Vec::new(),
+                    },
+                    notifications: vec![adopted_event_notification(
+                        &handle,
+                        "reattached persisted stream_ingest runtime",
+                        json!({
+                            "runtime_id": handle.runtime_id,
+                            "orphaned": true,
+                            "vhost": startup_probe.vhost,
+                            "app": startup_probe.app,
+                            "stream": startup_probe.stream,
+                        }),
+                    )],
+                    monitors: vec![RuntimeAdoptionMonitor::LiveRelay { startup_probe }],
+                }));
+                seen.insert(key);
+                continue;
+            }
+            _ => {}
+        }
+
+        let Ok(request) = restart_request_from_handle(&pending.persisted.handle) else {
+            continue;
+        };
+        let Some(restart) = restart_task(request).await else {
+            continue;
+        };
+        outcomes.push(RuntimeAdoptionOutcome::Restart(restart));
+        seen.insert(key);
+    }
+
+    outcomes
+}
+
 async fn probe_pending_zlm_adoptions<StreamOnline, StreamFuture, RtpServerPort, RtpFuture>(
     candidates: &[PendingZlmAdoption],
     zlm_stream_online: StreamOnline,
@@ -374,15 +668,16 @@ fn adopt_persisted_rtp_runtime(
     local_port: u16,
 ) -> RuntimeHandle {
     let stream_id = rtp_server.stream_id.clone();
-    let mut handle = mark_orphaned_handle(
-        persisted.handle.clone(),
-        context.filter.session_epoch,
-        context.zlm_server_id.as_deref(),
-    );
-    handle.metadata["rtp_server"] = json!(RtpServerMetadata {
+    let handle = build_adopted_rtp_handle(
+        &RuntimeAdoptionWorkerContext {
+            filter: context.filter.clone(),
+            zlm_server_id: context.zlm_server_id.clone(),
+            settings: context.settings.clone(),
+        },
+        &persisted.handle,
+        &rtp_server,
         local_port,
-        ..rtp_server.clone()
-    });
+    );
 
     track_adopted_runtime(context, handle.clone(), None, Vec::new());
     let _ = persist_runtime_state(&persisted.work_dir, &handle, &persisted.success_check);
@@ -408,6 +703,7 @@ fn adopt_persisted_rtp_runtime(
         context.registry.clone(),
         context.runtimes.clone(),
         context.events.clone(),
+        None,
     );
     handle
 }
@@ -420,18 +716,15 @@ fn adopt_persisted_zlm_proxy_runtime(
     let vhost = startup_probe.vhost.clone();
     let app = startup_probe.app.clone();
     let stream = startup_probe.stream.clone();
-    let mut handle = mark_orphaned_handle(
-        persisted.handle.clone(),
-        context.filter.session_epoch,
-        context.zlm_server_id.as_deref(),
+    let handle = build_adopted_zlm_proxy_handle(
+        &RuntimeAdoptionWorkerContext {
+            filter: context.filter.clone(),
+            zlm_server_id: context.zlm_server_id.clone(),
+            settings: context.settings.clone(),
+        },
+        &persisted.handle,
+        &startup_probe,
     );
-    handle.metadata["stream_online"] = json!(true);
-    handle.metadata["stream_binding"] = json!({
-        "schema": startup_probe.schema.clone(),
-        "vhost": startup_probe.vhost.clone(),
-        "app": startup_probe.app.clone(),
-        "stream": startup_probe.stream.clone(),
-    });
 
     track_adopted_runtime(context, handle.clone(), None, Vec::new());
     let _ = persist_runtime_state(&persisted.work_dir, &handle, &persisted.success_check);
@@ -456,7 +749,46 @@ fn adopt_persisted_zlm_proxy_runtime(
         context.registry.clone(),
         context.runtimes.clone(),
         context.events.clone(),
+        None,
     );
+    handle
+}
+
+fn build_adopted_rtp_handle(
+    context: &RuntimeAdoptionWorkerContext,
+    persisted_handle: &RuntimeHandle,
+    rtp_server: &RtpServerMetadata,
+    local_port: u16,
+) -> RuntimeHandle {
+    let mut handle = mark_orphaned_handle(
+        persisted_handle.clone(),
+        context.filter.session_epoch,
+        context.zlm_server_id.as_deref(),
+    );
+    handle.metadata["rtp_server"] = json!(RtpServerMetadata {
+        local_port,
+        ..rtp_server.clone()
+    });
+    handle
+}
+
+fn build_adopted_zlm_proxy_handle(
+    context: &RuntimeAdoptionWorkerContext,
+    persisted_handle: &RuntimeHandle,
+    startup_probe: &StartupProbe,
+) -> RuntimeHandle {
+    let mut handle = mark_orphaned_handle(
+        persisted_handle.clone(),
+        context.filter.session_epoch,
+        context.zlm_server_id.as_deref(),
+    );
+    handle.metadata["stream_online"] = json!(true);
+    handle.metadata["stream_binding"] = json!({
+        "schema": startup_probe.schema.clone(),
+        "vhost": startup_probe.vhost.clone(),
+        "app": startup_probe.app.clone(),
+        "stream": startup_probe.stream.clone(),
+    });
     handle
 }
 
@@ -501,7 +833,15 @@ fn emit_adopted_event(
     message: &str,
     payload: serde_json::Value,
 ) {
-    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+    let _ = events.send(adopted_event_notification(handle, message, payload));
+}
+
+pub(crate) fn adopted_event_notification(
+    handle: &RuntimeHandle,
+    message: &str,
+    payload: serde_json::Value,
+) -> RuntimeNotification {
+    RuntimeNotification::TaskEvent(RuntimeTaskEvent {
         task_id: handle.task_id,
         attempt_no: handle.attempt_no,
         lease_token: runtime_lease_token(handle).unwrap_or_default(),
@@ -510,7 +850,7 @@ fn emit_adopted_event(
         event_level: "info".to_string(),
         message: message.to_string(),
         payload,
-    }));
+    })
 }
 
 #[cfg(test)]

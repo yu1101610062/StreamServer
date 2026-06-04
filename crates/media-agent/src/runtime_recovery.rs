@@ -17,13 +17,11 @@ use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
-    runtime::{
-        ExecutorError, ManagedProcessExecutor, RuntimeCapabilityHints, SuccessCheck,
-        TaskRuntimeMode,
-    },
+    runtime::{ExecutorError, RuntimeCapabilityHints, SuccessCheck, TaskRuntimeMode},
     runtime_events::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
+    runtime_executor::ManagedProcessExecutor,
     runtime_metadata::managed_stream_restart_cleanup_binding,
     runtime_metadata::{
         completion_reason_from_handle, continuous_stream_ingest_from_handle,
@@ -116,11 +114,21 @@ pub(crate) async fn cleanup_managed_stream_before_restart(
     ctx: ProcessRecoveryContext<'_>,
     handle: &RuntimeHandle,
 ) {
+    let events = ctx.events.clone();
+    for notification in cleanup_managed_stream_before_restart_notifications(ctx, handle).await {
+        let _ = events.send(notification);
+    }
+}
+
+pub(crate) async fn cleanup_managed_stream_before_restart_notifications(
+    ctx: ProcessRecoveryContext<'_>,
+    handle: &RuntimeHandle,
+) -> Vec<RuntimeNotification> {
     let Some(binding) = managed_stream_restart_cleanup_binding(handle) else {
-        return;
+        return Vec::new();
     };
 
-    match call_zlm_api(
+    let notification = match call_zlm_api(
         ctx.http_client,
         ctx.settings,
         "/index/api/close_streams",
@@ -128,49 +136,42 @@ pub(crate) async fn cleanup_managed_stream_before_restart(
     )
     .await
     {
-        Ok(_) => {
-            let _ = ctx
-                .events
-                .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-                    task_id: handle.task_id,
-                    attempt_no: handle.attempt_no,
-                    lease_token: runtime_lease_token(handle).unwrap_or_default(),
-                    session_epoch: runtime_session_epoch(handle),
-                    event_type: "stream_cleanup".to_string(),
-                    event_level: "info".to_string(),
-                    message: "closed stale ZLM stream before managed process restart".to_string(),
-                    payload: json!({
-                        "schema": binding.schema,
-                        "vhost": binding.vhost,
-                        "app": binding.app,
-                        "stream": binding.stream,
-                        "reason": "managed_process_restart",
-                    }),
-                }));
-        }
-        Err(error) => {
-            let _ = ctx
-                .events
-                .send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
-                    task_id: handle.task_id,
-                    attempt_no: handle.attempt_no,
-                    lease_token: runtime_lease_token(handle).unwrap_or_default(),
-                    session_epoch: runtime_session_epoch(handle),
-                    event_type: "zlm_api_error".to_string(),
-                    event_level: "warn".to_string(),
-                    message: format!(
-                        "failed to close stale ZLM stream before managed process restart: {error}"
-                    ),
-                    payload: json!({
-                        "schema": binding.schema,
-                        "vhost": binding.vhost,
-                        "app": binding.app,
-                        "stream": binding.stream,
-                        "reason": "managed_process_restart",
-                    }),
-                }));
-        }
-    }
+        Ok(_) => RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+            task_id: handle.task_id,
+            attempt_no: handle.attempt_no,
+            lease_token: runtime_lease_token(handle).unwrap_or_default(),
+            session_epoch: runtime_session_epoch(handle),
+            event_type: "stream_cleanup".to_string(),
+            event_level: "info".to_string(),
+            message: "closed stale ZLM stream before managed process restart".to_string(),
+            payload: json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+                "reason": "managed_process_restart",
+            }),
+        }),
+        Err(error) => RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+            task_id: handle.task_id,
+            attempt_no: handle.attempt_no,
+            lease_token: runtime_lease_token(handle).unwrap_or_default(),
+            session_epoch: runtime_session_epoch(handle),
+            event_type: "zlm_api_error".to_string(),
+            event_level: "warn".to_string(),
+            message: format!(
+                "failed to close stale ZLM stream before managed process restart: {error}"
+            ),
+            payload: json!({
+                "schema": binding.schema,
+                "vhost": binding.vhost,
+                "app": binding.app,
+                "stream": binding.stream,
+                "reason": "managed_process_restart",
+            }),
+        }),
+    };
+    vec![notification]
 }
 
 fn carry_reconnect_metadata(

@@ -160,7 +160,7 @@ Agent 启动探测或接到探测命令后上报。
 
 行为：
 
-- Agent 收到后先校验 `lease_token` 和本地能力。
+- Agent 收到后先做协议和本地能力校验，再把命令交给 `RuntimeManager` 按 session 和并发限制排队。
 - Agent 必须先回发 `task_event{event_type="accepted"}`，再异步执行底层启动。
 - 底层启动失败时回发 `task_event{event_type="start_rejected"}`；不得复用旧 Attempt 直接重启。
 
@@ -177,7 +177,7 @@ Agent 启动探测或接到探测命令后上报。
 
 行为：
 
-- Agent 收到停止命令后必须先记录 stop intent，再去匹配或停止本地 runtime。
+- Agent 收到停止命令后由 `RuntimeManager` 校验当前 runtime、`lease_token` 和 generation，先提交 `Stopping` 快照，再让 stop worker 执行进程信号或 ZLM/RTP close。
 - 若 runtime 尚未注册，不得返回通用失败；应保留 stop intent，等待后台启动路径短路。
 - 无法执行停止时回发 `task_event{event_type="stop_rejected"}`，Core 保持 `STOPPING` 并走超时/接管收敛。
 
@@ -238,6 +238,9 @@ Agent 必须把本地执行对象抽象为统一 `RuntimeHandle`：
 
 - Agent 的本地索引主键必须是 `(task_id, attempt_no)`，`runtime_id` 只作为辅助索引。
 - 同 `(task_id, attempt_no, lease_token)` 的重复 `start_task` 必须幂等返回已有 runtime；同 Attempt 不同 `lease_token` 必须拒绝为 stale dispatch。
+- Agent 内部 runtime 状态由 `RuntimeManagerState` 维护，外部同步读取统一通过 `RuntimeReadHandle`。
+- Heartbeat 的 runtime 计数、artifact cleanup 的 active handle、terminal replay 的 active 过滤、stop 成功后的 snapshot 查询都来自 `RuntimeReadHandle`，不得直接读取 legacy registry。
+- 控制流断开后，旧 session 的 start/stop/record/adopt 结果不得向旧 sender 发送任务事件；manager 对 stale session 结果静默收敛。
 
 `worker_kind` 固定值：
 

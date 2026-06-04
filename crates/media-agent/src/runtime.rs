@@ -65,9 +65,12 @@ pub use crate::runtime_events::{
     RuntimeTaskProgress, TerminalRuntimeReplay,
 };
 pub(crate) use crate::runtime_events::{bounded_log_batches, runtime_session_epoch};
-pub use crate::runtime_executor::{LocalExecutor, ManagedProcessExecutor};
+pub use crate::runtime_executor::LocalExecutor;
 #[cfg(test)]
 pub(crate) use crate::runtime_io::{build_input_url, resolve_interface_binding_ip};
+pub use crate::runtime_manager::{
+    RuntimeManager, RuntimeManagerHandle, RuntimeManagerRequestOutcome,
+};
 pub(crate) use crate::runtime_metadata::{
     CompanionProcessKind, StreamBinding, runtime_lease_token,
 };
@@ -120,7 +123,11 @@ pub(crate) use crate::runtime_recovery::{
     LIVE_STREAM_OFFLINE_GRACE_POLLS, RTP_SERVER_MISSING_GRACE_POLLS, next_live_relay_offline_polls,
     next_rtp_server_missing_polls, should_auto_restart_process,
 };
-pub use crate::runtime_registry::{AdoptFilter, AdoptRuntimeFilter, LocalRuntimeRegistry};
+#[cfg(test)]
+pub(crate) use crate::runtime_registry::LocalRuntimeRegistry;
+pub use crate::runtime_registry::{
+    AdoptFilter, AdoptRuntimeFilter, RuntimeReadHandle, RuntimeReadModel,
+};
 #[cfg(test)]
 pub(crate) use crate::runtime_transcode::{
     resolve_transcode_selection_for_input_family, resolve_video_families,

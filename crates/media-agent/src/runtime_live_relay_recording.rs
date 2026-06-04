@@ -13,6 +13,7 @@ use chrono::Utc;
 use media_domain::{RuntimeHandle, RuntimeState};
 use reqwest::Client;
 use serde_json::{Value, json};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -26,6 +27,7 @@ use crate::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
     runtime_live_relay_cleanup::cleanup_live_relay_runtime,
+    runtime_manager::{RecordDurationReachedEvent, RuntimeInternalEvent, RuntimeMonitorHandle},
     runtime_metadata::{
         StreamBinding, clear_source_reconnecting, emit_recording_gap_ended_event,
         live_relay_recording_from_handle, runtime_lease_token, stream_binding_from_handle,
@@ -34,7 +36,8 @@ use crate::{
     runtime_process::{ManagedRuntime, remove_managed_runtime},
     runtime_recording::{
         LiveRelayRecording, mark_recording_completion, mark_recording_failed,
-        should_auto_stop_live_relay_recording, should_fail_on_recording_start_error,
+        recording_elapsed_seconds, should_auto_stop_live_relay_recording,
+        should_fail_on_recording_start_error,
     },
     runtime_registry::LocalRuntimeRegistry,
     runtime_zlm::stop_live_relay_recording,
@@ -330,6 +333,40 @@ pub(crate) async fn start_live_relay_recording_from_monitor(
             }
         }
     }
+}
+
+pub(crate) async fn notify_live_relay_record_duration_if_reached(
+    monitor_handle: &RuntimeMonitorHandle,
+    handle: &RuntimeHandle,
+) -> bool {
+    let now = Utc::now();
+    let Some(recording) = live_relay_recording_from_handle(handle)
+        .filter(|recording| should_auto_stop_live_relay_recording(recording, now))
+    else {
+        return false;
+    };
+
+    info!(
+        task_id = %handle.task_id,
+        attempt_no = handle.attempt_no,
+        runtime_id = %handle.runtime_id,
+        generation = monitor_handle.generation().value(),
+        recording_started_at = ?recording.recording_started_at,
+        duration_sec = recording.duration_sec.unwrap_or_default(),
+        now = %now.to_rfc3339(),
+        elapsed_sec = recording_elapsed_seconds(&recording, now).unwrap_or_default(),
+        command_line = handle.command_line.as_deref().unwrap_or(""),
+        "wall-clock recording duration reached; notifying runtime manager"
+    );
+    monitor_handle
+        .send_event(RuntimeInternalEvent::RecordDurationReached(
+            RecordDurationReachedEvent {
+                runtime_id: handle.runtime_id,
+                generation: monitor_handle.generation(),
+            },
+        ))
+        .await;
+    true
 }
 
 pub(crate) async fn stop_live_relay_for_record_duration_if_reached(

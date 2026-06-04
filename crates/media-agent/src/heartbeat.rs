@@ -169,8 +169,8 @@ fn sample_disk(path: &str) -> Option<DiskSample> {
     }
 
     let stat = unsafe { stat.assume_init() };
-    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
-    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+    let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
+    let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
     if total == 0 {
         return Some(DiskSample::default());
     }

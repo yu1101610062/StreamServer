@@ -19,11 +19,13 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    runtime::{ManagedProcessExecutor, SuccessCheck, TaskRuntimeMode},
+    runtime::{SuccessCheck, TaskRuntimeMode},
     runtime_artifacts::attach_file_artifact_metadata,
     runtime_events::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
+    runtime_executor::ManagedProcessExecutor,
+    runtime_manager::{ProcessExitedEvent, RuntimeInternalEvent, RuntimeMonitorHandle},
     runtime_metadata::{
         completion_reason_from_handle, continuous_stream_ingest_from_handle,
         emit_recording_gap_started_event, emit_source_reconnecting_event,
@@ -50,6 +52,7 @@ pub(crate) struct ProcessExitMonitorContext {
     pub(crate) runtimes: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
     pub(crate) events: RuntimeEventSink,
     pub(crate) restart_executor: ManagedProcessExecutor,
+    pub(crate) monitor_handle: Option<RuntimeMonitorHandle>,
 }
 
 pub(crate) fn spawn_process_exit_monitor(
@@ -68,9 +71,43 @@ pub(crate) fn spawn_process_exit_monitor(
             runtimes,
             events,
             restart_executor,
+            monitor_handle,
         } = context;
 
         let status = child.wait().await;
+        if let Some(monitor_handle) = monitor_handle {
+            let Some(snapshot) = monitor_handle.snapshot().await else {
+                return;
+            };
+            let was_stopped = snapshot.stop_requested || stop_requested.load(Ordering::Relaxed);
+            if !snapshot.companion_processes.is_empty() {
+                for companion_process in &snapshot.companion_processes {
+                    if is_process_running(companion_process) {
+                        let _ = signal_process(companion_process, libc::SIGTERM);
+                    }
+                }
+                wait_for_companion_pids_exit(&snapshot.companion_processes, Duration::from_secs(3))
+                    .await;
+                for companion_process in &snapshot.companion_processes {
+                    if is_process_running(companion_process) {
+                        let _ = signal_process(companion_process, libc::SIGKILL);
+                    }
+                }
+            }
+            monitor_handle
+                .send_event(RuntimeInternalEvent::ProcessExited(ProcessExitedEvent {
+                    runtime_id,
+                    generation: monitor_handle.generation(),
+                    work_dir,
+                    output_target,
+                    success_check,
+                    status: status.map_err(|error| error.to_string()),
+                    was_stopped,
+                }))
+                .await;
+            return;
+        }
+
         let (was_stopped, companion_processes) = {
             let mut runtimes_guard = runtimes.write().expect("runtime map lock poisoned");
             if let Some(runtime) = runtimes_guard.get_mut(&runtime_id) {

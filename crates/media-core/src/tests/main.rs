@@ -2230,6 +2230,64 @@ async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<
 }
 
 #[tokio::test]
+async fn node_heartbeat_marks_current_control_session_connected() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+    repository.update_node_health(node_id, false, None).await?;
+
+    let heartbeat_time = Utc::now();
+    let stored_heartbeat_time =
+        DateTime::<Utc>::from_timestamp_micros(heartbeat_time.timestamp_micros())
+            .expect("test timestamp should be representable");
+    repository
+        .record_node_heartbeat(
+            node_id,
+            &HeartbeatSnapshot {
+                node_time: heartbeat_time,
+                cpu_percent: 10.0,
+                mem_percent: 20.0,
+                disk_percent: 30.0,
+                upload_disk_total_bytes: 1_000,
+                upload_disk_available_bytes: 700,
+                upload_disk_used_percent: 30.0,
+                running_tasks: 1,
+                starting_tasks: 0,
+                stopping_tasks: 0,
+                orphaned_tasks: 0,
+                slot_usage: 0.2,
+                zlm_alive: true,
+                ffmpeg_alive: true,
+                artifact_cleanup_blocked: false,
+                artifact_cleanup_block_reason: None,
+                gpu_runtime: Vec::new(),
+            },
+        )
+        .await?;
+
+    let nodes = repository.list_nodes().await?;
+    let node = nodes
+        .into_iter()
+        .find(|candidate| candidate.id == node_id)
+        .expect("node should exist");
+    assert!(node.control_connected);
+    assert!(node.healthy);
+    assert_eq!(node.control_last_seen_at, Some(stored_heartbeat_time));
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn publish_lookup_requires_binding_when_node_has_multiple_media_servers() -> anyhow::Result<()>
 {
     let Some(db) = require_test_database(true).await? else {

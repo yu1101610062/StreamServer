@@ -1,50 +1,84 @@
-//! Runtime 执行器门面：负责把启停、录制控制、ZLM 启动和进程恢复串接起来。
+//! Runtime manager worker factory：负责把启停、录制控制、ZLM 启动和进程恢复串接起来。
 //!
-//! 具体的 FFmpeg 参数、ZLM API、持久化和监控逻辑分散在相邻 runtime_* 模块中，这里只保留
-//! `LocalExecutor` 对外契约和 `ManagedProcessExecutor` 的运行上下文组装。
+//! 生产控制入口只通过 `RuntimeManagerHandle` 提交状态。这里保留的 direct
+//! `LocalExecutor for ManagedProcessExecutor` 是 legacy/test 兼容路径，用于验证旧合同；
+//! manager 路径只把它当作慢副作用 worker factory。
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex as StdMutex, RwLock},
+    io,
+    sync::{Arc, Mutex as StdMutex, RwLock, atomic::AtomicBool},
     time::Duration,
 };
 
-use media_domain::RuntimeHandle;
+use chrono::Utc;
+use media_domain::{RuntimeHandle, RuntimeState, TaskType};
 use reqwest::Client;
+use serde_json::json;
 use tonic::async_trait;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
-    runtime_adoption::{RuntimeAdoptionContext, adopt_orphan_runtimes},
+    runtime_adoption::{
+        RuntimeAdoptionCommit, RuntimeAdoptionContext, RuntimeAdoptionMonitor,
+        RuntimeAdoptionOutcome, RuntimeAdoptionWorkerContext, adopt_orphan_runtimes,
+        adopted_event_notification, prepare_adopt_orphan_runtimes_for_manager,
+    },
+    runtime_artifacts::attach_file_artifact_metadata,
     runtime_controls::{
-        RuntimeControlContext, RuntimeRecordingControlContext,
+        RuntimeControlContext, RuntimeRecordingControlContext, RuntimeRecordingOutcome,
+        RuntimeRecordingPreparation, RuntimeRecordingWorkerRequest,
+        prepare_runtime_recording_for_manager, run_runtime_recording_worker,
         set_task_recording as set_runtime_task_recording,
     },
-    runtime_events::RuntimeEventSink,
+    runtime_events::{
+        RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
+    },
+    runtime_manager::{ProcessExitedEvent, RuntimeMonitorCommit, RuntimeMonitorHandle},
+    runtime_metadata::{
+        attach_zlm_server_id, completion_reason_from_handle, continuous_stream_ingest_from_handle,
+        fatal_recording_error_from_handle, mark_source_reconnecting, requires_stream_online,
+        runtime_lease_token, should_emit_recording_gap_started,
+        sticky_reconnect_stream_ingest_from_handle, stop_reason_from_handle, stream_online,
+        task_runtime_mode_from_handle, task_type_from_handle,
+    },
+    runtime_monitors::{
+        spawn_live_relay_monitor, spawn_rtp_receive_monitor, spawn_startup_probe_monitor,
+    },
+    runtime_persistence::persist_runtime_state,
     runtime_plan::TaskRuntimeMode,
     runtime_process::{ManagedRuntime, RuntimeSlotLimiter, RuntimeSlotPermit},
+    runtime_process_monitors::{
+        spawn_adopted_companion_process_monitor, spawn_adopted_runtime_monitor,
+    },
     runtime_process_start::{
         ManagedProcessStartContext, ManagedProcessStartHooks,
-        start_process_task as start_managed_process_task,
+        RuntimeStartOutcome as ManagedProcessStartOutcome, prepare_process_start_task,
     },
     runtime_recovery::{
         ProcessRecoveryContext,
         cleanup_managed_stream_before_restart as cleanup_managed_stream_before_restart_impl,
+        cleanup_managed_stream_before_restart_notifications,
         restart_process_task_after_failure as restart_process_task_after_failure_impl,
+        should_auto_restart_process,
     },
     runtime_registry::{AdoptFilter, LocalRuntimeRegistry},
     runtime_start::{RuntimeStartContext, RuntimeStartDecision, prepare_start_task},
-    runtime_stop::{RuntimeStopContext, stop_runtime_task},
+    runtime_stop::{
+        RuntimeStopContext, RuntimeStopOutcome, RuntimeStopPreparation, RuntimeStopWorkerRequest,
+        prepare_runtime_stop_for_manager, run_runtime_stop_worker, stop_runtime_task,
+    },
     runtime_types::{
-        ExecutorError, RuntimeCapabilityHints, StartTaskRequest, StopTaskRequest,
+        ExecutorError, RuntimeCapabilityHints, StartTaskRequest, StopTaskRequest, SuccessCheck,
         TaskRecordingControlRequest,
     },
     runtime_zlm::{zlm_rtp_server_port, zlm_stream_online},
     runtime_zlm_start::{
-        RuntimeZlmStartContext, RuntimeZlmStartHooks,
-        start_live_relay_task as start_zlm_live_relay_task,
-        start_rtp_receive_task as start_zlm_rtp_receive_task,
+        RuntimeZlmStartContext, RuntimeZlmStartHooks, RuntimeZlmStartOutcome,
+        start_live_relay_task as prepare_zlm_live_relay_start_task,
+        start_rtp_receive_task as prepare_zlm_rtp_receive_start_task,
     },
 };
 
@@ -61,8 +95,84 @@ pub trait LocalExecutor: Send + Sync {
     fn set_zlm_rtmp_enhanced_enabled(&self, _enabled: Option<bool>) {}
 }
 
+pub(crate) enum RuntimeStartWorkerResult {
+    Committed(RuntimeHandle),
+    PendingCommit(RuntimeStartOutcome),
+}
+
+pub(crate) enum RuntimeProcessExitOutcome {
+    Terminal(RuntimeMonitorCommit),
+    Restarted {
+        exit_commit: RuntimeMonitorCommit,
+        restart: RuntimeStartWorkerResult,
+        emit_starting_event: bool,
+    },
+}
+
+pub(crate) enum RuntimeStartOutcome {
+    ManagedProcess(ManagedProcessStartOutcome),
+    Zlm(RuntimeZlmStartOutcome),
+}
+
 #[derive(Debug, Clone)]
-pub struct ManagedProcessExecutor {
+pub(crate) struct RuntimeBackendSnapshot {
+    pub(crate) stop_requested: bool,
+    pub(crate) suppress_companion_events: bool,
+    pub(crate) companion_processes: Vec<crate::runtime_process::ProcessIdentity>,
+}
+
+impl RuntimeStartWorkerResult {
+    pub(crate) fn runtime_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Committed(handle) => Some(handle.runtime_id),
+            Self::PendingCommit(outcome) => Some(outcome.runtime_id()),
+        }
+    }
+
+    pub(crate) async fn commit(
+        self,
+        monitor_handle: Option<RuntimeMonitorHandle>,
+    ) -> Result<RuntimeHandle, ExecutorError> {
+        match self {
+            Self::Committed(handle) => Ok(handle),
+            Self::PendingCommit(outcome) => outcome.commit(monitor_handle).await,
+        }
+    }
+
+    pub(crate) fn carry_reconnect_metadata_from(&mut self, exited_handle: &RuntimeHandle) {
+        if let Self::PendingCommit(outcome) = self {
+            outcome.carry_reconnect_metadata_from(exited_handle);
+        }
+    }
+}
+
+impl RuntimeStartOutcome {
+    fn runtime_id(&self) -> Uuid {
+        match self {
+            Self::ManagedProcess(outcome) => outcome.runtime_id(),
+            Self::Zlm(outcome) => outcome.runtime_id(),
+        }
+    }
+
+    async fn commit(
+        self,
+        monitor_handle: Option<RuntimeMonitorHandle>,
+    ) -> Result<RuntimeHandle, ExecutorError> {
+        match self {
+            Self::ManagedProcess(outcome) => outcome.commit(monitor_handle),
+            Self::Zlm(outcome) => outcome.commit(monitor_handle).await,
+        }
+    }
+
+    fn carry_reconnect_metadata_from(&mut self, exited_handle: &RuntimeHandle) {
+        if let Self::ManagedProcess(outcome) = self {
+            outcome.carry_reconnect_metadata_from(exited_handle);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ManagedProcessExecutor {
     pub(crate) settings: AgentSettings,
     pub(crate) registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
@@ -73,10 +183,12 @@ pub struct ManagedProcessExecutor {
     http_client: Client,
     zlm_server_id: Arc<RwLock<Option<String>>>,
     zlm_rtmp_enhanced_enabled: Arc<RwLock<Option<bool>>>,
+    process_start_hooks: ManagedProcessStartHooks,
+    zlm_start_hooks: RuntimeZlmStartHooks,
 }
 
 impl ManagedProcessExecutor {
-    pub fn new(
+    pub(crate) fn new(
         settings: AgentSettings,
         registry: LocalRuntimeRegistry,
         events: RuntimeEventSink,
@@ -96,7 +208,37 @@ impl ManagedProcessExecutor {
                 .expect("failed to build runtime HTTP client"),
             zlm_server_id: Arc::new(RwLock::new(None)),
             zlm_rtmp_enhanced_enabled: Arc::new(RwLock::new(None)),
+            process_start_hooks: ManagedProcessStartHooks::default(),
+            zlm_start_hooks: RuntimeZlmStartHooks::default(),
         }
+    }
+
+    pub(crate) fn new_for_manager(settings: AgentSettings, events: RuntimeEventSink) -> Self {
+        Self::new(settings, LocalRuntimeRegistry::new(), events)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_process_start_hooks(
+        settings: AgentSettings,
+        registry: LocalRuntimeRegistry,
+        events: RuntimeEventSink,
+        process_start_hooks: ManagedProcessStartHooks,
+    ) -> Self {
+        let mut executor = Self::new(settings, registry, events);
+        executor.process_start_hooks = process_start_hooks;
+        executor
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_zlm_start_hooks(
+        settings: AgentSettings,
+        registry: LocalRuntimeRegistry,
+        events: RuntimeEventSink,
+        zlm_start_hooks: RuntimeZlmStartHooks,
+    ) -> Self {
+        let mut executor = Self::new(settings, registry, events);
+        executor.zlm_start_hooks = zlm_start_hooks;
+        executor
     }
 
     fn current_zlm_server_id(&self) -> Option<String> {
@@ -137,7 +279,7 @@ impl ManagedProcessExecutor {
             runtimes: &self.runtimes,
             events: &self.events,
             zlm_server_id: self.current_zlm_server_id(),
-            hooks: RuntimeZlmStartHooks::default(),
+            hooks: self.zlm_start_hooks.clone(),
         }
     }
 
@@ -156,32 +298,463 @@ impl ManagedProcessExecutor {
             restart_executor: self.clone(),
         }
     }
+
+    pub(crate) fn monitor_snapshot(&self, runtime_id: Uuid) -> Option<RuntimeBackendSnapshot> {
+        let runtime = {
+            let runtimes = self.runtimes.read().expect("runtime map lock poisoned");
+            runtimes.get(&runtime_id).cloned()
+        }?;
+        Some(RuntimeBackendSnapshot {
+            stop_requested: runtime
+                .stop_requested
+                .load(std::sync::atomic::Ordering::Relaxed),
+            suppress_companion_events: runtime
+                .suppress_companion_events
+                .load(std::sync::atomic::Ordering::Relaxed),
+            companion_processes: runtime.companion_processes,
+        })
+    }
+
+    pub(crate) fn apply_monitor_commit(&self, commit: RuntimeMonitorCommit) {
+        if commit.mark_stop_requested.is_some()
+            || commit.suppress_companion_events.is_some()
+            || commit.remove_companion_pid.is_some()
+        {
+            let mut runtimes = self.runtimes.write().expect("runtime map lock poisoned");
+            if let Some(runtime) = runtimes.get_mut(&commit.runtime_id) {
+                if let Some(stop_requested) = commit.mark_stop_requested {
+                    runtime
+                        .stop_requested
+                        .store(stop_requested, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(suppress_companion_events) = commit.suppress_companion_events {
+                    runtime.suppress_companion_events.store(
+                        suppress_companion_events,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+                if let Some(companion_pid) = commit.remove_companion_pid {
+                    runtime
+                        .companion_processes
+                        .retain(|process| process.pid != companion_pid);
+                }
+            }
+        }
+
+        if let Some(persist) = &commit.persist {
+            if let Err(error) =
+                persist_runtime_state(&persist.work_dir, &commit.handle, &persist.success_check)
+            {
+                warn!(
+                    runtime_id = %commit.runtime_id,
+                    error = %error,
+                    "failed to persist runtime monitor commit"
+                );
+            }
+        }
+        for notification in commit.notifications {
+            let _ = self.events.send(notification);
+        }
+        if commit.remove_backend {
+            let _ =
+                crate::runtime_process::remove_managed_runtime(&self.runtimes, commit.runtime_id);
+        }
+    }
+
+    pub(crate) fn prepare_stop_for_manager(
+        &self,
+        request: &StopTaskRequest,
+        handle: &RuntimeHandle,
+        generation: crate::runtime_manager::RuntimeGeneration,
+        monitor_handle: RuntimeMonitorHandle,
+    ) -> Result<RuntimeStopPreparation, ExecutorError> {
+        prepare_runtime_stop_for_manager(
+            &self.settings,
+            &self.runtimes,
+            &self.stop_intents,
+            request,
+            handle,
+            generation,
+            monitor_handle,
+        )
+    }
+
+    pub(crate) async fn run_stop_worker_for_manager(
+        &self,
+        worker: RuntimeStopWorkerRequest,
+    ) -> Result<RuntimeStopOutcome, ExecutorError> {
+        let controls = self.control_context();
+        run_runtime_stop_worker(controls, worker).await
+    }
+
+    pub(crate) fn prepare_recording_for_manager(
+        &self,
+        request: &TaskRecordingControlRequest,
+        handle: &RuntimeHandle,
+        generation: crate::runtime_manager::RuntimeGeneration,
+        monitor_handle: RuntimeMonitorHandle,
+    ) -> Result<RuntimeRecordingPreparation, ExecutorError> {
+        prepare_runtime_recording_for_manager(
+            &self.control_context(),
+            request,
+            handle,
+            generation,
+            monitor_handle,
+        )
+    }
+
+    pub(crate) async fn run_recording_worker_for_manager(
+        &self,
+        worker: RuntimeRecordingWorkerRequest,
+    ) -> Result<RuntimeRecordingOutcome, ExecutorError> {
+        let controls = self.control_context();
+        run_runtime_recording_worker(controls, worker).await
+    }
+
+    pub(crate) async fn handle_process_exited(
+        &self,
+        event: ProcessExitedEvent,
+        current_handle: RuntimeHandle,
+    ) -> RuntimeProcessExitOutcome {
+        let mut exited_handle = current_handle;
+        exited_handle.state = RuntimeState::Exited;
+        exited_handle.last_progress_at = Some(Utc::now());
+        attach_file_artifact_metadata(&mut exited_handle, &event.success_check);
+        let mut pre_terminal_notifications = Vec::new();
+
+        let restart_status = event
+            .status
+            .as_ref()
+            .map(|status| *status)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.clone()));
+        if should_auto_restart_process(&exited_handle, event.was_stopped, &restart_status) {
+            let sticky_reconnect = sticky_reconnect_stream_ingest_from_handle(&exited_handle);
+            let restart_reason = if stream_online(&exited_handle) {
+                "source_disconnected"
+            } else {
+                "source_unavailable"
+            };
+            let emit_gap_started = should_emit_recording_gap_started(&exited_handle);
+            if sticky_reconnect {
+                mark_source_reconnecting(&mut exited_handle, restart_reason);
+            }
+            let mut recovery_notifications = Vec::new();
+            if sticky_reconnect {
+                recovery_notifications.push(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                    task_id: exited_handle.task_id,
+                    attempt_no: exited_handle.attempt_no,
+                    lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&exited_handle),
+                    event_type: "source_reconnecting".to_string(),
+                    event_level: "warn".to_string(),
+                    message: "managed stream_ingest process exited; restarting locally".to_string(),
+                    payload: json!({
+                        "runtime_id": exited_handle.runtime_id,
+                        "exit_code": event.status.as_ref().ok().and_then(|value| value.code()),
+                        "output_target": event.output_target,
+                        "task_type": task_type_from_handle(&exited_handle),
+                        "reason": restart_reason,
+                    }),
+                }));
+                if emit_gap_started {
+                    recovery_notifications.push(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                        task_id: exited_handle.task_id,
+                        attempt_no: exited_handle.attempt_no,
+                        lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                        session_epoch: runtime_session_epoch(&exited_handle),
+                        event_type: "recording_gap_started".to_string(),
+                        event_level: "warn".to_string(),
+                        message: "stream recording gap started while source reconnects".to_string(),
+                        payload: json!({
+                            "runtime_id": exited_handle.runtime_id,
+                            "exit_code": event.status.as_ref().ok().and_then(|value| value.code()),
+                            "output_target": event.output_target,
+                            "task_type": task_type_from_handle(&exited_handle),
+                            "reason": restart_reason,
+                            "recording_gap_started_at": exited_handle
+                                .metadata
+                                .get("recording_gap_started_at")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
+                        }),
+                    }));
+                }
+            } else {
+                recovery_notifications.push(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                    task_id: exited_handle.task_id,
+                    attempt_no: exited_handle.attempt_no,
+                    lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&exited_handle),
+                    event_type: "recovering".to_string(),
+                    event_level: "warn".to_string(),
+                    message:
+                        "managed process exited after stream was online; attempting local recovery"
+                            .to_string(),
+                    payload: json!({
+                        "exit_code": event.status.as_ref().ok().and_then(|value| value.code()),
+                        "output_target": event.output_target,
+                        "task_type": task_type_from_handle(&exited_handle),
+                    }),
+                }));
+            }
+            recovery_notifications.extend(
+                cleanup_managed_stream_before_restart_notifications(
+                    self.process_recovery_context(),
+                    &exited_handle,
+                )
+                .await,
+            );
+
+            if let Ok(restart) = self
+                .restart_process_task_after_failure_for_manager(&exited_handle)
+                .await
+            {
+                let exit_commit =
+                    RuntimeMonitorCommit::new(exited_handle.clone(), event.generation)
+                        .with_persist(event.work_dir, event.success_check)
+                        .with_notifications(recovery_notifications)
+                        .terminal();
+                return RuntimeProcessExitOutcome::Restarted {
+                    exit_commit,
+                    restart,
+                    emit_starting_event: !sticky_reconnect,
+                };
+            }
+            pre_terminal_notifications = recovery_notifications;
+        }
+
+        let completion_reason = completion_reason_from_handle(&exited_handle);
+        let stop_reason = stop_reason_from_handle(&exited_handle);
+        let fatal_recording_error = fatal_recording_error_from_handle(&exited_handle);
+        let (event_type, event_level, message, payload) = match &event.status {
+            Ok(status)
+                if event.was_stopped
+                    && completion_reason.as_deref() == Some("record_duration_reached") =>
+            {
+                (
+                    "succeeded",
+                    "info",
+                    "child process completed after recording duration reached".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                        "reason": "record_duration_reached",
+                    }),
+                )
+            }
+            Ok(status)
+                if event.was_stopped
+                    && stop_reason.as_deref() == Some("disk_threshold_exceeded") =>
+            {
+                (
+                    "failed",
+                    "error",
+                    "child process stopped after disk threshold was exceeded".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                        "reason": "disk_threshold_exceeded",
+                    }),
+                )
+            }
+            Ok(status) if event.was_stopped => (
+                "canceled",
+                "info",
+                "child process stopped".to_string(),
+                json!({
+                    "exit_code": status.code(),
+                    "output_target": event.output_target,
+                    "reason": stop_reason,
+                }),
+            ),
+            Ok(status) if fatal_recording_error.is_some() => (
+                "failed",
+                "error",
+                format!(
+                    "child process stopped after recording startup failed: {}",
+                    fatal_recording_error
+                        .as_deref()
+                        .unwrap_or("unknown recording error")
+                ),
+                json!({
+                    "exit_code": status.code(),
+                    "output_target": event.output_target,
+                    "recording_error": fatal_recording_error,
+                }),
+            ),
+            Ok(status)
+                if status.success()
+                    && requires_stream_online(&exited_handle)
+                    && !stream_online(&exited_handle) =>
+            {
+                (
+                    "failed",
+                    "error",
+                    "child process exited before ZLM stream became online".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                    }),
+                )
+            }
+            Ok(status)
+                if status.success()
+                    && task_type_from_handle(&exited_handle) == Some(TaskType::StreamIngest)
+                    && task_runtime_mode_from_handle(&exited_handle)
+                        == Some(TaskRuntimeMode::ManagedProcess)
+                    && continuous_stream_ingest_from_handle(&exited_handle) =>
+            {
+                (
+                    "failed",
+                    "error",
+                    "continuous stream_ingest process exited unexpectedly".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                        "reason": "unexpected_stream_exit",
+                    }),
+                )
+            }
+            Ok(status) if status.success() => match &event.success_check {
+                SuccessCheck::FileExists(path) if path.exists() => (
+                    "succeeded",
+                    "info",
+                    "child process completed".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                    }),
+                ),
+                SuccessCheck::FileExists(path) => (
+                    "failed",
+                    "error",
+                    format!(
+                        "child process finished without artifact: {}",
+                        path.display()
+                    ),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                    }),
+                ),
+                SuccessCheck::FilesExist(paths) if paths.iter().all(|path| path.exists()) => (
+                    "succeeded",
+                    "info",
+                    "child process completed".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                    }),
+                ),
+                SuccessCheck::FilesExist(paths) => {
+                    let missing = paths
+                        .iter()
+                        .filter(|path| !path.exists())
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>();
+                    (
+                        "failed",
+                        "error",
+                        format!(
+                            "child process finished without artifacts: {}",
+                            missing.join(", ")
+                        ),
+                        json!({
+                            "exit_code": status.code(),
+                            "output_target": event.output_target,
+                            "missing_outputs": missing,
+                        }),
+                    )
+                }
+                SuccessCheck::ProcessExit => (
+                    "succeeded",
+                    "info",
+                    "child process completed".to_string(),
+                    json!({
+                        "exit_code": status.code(),
+                        "output_target": event.output_target,
+                    }),
+                ),
+            },
+            Ok(status) => (
+                "failed",
+                "error",
+                format!("child process exited unsuccessfully: {:?}", status.code()),
+                json!({
+                    "exit_code": status.code(),
+                    "output_target": event.output_target,
+                }),
+            ),
+            Err(error) if fatal_recording_error.is_some() => (
+                "failed",
+                "error",
+                format!(
+                    "child process stopped after recording startup failed: {}",
+                    fatal_recording_error
+                        .as_deref()
+                        .unwrap_or("unknown recording error")
+                ),
+                json!({
+                    "output_target": event.output_target,
+                    "recording_error": fatal_recording_error,
+                    "wait_error": error,
+                }),
+            ),
+            Err(error)
+                if event.was_stopped
+                    && stop_reason.as_deref() == Some("disk_threshold_exceeded") =>
+            {
+                (
+                    "failed",
+                    "error",
+                    format!("failed to wait child process after disk threshold stop: {error}"),
+                    json!({
+                        "output_target": event.output_target,
+                        "reason": "disk_threshold_exceeded",
+                        "wait_error": error,
+                    }),
+                )
+            }
+            Err(error) => (
+                "failed",
+                "error",
+                format!("failed to wait child process: {error}"),
+                json!({
+                    "output_target": event.output_target,
+                }),
+            ),
+        };
+
+        pre_terminal_notifications.push(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+            task_id: exited_handle.task_id,
+            attempt_no: exited_handle.attempt_no,
+            lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+            session_epoch: runtime_session_epoch(&exited_handle),
+            event_type: event_type.to_string(),
+            event_level: event_level.to_string(),
+            message,
+            payload,
+        }));
+        pre_terminal_notifications.push(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
+        RuntimeProcessExitOutcome::Terminal(
+            RuntimeMonitorCommit::new(exited_handle, event.generation)
+                .with_persist(event.work_dir, event.success_check)
+                .with_notifications(pre_terminal_notifications)
+                .terminal(),
+        )
+    }
 }
 
+// Legacy direct executor compatibility. Production control-plane code constructs this type only
+// through `RuntimeManager::spawn_managed_with_options`, so registry/runtimes writes below are not
+// the production runtime state source.
 #[async_trait]
 impl LocalExecutor for ManagedProcessExecutor {
     async fn start_task(&self, request: StartTaskRequest) -> Result<RuntimeHandle, ExecutorError> {
-        match prepare_start_task(
-            RuntimeStartContext {
-                settings: &self.settings,
-                registry: &self.registry,
-                runtimes: &self.runtimes,
-                stop_intents: &self.stop_intents,
-                slot_limiter: &self.slot_limiter,
-            },
-            &request,
-        )? {
-            RuntimeStartDecision::Existing(handle) => Ok(handle),
-            RuntimeStartDecision::Start { mode, slot_permit } => match mode {
-                TaskRuntimeMode::ZlmProxy => {
-                    self.start_live_relay_task(&request, slot_permit).await
-                }
-                TaskRuntimeMode::ZlmRtpServer => {
-                    self.start_rtp_receive_task(&request, slot_permit).await
-                }
-                TaskRuntimeMode::ManagedProcess => self.start_process_task(&request, slot_permit),
-            },
-        }
+        self.start_task_for_manager(request)
+            .await?
+            .commit(None)
+            .await
     }
 
     async fn stop_task(&self, request: StopTaskRequest) -> Result<(), ExecutorError> {
@@ -216,6 +789,37 @@ impl LocalExecutor for ManagedProcessExecutor {
     }
 
     async fn adopt_orphans(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
+        self.adopt_orphans_legacy(filter).await
+    }
+
+    fn set_zlm_server_id(&self, server_id: String) {
+        let server_id = server_id.trim().to_string();
+        {
+            let mut guard = self
+                .zlm_server_id
+                .write()
+                .expect("zlm_server_id lock poisoned");
+            if server_id.is_empty() {
+                *guard = None;
+            } else {
+                *guard = Some(server_id);
+            }
+        }
+    }
+
+    fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
+        {
+            let mut guard = self
+                .zlm_rtmp_enhanced_enabled
+                .write()
+                .expect("zlm_rtmp_enhanced_enabled lock poisoned");
+            *guard = enabled;
+        }
+    }
+}
+
+impl ManagedProcessExecutor {
+    async fn adopt_orphans_legacy(&self, filter: AdoptFilter) -> Vec<RuntimeHandle> {
         let stream_probe_client = self.http_client.clone();
         let stream_probe_settings = self.settings.clone();
         let rtp_probe_client = self.http_client.clone();
@@ -257,39 +861,221 @@ impl LocalExecutor for ManagedProcessExecutor {
         .await
     }
 
-    fn set_zlm_server_id(&self, server_id: String) {
-        let server_id = server_id.trim().to_string();
-        {
-            let mut guard = self
-                .zlm_server_id
-                .write()
-                .expect("zlm_server_id lock poisoned");
-            if server_id.is_empty() {
-                *guard = None;
-            } else {
-                *guard = Some(server_id);
+    pub(crate) async fn start_task_for_manager(
+        &self,
+        request: StartTaskRequest,
+    ) -> Result<RuntimeStartWorkerResult, ExecutorError> {
+        match prepare_start_task(
+            RuntimeStartContext {
+                settings: &self.settings,
+                registry: &self.registry,
+                runtimes: &self.runtimes,
+                stop_intents: &self.stop_intents,
+                slot_limiter: &self.slot_limiter,
+            },
+            &request,
+        )? {
+            RuntimeStartDecision::Existing(handle) => {
+                Ok(RuntimeStartWorkerResult::Committed(handle))
             }
+            RuntimeStartDecision::Start { mode, slot_permit } => match mode {
+                TaskRuntimeMode::ZlmProxy => self
+                    .start_live_relay_task(&request, slot_permit)
+                    .await
+                    .map(RuntimeStartOutcome::Zlm)
+                    .map(RuntimeStartWorkerResult::PendingCommit),
+                TaskRuntimeMode::ZlmRtpServer => self
+                    .start_rtp_receive_task(&request, slot_permit)
+                    .await
+                    .map(RuntimeStartOutcome::Zlm)
+                    .map(RuntimeStartWorkerResult::PendingCommit),
+                TaskRuntimeMode::ManagedProcess => self
+                    .prepare_process_task_for_manager(&request, slot_permit)
+                    .map(RuntimeStartOutcome::ManagedProcess)
+                    .map(RuntimeStartWorkerResult::PendingCommit),
+            },
         }
     }
 
-    fn set_zlm_rtmp_enhanced_enabled(&self, enabled: Option<bool>) {
+    pub(crate) async fn prepare_adopt_orphans_for_manager(
+        &self,
+        filter: AdoptFilter,
+    ) -> Vec<RuntimeAdoptionOutcome<RuntimeStartWorkerResult>> {
+        let stream_probe_client = self.http_client.clone();
+        let stream_probe_settings = self.settings.clone();
+        let rtp_probe_client = self.http_client.clone();
+        let rtp_probe_settings = self.settings.clone();
+
+        prepare_adopt_orphan_runtimes_for_manager(
+            RuntimeAdoptionWorkerContext {
+                filter,
+                zlm_server_id: self.current_zlm_server_id(),
+                settings: self.settings.clone(),
+            },
+            |request| async move { self.start_task_for_manager(request).await.ok() },
+            move |startup_probe| {
+                let client = stream_probe_client.clone();
+                let settings = stream_probe_settings.clone();
+                async move {
+                    zlm_stream_online(&client, &settings, &startup_probe)
+                        .await
+                        .map_err(|error| ExecutorError::ApiCall(error.to_string()))
+                        .unwrap_or(false)
+                }
+            },
+            move |stream_id| {
+                let client = rtp_probe_client.clone();
+                let settings = rtp_probe_settings.clone();
+                async move {
+                    zlm_rtp_server_port(&client, &settings, &stream_id)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+            },
+        )
+        .await
+    }
+
+    pub(crate) fn prepare_existing_adoption_commit(
+        &self,
+        handle: &RuntimeHandle,
+        session_epoch: u64,
+        generation: crate::runtime_manager::RuntimeGeneration,
+    ) -> RuntimeMonitorCommit {
+        let mut updated = handle.clone();
+        updated.metadata["session_epoch"] = json!(session_epoch);
+        attach_zlm_server_id(
+            &mut updated.metadata,
+            self.current_zlm_server_id().as_deref(),
+        );
+        RuntimeMonitorCommit::new(updated.clone(), generation).with_notifications(vec![
+            adopted_event_notification(
+                &updated,
+                "reattached active runtime after control-plane reconnect",
+                json!({
+                    "runtime_id": updated.runtime_id,
+                    "orphaned": false,
+                }),
+            ),
+        ])
+    }
+
+    pub(crate) fn apply_adoption_commit(
+        &self,
+        commit: RuntimeAdoptionCommit,
+        _generation: crate::runtime_manager::RuntimeGeneration,
+        monitor_handle: RuntimeMonitorHandle,
+    ) -> RuntimeHandle {
+        let handle = commit.handle.clone();
+        let runtime_id = handle.runtime_id;
+        let process = commit.backend.process;
+        let companion_processes = commit.backend.companion_processes.clone();
         {
-            let mut guard = self
-                .zlm_rtmp_enhanced_enabled
-                .write()
-                .expect("zlm_rtmp_enhanced_enabled lock poisoned");
-            *guard = enabled;
+            let mut runtimes = self.runtimes.write().expect("runtime map lock poisoned");
+            runtimes.insert(
+                runtime_id,
+                ManagedRuntime {
+                    process,
+                    companion_processes,
+                    _slot_permit: self.slot_limiter.attach_existing(),
+                    stop_requested: Arc::new(AtomicBool::new(false)),
+                    suppress_companion_events: Arc::new(AtomicBool::new(false)),
+                },
+            );
         }
+        if let Err(error) = persist_runtime_state(&commit.work_dir, &handle, &commit.success_check)
+        {
+            warn!(
+                runtime_id = %runtime_id,
+                error = %error,
+                "failed to persist adopted runtime state"
+            );
+        }
+        for notification in commit.notifications {
+            let _ = self.events.send(notification);
+        }
+
+        for monitor in commit.monitors {
+            match monitor {
+                RuntimeAdoptionMonitor::StartupProbe { startup_probe } => {
+                    spawn_startup_probe_monitor(
+                        runtime_id,
+                        commit.work_dir.clone(),
+                        commit.success_check.clone(),
+                        startup_probe,
+                        self.settings.clone(),
+                        self.http_client.clone(),
+                        self.registry.clone(),
+                        self.runtimes.clone(),
+                        self.events.clone(),
+                        Some(monitor_handle.clone()),
+                    );
+                }
+                RuntimeAdoptionMonitor::AdoptedRuntime => {
+                    spawn_adopted_runtime_monitor(
+                        handle.clone(),
+                        process,
+                        commit.work_dir.clone(),
+                        commit.success_check.clone(),
+                        self.registry.clone(),
+                        self.runtimes.clone(),
+                        self.events.clone(),
+                        Some(monitor_handle.clone()),
+                    );
+                }
+                RuntimeAdoptionMonitor::AdoptedCompanion { process, companion } => {
+                    spawn_adopted_companion_process_monitor(
+                        runtime_id,
+                        process,
+                        companion,
+                        commit.work_dir.clone(),
+                        commit.success_check.clone(),
+                        self.registry.clone(),
+                        self.runtimes.clone(),
+                        self.events.clone(),
+                        Some(monitor_handle.clone()),
+                    );
+                }
+                RuntimeAdoptionMonitor::LiveRelay { startup_probe } => {
+                    spawn_live_relay_monitor(
+                        runtime_id,
+                        commit.work_dir.clone(),
+                        startup_probe,
+                        self.settings.clone(),
+                        self.http_client.clone(),
+                        self.registry.clone(),
+                        self.runtimes.clone(),
+                        self.events.clone(),
+                        Some(monitor_handle.clone()),
+                    );
+                }
+                RuntimeAdoptionMonitor::RtpReceive { stream_id } => {
+                    spawn_rtp_receive_monitor(
+                        runtime_id,
+                        commit.work_dir.clone(),
+                        stream_id,
+                        self.settings.clone(),
+                        self.http_client.clone(),
+                        self.registry.clone(),
+                        self.runtimes.clone(),
+                        self.events.clone(),
+                        Some(monitor_handle.clone()),
+                    );
+                }
+            }
+        }
+        handle
     }
 }
 
 impl ManagedProcessExecutor {
-    fn start_process_task(
+    fn prepare_process_task_for_manager(
         &self,
         request: &StartTaskRequest,
         slot_permit: Arc<RuntimeSlotPermit>,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        start_managed_process_task(
+    ) -> Result<ManagedProcessStartOutcome, ExecutorError> {
+        prepare_process_start_task(
             ManagedProcessStartContext {
                 settings: &self.settings,
                 http_client: &self.http_client,
@@ -301,7 +1087,7 @@ impl ManagedProcessExecutor {
                     zlm_rtmp_enhanced_enabled: self.current_zlm_rtmp_enhanced_enabled(),
                 },
                 restart_executor: self.clone(),
-                hooks: ManagedProcessStartHooks::default(),
+                hooks: self.process_start_hooks.clone(),
             },
             request,
             slot_permit,
@@ -321,6 +1107,24 @@ impl ManagedProcessExecutor {
         .await
     }
 
+    pub(crate) async fn restart_process_task_after_failure_for_manager(
+        &self,
+        exited_handle: &RuntimeHandle,
+    ) -> Result<RuntimeStartWorkerResult, ExecutorError> {
+        crate::runtime_zlm::wait_for_zlm_api_ready(
+            &self.http_client,
+            &self.settings,
+            Duration::from_secs(15),
+        )
+        .await;
+
+        let request = crate::runtime_metadata::restart_request_from_handle(exited_handle)?;
+        let slot_permit = self.slot_limiter.try_acquire()?;
+        self.prepare_process_task_for_manager(&request, slot_permit)
+            .map(RuntimeStartOutcome::ManagedProcess)
+            .map(RuntimeStartWorkerResult::PendingCommit)
+    }
+
     pub(crate) async fn cleanup_managed_stream_before_restart(&self, handle: &RuntimeHandle) {
         cleanup_managed_stream_before_restart_impl(self.process_recovery_context(), handle).await;
     }
@@ -329,15 +1133,15 @@ impl ManagedProcessExecutor {
         &self,
         request: &StartTaskRequest,
         slot_permit: Arc<RuntimeSlotPermit>,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        start_zlm_live_relay_task(self.zlm_start_context(), request, slot_permit).await
+    ) -> Result<RuntimeZlmStartOutcome, ExecutorError> {
+        prepare_zlm_live_relay_start_task(self.zlm_start_context(), request, slot_permit).await
     }
 
     async fn start_rtp_receive_task(
         &self,
         request: &StartTaskRequest,
         slot_permit: Arc<RuntimeSlotPermit>,
-    ) -> Result<RuntimeHandle, ExecutorError> {
-        start_zlm_rtp_receive_task(self.zlm_start_context(), request, slot_permit).await
+    ) -> Result<RuntimeZlmStartOutcome, ExecutorError> {
+        prepare_zlm_rtp_receive_start_task(self.zlm_start_context(), request, slot_permit).await
     }
 }

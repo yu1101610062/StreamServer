@@ -22,6 +22,7 @@ mod runtime_live_relay_offline;
 mod runtime_live_relay_recording;
 mod runtime_live_relay_running;
 mod runtime_live_relay_startup_timeout;
+mod runtime_manager;
 mod runtime_metadata;
 mod runtime_monitors;
 mod runtime_outputs;

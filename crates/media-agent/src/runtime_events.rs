@@ -16,6 +16,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::runtime_manager::{ProgressObservedEvent, RuntimeInternalEvent, RuntimeMonitorHandle};
 use crate::runtime_registry::LocalRuntimeRegistry;
 
 const LOG_BATCH_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
@@ -256,6 +257,7 @@ pub(crate) async fn read_progress_stream(
     registry: LocalRuntimeRegistry,
     events: RuntimeEventSink,
     require_stream_online: bool,
+    monitor_handle: Option<RuntimeMonitorHandle>,
 ) {
     let mut reader = BufReader::new(stdout).lines();
     let mut current = HashMap::<String, String>::new();
@@ -270,28 +272,44 @@ pub(crate) async fn read_progress_stream(
         };
         current.insert(key.to_string(), value.to_string());
         if key == "progress" {
-            if require_stream_online
-                && !registry
-                    .get(runtime_id)
-                    .and_then(|runtime| {
-                        runtime
-                            .metadata
-                            .get("stream_online")
-                            .and_then(Value::as_bool)
-                    })
-                    .unwrap_or(false)
-            {
+            let snapshot = if let Some(monitor_handle) = monitor_handle.as_ref() {
+                let Some(snapshot) = monitor_handle.snapshot().await else {
+                    return;
+                };
+                Some(snapshot)
+            } else {
+                None
+            };
+            let fallback_handle = if snapshot.is_none() {
+                registry.get(runtime_id)
+            } else {
+                None
+            };
+            let stream_online = snapshot
+                .as_ref()
+                .map(|snapshot| &snapshot.handle)
+                .or(fallback_handle.as_ref())
+                .and_then(|runtime| {
+                    runtime
+                        .metadata
+                        .get("stream_online")
+                        .and_then(Value::as_bool)
+                })
+                .unwrap_or(false);
+            if require_stream_online && !stream_online {
                 current.clear();
                 continue;
             }
+            let session_epoch = snapshot
+                .as_ref()
+                .map(|snapshot| runtime_session_epoch(&snapshot.handle))
+                .or_else(|| fallback_handle.as_ref().map(runtime_session_epoch))
+                .unwrap_or_default();
             let progress = RuntimeTaskProgress {
                 task_id,
                 attempt_no,
                 lease_token: lease_token.clone(),
-                session_epoch: registry
-                    .get(runtime_id)
-                    .map(|runtime| runtime_session_epoch(&runtime))
-                    .unwrap_or_default(),
+                session_epoch,
                 frame: parse_u64(current.get("frame")),
                 fps: parse_f64(current.get("fps")),
                 bitrate_kbps: parse_bitrate_kbps(current.get("bitrate")),
@@ -300,11 +318,23 @@ pub(crate) async fn read_progress_stream(
                 dup_frames: parse_u64(current.get("dup_frames")),
                 drop_frames: parse_u64(current.get("drop_frames")),
             };
-            let _ = registry.update(runtime_id, |runtime| {
-                runtime.last_progress_at = Some(Utc::now());
-                runtime.state = RuntimeState::Running;
-            });
-            let _ = events.send(RuntimeNotification::TaskProgress(progress));
+            if let Some(monitor_handle) = monitor_handle.as_ref() {
+                monitor_handle
+                    .send_event(RuntimeInternalEvent::ProgressObserved(
+                        ProgressObservedEvent {
+                            runtime_id,
+                            generation: monitor_handle.generation(),
+                            progress,
+                        },
+                    ))
+                    .await;
+            } else {
+                let _ = registry.update(runtime_id, |runtime| {
+                    runtime.last_progress_at = Some(Utc::now());
+                    runtime.state = RuntimeState::Running;
+                });
+                let _ = events.send(RuntimeNotification::TaskProgress(progress));
+            }
             current.clear();
         }
     }

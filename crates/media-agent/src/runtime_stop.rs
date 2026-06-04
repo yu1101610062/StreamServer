@@ -26,10 +26,14 @@ use crate::{
         RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, runtime_session_epoch,
     },
     runtime_io::attempt_work_dir,
+    runtime_live_relay_events::{
+        LiveRelayEventStream, live_relay_stopped_terminal_event, live_relay_terminal_notification,
+    },
+    runtime_manager::{RuntimeGeneration, RuntimeMonitorCommit, RuntimeMonitorHandle},
     runtime_metadata::{
-        companion_process_identity_from_metadata, companion_recording_from_handle,
-        process_identity_from_handle, rtp_stream_id_from_handle, runtime_lease_token,
-        stream_binding_from_handle, task_runtime_mode_from_handle,
+        clear_source_reconnecting, companion_process_identity_from_metadata,
+        companion_recording_from_handle, process_identity_from_handle, rtp_stream_id_from_handle,
+        runtime_lease_token, stream_binding_from_handle, task_runtime_mode_from_handle,
     },
     runtime_persistence::{
         persist_runtime_state, scan_persisted_runtimes, success_check_from_handle,
@@ -38,8 +42,10 @@ use crate::{
     runtime_process::{
         ManagedRuntime, ProcessIdentity, is_process_running_for_command_line,
         remove_managed_runtime, runtime_processes, schedule_force_kill_if_running,
-        schedule_force_kill_processes_if_running, signal_process, signal_runtime_processes,
+        schedule_force_kill_processes_if_running, schedule_force_kill_with_monitor_if_running,
+        signal_process, signal_runtime_processes,
     },
+    runtime_recording::mark_recording_completion,
     runtime_registry::LocalRuntimeRegistry,
 };
 
@@ -126,6 +132,127 @@ pub(crate) struct RuntimeStopContext<'a> {
     pub(crate) controls: RuntimeControlContext<'a>,
 }
 
+pub(crate) enum RuntimeStopPreparation {
+    Worker {
+        commit: RuntimeMonitorCommit,
+        worker: RuntimeStopWorkerRequest,
+    },
+    AlreadyGone(RuntimeMonitorCommit),
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeStopWorkerRequest {
+    pub(crate) request: StopTaskRequest,
+    pub(crate) handle: RuntimeHandle,
+    pub(crate) stopping_handle: RuntimeHandle,
+    pub(crate) generation: RuntimeGeneration,
+    pub(crate) runtime: ManagedRuntime,
+    pub(crate) monitor_handle: RuntimeMonitorHandle,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeStopOutcome {
+    ManagedProcessStopAccepted,
+    Terminal(RuntimeMonitorCommit),
+    AlreadyGone(RuntimeMonitorCommit),
+}
+
+pub(crate) fn prepare_runtime_stop_for_manager(
+    settings: &AgentSettings,
+    runtimes: &Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
+    stop_intents: &Arc<RwLock<HashMap<(Uuid, i32), StopTaskRequest>>>,
+    request: &StopTaskRequest,
+    handle: &RuntimeHandle,
+    generation: RuntimeGeneration,
+    monitor_handle: RuntimeMonitorHandle,
+) -> Result<RuntimeStopPreparation, ExecutorError> {
+    let key = (request.task_id, request.attempt_no);
+    {
+        let mut stop_intents = stop_intents.write().expect("stop intents lock poisoned");
+        stop_intents.insert(key, request.clone());
+    }
+
+    let Some(runtime) = ({
+        let runtimes = runtimes.read().expect("runtime map lock poisoned");
+        runtimes.get(&handle.runtime_id).cloned()
+    }) else {
+        return Ok(RuntimeStopPreparation::AlreadyGone(
+            runtime_already_gone_commit(settings, handle, generation, request),
+        ));
+    };
+
+    let stopping_handle = stopping_handle_for_request(handle, request);
+    let mut commit = RuntimeMonitorCommit::new(stopping_handle.clone(), generation).with_persist(
+        attempt_work_dir(settings, request.task_id, request.attempt_no),
+        success_check_from_handle(&stopping_handle),
+    );
+    commit.mark_stop_requested = Some(true);
+    Ok(RuntimeStopPreparation::Worker {
+        commit,
+        worker: RuntimeStopWorkerRequest {
+            request: request.clone(),
+            handle: handle.clone(),
+            stopping_handle,
+            generation,
+            runtime,
+            monitor_handle,
+        },
+    })
+}
+
+pub(crate) async fn run_runtime_stop_worker(
+    controls: RuntimeControlContext<'_>,
+    worker: RuntimeStopWorkerRequest,
+) -> Result<RuntimeStopOutcome, ExecutorError> {
+    if worker.runtime.process.is_some() {
+        let managed_live_relay = matches!(
+            task_runtime_mode_from_handle(&worker.handle),
+            Some(TaskRuntimeMode::ManagedProcess)
+        ) && stream_binding_from_handle(&worker.handle).is_some();
+        if managed_live_relay {
+            stop_live_relay_recording_for_handle(&controls, &worker.handle).await?;
+        }
+        signal_runtime_processes(&worker.runtime, libc::SIGTERM)?;
+        if managed_live_relay {
+            close_live_relay(&controls, &worker.handle, true).await?;
+        }
+        if worker.request.force_after_sec > 0 {
+            schedule_force_kill_with_monitor_if_running(
+                worker.monitor_handle,
+                runtime_processes(&worker.runtime),
+                Duration::from_secs(worker.request.force_after_sec as u64),
+                "stop_task_force_after",
+            );
+        }
+        return Ok(RuntimeStopOutcome::ManagedProcessStopAccepted);
+    }
+
+    match task_runtime_mode_from_handle(&worker.handle) {
+        Some(TaskRuntimeMode::ZlmProxy) => {
+            stop_live_relay_recording_for_handle(&controls, &worker.handle).await?;
+            close_live_relay(&controls, &worker.handle, true).await?;
+            Ok(RuntimeStopOutcome::Terminal(
+                live_relay_stop_terminal_commit(&controls.settings, &worker),
+            ))
+        }
+        Some(TaskRuntimeMode::ZlmRtpServer) => {
+            close_rtp_receive(&controls, &worker.stopping_handle).await?;
+            Ok(RuntimeStopOutcome::Terminal(rtp_stop_terminal_commit(
+                &controls.settings,
+                &worker,
+            )))
+        }
+        _ => Ok(RuntimeStopOutcome::AlreadyGone(
+            runtime_already_gone_commit(
+                controls.settings,
+                &worker.stopping_handle,
+                worker.generation,
+                &worker.request,
+            ),
+        )),
+    }
+}
+
 pub(crate) async fn stop_runtime_task(
     ctx: RuntimeStopContext<'_>,
     request: &StopTaskRequest,
@@ -170,6 +297,7 @@ pub(crate) async fn stop_runtime_task(
     let reason = request.reason.clone();
     let grace_period_sec = request.grace_period_sec;
     let force_after_sec = request.force_after_sec;
+    let record_duration_reached = request.reason == "record_duration_reached";
     ctx.registry.update(runtime_id, |runtime| {
         runtime.state = RuntimeState::Stopping;
         runtime.last_progress_at = Some(Utc::now());
@@ -184,7 +312,13 @@ pub(crate) async fn stop_runtime_task(
             .cloned()
             .and_then(|value| serde_json::from_value::<LiveRelayRecording>(value).ok())
         {
-            recording.started = false;
+            let recording = if record_duration_reached {
+                runtime.metadata["completion_reason"] = json!("record_duration_reached");
+                mark_recording_completion(&recording, "record_duration_reached")
+            } else {
+                recording.started = false;
+                recording
+            };
             runtime.metadata["recording"] = json!(recording);
         }
     });
@@ -289,6 +423,121 @@ pub(crate) async fn stop_runtime_task(
     }
 
     Ok(())
+}
+
+fn stopping_handle_for_request(handle: &RuntimeHandle, request: &StopTaskRequest) -> RuntimeHandle {
+    let mut stopping_handle = handle.clone();
+    stopping_handle.state = RuntimeState::Stopping;
+    stopping_handle.last_progress_at = Some(Utc::now());
+    stopping_handle.metadata["stop"] = json!({
+        "reason": request.reason,
+        "grace_period_sec": request.grace_period_sec,
+        "force_after_sec": request.force_after_sec,
+    });
+    if let Some(mut recording) = stopping_handle
+        .metadata
+        .get("recording")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<LiveRelayRecording>(value).ok())
+    {
+        let recording = if request.reason == "record_duration_reached" {
+            stopping_handle.metadata["completion_reason"] = json!("record_duration_reached");
+            mark_recording_completion(&recording, "record_duration_reached")
+        } else {
+            recording.started = false;
+            recording
+        };
+        stopping_handle.metadata["recording"] = json!(recording);
+    }
+    stopping_handle
+}
+
+fn live_relay_stop_terminal_commit(
+    settings: &AgentSettings,
+    worker: &RuntimeStopWorkerRequest,
+) -> RuntimeMonitorCommit {
+    let mut exited_handle = worker.stopping_handle.clone();
+    exited_handle.state = RuntimeState::Exited;
+    exited_handle.last_progress_at = Some(Utc::now());
+    exited_handle.metadata["stream_online"] = json!(false);
+    clear_source_reconnecting(&mut exited_handle);
+    let mut notifications = Vec::new();
+    if let Some(binding) = stream_binding_from_handle(&worker.handle) {
+        notifications.push(live_relay_terminal_notification(
+            &exited_handle,
+            LiveRelayEventStream::from(&binding),
+            live_relay_stopped_terminal_event(&exited_handle),
+            false,
+        ));
+    }
+    notifications.push(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
+    RuntimeMonitorCommit::new(exited_handle.clone(), worker.generation)
+        .with_persist(
+            attempt_work_dir(settings, worker.request.task_id, worker.request.attempt_no),
+            success_check_from_handle(&exited_handle),
+        )
+        .with_notifications(notifications)
+        .terminal()
+}
+
+fn rtp_stop_terminal_commit(
+    settings: &AgentSettings,
+    worker: &RuntimeStopWorkerRequest,
+) -> RuntimeMonitorCommit {
+    let mut exited_handle = worker.stopping_handle.clone();
+    exited_handle.state = RuntimeState::Exited;
+    exited_handle.last_progress_at = Some(Utc::now());
+    exited_handle.metadata["stream_online"] = json!(false);
+    let (event_type, event_level, message) = if worker.request.reason == "disk_threshold_exceeded" {
+        (
+            "failed",
+            "error",
+            "stream_ingest rtp server stopped after disk threshold was exceeded",
+        )
+    } else {
+        ("canceled", "info", "stream_ingest rtp server stopped")
+    };
+    RuntimeMonitorCommit::new(exited_handle.clone(), worker.generation)
+        .with_persist(
+            attempt_work_dir(settings, worker.request.task_id, worker.request.attempt_no),
+            success_check_from_handle(&exited_handle),
+        )
+        .with_notifications(vec![
+            RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+                task_id: exited_handle.task_id,
+                attempt_no: exited_handle.attempt_no,
+                lease_token: runtime_lease_token(&exited_handle).unwrap_or_default(),
+                session_epoch: runtime_session_epoch(&exited_handle),
+                event_type: event_type.to_string(),
+                event_level: event_level.to_string(),
+                message: message.to_string(),
+                payload: json!({
+                    "runtime_id": exited_handle.runtime_id,
+                    "rtp_stream_id": rtp_stream_id_from_handle(&exited_handle),
+                    "reason": worker.request.reason,
+                }),
+            }),
+            RuntimeNotification::TaskSnapshot(exited_handle),
+        ])
+        .terminal()
+}
+
+fn runtime_already_gone_commit(
+    settings: &AgentSettings,
+    handle: &RuntimeHandle,
+    generation: RuntimeGeneration,
+    request: &StopTaskRequest,
+) -> RuntimeMonitorCommit {
+    let mut exited_handle = stopping_handle_for_request(handle, request);
+    exited_handle.state = RuntimeState::Exited;
+    exited_handle.last_progress_at = Some(Utc::now());
+    RuntimeMonitorCommit::new(exited_handle.clone(), generation)
+        .with_persist(
+            attempt_work_dir(settings, request.task_id, request.attempt_no),
+            success_check_from_handle(&exited_handle),
+        )
+        .with_notifications(vec![RuntimeNotification::TaskSnapshot(exited_handle)])
+        .terminal()
 }
 
 fn runtime_handle_live_processes(handle: &RuntimeHandle) -> Vec<ProcessIdentity> {

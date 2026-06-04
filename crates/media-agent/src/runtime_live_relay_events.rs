@@ -138,6 +138,20 @@ pub(crate) fn emit_live_relay_terminal_event(
     terminal_event: LiveRelayTerminalEvent,
     include_orphaned: bool,
 ) {
+    let _ = events.send(live_relay_terminal_notification(
+        exited_handle,
+        stream,
+        terminal_event,
+        include_orphaned,
+    ));
+}
+
+pub(crate) fn live_relay_terminal_notification(
+    exited_handle: &RuntimeHandle,
+    stream: LiveRelayEventStream<'_>,
+    terminal_event: LiveRelayTerminalEvent,
+    include_orphaned: bool,
+) -> RuntimeNotification {
     let mut payload = json!({
         "schema": stream.schema,
         "vhost": stream.vhost,
@@ -154,7 +168,7 @@ pub(crate) fn emit_live_relay_terminal_event(
                 .unwrap_or(false)
         );
     }
-    let _ = events.send(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
+    RuntimeNotification::TaskEvent(RuntimeTaskEvent {
         task_id: exited_handle.task_id,
         attempt_no: exited_handle.attempt_no,
         lease_token: runtime_lease_token(exited_handle).unwrap_or_default(),
@@ -163,5 +177,5 @@ pub(crate) fn emit_live_relay_terminal_event(
         event_level: terminal_event.event_level.to_string(),
         message: terminal_event.message.to_string(),
         payload,
-    }));
+    })
 }

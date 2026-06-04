@@ -389,7 +389,7 @@ fn reject_only_stop_action_targets_only_artifact_tasks_on_volume() {
     let executor = Arc::new(RecordingExecutor::default());
     let manager = ArtifactCleanupManager::with_executor(
         &AgentSettings::default(),
-        LocalRuntimeRegistry::new(),
+        Arc::new(LocalRuntimeRegistry::new()),
         Some(executor.clone()),
     );
     let artifact_task = Uuid::now_v7();

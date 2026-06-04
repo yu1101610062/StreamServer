@@ -24,9 +24,11 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::runtime::LocalRuntimeRegistry;
 use crate::{
     config::{AgentArtifactCleanupSettings, AgentSettings},
-    runtime::{LocalExecutor, LocalRuntimeRegistry, StopTaskRequest},
+    runtime::{LocalExecutor, RuntimeReadModel, StopTaskRequest},
 };
 
 const CLEANUP_HYSTERESIS_PERCENT: f64 = 5.0;
@@ -64,7 +66,7 @@ pub struct ArtifactCleanupManager {
 
 struct ArtifactCleanupManagerInner {
     cleanup: AgentArtifactCleanupSettings,
-    registry: LocalRuntimeRegistry,
+    runtime_read_model: Arc<dyn RuntimeReadModel>,
     executor: Option<Arc<dyn LocalExecutor>>,
     layout: ArtifactCleanupLayout,
     state: RwLock<ArtifactCleanupState>,
@@ -226,12 +228,12 @@ impl ArtifactCleanupLayout {
 impl ArtifactCleanupManager {
     #[cfg(test)]
     pub fn new(settings: &AgentSettings, registry: LocalRuntimeRegistry) -> Self {
-        Self::with_executor(settings, registry, None)
+        Self::with_executor(settings, Arc::new(registry), None)
     }
 
     pub fn with_executor(
         settings: &AgentSettings,
-        registry: LocalRuntimeRegistry,
+        runtime_read_model: Arc<dyn RuntimeReadModel>,
         executor: Option<Arc<dyn LocalExecutor>>,
     ) -> Self {
         let layout = ArtifactCleanupLayout::from_settings(settings);
@@ -239,7 +241,7 @@ impl ArtifactCleanupManager {
         Self {
             inner: Arc::new(ArtifactCleanupManagerInner {
                 cleanup: settings.artifact_cleanup.clone(),
-                registry,
+                runtime_read_model,
                 executor,
                 layout,
                 state: RwLock::new(state),
@@ -355,7 +357,7 @@ impl ArtifactCleanupManager {
             }
         }
 
-        let active_handles = self.inner.registry.active_handles();
+        let active_handles = self.inner.runtime_read_model.active_handles();
         let strategy = ArtifactCleanupStrategy::from_settings(&self.inner.cleanup);
         let threshold = self.inner.cleanup.threshold_percent;
         let mut by_device: HashMap<u64, Vec<BucketObservation>> = HashMap::new();
@@ -1172,8 +1174,8 @@ fn sample_disk(path: &Path) -> io::Result<DiskSample> {
     }
 
     let stat = unsafe { stat.assume_init() };
-    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
-    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+    let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
+    let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
     if total == 0 {
         return Ok(DiskSample { percent_used: 0.0 });
     }

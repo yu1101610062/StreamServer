@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     runtime::{ExecutorError, SuccessCheck, classify_adopted_exit, runtime_lease_token},
     runtime_events::{RuntimeTaskEvent, TerminalRuntimeReplay, runtime_session_epoch},
-    runtime_registry::LocalRuntimeRegistry,
+    runtime_registry::RuntimeReadModel,
 };
 
 pub(crate) const RUNTIME_STATE_FILE: &str = "runtime.json";
@@ -221,13 +221,13 @@ fn classify_replayed_exit(
 
 pub fn collect_terminal_runtime_replays(
     work_root: &str,
-    registry: &LocalRuntimeRegistry,
+    read_model: &dyn RuntimeReadModel,
 ) -> Vec<TerminalRuntimeReplay> {
     scan_exited_persisted_runtimes(work_root)
         .into_iter()
         .filter(|state| stop_requested_from_persisted_handle(&state.handle))
         .filter(|state| {
-            registry
+            read_model
                 .find_by_task_attempt(state.handle.task_id, state.handle.attempt_no)
                 .is_none()
         })
