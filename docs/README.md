@@ -59,6 +59,10 @@ StreamServer 文档分为三层：
 - [ADR-0004: FFmpeg and ZLMediaKit boundary](./adr/0004-ffmpeg-zlm-boundary.md)
 - [ADR-0005: PostgreSQL as source of truth](./adr/0005-postgresql-source-of-truth.md)
 
+### 开源许可证与第三方项目
+
+StreamServer 自有代码采用 **GNU General Public License v3.0 (GPL-3.0-only)**。本项目使用 [FFmpeg](https://ffmpeg.org/) 和 [ZLMediaKit](https://github.com/ZLMediaKit/ZLMediaKit) 作为第三方 runtime；发布源码或 native 离线包时，应保留并声明这些项目及其依赖的许可证、版权和源码/构建信息。具体说明见根目录 [README.md](../README.md#开源许可证与第三方项目)。
+
 ## English
 
 The English documentation is intentionally smaller than the Chinese source docs. It focuses on the documents most useful for first-time readers and technical reviewers.
@@ -72,3 +76,7 @@ The English documentation is intentionally smaller than the Chinese source docs.
 | [Testing](./en/09-testing.md) | Quality gates and verification strategy |
 
 Architecture decisions are available under [ADR](./adr/).
+
+### License and Third-party Notices
+
+StreamServer-owned code is licensed under the **GNU General Public License v3.0 (GPL-3.0-only)**. StreamServer uses [FFmpeg](https://ffmpeg.org/) and [ZLMediaKit](https://github.com/ZLMediaKit/ZLMediaKit) as third-party runtime projects; source releases and native bundles should keep and declare their licenses, copyright notices, source/build information, and dependency notices. See the root [README.md](../README.md#license-and-third-party-notices).

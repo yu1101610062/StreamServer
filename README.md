@@ -226,9 +226,16 @@ release/native 验证建议额外执行：
 
 本项目是一个 AI-assisted engineering 项目。项目 owner 负责需求拆解、架构设计、代码审查、测试验收、部署验证和持续重构。详细说明见 [AI-assisted Engineering Notes](docs/zh/12-ai-assisted-development.md)。
 
-### License
+### 开源许可证与第三方项目
 
-MIT
+本项目自有代码采用 **GNU General Public License v3.0 (GPL-3.0-only)** 发布。
+
+StreamServer 运行和 native 离线包构建使用以下第三方项目。本仓库许可证不覆盖这些项目及其运行时二进制：
+
+- [FFmpeg](https://ffmpeg.org/): FFmpeg 默认使用 LGPLv2.1+；如果构建或分发的 FFmpeg 启用了 GPL 组件，则对应 FFmpeg 二进制适用 GPLv2+。发布包含 FFmpeg runtime 的包时，应保留 FFmpeg 的许可证、版权、源码获取方式和构建配置说明。实际构建不得引入与 GPLv3 不兼容或不可再分发的组件。
+- [ZLMediaKit](https://github.com/ZLMediaKit/ZLMediaKit): ZLMediaKit 自有代码使用 MIT License。使用或分发 ZLMediaKit runtime 时，应保留其版权信息，并同时声明其依赖的第三方库许可证。
+
+发布源码或 native 离线包前，应以实际打包的 FFmpeg/ZLMediaKit 构建参数和依赖清单为准复核许可证声明。
 
 ---
 
@@ -372,6 +379,13 @@ The core control loop, Agent runtime, gRPC control plane, PostgreSQL persistence
 
 This is an AI-assisted engineering project. The project owner is responsible for requirements, architecture, code review, testing, deployment validation, and iterative refactoring.
 
-### License
+### License and Third-party Notices
 
-MIT
+StreamServer-owned code is licensed under the **GNU General Public License v3.0 (GPL-3.0-only)**.
+
+StreamServer uses the following third-party projects at runtime and during native bundle assembly. The repository license does not cover those projects or their runtime binaries:
+
+- [FFmpeg](https://ffmpeg.org/): FFmpeg is licensed under LGPLv2.1+ by default. If the FFmpeg build enables GPL components, the corresponding FFmpeg binary is covered by GPLv2+. When distributing bundles that include FFmpeg runtime assets, keep the FFmpeg license, copyright notices, source availability, and build configuration notes. The actual build must not include components that are incompatible with GPLv3 or not redistributable.
+- [ZLMediaKit](https://github.com/ZLMediaKit/ZLMediaKit): ZLMediaKit's self-owned code is licensed under the MIT License. When using or distributing ZLMediaKit runtime assets, keep its copyright notices and declare the licenses of its third-party dependencies.
+
+Before publishing source releases or native bundles, verify the license notices against the actual FFmpeg/ZLMediaKit build options and dependency manifests included in the distributed artifacts.
