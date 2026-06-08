@@ -336,6 +336,8 @@ impl Settings {
 }
 
 fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
+    // 环境变量覆盖发生在文件配置反序列化之后、validate 之前；这里只负责把文本
+    // 转成字段值，跨字段依赖仍统一交给 validate()。
     if let Some(value) = env("AGENT_HTTP_ADDR") {
         settings.agent.http_addr = value;
     }
@@ -445,6 +447,7 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     if let Some(value) = env("WORK_ROOT") {
         settings.agent.work_root = value;
     }
+    // 上传限制属于安全边界，解析失败必须让配置加载失败，不能静默退回默认值。
     if let Some(value) = env("UPLOAD_MAX_BYTES") {
         settings.agent.upload_max_bytes = parse_required_env("UPLOAD_MAX_BYTES", &value)?;
     }
@@ -509,6 +512,7 @@ fn parse_env_or_default<T>(value: &str, default: impl FnOnce() -> T) -> T
 where
     T: FromStr,
 {
+    // 兼容旧部署脚本：这些字段历史上解析失败会回落默认值，暂不改变行为。
     match T::from_str(value) {
         Ok(value) => value,
         Err(_) => default(),

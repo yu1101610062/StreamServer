@@ -13,6 +13,8 @@ pub async fn dispatch_json(input: &str) -> Result<Value, NativeError> {
 }
 
 async fn dispatch(api: ApiClient, request: NativeRequest) -> Result<Value, NativeError> {
+    // Flutter 侧通过 op 字符串进入 native 层；这里保持薄路由，只做参数提取、
+    // token 传递和少量本机能力分发，业务语义仍在 Core API 或子模块中实现。
     match request.op.as_str() {
         "server_profile.normalize" => {
             let server = require_server(&request)?;
@@ -67,6 +69,8 @@ async fn dispatch(api: ApiClient, request: NativeRequest) -> Result<Value, Nativ
             .await
         }
         "api.request" => {
+            // 通用 API 代理会尝试用 refresh token 刷新 access token；
+            // 登录、登出等固定端点保留在上面的显式分支中，方便前端区分响应形态。
             let server = require_server(&request)?;
             let method = request.method.as_deref().unwrap_or("GET");
             let path = request
@@ -101,6 +105,7 @@ async fn dispatch(api: ApiClient, request: NativeRequest) -> Result<Value, Nativ
             .await
         }
         "secure_store.read" => {
+            // secure_store 操作只接受 key/value，避免前端把完整请求体直接写入本机密钥存储。
             let key = request
                 .key
                 .as_deref()
@@ -136,6 +141,7 @@ async fn dispatch(api: ApiClient, request: NativeRequest) -> Result<Value, Nativ
             media_player::validate_url(&url)
         }
         "media_player.open" => {
+            // 播放器能力只处理已经由前端/Core 生成的媒体 URL，不在 native 层重新做鉴权。
             let url = media_url_from_body(&request)?;
             let requested_player = request
                 .body

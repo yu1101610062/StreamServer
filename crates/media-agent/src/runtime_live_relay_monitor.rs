@@ -55,6 +55,7 @@ pub(crate) fn spawn_live_relay_monitor(
                 };
                 let stop_requested = snapshot.stop_requested;
                 let handle = snapshot.handle;
+                // 显式停止请求优先于所有在线探测，先关闭 ZLM 侧代理流，再把 runtime 收口为终态。
                 if stop_requested {
                     let binding = stream_binding_from_handle(&handle).unwrap_or(StreamBinding {
                         schema: startup_probe.schema.clone(),
@@ -91,6 +92,8 @@ pub(crate) fn spawn_live_relay_monitor(
                     return;
                 }
 
+                // 常态监控只以 ZLM 当前可见状态为准；错误和缺流都先折算成离线计数，
+                // 由阈值函数决定是否进入重连或退出，避免单次探测抖动误杀任务。
                 let stream_status =
                     zlm_stream_status(&http_client, &settings, &startup_probe).await;
                 let stream_state = stream_status
@@ -102,6 +105,8 @@ pub(crate) fn spawn_live_relay_monitor(
                     next_live_relay_offline_polls(offline_polls, stream_was_online, stream_state);
                 match stream_status {
                     Ok(Some(stream_status)) => {
+                        // 流重新可见时刷新 runtime/read-model，并补齐 stream_binding 供后续事件、
+                        // 清理和录制控制复用；只有状态发生变化时才发送 running 事件。
                         offline_polls = next_offline_polls;
                         let binding = stream_binding_from_handle(&handle)
                             .unwrap_or_else(|| stream_status.binding.clone());
@@ -120,6 +125,8 @@ pub(crate) fn spawn_live_relay_monitor(
                         });
                         let mut notifications = Vec::new();
                         let mut recording_started = false;
+                        // live relay 的录制启动依赖流已上线；失败时按任务策略决定是降级运行，
+                        // 还是把启动视为致命错误并让 manager 走终态提交。
                         if let Some(recording) = live_relay_recording_from_handle(&handle)
                             .filter(should_start_live_relay_recording)
                         {
@@ -305,6 +312,8 @@ pub(crate) fn spawn_live_relay_monitor(
                         if !stream_online(&handle)
                             && started_at.elapsed() >= STARTUP_PROBE_TIMEOUT =>
                     {
+                        // 首次上线超时分两条路：粘性重连任务继续保活并暴露 reconnecting，
+                        // 普通任务直接失败，防止永久占用 runtime slot。
                         if sticky_reconnect_stream_ingest_from_handle(&handle) {
                             let emit_event =
                                 should_emit_source_reconnecting(&handle, "startup_timeout");
@@ -426,6 +435,8 @@ pub(crate) fn spawn_live_relay_monitor(
                         return;
                     }
                     Ok(None) if stream_was_online => {
+                        // 已运行过的 live relay 掉线后先给 ZLM 几个轮询周期恢复；达到阈值后，
+                        // 粘性重连任务进入 source_reconnecting，非粘性任务才真正退出。
                         offline_polls = next_offline_polls;
                         if !offline_threshold_reached {
                             sleep(STARTUP_PROBE_POLL_INTERVAL).await;

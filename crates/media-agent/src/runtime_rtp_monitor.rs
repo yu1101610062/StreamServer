@@ -49,6 +49,8 @@ pub(crate) fn spawn_rtp_receive_monitor(
                 let stop_requested = snapshot.stop_requested;
                 let handle = snapshot.handle;
 
+                // RTP receive 的权威事实是 ZLM 是否还保留对应 stream_id 的 RTP server。
+                // 缺失计数用于过滤 ZLM API 瞬时失败或 server 刚切换时的短暂空窗。
                 let server_port = zlm_rtp_server_port(&http_client, &settings, &stream_id).await;
                 let (next_missing_polls, missing_threshold_reached) = next_rtp_server_missing_polls(
                     missing_polls,
@@ -59,6 +61,8 @@ pub(crate) fn spawn_rtp_receive_monitor(
                 );
                 match server_port {
                     Ok(Some(local_port)) => {
+                        // server 仍存在时，只在首次进入 running 或曾经标记离线后才刷新状态，
+                        // 防止每个轮询周期都刷 task event。
                         missing_polls = next_missing_polls;
                         let should_emit_running =
                             handle.state != RuntimeState::Running || !stream_online(&handle);
@@ -124,12 +128,16 @@ pub(crate) fn spawn_rtp_receive_monitor(
                         }
                     }
                     Ok(None) => {
+                        // ZLM 没有这个 RTP server 不一定立即失败：可能是 media server 重启、
+                        // orphan adopt 过程或 openRtpServer 短暂丢失，先等阈值再裁决。
                         missing_polls = next_missing_polls;
                         if !missing_threshold_reached {
                             sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                             continue;
                         }
                         if sticky_reconnect_stream_ingest_from_handle(&handle) {
+                            // 粘性重连任务会尝试重新 openRtpServer，并继续保留 runtime。
+                            // 失败信息只写进事件 payload，下一轮仍有机会再次重开。
                             let emit_event =
                                 should_emit_source_reconnecting(&handle, "rtp_server_missing");
                             let emit_gap_started = should_emit_recording_gap_started(&handle);
@@ -220,6 +228,8 @@ pub(crate) fn spawn_rtp_receive_monitor(
                             sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                             continue;
                         }
+                        // 非粘性接入没有可恢复语义；server 达到缺失阈值后收口成终态，
+                        // 如果这是主动停止导致的缺失，则跳过告警事件。
                         let mut exited_handle = handle.clone();
                         exited_handle.state = RuntimeState::Exited;
                         exited_handle.last_progress_at = Some(Utc::now());

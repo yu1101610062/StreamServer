@@ -2190,6 +2190,8 @@ fn format_kib(value: &str) -> String {
     }
 }
 
+// 配置页展示用说明表，只描述安装器生成的 native .env 字段含义；
+// 实际校验逻辑仍由端口检查、实例校验和保存流程负责。
 const ENV_COMMENTS: &[(&str, &str)] = &[
     ("DEPLOY_MODE", "部署模式，固定为 native，由 systemd 管理。"),
     (

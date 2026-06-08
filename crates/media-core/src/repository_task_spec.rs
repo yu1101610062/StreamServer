@@ -111,6 +111,8 @@ pub(super) fn build_resolved_task_json(
 }
 
 pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
+    // overlay 只保留用户请求中显式出现的字段；默认值由 build_resolved_task_json
+    // 与 TaskSpec::resolved() 统一补齐，避免把空值误持久化成用户选择。
     let mut overlay = serde_json::Map::new();
     overlay.insert(
         "type".to_string(),
@@ -144,6 +146,8 @@ fn insert_overlay_section(
 }
 
 fn common_overlay(spec: &TaskSpec) -> Option<Value> {
+    // common 字段承担审计和回调归属，空字符串不进入 overlay，
+    // 后续 validate() 会决定 created_by 是否必须存在。
     let mut common = serde_json::Map::new();
     if let Some(created_by) = spec
         .common
@@ -263,6 +267,8 @@ fn expose_overlay(spec: &TaskSpec) -> Option<Value> {
 }
 
 fn publish_overlay(spec: &TaskSpec) -> Option<Value> {
+    // publish 字段在 stream_bridge 和 file_transcode 中含义不同；
+    // 这里只保存原始选择，不在组装阶段做跨任务类型判断。
     overlay_optional_fields(&[
         ("kind", spec.publish.kind.map(|value| json!(value))),
         ("url", spec.publish.url.as_ref().map(|value| json!(value))),
@@ -338,6 +344,8 @@ fn recovery_overlay(spec: &TaskSpec) -> Option<Value> {
 }
 
 fn schedule_overlay(spec: &TaskSpec) -> Option<Value> {
+    // schedule 为空时保持缺省 immediate 语义；cron 空字符串不写入 overlay，
+    // 避免覆盖配置中的默认调度方式。
     let mut schedule = serde_json::Map::new();
     if let Some(start_mode) = spec.schedule.start_mode {
         schedule.insert("start_mode".to_string(), json!(start_mode));
@@ -368,6 +376,7 @@ fn resource_overlay(spec: &TaskSpec) -> Option<Value> {
 }
 
 fn overlay_optional_fields(fields: &[(&str, Option<Value>)]) -> Option<Value> {
+    // Option::None 表示请求未显式设置该字段，而不是设置为 JSON null。
     let mut object = serde_json::Map::new();
     for (key, value) in fields {
         if let Some(value) = value {

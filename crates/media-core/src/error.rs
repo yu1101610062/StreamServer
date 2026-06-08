@@ -46,6 +46,8 @@ impl IntoResponse for AppError {
 
 impl AppError {
     fn into_response_parts(self) -> ErrorResponseParts {
+        // HTTP 层只负责把内部错误映射成稳定 API 错误码；具体错误来源
+        // 继续委托给 control_plane/repository 的专用映射函数。
         match self {
             Self::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,
@@ -89,6 +91,8 @@ impl AppError {
 }
 
 fn control_plane_error_parts(error: ControlPlaneError) -> ErrorResponseParts {
+    // 控制面错误面向“是否还有可用 agent”这一层语义；Repository 包装错误
+    // 继续下沉到仓储映射，避免同一种数据库错误出现两个 API code。
     match error {
         ControlPlaneError::NoConnectedNode => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -116,6 +120,8 @@ fn control_plane_error_parts(error: ControlPlaneError) -> ErrorResponseParts {
 }
 
 fn repo_error_parts(error: RepoError) -> ErrorResponseParts {
+    // 仓储错误按客户端可行动性分组：找不到返回 404，状态冲突返回 409，
+    // 规格校验返回 400，其余内部错误不泄露实现细节。
     match error {
         RepoError::TaskNotFound(task_id) => (
             StatusCode::NOT_FOUND,

@@ -21,6 +21,8 @@ impl TaskRepository {
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        // adopted/orphaned 是 agent 在重连后回报的事实，可能不是当前 owner；
+        // 其余事件必须严格来自当前租约持有者，防止旧 agent 覆盖新 attempt。
         let ownership_mode = if matches!(event.event_type.as_str(), "adopted" | "orphaned") {
             OwnershipMode::AuthorizedAttempt
         } else {
@@ -44,6 +46,8 @@ impl TaskRepository {
         let sticky_reconnect_active = sticky_reconnect_active(&ownership)?;
 
         let event_level = normalize_event_level(&event.event_level);
+        // 先持久化可审计事件，再做状态迁移；即便后续分支只更新状态，
+        // 事件流仍能还原 agent 当时上报的原始 payload。
         if should_persist_agent_task_event(&event.event_type, &event_level) {
             self.insert_event(
                 &mut tx,
@@ -71,6 +75,8 @@ impl TaskRepository {
                 .is_some_and(|reason| reason == "disk_threshold_exceeded");
 
         let mut retry_after_orphaned = false;
+        // 这里是 agent event -> task/attempt 状态机的核心映射。粘性重连中的
+        // running 任务会忽略部分 recover/terminal 事件，直到真正恢复或磁盘保护失败。
         match event.event_type.as_str() {
             "accepted" | "starting"
                 if sticky_reconnect_active && ownership.task_status == TaskStatus::Running => {}
@@ -180,6 +186,8 @@ impl TaskRepository {
                 .await?;
             }
             "orphaned" => {
+                // orphaned 可能表示“正在停止的 runtime 已被 agent 找不到”，也可能表示
+                // reclaim/adopt 后任务丢失；两种情况要分别保持 STOPPING 或触发重试。
                 if ownership.stop_requested_at.is_some() {
                     sqlx::query(
                         r#"
@@ -345,6 +353,8 @@ impl TaskRepository {
                         && retry_limit > 0
                         && consecutive_failures < retry_limit;
 
+                    // start_rejected 是启动阶段失败，仍可能按任务恢复策略自动回到 QUEUED；
+                    // 达到上限或禁用重试时才真正完成为 Failed。
                     if should_retry {
                         sqlx::query(
                             r#"
@@ -480,6 +490,8 @@ impl TaskRepository {
 
         tx.commit().await?;
         if retry_after_orphaned {
+            // 重试入队放在事务提交后执行，避免 enqueue_retry 再读任务摘要时看到
+            // 本事务内未提交的 LOST 状态。
             let current = self.fetch_task_summary(event.task_id).await?;
             if current.status == TaskStatus::Lost {
                 self.enqueue_retry(

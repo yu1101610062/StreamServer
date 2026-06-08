@@ -1889,6 +1889,8 @@ async fn process_zlm_hook(
         }
     }
 
+    // Hook 入口先做来源和密钥校验，再解析 server_id 到节点；只有通过这层边界后，
+    // 后续分支才允许把 ZLM 事件写入任务状态或产物表。
     validate_hook_source_ip(&state, peer_ip)?;
     validate_hook_secret(&state, &headers, query_secret.as_deref(), &payload)?;
     let node_id = state
@@ -1912,8 +1914,12 @@ async fn process_zlm_hook(
     let sanitized_payload = sanitize_hook_payload(&payload);
     let dedup_key = hash_hook_payload(server_id.trim(), &hook_name, &sanitized_payload);
 
+    // 不同 ZLM hook 的业务语义差异很大：on_publish 会影响是否允许推流，
+    // record hook 写产物，stream hook 只记事件，keepalive 刷新 media server 可见性。
     let response = match hook_name.as_str() {
         "on_publish" => {
+            // on_publish 是唯一需要返回播放/推流策略的 hook；匹配到任务时还会把
+            // gb_rtp 接入提升为 running，因为 RTP server 本身不等同于媒体真正到达。
             let hook = parse_publish_hook(&sanitized_payload)?;
             let publish_target = state
                 .repository
@@ -1981,6 +1987,8 @@ async fn process_zlm_hook(
             }
         }
         "on_rtp_server_timeout" => {
+            // RTP server 超时来自 ZLM 的被动通知；能匹配任务时转成任务事件，
+            // 匹配不到则只保留原始 hook，避免误改无归属任务。
             let hook = parse_rtp_server_timeout_hook(&sanitized_payload)?;
             let timeout_target = state
                 .repository
@@ -2023,6 +2031,8 @@ async fn process_zlm_hook(
             hook_ack(&hook_name)
         }
         "on_record_mp4" => {
+            // 录制文件路径必须经过 allowlist 校验，防止 ZLM 回调把任意宿主机路径
+            // 写入可下载产物或清理索引。
             let hook = parse_record_mp4_hook(&sanitized_payload)?;
             validate_record_file_path(&hook.file_path, &state.storage_allowlist)?;
             let _ = state
@@ -2053,6 +2063,8 @@ async fn process_zlm_hook(
             hook_ack(&hook_name)
         }
         "on_record_ts" | "on_record_hls" => {
+            // HLS/TS hook 有时只携带播放 URL，不携带完整文件路径；解析不到路径时
+            // 只能记录原始 hook，不能虚构产物行。
             let hook = parse_record_hls_hook(&sanitized_payload, &hook_name)?;
             if let Some(file_path) = resolve_record_hls_file_path(&hook) {
                 validate_record_file_path(&file_path, &state.storage_allowlist)?;
@@ -2153,6 +2165,8 @@ async fn process_zlm_hook(
             hook_ack(&hook_name)
         }
         "on_server_keepalive" | "on_server_started" => {
+            // keepalive 同时记录原始 hook 和节点可见时间，调度层用后者判断
+            // media server 是否仍然可作为任务目标。
             let _ = state
                 .repository
                 .record_zlm_hook(server_id.trim(), &hook_name, &dedup_key, sanitized_payload)

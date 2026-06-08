@@ -367,6 +367,8 @@ impl ManagedProcessExecutor {
             .as_ref()
             .map(|status| *status)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error.clone()));
+        // 进程退出后先判断是否能本地重启。可恢复路径会先写一次退出 commit，
+        // 再把新的 start outcome 交回 actor；真正终态只在恢复条件不满足时生成。
         if should_auto_restart_process(&exited_handle, event.was_stopped, &restart_status) {
             let sticky_reconnect = sticky_reconnect_stream_ingest_from_handle(&exited_handle);
             let restart_reason = if stream_online(&exited_handle) {
@@ -468,6 +470,9 @@ impl ManagedProcessExecutor {
         let completion_reason = completion_reason_from_handle(&exited_handle);
         let stop_reason = stop_reason_from_handle(&exited_handle);
         let fatal_recording_error = fatal_recording_error_from_handle(&exited_handle);
+        // 不能重启时才把进程退出折算成 task event。这里按“用户主动停止、
+        // 录制时长到达、磁盘保护、产物校验、异常退出”顺序裁决，避免成功 exit
+        // 被误报为任务成功。
         let (event_type, event_level, message, payload) = match &event.status {
             Ok(status)
                 if event.was_stopped
@@ -678,6 +683,8 @@ impl ManagedProcessExecutor {
             payload,
         }));
         pre_terminal_notifications.push(RuntimeNotification::TaskSnapshot(exited_handle.clone()));
+        // 终态 commit 是进程监控的最后一次写入，持久化、通知和 manager 状态收口
+        // 必须在同一个 RuntimeMonitorCommit 中完成。
         RuntimeProcessExitOutcome::Terminal(
             RuntimeMonitorCommit::new(exited_handle, event.generation)
                 .with_persist(event.work_dir, event.success_check)

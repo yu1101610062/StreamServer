@@ -665,6 +665,8 @@ impl TaskSpec {
         let mut issues = Vec::new();
         let resolved = self.resolved();
 
+        // 基础身份字段先校验，后面的类型分支会复用 name/priority/common.created_by
+        // 作为任务可审计性和调度排序的前提。
         if self.name.trim().is_empty() {
             issues.push(ValidationIssue::new("name", "must not be empty"));
         } else if contains_whitespace(&self.name) {
@@ -702,6 +704,8 @@ impl TaskSpec {
             ));
         }
 
+        // 录像时长属于 stream_ingest 的运行时控制字段；未启用 record 或非接入任务
+        // 配置该字段都会让执行计划产生歧义。
         if let Some(duration_sec) = self.record.duration_sec {
             if !self.record.enabled.unwrap_or(false) {
                 issues.push(ValidationIssue::new(
@@ -723,6 +727,8 @@ impl TaskSpec {
             }
         }
 
+        // input.kind 决定后续执行器选择，必须在这里把 URL、文件相对路径、
+        // 组播地址和 GB RTP 端口等互斥输入约束一次性收齐。
         match self.input.kind {
             None => issues.push(ValidationIssue::new("input.kind", "must be provided")),
             Some(InputKind::File) => match self.input.url.as_deref() {
@@ -800,6 +806,8 @@ impl TaskSpec {
             Some(_) => {}
         }
 
+        // source_mode 是输入族的语义补充：部分协议只能是 live/vod 中的固定值，
+        // 不校验会让后续恢复、循环播放和录制模式推断互相冲突。
         match (self.input.kind, self.input.source_mode) {
             (Some(InputKind::Hls | InputKind::HttpTs), None) => issues.push(ValidationIssue::new(
                 "input.source_mode",
@@ -822,6 +830,8 @@ impl TaskSpec {
             _ => {}
         }
 
+        // 循环播放只允许 VOD 接入；直播或组播循环没有稳定的 EOF 语义，
+        // 也不能用于非 stream_ingest 任务。
         if self.input.loop_enabled.unwrap_or(false) {
             if self.task_type != TaskType::StreamIngest {
                 issues.push(ValidationIssue::new(
@@ -846,6 +856,8 @@ impl TaskSpec {
             }
         }
 
+        // 快速录像绕过实时播放链路，如果 loop_enabled 又没有时长限制，
+        // 执行器会生成无法自然结束的快速落盘任务。
         if resolved.stream_ingest_record_mode() == Some(StreamIngestRecordMode::Fast)
             && resolved.input.loop_enabled.unwrap_or(false)
             && resolved.record.duration_sec.is_none()
@@ -856,6 +868,8 @@ impl TaskSpec {
             ));
         }
 
+        // 任务类型是最终的能力边界：同一字段在 stream_ingest、stream_bridge、
+        // file_transcode 下含义不同，类型分支负责禁止跨能力误用。
         match self.task_type {
             TaskType::StreamIngest => {
                 if !matches!(

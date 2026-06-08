@@ -226,6 +226,8 @@ impl Settings {
 }
 
 fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
+    // 环境变量覆盖只做单字段解析；TLS、鉴权和回调退避的组合约束
+    // 继续集中在 validate() 中处理，避免覆盖阶段提前耦合业务规则。
     if let Some(value) = env("CORE_HTTP_ADDR") {
         settings.core.http_addr = value;
     }
@@ -283,6 +285,7 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
         settings.core.zlm_auto_close_on_no_reader_enabled =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
+    // 回调重试参数直接影响后台任务调度，非法值必须变成启动期配置错误。
     if let Some(value) = env("CALLBACK_TIMEOUT_MS") {
         settings.core.callback_timeout_ms = parse_required_env("CALLBACK_TIMEOUT_MS", &value)?;
     }
