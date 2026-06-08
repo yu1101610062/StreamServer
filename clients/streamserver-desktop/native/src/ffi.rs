@@ -45,6 +45,7 @@ pub extern "C" fn streamserver_desktop_json_call(input: *const c_char) -> *mut c
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn streamserver_desktop_string_free(value: *mut c_char) {
     if value.is_null() {
         return;

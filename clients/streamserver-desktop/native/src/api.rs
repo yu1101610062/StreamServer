@@ -64,6 +64,7 @@ impl ApiClient {
         self.parse_response(request.send().await?).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn request_with_refresh(
         &self,
         server: &ServerProfile,

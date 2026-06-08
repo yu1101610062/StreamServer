@@ -25,9 +25,11 @@ ARTIFACT=""
 case "$TARGET_PLATFORM" in
   macos)
     APP_PATH="build/macos/Build/Products/Release/streamserver_desktop.app"
+    mkdir -p "$APP_PATH/Contents/Frameworks"
     cp build/native/libstreamserver_desktop_native.dylib \
-      "$APP_PATH/Contents/MacOS/"
+      "$APP_PATH/Contents/Frameworks/"
     if command -v codesign >/dev/null 2>&1; then
+      codesign --force --sign - "$APP_PATH/Contents/Frameworks/libstreamserver_desktop_native.dylib"
       codesign --force --deep --sign - --entitlements macos/Runner/Release.entitlements "$APP_PATH"
       codesign --verify --deep --strict "$APP_PATH"
     fi

@@ -98,6 +98,8 @@ class NativeBridge {
       '${Directory.current.path}/build/native/$name',
       '${Directory.current.path}/$name',
       '${File(Platform.resolvedExecutable).parent.path}/$name',
+      if (Platform.isMacOS)
+        '${File(Platform.resolvedExecutable).parent.parent.path}/Frameworks/$name',
     ];
     for (final candidate in candidates) {
       if (File(candidate).existsSync()) {

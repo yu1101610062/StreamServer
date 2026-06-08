@@ -76,6 +76,13 @@ cd clients/streamserver-desktop
 ./scripts/build_native.sh
 ```
 
+Windows hosts can use the PowerShell entrypoint:
+
+```powershell
+cd clients\streamserver-desktop
+.\scripts\build_native.ps1
+```
+
 Then run the Flutter desktop app:
 
 ```bash
@@ -102,11 +109,13 @@ The Dart FFI loader expects:
 - Linux: `libstreamserver_desktop_native.so`
 - Windows: `streamserver_desktop_native.dll`
 
-`scripts/build_native.sh` copies the built library into `build/native/`.
-`scripts/package_offline.sh` copies that file into the final app beside the
-executable. During development, Dart FFI also searches `build/native/`, the
-current working directory, the executable directory, and
-`STREAMSERVER_DESKTOP_NATIVE_LIB`.
+`scripts/build_native.sh` and `scripts/build_native.ps1` copy the built library
+into `build/native/`. `scripts/package_offline.sh` and
+`scripts/package_offline.ps1` copy that file into the final app. macOS packages
+place the dylib under `Contents/Frameworks` and sign the dylib before signing
+the app bundle. During development, Dart FFI also searches `build/native/`, the
+current working directory, the executable directory, macOS `Contents/Frameworks`
+and `STREAMSERVER_DESKTOP_NATIVE_LIB`.
 
 ## Security Note
 
