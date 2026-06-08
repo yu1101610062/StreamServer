@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "clients/streamserver-desktop/native",
     "crates/media-agent",
     "crates/media-core",
     "crates/media-domain",

@@ -1,0 +1,11 @@
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.idea/
+*.iml
+build/
+dist/
+coverage/
+__pycache__/
+*.py[cod]

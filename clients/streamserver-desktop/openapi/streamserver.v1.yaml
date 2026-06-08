@@ -1,0 +1,261 @@
+openapi: 3.1.0
+info:
+  title: StreamServer API
+  version: 0.1.0
+  description: API contract draft used by the StreamServer desktop client.
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+        details: { type: object, additionalProperties: true }
+    CurrentSession:
+      type: object
+      properties:
+        auth_enabled: { type: boolean }
+        auth_mode: { type: string }
+        subject: { type: string }
+        role: { type: string }
+        must_change_password: { type: boolean }
+        permissions:
+          type: array
+          items: { type: string }
+        environment: { type: string }
+    AuthTokensResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        subject: { type: string }
+    PageResult:
+      type: object
+      properties:
+        items:
+          type: array
+          items: {}
+        page: { type: integer }
+        page_size: { type: integer }
+        total: { type: integer }
+    TaskSummary:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        type: { type: string }
+        status: { type: string }
+        priority: { type: integer }
+        created_by: { type: string }
+        assigned_node_id: { type: string, nullable: true }
+        current_attempt_no: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    StreamSummary:
+      type: object
+      properties:
+        id: { type: string }
+        task_id: { type: string }
+        task_name: { type: string }
+        schema: { type: string }
+        vhost: { type: string }
+        app: { type: string }
+        stream: { type: string }
+        node_id: { type: string, nullable: true }
+        viewer_count: { type: integer, nullable: true }
+        play_urls:
+          type: array
+          items: { type: string }
+paths:
+  /me:
+    get:
+      summary: Current session
+      responses:
+        "200":
+          description: Current session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CurrentSession"
+  /auth/login:
+    post:
+      security: []
+      summary: Login with local password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200":
+          description: Tokens
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthTokensResponse"
+  /auth/refresh:
+    post:
+      security: []
+      summary: Refresh local-password token
+      responses:
+        "200":
+          description: Tokens
+  /tasks:
+    get:
+      summary: List tasks
+      responses:
+        "200":
+          description: Task page
+    post:
+      summary: Create task
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string }
+      responses:
+        "200":
+          description: Task summary
+  /tasks/preview:
+    post:
+      summary: Preview resolved task spec
+      responses:
+        "200":
+          description: Preview
+  /tasks/{id}:
+    get:
+      summary: Task detail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Detail
+    delete:
+      summary: Delete task
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Deleted task
+  /tasks/{id}/start:
+    post:
+      summary: Start task
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Task summary
+  /tasks/{id}/stop:
+    post:
+      summary: Stop task
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Task summary
+  /tasks/{id}/retry:
+    post:
+      summary: Retry task
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Task summary
+  /streams:
+    get:
+      summary: List online streams
+      responses:
+        "200":
+          description: Stream list
+  /records:
+    get:
+      summary: List records
+      responses:
+        "200":
+          description: Record page
+  /file-artifacts:
+    get:
+      summary: List file artifacts
+      responses:
+        "200":
+          description: Artifact page
+  /uploads/media:
+    get:
+      summary: List uploaded media assets
+      responses:
+        "200":
+          description: Upload page
+    post:
+      summary: Upload media file
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Uploaded media
+  /nodes:
+    get:
+      summary: List nodes
+      responses:
+        "200":
+          description: Node list
+  /security/machine-allowlist:
+    get:
+      summary: List machine API allowlist
+      responses:
+        "200":
+          description: Allowlist entries
+    put:
+      summary: Replace machine API allowlist
+      responses:
+        "200":
+          description: Updated allowlist
+  /debug/zlm/media:
+    get:
+      summary: Query ZLM media list
+      responses:
+        "200":
+          description: Debug payload
+  /debug/hooks:
+    get:
+      summary: List received hook events
+      responses:
+        "200":
+          description: Hook events
