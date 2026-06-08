@@ -32,138 +32,186 @@ pub enum AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let request_id = Uuid::now_v7().to_string();
-        let (status, code, message, details) = match self {
+        let parts = self.into_response_parts();
+        let body = ErrorBody {
+            code: parts.code,
+            message: parts.message,
+            request_id,
+            details: (!parts.details.is_null()).then_some(parts.details),
+        };
+
+        (parts.status, Json(body)).into_response()
+    }
+}
+
+impl AppError {
+    fn into_response_parts(self) -> ErrorResponseParts {
+        match self {
             Self::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,
                 "VALIDATION_BAD_REQUEST",
                 message,
                 Value::Null,
-            ),
+            )
+                .into(),
             Self::Forbidden(message) => (
                 StatusCode::FORBIDDEN,
                 "ACCESS_FORBIDDEN",
                 message,
                 Value::Null,
-            ),
+            )
+                .into(),
             Self::NotFound(message) => (
                 StatusCode::NOT_FOUND,
                 "RESOURCE_NOT_FOUND",
                 message,
                 Value::Null,
-            ),
+            )
+                .into(),
             Self::Validation(error) => (
                 StatusCode::BAD_REQUEST,
                 "VALIDATION_TASK_SPEC_INVALID",
                 "task validation failed".to_string(),
                 json!({ "issues": error.issues }),
-            ),
-            Self::ControlPlane(error) => match error {
-                ControlPlaneError::NoConnectedNode => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "CONTROL_PLANE_NO_CONNECTED_NODE",
-                    "no connected media-agent is available".to_string(),
-                    Value::Null,
-                ),
-                ControlPlaneError::NodeDisconnected(node_id) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "CONTROL_PLANE_NODE_DISCONNECTED",
-                    format!("media-agent {node_id} is not connected"),
-                    Value::Null,
-                ),
-                ControlPlaneError::Repository(error) => {
-                    return Self::Repository(error).into_response();
-                }
-                ControlPlaneError::Serde(error) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "CONTROL_PLANE_SERIALIZATION_ERROR",
-                    error.to_string(),
-                    Value::Null,
-                ),
-            },
-            Self::Repository(error) => match error {
-                RepoError::TaskNotFound(task_id) => (
-                    StatusCode::NOT_FOUND,
-                    "TASK_NOT_FOUND",
-                    format!("task {task_id} was not found"),
-                    Value::Null,
-                ),
-                RepoError::MediaUploadAssetNotFound(asset_id) => (
-                    StatusCode::NOT_FOUND,
-                    "MEDIA_UPLOAD_ASSET_NOT_FOUND",
-                    format!("media upload asset {asset_id} was not found"),
-                    Value::Null,
-                ),
-                RepoError::TaskMissingResolvedSpec(task_id) => (
-                    StatusCode::CONFLICT,
-                    "TASK_MISSING_RESOLVED_SPEC",
-                    format!("task {task_id} is missing resolved_spec"),
-                    Value::Null,
-                ),
-                RepoError::TaskNotDispatchable(status) => (
-                    StatusCode::CONFLICT,
-                    "TASK_NOT_DISPATCHABLE",
-                    format!("task is not dispatchable from status {status}"),
-                    Value::Null,
-                ),
-                RepoError::TaskDeleteForbidden(status) => (
-                    StatusCode::CONFLICT,
-                    "TASK_DELETE_FORBIDDEN",
-                    format!("task cannot be deleted from status {status}"),
-                    Value::Null,
-                ),
-                RepoError::RecordingControlUnsupported(message) => (
-                    StatusCode::CONFLICT,
-                    "RECORDING_CONTROL_UNSUPPORTED",
-                    message,
-                    Value::Null,
-                ),
-                RepoError::IdempotencyConflict => (
-                    StatusCode::CONFLICT,
-                    "CONFLICT_IDEMPOTENCY_KEY",
-                    "idempotency key already exists with a different request body".to_string(),
-                    Value::Null,
-                ),
-                RepoError::OperationInProgress => (
-                    StatusCode::CONFLICT,
-                    "CONFLICT_OPERATION_IN_PROGRESS",
-                    "a request with the same idempotency key is still being processed".to_string(),
-                    Value::Null,
-                ),
-                RepoError::TaskState(error) => (
-                    StatusCode::CONFLICT,
-                    "TASK_INVALID_STATE",
-                    error.to_string(),
-                    Value::Null,
-                ),
-                RepoError::Validation(error) => (
-                    StatusCode::BAD_REQUEST,
-                    "VALIDATION_TASK_SPEC_INVALID",
-                    "task validation failed".to_string(),
-                    json!({ "issues": error.issues }),
-                ),
-                other => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "CORE_INTERNAL_ERROR",
-                    other.to_string(),
-                    Value::Null,
-                ),
-            },
+            )
+                .into(),
+            Self::ControlPlane(error) => control_plane_error_parts(error),
+            Self::Repository(error) => repo_error_parts(error),
             Self::Internal(message) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "CORE_INTERNAL_ERROR",
                 message,
                 Value::Null,
-            ),
-        };
+            )
+                .into(),
+        }
+    }
+}
 
-        let body = ErrorBody {
+fn control_plane_error_parts(error: ControlPlaneError) -> ErrorResponseParts {
+    match error {
+        ControlPlaneError::NoConnectedNode => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CONTROL_PLANE_NO_CONNECTED_NODE",
+            "no connected media-agent is available".to_string(),
+            Value::Null,
+        )
+            .into(),
+        ControlPlaneError::NodeDisconnected(node_id) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CONTROL_PLANE_NODE_DISCONNECTED",
+            format!("media-agent {node_id} is not connected"),
+            Value::Null,
+        )
+            .into(),
+        ControlPlaneError::Repository(error) => repo_error_parts(error),
+        ControlPlaneError::Serde(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CONTROL_PLANE_SERIALIZATION_ERROR",
+            error.to_string(),
+            Value::Null,
+        )
+            .into(),
+    }
+}
+
+fn repo_error_parts(error: RepoError) -> ErrorResponseParts {
+    match error {
+        RepoError::TaskNotFound(task_id) => (
+            StatusCode::NOT_FOUND,
+            "TASK_NOT_FOUND",
+            format!("task {task_id} was not found"),
+            Value::Null,
+        )
+            .into(),
+        RepoError::MediaUploadAssetNotFound(asset_id) => (
+            StatusCode::NOT_FOUND,
+            "MEDIA_UPLOAD_ASSET_NOT_FOUND",
+            format!("media upload asset {asset_id} was not found"),
+            Value::Null,
+        )
+            .into(),
+        RepoError::TaskMissingResolvedSpec(task_id) => (
+            StatusCode::CONFLICT,
+            "TASK_MISSING_RESOLVED_SPEC",
+            format!("task {task_id} is missing resolved_spec"),
+            Value::Null,
+        )
+            .into(),
+        RepoError::TaskNotDispatchable(status) => (
+            StatusCode::CONFLICT,
+            "TASK_NOT_DISPATCHABLE",
+            format!("task is not dispatchable from status {status}"),
+            Value::Null,
+        )
+            .into(),
+        RepoError::TaskDeleteForbidden(status) => (
+            StatusCode::CONFLICT,
+            "TASK_DELETE_FORBIDDEN",
+            format!("task cannot be deleted from status {status}"),
+            Value::Null,
+        )
+            .into(),
+        RepoError::RecordingControlUnsupported(message) => (
+            StatusCode::CONFLICT,
+            "RECORDING_CONTROL_UNSUPPORTED",
+            message,
+            Value::Null,
+        )
+            .into(),
+        RepoError::IdempotencyConflict => (
+            StatusCode::CONFLICT,
+            "CONFLICT_IDEMPOTENCY_KEY",
+            "idempotency key already exists with a different request body".to_string(),
+            Value::Null,
+        )
+            .into(),
+        RepoError::OperationInProgress => (
+            StatusCode::CONFLICT,
+            "CONFLICT_OPERATION_IN_PROGRESS",
+            "a request with the same idempotency key is still being processed".to_string(),
+            Value::Null,
+        )
+            .into(),
+        RepoError::TaskState(error) => (
+            StatusCode::CONFLICT,
+            "TASK_INVALID_STATE",
+            error.to_string(),
+            Value::Null,
+        )
+            .into(),
+        RepoError::Validation(error) => (
+            StatusCode::BAD_REQUEST,
+            "VALIDATION_TASK_SPEC_INVALID",
+            "task validation failed".to_string(),
+            json!({ "issues": error.issues }),
+        )
+            .into(),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CORE_INTERNAL_ERROR",
+            other.to_string(),
+            Value::Null,
+        )
+            .into(),
+    }
+}
+
+struct ErrorResponseParts {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    details: Value,
+}
+
+impl From<(StatusCode, &'static str, String, Value)> for ErrorResponseParts {
+    fn from((status, code, message, details): (StatusCode, &'static str, String, Value)) -> Self {
+        Self {
+            status,
             code,
             message,
-            request_id,
-            details: (!details.is_null()).then_some(details),
-        };
-
-        (status, Json(body)).into_response()
+            details,
+        }
     }
 }
 
