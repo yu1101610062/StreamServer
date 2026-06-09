@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -60,6 +61,21 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
       builder: (context, constraints) {
         final compact = constraints.maxWidth < 820;
         final horizontalPadding = constraints.maxWidth < 620 ? 12.0 : 24.0;
+        final windowHeight = MediaQuery.sizeOf(context).height;
+        final cardPadding = compact ? 12.0 : 16.0;
+        final usableWidth = math.max(
+          240.0,
+          constraints.maxWidth - horizontalPadding * 2 - cardPadding * 2,
+        );
+        final preferredVideoWidth =
+            compact ? usableWidth : math.max(280.0, usableWidth - 336);
+        final preferredVideoHeight = preferredVideoWidth * 9 / 16;
+        final maxVideoHeight =
+            math.max(140.0, windowHeight * (compact ? 0.34 : 0.42));
+        final videoHeight = math.max(
+          windowHeight < 560 ? 130.0 : 170.0,
+          math.min(preferredVideoHeight, maxVideoHeight),
+        );
         final video = AspectRatio(
           aspectRatio: 16 / 9,
           child: DecoratedBox(
@@ -90,7 +106,7 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
             elevation: 0,
             color: Colors.white,
             child: Padding(
-              padding: EdgeInsets.all(compact ? 12 : 16),
+              padding: EdgeInsets.all(cardPadding),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -120,14 +136,20 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
                   ),
                   const SizedBox(height: 12),
                   if (compact) ...[
-                    video,
+                    SizedBox(
+                        height: videoHeight,
+                        width: double.infinity,
+                        child: video),
                     const SizedBox(height: 12),
                     controls,
                   ] else
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Expanded(flex: 3, child: video),
+                        Expanded(
+                          flex: 3,
+                          child: SizedBox(height: videoHeight, child: video),
+                        ),
                         const SizedBox(width: 16),
                         SizedBox(width: 320, child: controls),
                       ],

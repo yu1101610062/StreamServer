@@ -110,9 +110,9 @@ class NativeBridge {
   }
 
   static String _libraryName() {
-    if (Platform.isMacOS) return 'libstreamserver_desktop_native.dylib';
-    if (Platform.isWindows) return 'streamserver_desktop_native.dll';
-    if (Platform.isLinux) return 'libstreamserver_desktop_native.so';
+    if (Platform.isMacOS) return 'libstreamserver_desktop.dylib';
+    if (Platform.isWindows) return 'streamserver_desktop.dll';
+    if (Platform.isLinux) return 'libstreamserver_desktop.so';
     throw UnsupportedError(
         'StreamServer Desktop supports desktop platforms only');
   }

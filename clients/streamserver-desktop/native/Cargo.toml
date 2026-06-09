@@ -1,5 +1,5 @@
 [package]
-name = "streamserver-desktop-native"
+name = "streamserver-desktop"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

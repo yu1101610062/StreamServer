@@ -26,10 +26,11 @@ case "$TARGET_PLATFORM" in
   macos)
     APP_PATH="build/macos/Build/Products/Release/streamserver_desktop.app"
     mkdir -p "$APP_PATH/Contents/Frameworks"
-    cp build/native/libstreamserver_desktop_native.dylib \
+    rm -f "$APP_PATH/Contents/Frameworks"/libstreamserver_desktop*.dylib
+    cp build/native/libstreamserver_desktop.dylib \
       "$APP_PATH/Contents/Frameworks/"
     if command -v codesign >/dev/null 2>&1; then
-      codesign --force --sign - "$APP_PATH/Contents/Frameworks/libstreamserver_desktop_native.dylib"
+      codesign --force --sign - "$APP_PATH/Contents/Frameworks/libstreamserver_desktop.dylib"
       codesign --force --deep --sign - --entitlements macos/Runner/Release.entitlements "$APP_PATH"
       codesign --verify --deep --strict "$APP_PATH"
     fi
@@ -37,12 +38,14 @@ case "$TARGET_PLATFORM" in
     tar -C build/macos/Build/Products/Release -czf "dist/$ARTIFACT" streamserver_desktop.app
     ;;
   linux)
-    cp build/native/libstreamserver_desktop_native.so build/linux/x64/release/bundle/
+    rm -f build/linux/x64/release/bundle/libstreamserver_desktop*.so
+    cp build/native/libstreamserver_desktop.so build/linux/x64/release/bundle/
     ARTIFACT="streamserver-desktop-linux-x64-$STAMP.tar.gz"
     tar -C build/linux/x64/release/bundle -czf "dist/$ARTIFACT" .
     ;;
   windows)
-    cp build/native/streamserver_desktop_native.dll build/windows/x64/runner/Release/
+    rm -f build/windows/x64/runner/Release/streamserver_desktop*.dll
+    cp build/native/streamserver_desktop.dll build/windows/x64/runner/Release/
     ARTIFACT="streamserver-desktop-windows-x64-$STAMP.zip"
     (cd build/windows/x64/runner/Release && zip -r "../../../../../dist/$ARTIFACT" .)
     ;;

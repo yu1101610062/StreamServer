@@ -185,7 +185,7 @@ async fn dispatch(api: ApiClient, request: NativeRequest) -> Result<Value, Nativ
         "version" => Ok(json_object([
             (
                 "name",
-                Value::String("streamserver-desktop-native".to_string()),
+                Value::String("streamserver-desktop".to_string()),
             ),
             (
                 "version",
@@ -224,7 +224,7 @@ mod tests {
     #[tokio::test]
     async fn dispatches_version() {
         let value = dispatch_json(r#"{"op":"version"}"#).await.unwrap();
-        assert_eq!(value["name"], "streamserver-desktop-native");
+        assert_eq!(value["name"], "streamserver-desktop");
     }
 
     #[tokio::test]

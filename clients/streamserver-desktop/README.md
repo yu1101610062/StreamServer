@@ -105,9 +105,9 @@ sudo xcodebuild -runFirstLaunch
 
 The Dart FFI loader expects:
 
-- macOS: `libstreamserver_desktop_native.dylib`
-- Linux: `libstreamserver_desktop_native.so`
-- Windows: `streamserver_desktop_native.dll`
+- macOS: `libstreamserver_desktop.dylib`
+- Linux: `libstreamserver_desktop.so`
+- Windows: `streamserver_desktop.dll`
 
 `scripts/build_native.sh` and `scripts/build_native.ps1` copy the built library
 into `build/native/`. `scripts/package_offline.sh` and

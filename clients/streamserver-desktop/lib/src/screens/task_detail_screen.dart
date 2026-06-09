@@ -48,15 +48,25 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
           key: ValueKey('$taskId-$refreshSeed'),
           loader: (controller) async {
             final detail = await controller.api('GET', '/api/v1/tasks/$taskId');
-            final events = await controller.api('GET', '/api/v1/tasks/$taskId/events', query: {'page_size': 100});
-            final logs = await controller.api('GET', '/api/v1/tasks/$taskId/logs');
-            final streams = await controller.api('GET', '/api/v1/streams', query: {'task_id': taskId});
-            return {'detail': detail, 'events': events, 'logs': logs, 'streams': streams};
+            final events = await controller.api(
+                'GET', '/api/v1/tasks/$taskId/events',
+                query: {'page_size': 100});
+            final logs =
+                await controller.api('GET', '/api/v1/tasks/$taskId/logs');
+            final streams = await controller
+                .api('GET', '/api/v1/streams', query: {'task_id': taskId});
+            return {
+              'detail': detail,
+              'events': events,
+              'logs': logs,
+              'streams': streams
+            };
           },
           builder: (context, data) {
             final map = (data as Map).cast<String, Object?>();
             final detail = (map['detail'] as Map).cast<String, Object?>();
-            final task = (detail['task'] as Map?)?.cast<String, Object?>() ?? <String, Object?>{};
+            final task = (detail['task'] as Map?)?.cast<String, Object?>() ??
+                <String, Object?>{};
             final events = rowsFrom((map['events'] as Map?)?['items']);
             final logs = rowsFrom((map['logs'] as Map?)?['lines']);
             final records = rowsFrom(detail['records']);
@@ -76,7 +86,10 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                   },
                 ),
                 const SizedBox(height: 12),
-                _TaskOperations(taskId: taskId, detail: detail, onDone: () => setState(() => refreshSeed++)),
+                _TaskOperations(
+                    taskId: taskId,
+                    detail: detail,
+                    onDone: () => setState(() => refreshSeed++)),
                 const SizedBox(height: 12),
                 DefaultTabController(
                   length: 7,
@@ -106,7 +119,8 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                               _StreamsTable(streams),
                               _RecordsTable(records),
                               _ArtifactsTable(artifacts),
-                              SingleChildScrollView(child: SelectableText(prettyJson(detail))),
+                              SingleChildScrollView(
+                                  child: SelectableText(prettyJson(detail))),
                             ],
                           ),
                         ),
@@ -124,7 +138,8 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
 }
 
 class _TaskOperations extends StatelessWidget {
-  const _TaskOperations({required this.taskId, required this.detail, required this.onDone});
+  const _TaskOperations(
+      {required this.taskId, required this.detail, required this.onDone});
 
   final String taskId;
   final Map<String, Object?> detail;
@@ -138,28 +153,69 @@ class _TaskOperations extends StatelessWidget {
         spacing: 8,
         runSpacing: 8,
         children: [
-          FilledButton.icon(onPressed: () => _mutate(context, controller, '启动任务', 'POST', '/api/v1/tasks/$taskId/start'), icon: const Icon(Icons.play_arrow), label: const Text('启动')),
-          OutlinedButton.icon(onPressed: () => _confirmMutate(context, controller, '停止任务', 'POST', '/api/v1/tasks/$taskId/stop'), icon: const Icon(Icons.stop), label: const Text('停止')),
-          OutlinedButton.icon(onPressed: () => _confirmMutate(context, controller, '取消任务', 'POST', '/api/v1/tasks/$taskId/cancel'), icon: const Icon(Icons.cancel), label: const Text('取消')),
-          OutlinedButton.icon(onPressed: () => _mutate(context, controller, '重试任务', 'POST', '/api/v1/tasks/$taskId/retry'), icon: const Icon(Icons.replay), label: const Text('重试')),
-          OutlinedButton.icon(onPressed: () => _mutate(context, controller, '克隆任务', 'POST', '/api/v1/tasks/$taskId/clone', body: detail['requested_spec'] ?? {}), icon: const Icon(Icons.copy), label: const Text('克隆')),
-          FilledButton.tonalIcon(onPressed: () => _mutate(context, controller, '开始录制', 'POST', '/api/v1/tasks/$taskId/recording/start', body: {'format': 'mp4'}), icon: const Icon(Icons.fiber_manual_record), label: const Text('开始录制')),
-          OutlinedButton.icon(onPressed: () => _confirmMutate(context, controller, '停止录制', 'POST', '/api/v1/tasks/$taskId/recording/stop', body: {'reason': 'desktop_user_requested'}), icon: const Icon(Icons.stop_circle), label: const Text('停止录制')),
-          TextButton.icon(onPressed: () => _confirmMutate(context, controller, '删除任务', 'DELETE', '/api/v1/tasks/$taskId'), icon: const Icon(Icons.delete), label: const Text('删除')),
+          FilledButton.icon(
+              onPressed: () => _mutate(context, controller, '启动任务', 'POST',
+                  '/api/v1/tasks/$taskId/start'),
+              icon: const Icon(Icons.play_arrow),
+              label: const Text('启动')),
+          OutlinedButton.icon(
+              onPressed: () => _confirmMutate(context, controller, '停止任务',
+                  'POST', '/api/v1/tasks/$taskId/stop'),
+              icon: const Icon(Icons.stop),
+              label: const Text('停止')),
+          OutlinedButton.icon(
+              onPressed: () => _confirmMutate(context, controller, '取消任务',
+                  'POST', '/api/v1/tasks/$taskId/cancel'),
+              icon: const Icon(Icons.cancel),
+              label: const Text('取消')),
+          OutlinedButton.icon(
+              onPressed: () => _mutate(context, controller, '重试任务', 'POST',
+                  '/api/v1/tasks/$taskId/retry'),
+              icon: const Icon(Icons.replay),
+              label: const Text('重试')),
+          OutlinedButton.icon(
+              onPressed: () => _mutate(context, controller, '克隆任务', 'POST',
+                  '/api/v1/tasks/$taskId/clone',
+                  body: detail['requested_spec'] ?? {}),
+              icon: const Icon(Icons.copy),
+              label: const Text('克隆')),
+          FilledButton.tonalIcon(
+              onPressed: () => _mutate(context, controller, '开始录制', 'POST',
+                  '/api/v1/tasks/$taskId/recording/start',
+                  body: {'format': 'mp4'}),
+              icon: const Icon(Icons.fiber_manual_record),
+              label: const Text('开始录制')),
+          OutlinedButton.icon(
+              onPressed: () => _confirmMutate(context, controller, '停止录制',
+                  'POST', '/api/v1/tasks/$taskId/recording/stop',
+                  body: {'reason': 'desktop_user_requested'}),
+              icon: const Icon(Icons.stop_circle),
+              label: const Text('停止录制')),
+          TextButton.icon(
+              onPressed: () => _confirmMutate(context, controller, '删除任务',
+                  'DELETE', '/api/v1/tasks/$taskId'),
+              icon: const Icon(Icons.delete),
+              label: const Text('删除')),
         ],
       ),
     );
   }
 
-  Future<void> _confirmMutate(BuildContext context, AppController controller, String title, String method, String path, {Object? body}) async {
+  Future<void> _confirmMutate(BuildContext context, AppController controller,
+      String title, String method, String path,
+      {Object? body}) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: Text(title),
         content: const Text('该操作会改变运行态，请确认。'),
         actions: [
-          TextButton(onPressed: () => Navigator.of(context).pop(false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.of(context).pop(true), child: const Text('确认')),
+          TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('确认')),
         ],
       ),
     );
@@ -168,16 +224,20 @@ class _TaskOperations extends StatelessWidget {
     }
   }
 
-  Future<void> _mutate(BuildContext context, AppController controller, String title, String method, String path, {Object? body}) async {
+  Future<void> _mutate(BuildContext context, AppController controller,
+      String title, String method, String path,
+      {Object? body}) async {
     try {
       await controller.mutate(method, path, body: body);
       onDone();
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$title 已提交')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('$title 已提交')));
       }
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString())));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(error.toString())));
       }
     }
   }
@@ -195,7 +255,8 @@ class _Overview extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SelectableText('当前 Attempt\n${prettyJson(detail['current_attempt'])}'),
+          SelectableText(
+              '当前 Attempt\n${prettyJson(detail['current_attempt'])}'),
           const SizedBox(height: 16),
           SelectableText('回调状态\n${prettyJson(detail['callback_delivery'])}'),
         ],
@@ -213,7 +274,15 @@ class _EventsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['时间', '来源', '等级', '类型', 'Payload'],
-      rows: rows.map((row) => [row['created_at'], row['source'], row['event_level'], row['event_type'], row['payload']]).toList(),
+      rows: rows
+          .map((row) => [
+                row['created_at'],
+                row['source'],
+                row['event_level'],
+                row['event_type'],
+                row['payload']
+              ])
+          .toList(),
     );
   }
 }
@@ -241,7 +310,14 @@ class _StreamsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['协议', 'App/Stream', '观众', '播放地址'],
-      rows: rows.map((row) => [row['schema'], '${row['app']}/${row['stream']}', row['viewer_count'], row['play_urls']]).toList(),
+      rows: rows
+          .map((row) => [
+                row['schema'],
+                '${row['app']}/${row['stream']}',
+                row['viewer_count'],
+                row['play_urls']
+              ])
+          .toList(),
     );
   }
 }
@@ -255,7 +331,14 @@ class _RecordsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['流', '路径', '大小', 'HTTP'],
-      rows: rows.map((row) => ['${row['app']}/${row['stream']}', row['file_path'], bytesLabel(row['file_size']), row['http_url']]).toList(),
+      rows: rows
+          .map((row) => [
+                '${row['app']}/${row['stream']}',
+                row['file_path'],
+                bytesLabel(row['file_size']),
+                row['http_url']
+              ])
+          .toList(),
     );
   }
 }
@@ -269,7 +352,14 @@ class _ArtifactsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['类型', '文件', '路径', 'HTTP'],
-      rows: rows.map((row) => [row['artifact_kind'], row['file_name'], row['file_path'], row['http_url']]).toList(),
+      rows: rows
+          .map((row) => [
+                row['artifact_kind'],
+                row['file_name'],
+                row['file_path'],
+                row['http_url']
+              ])
+          .toList(),
     );
   }
 }
@@ -285,15 +375,35 @@ class _SimpleTable extends StatelessWidget {
     if (rows.isEmpty) {
       return const Center(child: Text('暂无数据'));
     }
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      scrollDirection: Axis.horizontal,
-      child: DataTable(
-        columns: columns.map((column) => DataColumn(label: Text(column))).toList(),
-        rows: rows.map((row) {
-          return DataRow(cells: row.map((value) => DataCell(SelectableText(textValue(value)))).toList());
-        }).toList(),
-      ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final cellWidth = constraints.maxWidth < 760 ? 220.0 : 340.0;
+        return SingleChildScrollView(
+          padding: const EdgeInsets.all(12),
+          scrollDirection: Axis.horizontal,
+          child: DataTable(
+            dataRowMinHeight: 52,
+            dataRowMaxHeight: 180,
+            columns: columns
+                .map((column) => DataColumn(label: Text(column)))
+                .toList(),
+            rows: rows.map((row) {
+              return DataRow(
+                cells: row.asMap().entries.map((entry) {
+                  final column = columns[entry.key];
+                  final value = entry.value;
+                  if (column.contains('状态') ||
+                      column.toLowerCase().contains('status')) {
+                    return DataCell(StatusBadge(status: value));
+                  }
+                  return DataCell(WrappedTextCell(
+                      value: value, maxWidth: cellWidth, selectable: true));
+                }).toList(),
+              );
+            }).toList(),
+          ),
+        );
+      },
     );
   }
 }

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../state.dart';
+import '../utils.dart';
 
 class PageHeader extends StatelessWidget {
   const PageHeader({
@@ -182,12 +183,15 @@ class KeyValueGrid extends StatelessWidget {
                 Text(entry.key,
                     style: const TextStyle(color: Color(0xff5b6477))),
                 const SizedBox(height: 8),
-                Text(
-                  '${entry.value ?? '—'}',
-                  style: const TextStyle(
-                      fontSize: 24, fontWeight: FontWeight.w700),
-                  overflow: TextOverflow.ellipsis,
-                ),
+                if (_isStatusKey(entry.key))
+                  StatusBadge(status: entry.value, large: true)
+                else
+                  Text(
+                    '${entry.value ?? '—'}',
+                    style: const TextStyle(
+                        fontSize: 24, fontWeight: FontWeight.w700),
+                    overflow: TextOverflow.ellipsis,
+                  ),
               ],
             ),
           ),
@@ -195,4 +199,141 @@ class KeyValueGrid extends StatelessWidget {
       }).toList(),
     );
   }
+}
+
+class StatusBadge extends StatelessWidget {
+  const StatusBadge({
+    required this.status,
+    this.large = false,
+    super.key,
+  });
+
+  final Object? status;
+  final bool large;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = textValue(status);
+    final tone = _statusTone(text);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: tone.background,
+        border: Border.all(color: tone.border),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: large ? 12 : 10,
+          vertical: large ? 7 : 5,
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: large ? 9 : 7,
+              height: large ? 9 : 7,
+              decoration: BoxDecoration(
+                color: tone.foreground,
+                shape: BoxShape.circle,
+              ),
+            ),
+            SizedBox(width: large ? 8 : 6),
+            Text(
+              text,
+              style: TextStyle(
+                color: tone.foreground,
+                fontSize: large ? 15 : 12,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class WrappedTextCell extends StatelessWidget {
+  const WrappedTextCell({
+    required this.value,
+    required this.maxWidth,
+    this.selectable = false,
+    this.fontWeight,
+    super.key,
+  });
+
+  final Object? value;
+  final double maxWidth;
+  final bool selectable;
+  final FontWeight? fontWeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = textValue(value);
+    final style = TextStyle(fontWeight: fontWeight);
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: selectable
+          ? SelectableText(text, style: style)
+          : Text(
+              text,
+              softWrap: true,
+              overflow: TextOverflow.visible,
+              style: style,
+            ),
+    );
+  }
+}
+
+bool _isStatusKey(String key) =>
+    key.toLowerCase().contains('status') || key.contains('状态');
+
+_StatusTone _statusTone(String value) {
+  switch (value.trim().toUpperCase()) {
+    case 'RUNNING':
+      return const _StatusTone(
+          Color(0xff05603a), Color(0xffdcfae6), Color(0xff75e0a7));
+    case 'SUCCEEDED':
+    case 'SUCCESS':
+    case 'ACTIVE':
+      return const _StatusTone(
+          Color(0xff027a48), Color(0xffecfdf3), Color(0xffabefc6));
+    case 'FAILED':
+    case 'ERROR':
+      return const _StatusTone(
+          Color(0xffb42318), Color(0xfffff1f3), Color(0xfffda29b));
+    case 'LOST':
+      return const _StatusTone(
+          Color(0xffb54708), Color(0xfffff6ed), Color(0xfffdba74));
+    case 'CANCELED':
+    case 'CANCELLED':
+    case 'DELETED':
+      return const _StatusTone(
+          Color(0xff475467), Color(0xfff2f4f7), Color(0xffd0d5dd));
+    case 'QUEUED':
+    case 'CREATED':
+      return const _StatusTone(
+          Color(0xff175cd3), Color(0xffeff8ff), Color(0xff84caff));
+    case 'VALIDATING':
+    case 'STARTING':
+      return const _StatusTone(
+          Color(0xff026aa2), Color(0xfff0f9ff), Color(0xff7cd4fd));
+    case 'STOPPING':
+      return const _StatusTone(
+          Color(0xffc4320a), Color(0xfffff6ed), Color(0xfffd853a));
+    case 'RECOVERING':
+      return const _StatusTone(
+          Color(0xff6941c6), Color(0xfff4f3ff), Color(0xffbdb4fe));
+    default:
+      return const _StatusTone(
+          Color(0xff344054), Color(0xfff8fafc), Color(0xffcbd5e1));
+  }
+}
+
+class _StatusTone {
+  const _StatusTone(this.foreground, this.background, this.border);
+
+  final Color foreground;
+  final Color background;
+  final Color border;
 }

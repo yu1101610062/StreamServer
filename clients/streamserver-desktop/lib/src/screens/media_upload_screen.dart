@@ -46,7 +46,8 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
       children: [
         const PageHeader(
           title: '媒资上传',
-          description: '通过 Rust native multipart 客户端上传本地文件到 StreamServer Agent 节点。',
+          description:
+              '通过 Rust native multipart 客户端上传本地文件到 StreamServer Agent 节点。',
         ),
         Surface(
           child: Row(
@@ -60,7 +61,12 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
               const SizedBox(width: 12),
               FilledButton.icon(
                 onPressed: uploading ? null : () => _upload(controller),
-                icon: uploading ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.upload_file),
+                icon: uploading
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.upload_file),
                 label: Text(uploading ? '上传中' : '上传'),
               ),
             ],
@@ -87,8 +93,14 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
                 options: const ['active', 'deleted', 'all'],
                 onChanged: (value) => setState(() => statusFilter = value),
               ),
-              SmallTextField(controller: keywordController, label: '关键字', onSubmitted: (_) => _refresh(resetPage: true)),
-              SmallTextField(controller: nodeController, label: '节点 ID', onSubmitted: (_) => _refresh(resetPage: true)),
+              SmallTextField(
+                  controller: keywordController,
+                  label: '关键字',
+                  onSubmitted: (_) => _refresh(resetPage: true)),
+              SmallTextField(
+                  controller: nodeController,
+                  label: '节点 ID',
+                  onSubmitted: (_) => _refresh(resetPage: true)),
             ],
           ),
         ),
@@ -115,37 +127,59 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
               children: [
                 Align(
                   alignment: Alignment.centerRight,
-                  child: PagerBar(page: page, pageSize: pageSize, total: total, onPageChanged: (value) {
-                    page = value;
-                    _refresh();
-                  }),
+                  child: PagerBar(
+                      page: page,
+                      pageSize: pageSize,
+                      total: total,
+                      onPageChanged: (value) {
+                        page = value;
+                        _refresh();
+                      }),
                 ),
                 Surface(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      columns: const [
-                        DataColumn(label: Text('文件')),
-                        DataColumn(label: Text('节点')),
-                        DataColumn(label: Text('大小')),
-                        DataColumn(label: Text('时长')),
-                        DataColumn(label: Text('状态')),
-                        DataColumn(label: Text('HTTP 地址')),
-                        DataColumn(label: Text('操作')),
-                      ],
-                      rows: rows.map((row) {
-                        final url = '${row['http_url'] ?? ''}';
-                        return DataRow(cells: [
-                          DataCell(Text(textValue(row['file_name']))),
-                          DataCell(Text(textValue(row['node_name'] ?? row['node_id']))),
-                          DataCell(Text(bytesLabel(row['file_size']))),
-                          DataCell(Text('${row['duration_sec'] ?? 0}s')),
-                          DataCell(Text(textValue(row['status']))),
-                          DataCell(SelectableText(textValue(row['http_url']))),
-                          DataCell(_UploadActions(row: row, url: url, onDone: _refresh)),
-                        ]);
-                      }).toList(),
-                    ),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final nameWidth =
+                          constraints.maxWidth < 760 ? 180.0 : 260.0;
+                      final urlWidth =
+                          constraints.maxWidth < 760 ? 240.0 : 420.0;
+                      return SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: DataTable(
+                          dataRowMinHeight: 56,
+                          dataRowMaxHeight: 132,
+                          columns: const [
+                            DataColumn(label: Text('文件')),
+                            DataColumn(label: Text('节点')),
+                            DataColumn(label: Text('大小')),
+                            DataColumn(label: Text('时长')),
+                            DataColumn(label: Text('状态')),
+                            DataColumn(label: Text('HTTP 地址')),
+                            DataColumn(label: Text('操作')),
+                          ],
+                          rows: rows.map((row) {
+                            final url = '${row['http_url'] ?? ''}';
+                            return DataRow(cells: [
+                              DataCell(WrappedTextCell(
+                                  value: row['file_name'],
+                                  maxWidth: nameWidth)),
+                              DataCell(WrappedTextCell(
+                                  value: row['node_name'] ?? row['node_id'],
+                                  maxWidth: 180)),
+                              DataCell(Text(bytesLabel(row['file_size']))),
+                              DataCell(Text('${row['duration_sec'] ?? 0}s')),
+                              DataCell(StatusBadge(status: row['status'])),
+                              DataCell(WrappedTextCell(
+                                  value: row['http_url'],
+                                  maxWidth: urlWidth,
+                                  selectable: true)),
+                              DataCell(_UploadActions(
+                                  row: row, url: url, onDone: _refresh)),
+                            ]);
+                          }).toList(),
+                        ),
+                      );
+                    },
                   ),
                 ),
               ],
@@ -176,7 +210,8 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
 }
 
 class _UploadActions extends StatelessWidget {
-  const _UploadActions({required this.row, required this.url, required this.onDone});
+  const _UploadActions(
+      {required this.row, required this.url, required this.onDone});
 
   final Map<String, Object?> row;
   final String url;
@@ -222,7 +257,9 @@ class _UploadActions extends StatelessWidget {
     final confirmed = await confirmAction(
       context,
       title: deleteFile ? '删除上传文件' : '删除上传台账',
-      message: deleteFile ? '确认删除 $name 的台账并同步删除底层文件？这可能影响历史任务和外部引用。' : '确认仅删除 $name 的上传台账？底层文件会保留。',
+      message: deleteFile
+          ? '确认删除 $name 的台账并同步删除底层文件？这可能影响历史任务和外部引用。'
+          : '确认仅删除 $name 的上传台账？底层文件会保留。',
       confirmLabel: deleteFile ? '删文件' : '删台账',
       destructive: true,
     );

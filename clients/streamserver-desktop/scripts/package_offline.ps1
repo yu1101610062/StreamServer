@@ -94,7 +94,8 @@ $releaseDir = Join-Path $ClientDir "build\windows\x64\runner\Release"
 if (-not (Test-Path -LiteralPath $releaseDir -PathType Container)) {
     throw "Windows release directory was not produced: $releaseDir"
 }
-Copy-Item -LiteralPath (Join-Path $ClientDir "build\native\streamserver_desktop_native.dll") -Destination $releaseDir -Force
+Remove-Item -Path (Join-Path $releaseDir "streamserver_desktop*.dll") -Force -ErrorAction SilentlyContinue
+Copy-Item -LiteralPath (Join-Path $ClientDir "build\native\streamserver_desktop.dll") -Destination $releaseDir -Force
 
 $distDir = Join-Path $ClientDir "dist"
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
