@@ -48,7 +48,8 @@ class _StreamsScreenState extends State<StreamsScreen> {
       children: [
         PageHeader(
           title: isMulticast ? '组播中心' : '流中心',
-          description: isMulticast ? '聚焦 RTP/组播相关在线流和任务绑定。' : '查看在线内部流、播放地址、观众数和关流入口。',
+          description:
+              isMulticast ? '聚焦 RTP/组播相关在线流和任务绑定。' : '查看在线内部流、播放地址、观众数和关流入口。',
         ),
         Surface(
           child: FilterBar(
@@ -66,13 +67,27 @@ class _StreamsScreenState extends State<StreamsScreen> {
               SmallSelect(
                 label: '协议',
                 value: schema,
-                options: widget.schemaFilter == null ? const ['', 'rtsp', 'rtmp', 'hls', 'http-flv', 'rtp'] : [widget.schemaFilter!],
+                options: widget.schemaFilter == null
+                    ? const ['', 'rtsp', 'rtmp', 'hls', 'http-flv', 'rtp']
+                    : [widget.schemaFilter!],
                 onChanged: (value) => setState(() => schema = value),
               ),
-              SmallTextField(controller: appController, label: 'App', onSubmitted: (_) => _refresh()),
-              SmallTextField(controller: streamController, label: 'Stream', onSubmitted: (_) => _refresh()),
-              SmallTextField(controller: taskController, label: '任务 ID', onSubmitted: (_) => _refresh()),
-              SmallTextField(controller: nodeController, label: '节点 ID', onSubmitted: (_) => _refresh()),
+              SmallTextField(
+                  controller: appController,
+                  label: 'App',
+                  onSubmitted: (_) => _refresh()),
+              SmallTextField(
+                  controller: streamController,
+                  label: 'Stream',
+                  onSubmitted: (_) => _refresh()),
+              SmallTextField(
+                  controller: taskController,
+                  label: '任务 ID',
+                  onSubmitted: (_) => _refresh()),
+              SmallTextField(
+                  controller: nodeController,
+                  label: '节点 ID',
+                  onSubmitted: (_) => _refresh()),
               SmallSelect(
                 label: '观众',
                 value: hasViewer,
@@ -101,40 +116,172 @@ class _StreamsScreenState extends State<StreamsScreen> {
           builder: (context, data) {
             final rows = rowsFrom((data as Map)['value']);
             return Surface(
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DataTable(
-                  columns: const [
-                    DataColumn(label: Text('协议')),
-                    DataColumn(label: Text('应用/流')),
-                    DataColumn(label: Text('任务')),
-                    DataColumn(label: Text('节点')),
-                    DataColumn(label: Text('观众')),
-                    DataColumn(label: Text('码率')),
-                    DataColumn(label: Text('播放地址')),
-                    DataColumn(label: Text('操作')),
-                  ],
-                  rows: rows.map((row) {
-                    final urls = (row['play_urls'] as List?)?.cast<Object?>() ?? const [];
-                    return DataRow(
-                      cells: [
-                        DataCell(Text(textValue(row['schema']))),
-                        DataCell(Text('${row['app']}/${row['stream']}')),
-                        DataCell(Text(textValue(row['task_name'] ?? row['task_id']))),
-                        DataCell(Text(shortId(row['node_id']))),
-                        DataCell(Text(textValue(row['viewer_count']))),
-                        DataCell(Text('${row['bitrate_kbps'] ?? 0} kbps')),
-                        DataCell(Wrap(spacing: 4, children: urls.map((url) => _PlayButton(url: '$url')).toList())),
-                        DataCell(_CloseStreamButton(row: row, onDone: _refresh)),
-                      ],
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  if (constraints.maxWidth < 820) {
+                    return _CompactStreamsList(
+                      rows: rows,
+                      onDone: _refresh,
                     );
-                  }).toList(),
-                ),
+                  }
+                  return SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: DataTable(
+                      dataRowMinHeight: 56,
+                      dataRowMaxHeight: 132,
+                      columns: const [
+                        DataColumn(label: Text('协议')),
+                        DataColumn(label: Text('应用/流')),
+                        DataColumn(label: Text('任务')),
+                        DataColumn(label: Text('节点')),
+                        DataColumn(label: Text('观众')),
+                        DataColumn(label: Text('码率')),
+                        DataColumn(label: Text('播放地址')),
+                        DataColumn(label: Text('操作')),
+                      ],
+                      rows: rows.map((row) {
+                        final urls =
+                            (row['play_urls'] as List?)?.cast<Object?>() ??
+                                const [];
+                        return DataRow(
+                          cells: [
+                            DataCell(Text(textValue(row['schema']))),
+                            DataCell(WrappedTextCell(
+                                value: '${row['app']}/${row['stream']}',
+                                maxWidth: 240)),
+                            DataCell(WrappedTextCell(
+                                value: row['task_name'] ?? row['task_id'],
+                                maxWidth: 240)),
+                            DataCell(Text(shortId(row['node_id']))),
+                            DataCell(Text(textValue(row['viewer_count']))),
+                            DataCell(Text('${row['bitrate_kbps'] ?? 0} kbps')),
+                            DataCell(Wrap(
+                                spacing: 4,
+                                runSpacing: 4,
+                                children: urls
+                                    .map((url) => _PlayButton(url: '$url'))
+                                    .toList())),
+                            DataCell(
+                                _CloseStreamButton(row: row, onDone: _refresh)),
+                          ],
+                        );
+                      }).toList(),
+                    ),
+                  );
+                },
               ),
             );
           },
         ),
       ],
+    );
+  }
+}
+
+class _CompactStreamsList extends StatelessWidget {
+  const _CompactStreamsList({required this.rows, required this.onDone});
+
+  final List<Map<String, Object?>> rows;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    if (rows.isEmpty) {
+      return const SizedBox(
+        height: 110,
+        child: Center(child: Text('暂无在线流')),
+      );
+    }
+    return Column(
+      children: [
+        for (var index = 0; index < rows.length; index++) ...[
+          _CompactStreamItem(row: rows[index], onDone: onDone),
+          if (index != rows.length - 1)
+            const Divider(height: 24, color: Color(0xffe4e8f0)),
+        ],
+      ],
+    );
+  }
+}
+
+class _CompactStreamItem extends StatelessWidget {
+  const _CompactStreamItem({required this.row, required this.onDone});
+
+  final Map<String, Object?> row;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final urls = (row['play_urls'] as List?)?.cast<Object?>() ?? const [];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Text(
+                '${row['app']}/${row['stream']}',
+                softWrap: true,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            const SizedBox(width: 10),
+            StatusBadge(status: row['schema']),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 14,
+          runSpacing: 8,
+          children: [
+            _StreamMeta(label: '任务', value: row['task_name'] ?? row['task_id']),
+            _StreamMeta(label: '节点', value: shortId(row['node_id'])),
+            _StreamMeta(label: '观众', value: row['viewer_count']),
+            _StreamMeta(label: '码率', value: '${row['bitrate_kbps'] ?? 0} kbps'),
+          ],
+        ),
+        if (urls.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 4,
+            runSpacing: 4,
+            children: urls.map((url) => _PlayButton(url: '$url')).toList(),
+          ),
+        ],
+        const SizedBox(height: 8),
+        _CloseStreamButton(row: row, onDone: onDone),
+      ],
+    );
+  }
+}
+
+class _StreamMeta extends StatelessWidget {
+  const _StreamMeta({required this.label, required this.value});
+
+  final String label;
+  final Object? value;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 300),
+      child: RichText(
+        text: TextSpan(
+          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
+          children: [
+            TextSpan(
+              text: '$label：',
+              style: const TextStyle(
+                color: Color(0xff5b6477),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            TextSpan(text: textValue(value)),
+          ],
+        ),
+        softWrap: true,
+      ),
     );
   }
 }
@@ -153,7 +300,14 @@ class _PlayButton extends StatelessWidget {
         TextButton.icon(
           onPressed: () => _open(context),
           icon: const Icon(Icons.play_arrow),
-          label: Text(url, overflow: TextOverflow.ellipsis),
+          label: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 320),
+            child: Text(
+              url,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
         ),
         IconButton(
           tooltip: '复制地址',

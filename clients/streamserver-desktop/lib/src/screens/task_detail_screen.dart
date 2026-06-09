@@ -377,6 +377,9 @@ class _SimpleTable extends StatelessWidget {
     }
     return LayoutBuilder(
       builder: (context, constraints) {
+        if (constraints.maxWidth < 760) {
+          return _CompactSimpleTable(columns: columns, rows: rows);
+        }
         final cellWidth = constraints.maxWidth < 760 ? 220.0 : 340.0;
         return SingleChildScrollView(
           padding: const EdgeInsets.all(12),
@@ -404,6 +407,81 @@ class _SimpleTable extends StatelessWidget {
           ),
         );
       },
+    );
+  }
+}
+
+class _CompactSimpleTable extends StatelessWidget {
+  const _CompactSimpleTable({required this.columns, required this.rows});
+
+  final List<String> columns;
+  final List<List<Object?>> rows;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.all(12),
+      child: Column(
+        children: [
+          for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) ...[
+            _CompactSimpleRow(columns: columns, row: rows[rowIndex]),
+            if (rowIndex != rows.length - 1)
+              const Divider(height: 24, color: Color(0xffe4e8f0)),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _CompactSimpleRow extends StatelessWidget {
+  const _CompactSimpleRow({required this.columns, required this.row});
+
+  final List<String> columns;
+  final List<Object?> row;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        for (var index = 0; index < row.length; index++) ...[
+          _CompactSimpleCell(label: columns[index], value: row[index]),
+          if (index != row.length - 1) const SizedBox(height: 8),
+        ],
+      ],
+    );
+  }
+}
+
+class _CompactSimpleCell extends StatelessWidget {
+  const _CompactSimpleCell({required this.label, required this.value});
+
+  final String label;
+  final Object? value;
+
+  @override
+  Widget build(BuildContext context) {
+    final isStatus =
+        label.contains('状态') || label.toLowerCase().contains('status');
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            color: Color(0xff5b6477),
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 3),
+        if (isStatus)
+          StatusBadge(status: value)
+        else
+          SelectableText(textValue(value),
+              style: const TextStyle(fontSize: 13)),
+      ],
     );
   }
 }

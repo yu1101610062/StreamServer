@@ -46,12 +46,15 @@ class _SecurityScreenState extends State<SecurityScreen> {
       error = null;
     });
     try {
-      final payload = await AppScope.of(context).api('GET', '/api/v1/security/machine-allowlist');
+      final payload = await AppScope.of(context)
+          .api('GET', '/api/v1/security/machine-allowlist');
       final rows = rowsFrom(payload['entries']);
       entries = rows;
       allowlistController.text = rows.map((row) {
         final cidr = textValue(row['cidr']);
-        final description = textValue(row['description']) == '—' ? '' : textValue(row['description']);
+        final description = textValue(row['description']) == '—'
+            ? ''
+            : textValue(row['description']);
         return description.isEmpty ? cidr : '$cidr $description';
       }).join('\n');
     } catch (cause) {
@@ -71,17 +74,24 @@ class _SecurityScreenState extends State<SecurityScreen> {
           description: '维护机器 API 白名单，并在 local_password 模式下修改当前用户密码。',
         ),
         if (loading)
-          const Surface(child: SizedBox(height: 160, child: Center(child: CircularProgressIndicator())))
+          const Surface(
+              child: SizedBox(
+                  height: 160,
+                  child: Center(child: CircularProgressIndicator())))
         else if (error != null)
           Surface(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('加载失败', style: TextStyle(fontWeight: FontWeight.w700)),
+                const Text('加载失败',
+                    style: TextStyle(fontWeight: FontWeight.w700)),
                 const SizedBox(height: 8),
                 Text(error.toString()),
                 const SizedBox(height: 12),
-                OutlinedButton.icon(onPressed: _loadAllowlist, icon: const Icon(Icons.refresh), label: const Text('重试')),
+                OutlinedButton.icon(
+                    onPressed: _loadAllowlist,
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('重试')),
               ],
             ),
           )
@@ -208,11 +218,21 @@ class _AllowlistEditor extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Expanded(child: Text('机器 API 白名单', style: TextStyle(fontWeight: FontWeight.w700))),
-              IconButton(onPressed: saving ? null : onReload, tooltip: '刷新', icon: const Icon(Icons.refresh)),
+              const Expanded(
+                  child: Text('机器 API 白名单',
+                      style: TextStyle(fontWeight: FontWeight.w700))),
+              IconButton(
+                  onPressed: saving ? null : onReload,
+                  tooltip: '刷新',
+                  icon: const Icon(Icons.refresh)),
               FilledButton.icon(
                 onPressed: saving ? null : onSave,
-                icon: saving ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.save),
+                icon: saving
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.save),
                 label: Text(saving ? '保存中' : '保存'),
               ),
             ],
@@ -228,25 +248,112 @@ class _AllowlistEditor extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
-          SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: DataTable(
-              columns: const [
-                DataColumn(label: Text('CIDR')),
-                DataColumn(label: Text('说明')),
-                DataColumn(label: Text('更新时间')),
-              ],
-              rows: entries.map((row) {
-                return DataRow(cells: [
-                  DataCell(Text(textValue(row['cidr']))),
-                  DataCell(Text(textValue(row['description']))),
-                  DataCell(Text(textValue(row['updated_at']))),
-                ]);
-              }).toList(),
-            ),
+          LayoutBuilder(
+            builder: (context, constraints) {
+              if (constraints.maxWidth < 680) {
+                return _CompactAllowlist(entries);
+              }
+              return SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: DataTable(
+                  dataRowMinHeight: 52,
+                  dataRowMaxHeight: 112,
+                  columns: const [
+                    DataColumn(label: Text('CIDR')),
+                    DataColumn(label: Text('说明')),
+                    DataColumn(label: Text('更新时间')),
+                  ],
+                  rows: entries.map((row) {
+                    return DataRow(cells: [
+                      DataCell(
+                          WrappedTextCell(value: row['cidr'], maxWidth: 220)),
+                      DataCell(WrappedTextCell(
+                          value: row['description'], maxWidth: 320)),
+                      DataCell(WrappedTextCell(
+                          value: row['updated_at'], maxWidth: 220)),
+                    ]);
+                  }).toList(),
+                ),
+              );
+            },
           ),
         ],
       ),
+    );
+  }
+}
+
+class _CompactAllowlist extends StatelessWidget {
+  const _CompactAllowlist(this.entries);
+
+  final List<Map<String, Object?>> entries;
+
+  @override
+  Widget build(BuildContext context) {
+    if (entries.isEmpty) {
+      return const SizedBox(
+        height: 90,
+        child: Center(child: Text('暂无白名单')),
+      );
+    }
+    return Column(
+      children: [
+        for (var index = 0; index < entries.length; index++) ...[
+          _CompactAllowlistItem(entries[index]),
+          if (index != entries.length - 1)
+            const Divider(height: 24, color: Color(0xffe4e8f0)),
+        ],
+      ],
+    );
+  }
+}
+
+class _CompactAllowlistItem extends StatelessWidget {
+  const _CompactAllowlistItem(this.row);
+
+  final Map<String, Object?> row;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SelectableText(
+          textValue(row['cidr']),
+          style: const TextStyle(fontWeight: FontWeight.w700),
+        ),
+        const SizedBox(height: 8),
+        _AllowlistMeta(label: '说明', value: row['description']),
+        const SizedBox(height: 6),
+        _AllowlistMeta(label: '更新时间', value: row['updated_at']),
+      ],
+    );
+  }
+}
+
+class _AllowlistMeta extends StatelessWidget {
+  const _AllowlistMeta({required this.label, required this.value});
+
+  final String label;
+  final Object? value;
+
+  @override
+  Widget build(BuildContext context) {
+    return RichText(
+      text: TextSpan(
+        style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
+        children: [
+          TextSpan(
+            text: '$label：',
+            style: const TextStyle(
+              color: Color(0xff5b6477),
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          TextSpan(text: textValue(value)),
+        ],
+      ),
+      softWrap: true,
     );
   }
 }
@@ -277,10 +384,22 @@ class _PasswordPanel extends StatelessWidget {
             runSpacing: 12,
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              SmallTextField(controller: currentPasswordController, label: '当前密码', obscureText: true),
-              SmallTextField(controller: newPasswordController, label: '新密码', obscureText: true),
-              SmallTextField(controller: repeatPasswordController, label: '重复新密码', obscureText: true),
-              FilledButton.icon(onPressed: onSubmit, icon: const Icon(Icons.lock_reset), label: const Text('修改')),
+              SmallTextField(
+                  controller: currentPasswordController,
+                  label: '当前密码',
+                  obscureText: true),
+              SmallTextField(
+                  controller: newPasswordController,
+                  label: '新密码',
+                  obscureText: true),
+              SmallTextField(
+                  controller: repeatPasswordController,
+                  label: '重复新密码',
+                  obscureText: true),
+              FilledButton.icon(
+                  onPressed: onSubmit,
+                  icon: const Icon(Icons.lock_reset),
+                  label: const Text('修改')),
             ],
           ),
         ],

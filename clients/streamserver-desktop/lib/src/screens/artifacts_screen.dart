@@ -59,13 +59,27 @@ class _ArtifactsScreenState extends State<ArtifactsScreen> {
               SmallSelect(
                 label: '产物类型',
                 value: kindFilter,
-                options: const ['', 'transcode_output', 'bridge_output', 'stream_ingest_record'],
+                options: const [
+                  '',
+                  'transcode_output',
+                  'bridge_output',
+                  'stream_ingest_record'
+                ],
                 onChanged: (value) => setState(() => kindFilter = value),
                 width: 240,
               ),
-              SmallTextField(controller: taskController, label: '任务 ID', onSubmitted: (_) => _refresh(resetPage: true)),
-              SmallTextField(controller: dateFromController, label: '开始时间', onSubmitted: (_) => _refresh(resetPage: true)),
-              SmallTextField(controller: dateToController, label: '结束时间', onSubmitted: (_) => _refresh(resetPage: true)),
+              SmallTextField(
+                  controller: taskController,
+                  label: '任务 ID',
+                  onSubmitted: (_) => _refresh(resetPage: true)),
+              SmallTextField(
+                  controller: dateFromController,
+                  label: '开始时间',
+                  onSubmitted: (_) => _refresh(resetPage: true)),
+              SmallTextField(
+                  controller: dateToController,
+                  label: '结束时间',
+                  onSubmitted: (_) => _refresh(resetPage: true)),
             ],
           ),
         ),
@@ -93,37 +107,60 @@ class _ArtifactsScreenState extends State<ArtifactsScreen> {
               children: [
                 Align(
                   alignment: Alignment.centerRight,
-                  child: PagerBar(page: page, pageSize: pageSize, total: total, onPageChanged: (value) {
-                    page = value;
-                    _refresh();
-                  }),
+                  child: PagerBar(
+                      page: page,
+                      pageSize: pageSize,
+                      total: total,
+                      onPageChanged: (value) {
+                        page = value;
+                        _refresh();
+                      }),
                 ),
                 Surface(
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      columns: const [
-                        DataColumn(label: Text('类型')),
-                        DataColumn(label: Text('任务')),
-                        DataColumn(label: Text('文件名')),
-                        DataColumn(label: Text('路径')),
-                        DataColumn(label: Text('大小')),
-                        DataColumn(label: Text('HTTP 地址')),
-                        DataColumn(label: Text('操作')),
-                      ],
-                      rows: rows.map((row) {
-                        final url = '${row['http_url'] ?? ''}';
-                        return DataRow(cells: [
-                          DataCell(Text(textValue(row['artifact_kind']))),
-                          DataCell(Text(textValue(row['task_name'] ?? row['task_id']))),
-                          DataCell(Text(textValue(row['file_name']))),
-                          DataCell(Text(textValue(row['file_path']))),
-                          DataCell(Text(bytesLabel(row['file_size']))),
-                          DataCell(SelectableText(textValue(row['http_url']))),
-                          DataCell(_ArtifactActions(url: url)),
-                        ]);
-                      }).toList(),
-                    ),
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      if (constraints.maxWidth < 820) {
+                        return _CompactArtifactsList(rows);
+                      }
+                      return SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: DataTable(
+                          dataRowMinHeight: 56,
+                          dataRowMaxHeight: 160,
+                          columns: const [
+                            DataColumn(label: Text('类型')),
+                            DataColumn(label: Text('任务')),
+                            DataColumn(label: Text('文件名')),
+                            DataColumn(label: Text('路径')),
+                            DataColumn(label: Text('大小')),
+                            DataColumn(label: Text('HTTP 地址')),
+                            DataColumn(label: Text('操作')),
+                          ],
+                          rows: rows.map((row) {
+                            final url = '${row['http_url'] ?? ''}';
+                            return DataRow(cells: [
+                              DataCell(WrappedTextCell(
+                                  value: row['artifact_kind'], maxWidth: 180)),
+                              DataCell(WrappedTextCell(
+                                  value: row['task_name'] ?? row['task_id'],
+                                  maxWidth: 240)),
+                              DataCell(WrappedTextCell(
+                                  value: row['file_name'], maxWidth: 240)),
+                              DataCell(WrappedTextCell(
+                                  value: row['file_path'],
+                                  maxWidth: 360,
+                                  selectable: true)),
+                              DataCell(Text(bytesLabel(row['file_size']))),
+                              DataCell(WrappedTextCell(
+                                  value: row['http_url'],
+                                  maxWidth: 420,
+                                  selectable: true)),
+                              DataCell(_ArtifactActions(url: url)),
+                            ]);
+                          }).toList(),
+                        ),
+                      );
+                    },
                   ),
                 ),
               ],
@@ -131,6 +168,110 @@ class _ArtifactsScreenState extends State<ArtifactsScreen> {
           },
         ),
       ],
+    );
+  }
+}
+
+class _CompactArtifactsList extends StatelessWidget {
+  const _CompactArtifactsList(this.rows);
+
+  final List<Map<String, Object?>> rows;
+
+  @override
+  Widget build(BuildContext context) {
+    if (rows.isEmpty) {
+      return const SizedBox(
+        height: 110,
+        child: Center(child: Text('暂无文件产物')),
+      );
+    }
+    return Column(
+      children: [
+        for (var index = 0; index < rows.length; index++) ...[
+          _CompactArtifactItem(rows[index]),
+          if (index != rows.length - 1)
+            const Divider(height: 24, color: Color(0xffe4e8f0)),
+        ],
+      ],
+    );
+  }
+}
+
+class _CompactArtifactItem extends StatelessWidget {
+  const _CompactArtifactItem(this.row);
+
+  final Map<String, Object?> row;
+
+  @override
+  Widget build(BuildContext context) {
+    final url = '${row['http_url'] ?? ''}';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Text(
+                textValue(row['file_name']),
+                softWrap: true,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            const SizedBox(width: 10),
+            StatusBadge(status: row['artifact_kind']),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 14,
+          runSpacing: 8,
+          children: [
+            _ArtifactMeta(
+                label: '任务', value: row['task_name'] ?? row['task_id']),
+            _ArtifactMeta(label: '大小', value: bytesLabel(row['file_size'])),
+          ],
+        ),
+        const SizedBox(height: 8),
+        SelectableText(textValue(row['file_path']),
+            style: const TextStyle(fontSize: 12)),
+        if (url.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          SelectableText(url, style: const TextStyle(fontSize: 12)),
+        ],
+        const SizedBox(height: 8),
+        _ArtifactActions(url: url),
+      ],
+    );
+  }
+}
+
+class _ArtifactMeta extends StatelessWidget {
+  const _ArtifactMeta({required this.label, required this.value});
+
+  final String label;
+  final Object? value;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 320),
+      child: RichText(
+        text: TextSpan(
+          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
+          children: [
+            TextSpan(
+              text: '$label：',
+              style: const TextStyle(
+                color: Color(0xff5b6477),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            TextSpan(text: textValue(value)),
+          ],
+        ),
+        softWrap: true,
+      ),
     );
   }
 }

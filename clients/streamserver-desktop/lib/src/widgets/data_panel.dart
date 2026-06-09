@@ -296,10 +296,18 @@ _StatusTone _statusTone(String value) {
     case 'SUCCEEDED':
     case 'SUCCESS':
     case 'ACTIVE':
+    case 'HEALTHY':
+    case 'CONNECTED':
+    case 'ALIVE':
+    case 'TRUE':
       return const _StatusTone(
           Color(0xff027a48), Color(0xffecfdf3), Color(0xffabefc6));
     case 'FAILED':
     case 'ERROR':
+    case 'UNHEALTHY':
+    case 'DISCONNECTED':
+    case 'DEAD':
+    case 'FALSE':
       return const _StatusTone(
           Color(0xffb42318), Color(0xfffff1f3), Color(0xfffda29b));
     case 'LOST':

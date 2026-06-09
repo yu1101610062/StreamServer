@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:file_selector/file_selector.dart';
 
 import '../state.dart';
 import '../utils.dart';
@@ -50,26 +51,54 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
               '通过 Rust native multipart 客户端上传本地文件到 StreamServer Agent 节点。',
         ),
         Surface(
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: fileController,
-                  decoration: const InputDecoration(labelText: '本地文件路径'),
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final narrow = constraints.maxWidth < 640;
+              final pathField = TextField(
+                controller: fileController,
+                decoration: const InputDecoration(
+                  labelText: '本地文件路径',
+                  prefixIcon: Icon(Icons.insert_drive_file),
                 ),
-              ),
-              const SizedBox(width: 12),
-              FilledButton.icon(
-                onPressed: uploading ? null : () => _upload(controller),
-                icon: uploading
-                    ? const SizedBox(
-                        width: 18,
-                        height: 18,
-                        child: CircularProgressIndicator(strokeWidth: 2))
-                    : const Icon(Icons.upload_file),
-                label: Text(uploading ? '上传中' : '上传'),
-              ),
-            ],
+              );
+              final actions = Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  OutlinedButton.icon(
+                    onPressed: uploading ? null : _pickFile,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('选择文件'),
+                  ),
+                  FilledButton.icon(
+                    onPressed: uploading ? null : () => _upload(controller),
+                    icon: uploading
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.upload_file),
+                    label: Text(uploading ? '上传中' : '上传'),
+                  ),
+                ],
+              );
+              return narrow
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        pathField,
+                        const SizedBox(height: 12),
+                        actions,
+                      ],
+                    )
+                  : Row(
+                      children: [
+                        Expanded(child: pathField),
+                        const SizedBox(width: 12),
+                        actions,
+                      ],
+                    );
+            },
           ),
         ),
         if (result != null) ...[
@@ -139,6 +168,12 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
                 Surface(
                   child: LayoutBuilder(
                     builder: (context, constraints) {
+                      if (constraints.maxWidth < 760) {
+                        return _CompactUploadList(
+                          rows: rows,
+                          onDone: _refresh,
+                        );
+                      }
                       final nameWidth =
                           constraints.maxWidth < 760 ? 180.0 : 260.0;
                       final urlWidth =
@@ -190,13 +225,27 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
     );
   }
 
+  Future<void> _pickFile() async {
+    final file = await openFile();
+    if (file == null) return;
+    setState(() {
+      fileController.text = file.path;
+      result = '已选择：${file.name}';
+    });
+  }
+
   Future<void> _upload(AppController controller) async {
+    final path = fileController.text.trim();
+    if (path.isEmpty) {
+      setState(() => result = '请先选择要上传的本地文件。');
+      return;
+    }
     setState(() {
       uploading = true;
       result = null;
     });
     try {
-      final value = await controller.uploadMedia(fileController.text);
+      final value = await controller.uploadMedia(path);
       setState(() {
         result = prettyJson(value);
         refreshSeed++;
@@ -206,6 +255,109 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
     } finally {
       if (mounted) setState(() => uploading = false);
     }
+  }
+}
+
+class _CompactUploadList extends StatelessWidget {
+  const _CompactUploadList({required this.rows, required this.onDone});
+
+  final List<Map<String, Object?>> rows;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    if (rows.isEmpty) {
+      return const SizedBox(
+        height: 110,
+        child: Center(child: Text('暂无上传记录')),
+      );
+    }
+    return Column(
+      children: [
+        for (var index = 0; index < rows.length; index++) ...[
+          _CompactUploadItem(row: rows[index], onDone: onDone),
+          if (index != rows.length - 1)
+            const Divider(height: 24, color: Color(0xffe4e8f0)),
+        ],
+      ],
+    );
+  }
+}
+
+class _CompactUploadItem extends StatelessWidget {
+  const _CompactUploadItem({required this.row, required this.onDone});
+
+  final Map<String, Object?> row;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final url = '${row['http_url'] ?? ''}';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Text(
+                textValue(row['file_name']),
+                softWrap: true,
+                style: const TextStyle(fontWeight: FontWeight.w700),
+              ),
+            ),
+            const SizedBox(width: 10),
+            StatusBadge(status: row['status']),
+          ],
+        ),
+        const SizedBox(height: 10),
+        Wrap(
+          spacing: 14,
+          runSpacing: 8,
+          children: [
+            _UploadMeta(label: '节点', value: row['node_name'] ?? row['node_id']),
+            _UploadMeta(label: '大小', value: bytesLabel(row['file_size'])),
+            _UploadMeta(label: '时长', value: '${row['duration_sec'] ?? 0}s'),
+          ],
+        ),
+        if (url.isNotEmpty) ...[
+          const SizedBox(height: 8),
+          SelectableText(url, style: const TextStyle(fontSize: 12)),
+        ],
+        const SizedBox(height: 8),
+        _UploadActions(row: row, url: url, onDone: onDone),
+      ],
+    );
+  }
+}
+
+class _UploadMeta extends StatelessWidget {
+  const _UploadMeta({required this.label, required this.value});
+
+  final String label;
+  final Object? value;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: const BoxConstraints(maxWidth: 280),
+      child: RichText(
+        text: TextSpan(
+          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
+          children: [
+            TextSpan(
+              text: '$label：',
+              style: const TextStyle(
+                color: Color(0xff5b6477),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            TextSpan(text: textValue(value)),
+          ],
+        ),
+        softWrap: true,
+      ),
+    );
   }
 }
 

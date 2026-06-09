@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
@@ -30,6 +31,7 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
   String status = '';
   bool opening = false;
   bool takingSnapshot = false;
+  int openTicket = 0;
 
   @override
   void initState() {
@@ -164,25 +166,190 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
   }
 
   Future<void> _open(String url) async {
+    final ticket = ++openTicket;
     setState(() {
       opening = true;
       status = '正在打开：$url';
     });
     try {
-      await player.open(Media(url), play: true);
+      final playableUrl = await _preparePlayableUrl(url, ticket);
+      if (!mounted || ticket != openTicket) return;
+      await player.open(Media(playableUrl), play: true);
       if (mounted) {
         setState(() {
           status = '内嵌 libmpv 播放中';
         });
       }
     } catch (error) {
-      if (mounted) {
+      if (mounted && ticket == openTicket) {
         setState(() => status = '打开失败：$error');
       }
     } finally {
-      if (mounted) {
+      if (mounted && ticket == openTicket) {
         setState(() => opening = false);
       }
+    }
+  }
+
+  Future<String> _preparePlayableUrl(String url, int ticket) async {
+    final uri = Uri.tryParse(url);
+    if (!_shouldCacheForPlayback(uri)) {
+      return url;
+    }
+
+    _setOpenStatus(ticket, '正在检测服务端 Range 支持');
+    final supportsRange = await _supportsByteRange(uri!);
+    if (supportsRange) {
+      return url;
+    }
+    if (!mounted || ticket != openTicket) {
+      throw StateError('播放请求已取消');
+    }
+    return _cacheRemoteMedia(uri, ticket);
+  }
+
+  bool _shouldCacheForPlayback(Uri? uri) {
+    if (uri == null || !(uri.scheme == 'http' || uri.scheme == 'https')) {
+      return false;
+    }
+    final path = uri.path.toLowerCase();
+    return path.endsWith('.mp4') ||
+        path.endsWith('.m4v') ||
+        path.endsWith('.mov');
+  }
+
+  Future<bool> _supportsByteRange(Uri uri) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
+    try {
+      final request = await client.getUrl(uri).timeout(
+            const Duration(seconds: 3),
+          );
+      request.headers.set(HttpHeaders.rangeHeader, 'bytes=0-0');
+      final response = await request.close().timeout(
+            const Duration(seconds: 5),
+          );
+      return response.statusCode == HttpStatus.partialContent;
+    } catch (_) {
+      return true;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<String> _cacheRemoteMedia(Uri uri, int ticket) async {
+    final cacheFile = await _cacheFileForUrl(uri);
+    if (await cacheFile.exists() && await cacheFile.length() > 0) {
+      _setOpenStatus(ticket, '服务端不支持 Range，使用本地播放缓存：${cacheFile.path}');
+      return Uri.file(cacheFile.path).toString();
+    }
+
+    final tempFile = File('${cacheFile.path}.part');
+    await tempFile.parent.create(recursive: true);
+    if (await tempFile.exists()) {
+      await tempFile.delete();
+    }
+
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 6);
+    IOSink? sink;
+    try {
+      _setOpenStatus(ticket, '服务端不支持 Range，正在缓存后播放');
+      final request = await client.getUrl(uri);
+      final response = await request.close();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException(
+          '缓存下载失败：HTTP ${response.statusCode}',
+          uri: uri,
+        );
+      }
+
+      sink = tempFile.openWrite();
+      var downloaded = 0;
+      var lastProgress = DateTime.fromMillisecondsSinceEpoch(0);
+      await for (final chunk in response) {
+        if (!mounted || ticket != openTicket) {
+          throw StateError('播放请求已取消');
+        }
+        downloaded += chunk.length;
+        sink.add(chunk);
+        final now = DateTime.now();
+        if (now.difference(lastProgress) > const Duration(milliseconds: 250)) {
+          _setOpenStatus(
+            ticket,
+            _downloadStatus(downloaded, response.contentLength),
+          );
+          lastProgress = now;
+        }
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+
+      if (response.contentLength > 0 && downloaded != response.contentLength) {
+        throw HttpException(
+          '缓存下载不完整：$downloaded/${response.contentLength}',
+          uri: uri,
+        );
+      }
+      if (await cacheFile.exists()) {
+        await cacheFile.delete();
+      }
+      await tempFile.rename(cacheFile.path);
+      _setOpenStatus(ticket, '已缓存，正在打开本地文件：${cacheFile.path}');
+      return Uri.file(cacheFile.path).toString();
+    } catch (_) {
+      if (await tempFile.exists()) {
+        await tempFile.delete();
+      }
+      rethrow;
+    } finally {
+      await sink?.close();
+      client.close(force: true);
+    }
+  }
+
+  String _downloadStatus(int downloaded, int contentLength) {
+    final downloadedText = _formatBytes(downloaded);
+    if (contentLength <= 0) {
+      return '服务端不支持 Range，正在缓存后播放：$downloadedText';
+    }
+    final percent = downloaded * 100 / contentLength;
+    return '服务端不支持 Range，正在缓存后播放：${percent.toStringAsFixed(1)}% ($downloadedText / ${_formatBytes(contentLength)})';
+  }
+
+  String _formatBytes(int value) {
+    if (value >= 1024 * 1024 * 1024) {
+      return '${(value / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+    }
+    if (value >= 1024 * 1024) {
+      return '${(value / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    if (value >= 1024) {
+      return '${(value / 1024).toStringAsFixed(1)} KB';
+    }
+    return '$value B';
+  }
+
+  Future<File> _cacheFileForUrl(Uri uri) async {
+    final dir = await getTemporaryDirectory();
+    final cacheDir = Directory('${dir.path}/streamserver-desktop-media-cache');
+    final pathName =
+        uri.pathSegments.isEmpty ? 'media.mp4' : uri.pathSegments.last;
+    final safeName = pathName.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+    return File('${cacheDir.path}/${_fnv32(uri.toString())}-$safeName');
+  }
+
+  String _fnv32(String value) {
+    var hash = 0x811c9dc5;
+    for (final byte in utf8.encode(value)) {
+      hash ^= byte;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
+  }
+
+  void _setOpenStatus(int ticket, String value) {
+    if (mounted && ticket == openTicket) {
+      setState(() => status = value);
     }
   }
 

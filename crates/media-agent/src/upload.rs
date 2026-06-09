@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    io::SeekFrom,
     path::{Component, Path as FsPath, PathBuf},
     process::Stdio,
     time::Duration,
@@ -16,7 +17,12 @@ use axum::{
 use chrono::{Datelike, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::{fs, io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    process::Command,
+    time::timeout,
+};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 use uuid::Uuid;
@@ -119,6 +125,7 @@ pub(crate) async fn upload_media(
 
 pub(crate) async fn serve_media_file(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(path): AxumPath<String>,
 ) -> Result<Response, UploadError> {
     let relative = normalize_media_relative_path(&path)?;
@@ -141,16 +148,51 @@ pub(crate) async fn serve_media_file(
         return Err(UploadError::not_found("media file not found"));
     }
 
-    let file = fs::File::open(&file_path)
+    let mut file = fs::File::open(&file_path)
         .await
         .context("open media file failed")?;
-    let body = Body::from_stream(ReaderStream::new(file));
+    let media_range = match parse_single_byte_range(
+        headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok()),
+        metadata.len(),
+    ) {
+        Ok(range) => range,
+        Err(RangeParseError::Invalid | RangeParseError::Unsatisfiable) => {
+            return Ok(range_not_satisfiable_response(metadata.len()));
+        }
+    };
+
+    let (status, content_length, content_range) = if let Some(range) = media_range {
+        file.seek(SeekFrom::Start(range.start))
+            .await
+            .context("seek media file failed")?;
+        (
+            StatusCode::PARTIAL_CONTENT,
+            range.len(),
+            Some(format!(
+                "bytes {}-{}/{}",
+                range.start,
+                range.end,
+                metadata.len()
+            )),
+        )
+    } else {
+        (StatusCode::OK, metadata.len(), None)
+    };
+
+    let body = Body::from_stream(ReaderStream::new(file.take(content_length)));
     let mut response = Response::new(body);
-    *response.status_mut() = StatusCode::OK;
+    *response.status_mut() = status;
     let headers = response.headers_mut();
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    if let Ok(value) = HeaderValue::from_str(&metadata.len().to_string()) {
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
         headers.insert(header::CONTENT_LENGTH, value);
+    }
+    if let Some(content_range) = content_range {
+        if let Ok(value) = HeaderValue::from_str(&content_range) {
+            headers.insert(header::CONTENT_RANGE, value);
+        }
     }
     if let Some(content_type) =
         content_type_from_extension(relative.extension().and_then(|value| value.to_str()))
@@ -158,6 +200,86 @@ pub(crate) async fn serve_media_file(
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     }
     Ok(response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaByteRange {
+    start: u64,
+    end: u64,
+}
+
+impl MediaByteRange {
+    fn len(self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeParseError {
+    Invalid,
+    Unsatisfiable,
+}
+
+fn parse_single_byte_range(
+    header_value: Option<&str>,
+    file_len: u64,
+) -> Result<Option<MediaByteRange>, RangeParseError> {
+    let Some(header_value) = header_value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if file_len == 0 {
+        return Err(RangeParseError::Unsatisfiable);
+    }
+    let spec = header_value
+        .strip_prefix("bytes=")
+        .ok_or(RangeParseError::Invalid)?;
+    if spec.contains(',') {
+        return Err(RangeParseError::Invalid);
+    }
+    let (start, end) = spec.split_once('-').ok_or(RangeParseError::Invalid)?;
+    let start = start.trim();
+    let end = end.trim();
+    if start.is_empty() {
+        let suffix_len = end.parse::<u64>().map_err(|_| RangeParseError::Invalid)?;
+        if suffix_len == 0 {
+            return Err(RangeParseError::Unsatisfiable);
+        }
+        let start = file_len.saturating_sub(suffix_len);
+        return Ok(Some(MediaByteRange {
+            start,
+            end: file_len - 1,
+        }));
+    }
+
+    let start = start.parse::<u64>().map_err(|_| RangeParseError::Invalid)?;
+    if start >= file_len {
+        return Err(RangeParseError::Unsatisfiable);
+    }
+    let end = if end.is_empty() {
+        file_len - 1
+    } else {
+        end.parse::<u64>()
+            .map_err(|_| RangeParseError::Invalid)?
+            .min(file_len - 1)
+    };
+    if end < start {
+        return Err(RangeParseError::Unsatisfiable);
+    }
+    Ok(Some(MediaByteRange { start, end }))
+}
+
+fn range_not_satisfiable_response(file_len: u64) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+    let headers = response.headers_mut();
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{file_len}")) {
+        headers.insert(header::CONTENT_RANGE, value);
+    }
+    response
 }
 
 pub(crate) async fn delete_media_file(
@@ -540,11 +662,15 @@ mod tests {
     use super::{
         DEFAULT_UPLOAD_DURATION_SEC, UPLOAD_DURATION_ANALYZE_DURATION_US,
         UPLOAD_DURATION_PROBE_SIZE_BYTES, UploadConfig, content_type_from_extension,
-        delete_media_file, normalize_media_relative_path, probe_duration_sec,
-        probe_duration_sec_or_default,
+        delete_media_file, normalize_media_relative_path, parse_single_byte_range,
+        probe_duration_sec, probe_duration_sec_or_default, serve_media_file,
     };
     use crate::{AgentReadiness, AppState};
-    use axum::extract::{Path as AxumPath, State};
+    use axum::{
+        body::to_bytes,
+        extract::{Path as AxumPath, State},
+        http::{HeaderMap, HeaderValue, StatusCode, header},
+    };
     use chrono::Utc;
     use uuid::Uuid;
 
@@ -744,6 +870,69 @@ exit 1
             .expect_err("parent segments should fail");
 
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn byte_range_parser_accepts_common_media_ranges() {
+        assert_eq!(
+            parse_single_byte_range(Some("bytes=2-4"), 10)
+                .expect("range should parse")
+                .expect("range should exist"),
+            super::MediaByteRange { start: 2, end: 4 }
+        );
+        assert_eq!(
+            parse_single_byte_range(Some("bytes=6-"), 10)
+                .expect("range should parse")
+                .expect("range should exist"),
+            super::MediaByteRange { start: 6, end: 9 }
+        );
+        assert_eq!(
+            parse_single_byte_range(Some("bytes=-3"), 10)
+                .expect("range should parse")
+                .expect("range should exist"),
+            super::MediaByteRange { start: 7, end: 9 }
+        );
+        assert!(parse_single_byte_range(Some("bytes=10-20"), 10).is_err());
+        assert!(parse_single_byte_range(Some("items=0-1"), 10).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_media_file_honors_byte_range_requests() {
+        let temp_root = temp_upload_probe_root("streamserver-upload-range");
+        let work_root = temp_root.join("work");
+        let relative = PathBuf::from("uploads/node-a/2026/04/29/demo.mp4");
+        let target = work_root.join(&relative);
+        std::fs::create_dir_all(target.parent().expect("target parent should exist"))
+            .expect("upload dir should be created");
+        std::fs::write(&target, b"abcdef").expect("media file should be written");
+        let state = test_app_state(work_root);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-4"));
+
+        let response = serve_media_file(
+            State(state),
+            headers,
+            AxumPath(relative.to_string_lossy().to_string()),
+        )
+        .await
+        .expect("range request should pass");
+
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers().get(header::CONTENT_RANGE),
+            Some(&HeaderValue::from_static("bytes 2-4/6"))
+        );
+        assert_eq!(
+            response.headers().get(header::CONTENT_LENGTH),
+            Some(&HeaderValue::from_static("3"))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        assert_eq!(&body[..], b"cde");
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }
