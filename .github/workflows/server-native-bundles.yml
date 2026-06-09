@@ -1,0 +1,199 @@
+name: Server native bundles
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Native bundle variant to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - cpu-only
+          - gpu-enabled
+          - control-plane-minimal
+  push:
+    branches:
+      - DEV
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/server-native-bundles.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "packaging/native/**"
+      - "packaging/docker/**"
+      - "scripts/build-frontend-ui.mjs"
+      - "scripts/build-musl-binaries.sh"
+      - "scripts/build-native-bundle.sh"
+  pull_request:
+    branches:
+      - DEV
+    paths:
+      - ".github/workflows/server-native-bundles.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "packaging/native/**"
+      - "packaging/docker/**"
+      - "scripts/build-frontend-ui.mjs"
+      - "scripts/build-musl-binaries.sh"
+      - "scripts/build-native-bundle.sh"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: server-native-bundles-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu-only
+            flag: --without-gpu
+          - variant: gpu-enabled
+            flag: --with-gpu
+          - variant: control-plane-minimal
+            flag: --control-plane-minimal
+    env:
+      REQUESTED_VARIANT: ${{ github.event.inputs.variant || 'all' }}
+      NATIVE_VARIANT: ${{ matrix.variant }}
+      NATIVE_FLAG: ${{ matrix.flag }}
+      OUTPUT_DIR: dist/native-actions/${{ matrix.variant }}
+    steps:
+      - name: Select variant
+        id: select
+        shell: bash
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" \
+            && "${REQUESTED_VARIANT}" != "all" \
+            && "${REQUESTED_VARIANT}" != "${NATIVE_VARIANT}" ]]; then
+            echo "selected=false" >> "${GITHUB_OUTPUT}"
+            echo "Skipping ${NATIVE_VARIANT}; requested ${REQUESTED_VARIANT}."
+          else
+            echo "selected=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout
+        if: steps.select.outputs.selected == 'true'
+        uses: actions/checkout@v4
+
+      - name: Prepare disk
+        if: steps.select.outputs.selected == 'true'
+        shell: bash
+        run: |
+          echo "== Disk before cleanup =="
+          df -h
+          docker system df || true
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+          docker system prune -af || true
+          docker builder prune -af || true
+          echo "== Disk after cleanup =="
+          df -h
+          docker system df || true
+
+      - name: Set up Node.js
+        if: steps.select.outputs.selected == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: crates/media-core/frontend/package-lock.json
+
+      - name: Build native bundle
+        if: steps.select.outputs.selected == 'true'
+        shell: bash
+        run: |
+          mkdir -p "${OUTPUT_DIR}"
+          scripts/build-native-bundle.sh \
+            "${NATIVE_FLAG}" \
+            --no-runtime-cache \
+            --prune-images-after-extract \
+            --output-dir "${OUTPUT_DIR}"
+
+      - name: Print disk usage
+        if: always() && steps.select.outputs.selected == 'true'
+        shell: bash
+        run: |
+          echo "== Disk after build =="
+          df -h
+          docker system df || true
+
+      - name: Prepare release assets
+        if: steps.select.outputs.selected == 'true'
+        shell: bash
+        run: |
+          mkdir -p dist/release-assets
+          cp "${OUTPUT_DIR}"/* dist/release-assets/
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          release_dir = Path("dist/release-assets")
+          split_threshold = 1900 * 1024 * 1024
+          part_size = 1900 * 1024 * 1024
+          buffer_size = 16 * 1024 * 1024
+
+          for path in list(release_dir.glob("*.tar.gz")):
+              if path.stat().st_size <= split_threshold:
+                  continue
+              digest = hashlib.sha256()
+              part_index = 0
+              with path.open("rb") as source:
+                  while True:
+                      part_path = path.with_name(f"{path.name}.part-{part_index:03d}")
+                      written = 0
+                      with part_path.open("wb") as part:
+                          while written < part_size:
+                              chunk = source.read(min(buffer_size, part_size - written))
+                              if not chunk:
+                                  break
+                              digest.update(chunk)
+                              part.write(chunk)
+                              written += len(chunk)
+                      if written == 0:
+                          part_path.unlink(missing_ok=True)
+                          break
+                      part_index += 1
+              path.with_name(f"{path.name}.full.sha256").write_text(
+                  f"{digest.hexdigest()}  {path.name}\n",
+                  encoding="utf-8",
+              )
+              path.with_name(f"{path.name}.split.txt").write_text(
+                  "Reassemble with:\n"
+                  f"  cat {path.name}.part-* > {path.name}\n"
+                  f"  sha256sum -c {path.name}.full.sha256\n",
+                  encoding="utf-8",
+              )
+              path.unlink()
+          PY
+
+      - name: Upload workflow artifact
+        if: steps.select.outputs.selected == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamserver-native-${{ matrix.variant }}
+          path: dist/release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/v') && steps.select.outputs.selected == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release view "${tag}" >/dev/null 2>&1 \
+            || gh release create "${tag}" --title "${tag}" --notes "Automated StreamServer release." \
+            || true
+          gh release upload "${tag}" dist/release-assets/* --clobber

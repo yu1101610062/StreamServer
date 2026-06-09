@@ -12,6 +12,8 @@ FRONTEND_SKIP_INSTALL=0
 REFRESH_RUNTIME_CACHE=0
 OFFLINE_RUNTIME_CACHE=0
 NO_RUNTIME_CACHE=0
+PRUNE_IMAGES_AFTER_EXTRACT=0
+TEMP_STAGE_DIR=""
 
 DEFAULT_APT_MIRROR="http://mirrors.aliyun.com"
 DEFAULT_CARGO_REGISTRY_MIRROR="sparse+https://rsproxy.cn/index/"
@@ -95,6 +97,7 @@ usage() {
   $(basename "$0") [--output-dir DIR] [--with-gpu|--without-gpu|--control-plane-minimal]
                  [--prebuilt-ui-dir DIR] [--skip-frontend-install]
                  [--refresh-runtime-cache|--offline-runtime-cache|--no-runtime-cache]
+                 [--prune-images-after-extract]
 
 说明:
   生成无 Docker 运行时依赖的 StreamServer native 离线包。构建机可以使用 Docker
@@ -110,6 +113,8 @@ runtime 缓存:
   --refresh-runtime-cache   忽略已有 runtime 缓存，重新从镜像提取并覆盖缓存
   --offline-runtime-cache   只允许使用已有 runtime 缓存；缺失或无效时失败，不拉取 runtime 镜像
   --no-runtime-cache        禁用 runtime 缓存，保持每次从镜像提取的旧行为
+  --prune-images-after-extract
+                            低磁盘模式：runtime 提取后立即删除相关镜像，退出时清理 Docker build cache
 
 环境变量:
   RUST_BUILDER_IMAGE                  默认 ${RUST_BUILDER_IMAGE}
@@ -170,7 +175,12 @@ parse_args() {
         NO_RUNTIME_CACHE=1
         shift
         ;;
+      --prune-images-after-extract)
+        PRUNE_IMAGES_AFTER_EXTRACT=1
+        shift
+        ;;
       -h|--help)
+        PRUNE_IMAGES_AFTER_EXTRACT=0
         usage
         exit 0
         ;;
@@ -231,6 +241,48 @@ ensure_tools() {
   fi
 }
 
+prune_docker_image() {
+  local image="$1"
+
+  [ "${PRUNE_IMAGES_AFTER_EXTRACT}" -eq 1 ] || return 0
+  [ -n "${image}" ] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+
+  if docker image inspect "${image}" >/dev/null 2>&1; then
+    log "删除构建期镜像: ${image}"
+    docker image rm "${image}" >/dev/null 2>&1 || log "镜像仍被占用，跳过删除: ${image}"
+  fi
+}
+
+prune_musl_builder_images() {
+  [ "${PRUNE_IMAGES_AFTER_EXTRACT}" -eq 1 ] || return 0
+  prune_docker_image "streamserver-rust-musl-builder:${HOST_BINARY_TARGET_TRIPLE}"
+  prune_docker_image "${RUST_BUILDER_IMAGE}"
+  docker builder prune -af >/dev/null 2>&1 || true
+}
+
+prune_docker_build_artifacts() {
+  [ "${PRUNE_IMAGES_AFTER_EXTRACT}" -eq 1 ] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+  docker info >/dev/null 2>&1 || return 0
+
+  log "清理 Docker 构建缓存和未使用镜像"
+  docker system prune -af >/dev/null 2>&1 || true
+  docker builder prune -af >/dev/null 2>&1 || true
+}
+
+cleanup_temp_artifacts() {
+  local status=$?
+
+  if [ -n "${TEMP_STAGE_DIR}" ] && [ -d "${TEMP_STAGE_DIR}" ]; then
+    rm -rf "${TEMP_STAGE_DIR}"
+  fi
+  prune_docker_build_artifacts
+  exit "${status}"
+}
+
+trap cleanup_temp_artifacts EXIT
+
 workspace_version() {
   awk '
     /^\[workspace.package\]/ { in_section = 1; next }
@@ -263,17 +315,44 @@ prepare_frontend_ui() {
 
 export_business_binaries() {
   local output_dir="$1"
+  local env_args=()
+  local ephemeral_musl_cache=0
+  local musl_cargo_home_dir="${MUSL_CARGO_HOME_DIR:-}"
+  local musl_cargo_target_dir="${MUSL_CARGO_TARGET_DIR:-}"
+
+  if [ "${PRUNE_IMAGES_AFTER_EXTRACT}" -eq 1 ] \
+    && [ -n "${TEMP_STAGE_DIR}" ] \
+    && [ -z "${musl_cargo_home_dir}" ] \
+    && [ -z "${musl_cargo_target_dir}" ]; then
+    ephemeral_musl_cache=1
+    musl_cargo_home_dir="${TEMP_STAGE_DIR}/musl-cargo-home"
+    musl_cargo_target_dir="${TEMP_STAGE_DIR}/musl-target"
+  fi
+
+  env_args=(
+    "APT_MIRROR=${APT_MIRROR}"
+    "CARGO_REGISTRY_MIRROR=${CARGO_REGISTRY_MIRROR}"
+    "RUST_BUILDER_IMAGE=${RUST_BUILDER_IMAGE}"
+  )
+  if [ -n "${musl_cargo_home_dir}" ]; then
+    env_args+=("MUSL_CARGO_HOME_DIR=${musl_cargo_home_dir}")
+  fi
+  if [ -n "${musl_cargo_target_dir}" ]; then
+    env_args+=("MUSL_CARGO_TARGET_DIR=${musl_cargo_target_dir}")
+  fi
+
   mkdir -p "${output_dir}"
   log "构建 Linux AMD64 musl 业务二进制"
-  APT_MIRROR="${APT_MIRROR}" \
-  CARGO_REGISTRY_MIRROR="${CARGO_REGISTRY_MIRROR}" \
-  RUST_BUILDER_IMAGE="${RUST_BUILDER_IMAGE}" \
-    bash "${BUILD_MUSL_BIN_SCRIPT}" \
-      --target-triple "${HOST_BINARY_TARGET_TRIPLE}" \
-      --package media-core \
-      --package media-agent \
-      --package streamserver-config \
-      --output-dir "${output_dir}"
+  env "${env_args[@]}" bash "${BUILD_MUSL_BIN_SCRIPT}" \
+    --target-triple "${HOST_BINARY_TARGET_TRIPLE}" \
+    --package media-core \
+    --package media-agent \
+    --package streamserver-config \
+    --output-dir "${output_dir}"
+  if [ "${ephemeral_musl_cache}" -eq 1 ]; then
+    rm -rf "${musl_cargo_home_dir}" "${musl_cargo_target_dir}"
+  fi
+  prune_musl_builder_images
 }
 
 pull_linux_amd64_image() {
@@ -429,7 +508,11 @@ extract_runtime_with_cache() {
   if [ "${NO_RUNTIME_CACHE}" -eq 1 ]; then
     # 调试时可禁用缓存，强制保持每次从镜像重新提取的旧行为。
     pull_linux_amd64_image "${image}"
-    "${extractor}" "${image}" "${output_dir}" "$@"
+    if ! "${extractor}" "${image}" "${output_dir}" "$@"; then
+      prune_docker_image "${image}"
+      fail "runtime 提取失败: ${kind} (${image})"
+    fi
+    prune_docker_image "${image}"
     return 0
   fi
 
@@ -467,10 +550,12 @@ extract_runtime_with_cache() {
 
   # 先写临时目录并校验 checksum，最后原子替换正式缓存，避免留下部分提取结果。
   if ! "${extractor}" "${image}" "${tmp_dir}/payload" "$@"; then
+    prune_docker_image "${image}"
     rm -rf "${tmp_dir}"
     release_runtime_cache_lock "${lock_dir}"
     fail "runtime 提取失败: ${kind} (${image})"
   fi
+  prune_docker_image "${image}"
 
   if ! write_runtime_cache_metadata "${tmp_dir}" "${kind}" "${image}" "${key}" "$@"; then
     rm -rf "${tmp_dir}"
@@ -917,6 +1002,7 @@ main() {
   archive_path="${OUTPUT_DIR}/${bundle_name}.tar.gz"
 
   stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/streamserver-native.XXXXXX")"
+  TEMP_STAGE_DIR="${stage_dir}"
   bundle_root="${stage_dir}/${bundle_name}"
   binaries_dir="${stage_dir}/binaries"
   mkdir -p "${bundle_root}"
