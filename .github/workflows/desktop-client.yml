@@ -61,6 +61,7 @@ jobs:
             dpkg-dev \
             libgtk-3-dev \
             liblzma-dev \
+            libmpv-dev \
             libsecret-1-dev \
             ninja-build \
             pkg-config
@@ -203,7 +204,7 @@ jobs:
           Architecture: amd64
           Maintainer: StreamServer
           Installed-Size: ${installed_size}
-          Depends: libgtk-3-0, libsecret-1-0
+          Depends: libgtk-3-0, libmpv2, libsecret-1-0
           Description: StreamServer desktop client
            Desktop client for StreamServer operations and media playback.
           EOF
