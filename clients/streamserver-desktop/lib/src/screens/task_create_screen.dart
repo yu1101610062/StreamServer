@@ -6,6 +6,64 @@ import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
 
+const _multicastInputKinds = {
+  'udp_mpegts_multicast',
+  'rtp_multicast',
+};
+const _portInputKinds = {
+  'udp_mpegts_multicast',
+  'rtp_multicast',
+  'gb_rtp',
+};
+
+bool taskInputUsesUrl(String kind) =>
+    !_multicastInputKinds.contains(kind) && kind != 'gb_rtp';
+
+bool taskInputUsesGroup(String kind) => _multicastInputKinds.contains(kind);
+
+bool taskInputUsesPort(String kind) => _portInputKinds.contains(kind);
+
+Map<String, Object?> buildTaskInputPayload({
+  required String inputKind,
+  required String sourceMode,
+  required bool loopEnabled,
+  required String url,
+  required String group,
+  required String port,
+  required String interfaceName,
+  required String interfaceIp,
+  required String ttl,
+}) {
+  return cleanTaskPayloadMap({
+    'kind': inputKind,
+    'source_mode': sourceMode,
+    'loop_enabled': loopEnabled,
+    if (taskInputUsesUrl(inputKind)) 'url': url,
+    if (taskInputUsesGroup(inputKind)) 'group': group,
+    if (taskInputUsesPort(inputKind)) 'port': int.tryParse(port.trim()),
+    'interface_name': interfaceName,
+    'interface_ip': interfaceIp,
+    'ttl': int.tryParse(ttl.trim()),
+  });
+}
+
+Map<String, Object?> cleanTaskPayloadMap(Map<String, Object?> map) {
+  final next = <String, Object?>{};
+  for (final entry in map.entries) {
+    final value = entry.value;
+    if (value == null) continue;
+    if (value is String && value.trim().isEmpty) continue;
+    if (value is List && value.isEmpty) continue;
+    if (value is Map<String, Object?>) {
+      final cleaned = cleanTaskPayloadMap(value);
+      if (cleaned.isNotEmpty) next[entry.key] = cleaned;
+      continue;
+    }
+    next[entry.key] = value;
+  }
+  return next;
+}
+
 class TaskCreateScreen extends StatefulWidget {
   const TaskCreateScreen({super.key});
 
@@ -24,6 +82,8 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
   final callbackController = TextEditingController();
   final labelsController = TextEditingController();
   final publishUrlController = TextEditingController();
+  final inputGroupController = TextEditingController();
+  final inputPortController = TextEditingController();
   final publishGroupController = TextEditingController();
   final publishPortController = TextEditingController();
   final interfaceNameController = TextEditingController();
@@ -69,6 +129,8 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
       callbackController,
       labelsController,
       publishUrlController,
+      inputGroupController,
+      inputPortController,
       publishGroupController,
       publishPortController,
       interfaceNameController,
@@ -133,29 +195,83 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
                     ]),
                     const _SectionTitle('输入与处理'),
                     _Grid([
-                      _SelectBox('任务类型', taskType, ['stream_ingest', 'stream_bridge', 'file_transcode'], (value) => setState(() => taskType = value)),
-                      _SelectBox('输入类型', inputKind, ['rtsp', 'rtmp', 'hls', 'http_flv', 'http_ts', 'http_mp4', 'ftp', 'file', 'udp_mpegts_multicast', 'rtp_multicast', 'gb_rtp'], (value) => setState(() => inputKind = value)),
-                      _SelectBox('源模式', sourceMode, ['live', 'vod'], (value) => setState(() => sourceMode = value)),
-                      _SelectBox('处理模式', processMode, ['copy_or_transcode', 'copy', 'transcode'], (value) => setState(() => processMode = value)),
-                      _TextFieldBox('输入 URL / 文件路径', sourceController, width: 520),
-                      _SwitchBox('循环 VOD', loopEnabled, (value) => setState(() => loopEnabled = value)),
+                      _SelectBox(
+                          '任务类型',
+                          taskType,
+                          ['stream_ingest', 'stream_bridge', 'file_transcode'],
+                          (value) => setState(() => taskType = value)),
+                      _SelectBox(
+                          '输入类型',
+                          inputKind,
+                          [
+                            'rtsp',
+                            'rtmp',
+                            'hls',
+                            'http_flv',
+                            'http_ts',
+                            'http_mp4',
+                            'ftp',
+                            'file',
+                            'udp_mpegts_multicast',
+                            'rtp_multicast',
+                            'gb_rtp'
+                          ],
+                          (value) => setState(() => inputKind = value)),
+                      _SelectBox('源模式', sourceMode, ['live', 'vod'],
+                          (value) => setState(() => sourceMode = value)),
+                      _SelectBox(
+                          '处理模式',
+                          processMode,
+                          ['copy_or_transcode', 'copy', 'transcode'],
+                          (value) => setState(() => processMode = value)),
+                      if (taskInputUsesUrl(inputKind))
+                        _TextFieldBox('输入 URL / 文件路径', sourceController,
+                            width: 520),
+                      if (taskInputUsesGroup(inputKind))
+                        _TextFieldBox('输入组播地址', inputGroupController),
+                      if (taskInputUsesPort(inputKind))
+                        _TextFieldBox(
+                            inputKind == 'gb_rtp' ? 'GB RTP 监听端口' : '输入端口',
+                            inputPortController),
+                      _SwitchBox('循环 VOD', loopEnabled,
+                          (value) => setState(() => loopEnabled = value)),
                     ]),
                     const _SectionTitle('内部流与播放协议'),
                     _Grid([
                       _TextFieldBox('App', streamAppController),
                       _TextFieldBox('Stream', streamNameController),
                       _TextFieldBox('Vhost', vhostController),
-                      _SwitchBox('RTSP', enableRtsp, (value) => setState(() => enableRtsp = value)),
-                      _SwitchBox('RTMP', enableRtmp, (value) => setState(() => enableRtmp = value)),
-                      _SwitchBox('HTTP-TS', enableHttpTs, (value) => setState(() => enableHttpTs = value)),
-                      _SwitchBox('HTTP-FMP4', enableHttpFmp4, (value) => setState(() => enableHttpFmp4 = value)),
-                      _SwitchBox('HLS', enableHls, (value) => setState(() => enableHls = value)),
+                      _SwitchBox('RTSP', enableRtsp,
+                          (value) => setState(() => enableRtsp = value)),
+                      _SwitchBox('RTMP', enableRtmp,
+                          (value) => setState(() => enableRtmp = value)),
+                      _SwitchBox('HTTP-TS', enableHttpTs,
+                          (value) => setState(() => enableHttpTs = value)),
+                      _SwitchBox('HTTP-FMP4', enableHttpFmp4,
+                          (value) => setState(() => enableHttpFmp4 = value)),
+                      _SwitchBox('HLS', enableHls,
+                          (value) => setState(() => enableHls = value)),
                     ]),
                     const _SectionTitle('发布与网络'),
                     _Grid([
-                      _SelectBox('发布类型', publishKind, ['', 'file', 'udp_mpegts_multicast', 'rtp_multicast', 'rtmp_push'], (value) => setState(() => publishKind = value)),
-                      _SelectBox('文件格式', publishFormat, ['', 'mp4', 'hls', 'mpegts', 'flv'], (value) => setState(() => publishFormat = value)),
-                      _TextFieldBox('发布 URL / 文件路径', publishUrlController, width: 420),
+                      _SelectBox(
+                          '发布类型',
+                          publishKind,
+                          [
+                            '',
+                            'file',
+                            'udp_mpegts_multicast',
+                            'rtp_multicast',
+                            'rtmp_push'
+                          ],
+                          (value) => setState(() => publishKind = value)),
+                      _SelectBox(
+                          '文件格式',
+                          publishFormat,
+                          ['', 'mp4', 'hls', 'mpegts', 'flv'],
+                          (value) => setState(() => publishFormat = value)),
+                      _TextFieldBox('发布 URL / 文件路径', publishUrlController,
+                          width: 420),
                       _TextFieldBox('组播地址', publishGroupController),
                       _TextFieldBox('端口', publishPortController),
                       _TextFieldBox('网卡名', interfaceNameController),
@@ -164,16 +280,25 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
                     ]),
                     const _SectionTitle('录制、恢复与调度'),
                     _Grid([
-                      _SwitchBox('启用录制', recordEnabled, (value) => setState(() => recordEnabled = value)),
-                      _SelectBox('录制格式', recordFormat, ['mp4', 'hls', 'both'], (value) => setState(() => recordFormat = value)),
+                      _SwitchBox('启用录制', recordEnabled,
+                          (value) => setState(() => recordEnabled = value)),
+                      _SelectBox('录制格式', recordFormat, ['mp4', 'hls', 'both'],
+                          (value) => setState(() => recordFormat = value)),
                       _TextFieldBox('录制时长秒', durationController),
                       _TextFieldBox('分段秒', segmentController),
-                      _SwitchBox('按播放器模式录制', recordAsPlayer, (value) => setState(() => recordAsPlayer = value)),
-                      _SelectBox('恢复策略', recoveryPolicy, ['auto', 'none'], (value) => setState(() => recoveryPolicy = value)),
-                      _SelectBox('启动模式', startMode, ['immediate', 'manual', 'at', 'cron'], (value) => setState(() => startMode = value)),
+                      _SwitchBox('按播放器模式录制', recordAsPlayer,
+                          (value) => setState(() => recordAsPlayer = value)),
+                      _SelectBox('恢复策略', recoveryPolicy, ['auto', 'none'],
+                          (value) => setState(() => recoveryPolicy = value)),
+                      _SelectBox(
+                          '启动模式',
+                          startMode,
+                          ['immediate', 'manual', 'at', 'cron'],
+                          (value) => setState(() => startMode = value)),
                       _TextFieldBox('启动时间 RFC3339', startAtController),
                       _TextFieldBox('Cron', cronController),
-                      _TextFieldBox('节点标签要求，逗号分隔', requiredLabelsController, width: 420),
+                      _TextFieldBox('节点标签要求，逗号分隔', requiredLabelsController,
+                          width: 420),
                     ]),
                   ],
                 ),
@@ -241,8 +366,12 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
     if (scenario == 'expert') {
       return (jsonDecode(expertController.text) as Map).cast<String, Object?>();
     }
-    final name = nameController.text.trim().isEmpty ? 'desktop-${DateTime.now().millisecondsSinceEpoch}' : nameController.text.trim();
-    final streamName = streamNameController.text.trim().isEmpty ? name : streamNameController.text.trim();
+    final name = nameController.text.trim().isEmpty
+        ? 'desktop-${DateTime.now().millisecondsSinceEpoch}'
+        : nameController.text.trim();
+    final streamName = streamNameController.text.trim().isEmpty
+        ? name
+        : streamNameController.text.trim();
     final payload = <String, Object?>{
       'name': name,
       'type': taskType,
@@ -252,27 +381,34 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
         'callback_url': callbackController.text,
         'labels': _csv(labelsController.text),
       }),
-      'input': _clean({
-        'kind': inputKind,
-        'source_mode': sourceMode,
-        'loop_enabled': loopEnabled,
-        'url': sourceController.text,
-        'interface_name': interfaceNameController.text,
-        'interface_ip': interfaceIpController.text,
-        'ttl': int.tryParse(ttlController.text),
-      }),
+      'input': buildTaskInputPayload(
+        inputKind: inputKind,
+        sourceMode: sourceMode,
+        loopEnabled: loopEnabled,
+        url: sourceController.text,
+        group: inputGroupController.text,
+        port: inputPortController.text,
+        interfaceName: interfaceNameController.text,
+        interfaceIp: interfaceIpController.text,
+        ttl: ttlController.text,
+      ),
       'process': _clean({'mode': processMode}),
       'schedule': _clean({
         'start_mode': startMode,
         'start_at': startAtController.text,
         'cron': cronController.text,
       }),
-      'resource': _clean({'required_labels': _csv(requiredLabelsController.text)}),
+      'resource':
+          _clean({'required_labels': _csv(requiredLabelsController.text)}),
       'recovery': _clean({'policy': recoveryPolicy}),
     };
 
     if (taskType == 'stream_ingest') {
-      payload['stream'] = _clean({'app': streamAppController.text, 'name': streamName, 'vhost': vhostController.text});
+      payload['stream'] = _clean({
+        'app': streamAppController.text,
+        'name': streamName,
+        'vhost': vhostController.text
+      });
       payload['expose'] = {
         'enable_rtsp': enableRtsp,
         'enable_rtmp': enableRtmp,
@@ -304,43 +440,39 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
   }
 
   Map<String, Object?> _clean(Map<String, Object?> map) {
-    final next = <String, Object?>{};
-    for (final entry in map.entries) {
-      final value = entry.value;
-      if (value == null) continue;
-      if (value is String && value.trim().isEmpty) continue;
-      if (value is List && value.isEmpty) continue;
-      if (value is Map<String, Object?>) {
-        final cleaned = _clean(value);
-        if (cleaned.isNotEmpty) next[entry.key] = cleaned;
-        continue;
-      }
-      next[entry.key] = value;
-    }
-    return next;
+    return cleanTaskPayloadMap(map);
   }
 
-  List<String> _csv(String value) => value.split(',').map((item) => item.trim()).where((item) => item.isNotEmpty).toList();
+  List<String> _csv(String value) => value
+      .split(',')
+      .map((item) => item.trim())
+      .where((item) => item.isNotEmpty)
+      .toList();
 
   Future<void> _preview(AppController controller) async {
-    final payload = await controller.api('POST', '/api/v1/tasks/preview', body: _payload());
+    final payload =
+        await controller.api('POST', '/api/v1/tasks/preview', body: _payload());
     setState(() => result = prettyJson(payload));
   }
 
   Future<void> _create(AppController controller) async {
-    final payload = await controller.api('POST', '/api/v1/tasks', body: _payload());
+    final payload =
+        await controller.api('POST', '/api/v1/tasks', body: _payload());
     setState(() => result = prettyJson(payload));
   }
 
-  Future<void> _run(BuildContext context, Future<void> Function() action) async {
+  Future<void> _run(
+      BuildContext context, Future<void> Function() action) async {
     try {
       await action();
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('操作完成')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(const SnackBar(content: Text('操作完成')));
       }
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString())));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text(error.toString())));
       }
     }
   }
@@ -355,7 +487,8 @@ class _SectionTitle extends StatelessWidget {
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(top: 16, bottom: 8),
-      child: Text(text, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+      child: Text(text,
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
     );
   }
 }
@@ -380,7 +513,11 @@ class _TextFieldBox extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(width: width, child: TextField(controller: controller, decoration: InputDecoration(labelText: label)));
+    return SizedBox(
+        width: width,
+        child: TextField(
+            controller: controller,
+            decoration: InputDecoration(labelText: label)));
   }
 }
 
@@ -399,7 +536,10 @@ class _SelectBox extends StatelessWidget {
       child: DropdownButtonFormField<String>(
         initialValue: options.contains(value) ? value : options.first,
         decoration: InputDecoration(labelText: label),
-        items: options.map((item) => DropdownMenuItem(value: item, child: Text(item.isEmpty ? '不设置' : item))).toList(),
+        items: options
+            .map((item) => DropdownMenuItem(
+                value: item, child: Text(item.isEmpty ? '不设置' : item)))
+            .toList(),
         onChanged: (value) {
           if (value != null) onChanged(value);
         },

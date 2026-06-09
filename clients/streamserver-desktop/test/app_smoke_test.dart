@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:streamserver_desktop/src/screens/screen_helpers.dart';
+import 'package:streamserver_desktop/src/screens/task_create_screen.dart';
 import 'package:streamserver_desktop/src/utils.dart';
 import 'package:streamserver_desktop/src/widgets/embedded_player_panel.dart';
 
@@ -56,5 +57,62 @@ void main() {
       )),
       isTrue,
     );
+  });
+
+  test('task input payload includes multicast address fields', () {
+    final payload = buildTaskInputPayload(
+      inputKind: 'udp_mpegts_multicast',
+      sourceMode: 'live',
+      loopEnabled: false,
+      url: 'udp://239.0.0.1:5000',
+      group: '239.0.0.1',
+      port: '5000',
+      interfaceName: 'en0',
+      interfaceIp: '',
+      ttl: '16',
+    );
+
+    expect(payload['group'], '239.0.0.1');
+    expect(payload['port'], 5000);
+    expect(payload['interface_name'], 'en0');
+    expect(payload['ttl'], 16);
+    expect(payload.containsKey('url'), isFalse);
+  });
+
+  test('task input payload includes gb rtp port without group', () {
+    final payload = buildTaskInputPayload(
+      inputKind: 'gb_rtp',
+      sourceMode: 'live',
+      loopEnabled: false,
+      url: 'rtp://127.0.0.1:15060',
+      group: '239.0.0.1',
+      port: '15060',
+      interfaceName: '',
+      interfaceIp: '',
+      ttl: '',
+    );
+
+    expect(payload['port'], 15060);
+    expect(payload.containsKey('group'), isFalse);
+    expect(payload.containsKey('url'), isFalse);
+  });
+
+  test('task input payload keeps url inputs separate from multicast fields',
+      () {
+    final payload = buildTaskInputPayload(
+      inputKind: 'rtsp',
+      sourceMode: 'live',
+      loopEnabled: false,
+      url: 'rtsp://example/live/stream',
+      group: '239.0.0.1',
+      port: '5000',
+      interfaceName: '',
+      interfaceIp: '',
+      ttl: '',
+    );
+
+    expect(payload['url'], 'rtsp://example/live/stream');
+    expect(payload.containsKey('group'), isFalse);
+    expect(payload.containsKey('port'), isFalse);
   });
 }
