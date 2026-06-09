@@ -75,6 +75,7 @@ Web Console / Desktop Client / External API
 | Native bundle | Linux AMD64 native 离线包，目标机无 Docker 运行时依赖 | 已实现 |
 | systemd install | `install.sh`、`uninstall.sh`、service unit 和 `streamserverctl` | 已实现 |
 | Web console | Vue/Vite 管理台 | 已实现 |
+| Desktop client | Flutter Desktop + Rust native module 客户端 | v1 开发中 |
 | GPU runtime package | GPU FFmpeg runtime 包变体和能力基础 | 已实现 |
 | GPU scheduling closure | GPU 调度闭环、容量模型和生产策略仍需增强 | 增强中 |
 | Production hardening | 安全、可观测性、升级回滚和现场运维继续增强 | 增强中 |
@@ -170,6 +171,17 @@ cd crates/media-core/frontend
 npm install
 npm run dev
 ```
+
+桌面客户端开发：
+
+```bash
+cd clients/streamserver-desktop
+./scripts/build_native.sh
+./scripts/bootstrap_flutter_platforms.sh
+flutter run -d macos
+```
+
+桌面客户端说明见 [StreamServer Desktop Client](clients/streamserver-desktop/README.md)。
 
 ### 测试与质量
 

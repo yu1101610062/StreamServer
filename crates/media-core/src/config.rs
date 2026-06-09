@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 
@@ -126,14 +128,16 @@ impl Default for CoreSettings {
 
 impl Settings {
     pub fn load() -> anyhow::Result<Self> {
-        let environment =
-            std::env::var("STREAMSERVER_ENV").unwrap_or_else(|_| "development".into());
+        let environment = match std::env::var("STREAMSERVER_ENV") {
+            Ok(value) => value,
+            Err(_) => "development".into(),
+        };
         let builder = config::Config::builder()
             .add_source(config::File::with_name("config/base").required(false))
             .add_source(config::File::with_name(&format!("config/{environment}")).required(false));
 
         let mut file_settings = builder.build()?.try_deserialize::<FileSettings>()?;
-        apply_env_overrides(&mut file_settings);
+        apply_env_overrides(&mut file_settings)?;
 
         let settings = Self {
             environment,
@@ -221,7 +225,9 @@ impl Settings {
     }
 }
 
-fn apply_env_overrides(settings: &mut FileSettings) {
+fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
+    // 环境变量覆盖只做单字段解析；TLS、鉴权和回调退避的组合约束
+    // 继续集中在 validate() 中处理，避免覆盖阶段提前耦合业务规则。
     if let Some(value) = env("CORE_HTTP_ADDR") {
         settings.core.http_addr = value;
     }
@@ -245,7 +251,7 @@ fn apply_env_overrides(settings: &mut FileSettings) {
             "disabled" => AuthMode::Disabled,
             "external_jwt" => AuthMode::ExternalJwt,
             "local_password" => AuthMode::LocalPassword,
-            other => panic!("unsupported AUTH_MODE: {other}"),
+            other => anyhow::bail!("unsupported AUTH_MODE: {other}"),
         };
     } else if let Some(value) = env("AUTH_ENABLED") {
         settings.core.auth_mode = if matches!(value.as_str(), "1" | "true" | "TRUE" | "yes") {
@@ -279,30 +285,24 @@ fn apply_env_overrides(settings: &mut FileSettings) {
         settings.core.zlm_auto_close_on_no_reader_enabled =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
+    // 回调重试参数直接影响后台任务调度，非法值必须变成启动期配置错误。
     if let Some(value) = env("CALLBACK_TIMEOUT_MS") {
-        settings.core.callback_timeout_ms = value
-            .parse()
-            .expect("CALLBACK_TIMEOUT_MS must be an integer");
+        settings.core.callback_timeout_ms = parse_required_env("CALLBACK_TIMEOUT_MS", &value)?;
     }
     if let Some(value) = env("CALLBACK_MAX_ATTEMPTS") {
-        settings.core.callback_max_attempts = value
-            .parse()
-            .expect("CALLBACK_MAX_ATTEMPTS must be an integer");
+        settings.core.callback_max_attempts = parse_required_env("CALLBACK_MAX_ATTEMPTS", &value)?;
     }
     if let Some(value) = env("CALLBACK_INITIAL_BACKOFF_MS") {
-        settings.core.callback_initial_backoff_ms = value
-            .parse()
-            .expect("CALLBACK_INITIAL_BACKOFF_MS must be an integer");
+        settings.core.callback_initial_backoff_ms =
+            parse_required_env("CALLBACK_INITIAL_BACKOFF_MS", &value)?;
     }
     if let Some(value) = env("CALLBACK_MAX_BACKOFF_MS") {
-        settings.core.callback_max_backoff_ms = value
-            .parse()
-            .expect("CALLBACK_MAX_BACKOFF_MS must be an integer");
+        settings.core.callback_max_backoff_ms =
+            parse_required_env("CALLBACK_MAX_BACKOFF_MS", &value)?;
     }
     if let Some(value) = env("CALLBACK_SETTLE_DELAY_MS") {
-        settings.core.callback_settle_delay_ms = value
-            .parse()
-            .expect("CALLBACK_SETTLE_DELAY_MS must be an integer");
+        settings.core.callback_settle_delay_ms =
+            parse_required_env("CALLBACK_SETTLE_DELAY_MS", &value)?;
     }
     if let Some(value) = env("CALLBACK_SHARED_SECRET") {
         settings.core.callback_shared_secret = value;
@@ -316,13 +316,24 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("LOG_JSON") {
         settings.logging.json = matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
+    Ok(())
 }
 
 fn env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        }
+        Err(_) => None,
+    }
+}
+
+fn parse_required_env<T>(name: &str, value: &str) -> anyhow::Result<T>
+where
+    T: FromStr,
+{
+    T::from_str(value).map_err(|_| anyhow::anyhow!("{name} must be an integer"))
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -396,9 +407,7 @@ pub fn parse_duration_spec(value: &str) -> anyhow::Result<Duration> {
     anyhow::ensure!(trimmed.len() >= 2, "duration is too short");
 
     let (number, unit) = trimmed.split_at(trimmed.len() - 1);
-    let amount: i64 = number
-        .trim()
-        .parse()
+    let amount = i64::from_str(number.trim())
         .map_err(|_| anyhow::anyhow!("duration amount must be an integer"))?;
     anyhow::ensure!(amount > 0, "duration amount must be positive");
 

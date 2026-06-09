@@ -2190,72 +2190,116 @@ fn format_kib(value: &str) -> String {
     }
 }
 
+// 配置页展示用说明表，只描述安装器生成的 native .env 字段含义；
+// 实际校验逻辑仍由端口检查、实例校验和保存流程负责。
+const ENV_COMMENTS: &[(&str, &str)] = &[
+    ("DEPLOY_MODE", "部署模式，固定为 native，由 systemd 管理。"),
+    (
+        "INSTALL_ROLE",
+        "这台机器的部署角色，由安装器选择，配置模块只展示。",
+    ),
+    ("INSTANCE_NAME", "native 实例名，用于生成 systemd 服务名。"),
+    ("SYSTEMD_TARGET", "native 聚合 target。"),
+    ("SYSTEMD_CORE_UNIT", "native media-core systemd 服务名。"),
+    ("SYSTEMD_AGENT_UNIT", "native media-agent systemd 服务名。"),
+    ("SYSTEMD_ZLM_UNIT", "native ZLMediaKit systemd 服务名。"),
+    (
+        "SYSTEMD_POSTGRES_UNIT",
+        "native PostgreSQL systemd 服务名。",
+    ),
+    ("POSTGRES_DB", "PostgreSQL 数据库名。"),
+    ("POSTGRES_USER", "PostgreSQL 用户名。"),
+    ("POSTGRES_PORT", "数据库宿主机端口。"),
+    ("CORE_HTTP_HOST", "工作节点访问控制面的 HTTP 地址。"),
+    ("CORE_HTTP_PORT", "控制面板网页和 HTTP API 端口。"),
+    ("CORE_GRPC_HOST", "工作节点访问控制面的内部通信地址。"),
+    ("CORE_GRPC_PORT", "控制面板内部通信端口。"),
+    (
+        "AUTH_MODE",
+        "控制台鉴权模式，可选 disabled/local_password。",
+    ),
+    ("AUTH_ENABLED", "是否启用鉴权。"),
+    ("NODE_ID", "工作节点唯一 ID，已上线后不要随意修改。"),
+    ("AGENT_NODE_NAME", "控制台展示的节点名称。"),
+    ("PUBLIC_HOST", "客户端播放地址使用的宿主机 IP 或域名。"),
+    ("ZLM_API_HOST", "工作节点访问本机流媒体服务接口的地址。"),
+    ("AGENT_HTTP_PORT", "工作节点本地接口端口。"),
+    ("ZLM_HTTP_PORT", "流媒体 HTTP 播放和接口端口。"),
+    ("ZLM_HTTPS_PORT", "流媒体 HTTPS 端口，0 表示关闭。"),
+    ("ZLM_RTMP_PORT", "RTMP 播放/推流端口。"),
+    ("ZLM_RTMPS_PORT", "RTMPS 端口，0 表示关闭。"),
+    ("ZLM_RTSP_PORT", "RTSP 播放端口。"),
+    ("ZLM_RTSPS_PORT", "RTSPS 端口，0 表示关闭。"),
+    ("ZLM_RTP_PROXY_PORT", "RTP 接收固定端口，0 表示关闭。"),
+    (
+        "ZLM_RTP_PROXY_PORT_RANGE",
+        "RTP 接收端口范围，格式 start-end；0-0 表示关闭。",
+    ),
+    ("ZLM_RTC_SIGNALING_PORT", "WebRTC 信令端口，0 表示关闭。"),
+    (
+        "ZLM_RTC_SIGNALING_SSL_PORT",
+        "WebRTC 加密信令端口，0 表示关闭。",
+    ),
+    ("ZLM_RTC_ICE_PORT", "STUN/TURN UDP 端口，0 表示关闭。"),
+    ("ZLM_RTC_ICE_TCP_PORT", "STUN/TURN TCP 端口，0 表示关闭。"),
+    ("ZLM_RTC_PORT", "WebRTC UDP 媒体端口，0 表示关闭。"),
+    ("ZLM_RTC_TCP_PORT", "WebRTC TCP 媒体端口，0 表示关闭。"),
+    (
+        "ZLM_RTC_PORT_RANGE",
+        "WebRTC 媒体端口范围，格式 start-end；0-0 表示关闭。",
+    ),
+    ("ZLM_SRT_PORT", "SRT 端口，0 表示关闭。"),
+    ("ZLM_SHELL_PORT", "流媒体调试 Shell 端口，0 表示关闭。"),
+    ("ZLM_ONVIF_PORT", "ONVIF 端口，0 表示关闭。"),
+    ("AGENT_PRIMARY_INTERFACE_NAME", "主网卡名称。"),
+    ("AGENT_PRIMARY_INTERFACE_IP", "主网卡 IP。"),
+    ("AGENT_MULTICAST_INTERFACE_NAME", "组播/副网卡名称。"),
+    ("AGENT_MULTICAST_INTERFACE_IP", "组播/副网卡 IP。"),
+    ("AGENT_NETWORK_MODE", "固定为 host，直接使用宿主机网络。"),
+    (
+        "AGENT_ACCELERATION_MODE",
+        "节点算力模式，由安装角色决定，配置模块只展示。",
+    ),
+    (
+        "AGENT_LABELS",
+        "节点标签，固定包含算力标签 cpu/gpu，额外标签用英文逗号分隔。",
+    ),
+    (
+        "AGENT_MAX_RUNTIME_SLOTS",
+        "最大同时任务数，0 表示自动估算。",
+    ),
+    (
+        "ZLM_WWW_MOUNT_HOST_DIR",
+        "服务挂载源宿主机目录，用于在线播放临时文件，建议本机磁盘。",
+    ),
+    (
+        "ZLM_OUTPUT_MOUNT_HOST_DIR",
+        "服务挂载源宿主机目录，用于录制和转码产物，可挂载网络存储。",
+    ),
+    (
+        "AGENT_HLS_RECORD_SEGMENT_SEC",
+        "录制 HLS 默认分片秒数，可选 30/60。",
+    ),
+    ("AGENT_ARTIFACT_CLEANUP_ENABLED", "是否启用产物盘空间保护。"),
+    (
+        "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT",
+        "产物盘使用率达到该百分比后触发保护。",
+    ),
+    (
+        "AGENT_ARTIFACT_CLEANUP_STRATEGY",
+        "产物盘保护策略，可选 delete_oldest_then_reject/reject_only。",
+    ),
+    (
+        "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC",
+        "产物盘空间检查间隔秒数。",
+    ),
+    ("WORK_ROOT", "工作节点工作目录。"),
+];
+
 fn env_comment(key: &str) -> Option<&'static str> {
-    match key {
-        "DEPLOY_MODE" => Some("部署模式，固定为 native，由 systemd 管理。"),
-        "INSTALL_ROLE" => Some("这台机器的部署角色，由安装器选择，配置模块只展示。"),
-        "INSTANCE_NAME" => Some("native 实例名，用于生成 systemd 服务名。"),
-        "SYSTEMD_TARGET" => Some("native 聚合 target。"),
-        "SYSTEMD_CORE_UNIT" => Some("native media-core systemd 服务名。"),
-        "SYSTEMD_AGENT_UNIT" => Some("native media-agent systemd 服务名。"),
-        "SYSTEMD_ZLM_UNIT" => Some("native ZLMediaKit systemd 服务名。"),
-        "SYSTEMD_POSTGRES_UNIT" => Some("native PostgreSQL systemd 服务名。"),
-        "POSTGRES_DB" => Some("PostgreSQL 数据库名。"),
-        "POSTGRES_USER" => Some("PostgreSQL 用户名。"),
-        "POSTGRES_PORT" => Some("数据库宿主机端口。"),
-        "CORE_HTTP_HOST" => Some("工作节点访问控制面的 HTTP 地址。"),
-        "CORE_HTTP_PORT" => Some("控制面板网页和 HTTP API 端口。"),
-        "CORE_GRPC_HOST" => Some("工作节点访问控制面的内部通信地址。"),
-        "CORE_GRPC_PORT" => Some("控制面板内部通信端口。"),
-        "AUTH_MODE" => Some("控制台鉴权模式，可选 disabled/local_password。"),
-        "AUTH_ENABLED" => Some("是否启用鉴权。"),
-        "NODE_ID" => Some("工作节点唯一 ID，已上线后不要随意修改。"),
-        "AGENT_NODE_NAME" => Some("控制台展示的节点名称。"),
-        "PUBLIC_HOST" => Some("客户端播放地址使用的宿主机 IP 或域名。"),
-        "ZLM_API_HOST" => Some("工作节点访问本机流媒体服务接口的地址。"),
-        "AGENT_HTTP_PORT" => Some("工作节点本地接口端口。"),
-        "ZLM_HTTP_PORT" => Some("流媒体 HTTP 播放和接口端口。"),
-        "ZLM_HTTPS_PORT" => Some("流媒体 HTTPS 端口，0 表示关闭。"),
-        "ZLM_RTMP_PORT" => Some("RTMP 播放/推流端口。"),
-        "ZLM_RTMPS_PORT" => Some("RTMPS 端口，0 表示关闭。"),
-        "ZLM_RTSP_PORT" => Some("RTSP 播放端口。"),
-        "ZLM_RTSPS_PORT" => Some("RTSPS 端口，0 表示关闭。"),
-        "ZLM_RTP_PROXY_PORT" => Some("RTP 接收固定端口，0 表示关闭。"),
-        "ZLM_RTP_PROXY_PORT_RANGE" => Some("RTP 接收端口范围，格式 start-end；0-0 表示关闭。"),
-        "ZLM_RTC_SIGNALING_PORT" => Some("WebRTC 信令端口，0 表示关闭。"),
-        "ZLM_RTC_SIGNALING_SSL_PORT" => Some("WebRTC 加密信令端口，0 表示关闭。"),
-        "ZLM_RTC_ICE_PORT" => Some("STUN/TURN UDP 端口，0 表示关闭。"),
-        "ZLM_RTC_ICE_TCP_PORT" => Some("STUN/TURN TCP 端口，0 表示关闭。"),
-        "ZLM_RTC_PORT" => Some("WebRTC UDP 媒体端口，0 表示关闭。"),
-        "ZLM_RTC_TCP_PORT" => Some("WebRTC TCP 媒体端口，0 表示关闭。"),
-        "ZLM_RTC_PORT_RANGE" => Some("WebRTC 媒体端口范围，格式 start-end；0-0 表示关闭。"),
-        "ZLM_SRT_PORT" => Some("SRT 端口，0 表示关闭。"),
-        "ZLM_SHELL_PORT" => Some("流媒体调试 Shell 端口，0 表示关闭。"),
-        "ZLM_ONVIF_PORT" => Some("ONVIF 端口，0 表示关闭。"),
-        "AGENT_PRIMARY_INTERFACE_NAME" => Some("主网卡名称。"),
-        "AGENT_PRIMARY_INTERFACE_IP" => Some("主网卡 IP。"),
-        "AGENT_MULTICAST_INTERFACE_NAME" => Some("组播/副网卡名称。"),
-        "AGENT_MULTICAST_INTERFACE_IP" => Some("组播/副网卡 IP。"),
-        "AGENT_NETWORK_MODE" => Some("固定为 host，直接使用宿主机网络。"),
-        "AGENT_ACCELERATION_MODE" => Some("节点算力模式，由安装角色决定，配置模块只展示。"),
-        "AGENT_LABELS" => Some("节点标签，固定包含算力标签 cpu/gpu，额外标签用英文逗号分隔。"),
-        "AGENT_MAX_RUNTIME_SLOTS" => Some("最大同时任务数，0 表示自动估算。"),
-        "ZLM_WWW_MOUNT_HOST_DIR" => {
-            Some("服务挂载源宿主机目录，用于在线播放临时文件，建议本机磁盘。")
-        }
-        "ZLM_OUTPUT_MOUNT_HOST_DIR" => {
-            Some("服务挂载源宿主机目录，用于录制和转码产物，可挂载网络存储。")
-        }
-        "AGENT_HLS_RECORD_SEGMENT_SEC" => Some("录制 HLS 默认分片秒数，可选 30/60。"),
-        "AGENT_ARTIFACT_CLEANUP_ENABLED" => Some("是否启用产物盘空间保护。"),
-        "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" => Some("产物盘使用率达到该百分比后触发保护。"),
-        "AGENT_ARTIFACT_CLEANUP_STRATEGY" => {
-            Some("产物盘保护策略，可选 delete_oldest_then_reject/reject_only。")
-        }
-        "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" => Some("产物盘空间检查间隔秒数。"),
-        "WORK_ROOT" => Some("工作节点工作目录。"),
-        _ => None,
-    }
+    ENV_COMMENTS
+        .iter()
+        .find_map(|(entry_key, comment)| (*entry_key == key).then_some(*comment))
 }
 
 #[cfg(test)]

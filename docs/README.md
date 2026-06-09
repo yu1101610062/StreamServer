@@ -42,6 +42,7 @@ StreamServer 文档分为三层：
 | [Web 管理台规格](./zh/15-frontend-console.md) | 页面、字段、状态和前端交互 |
 | [环境与依赖基线](./zh/16-environment-and-dependencies.md) | 本地开发、运行依赖和版本策略 |
 | [部署架构图](./zh/17-deployment-diagrams.md) | 多视角部署图和网络路径 |
+| [桌面客户端](../clients/streamserver-desktop/README.md) | Flutter Desktop + Rust native module 客户端工程 |
 
 ### 专项优化报告
 

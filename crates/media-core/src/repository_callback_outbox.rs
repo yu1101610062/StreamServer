@@ -19,6 +19,8 @@ impl TaskRepository {
         limit: u32,
     ) -> Result<Vec<CallbackOutboxJob>, RepoError> {
         let limit = limit.clamp(1, 100);
+        // outbox worker 只领取到期任务，按 deliver_after/created_at 保持近似 FIFO；
+        // limit 上限防止一次调度占用数据库连接太久。
         Ok(sqlx::query(
             r#"
             select
@@ -54,6 +56,8 @@ impl TaskRepository {
         now: DateTime<Utc>,
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
+        // 成功投递只更新 outbox，不再写 task event；任务完成事件已经在入队时记录，
+        // 这里保留 HTTP 响应用于排障即可。
         sqlx::query(
             r#"
             update task_callback_outbox
@@ -87,6 +91,8 @@ impl TaskRepository {
         now: DateTime<Utc>,
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
+        // 重试调度和事件写入在同一事务中完成，保证 UI 能同时看到 retrying 状态
+        // 和下一次投递时间。
         sqlx::query(
             r#"
             update task_callback_outbox
@@ -141,6 +147,8 @@ impl TaskRepository {
     ) -> Result<(), RepoError> {
         let last_error = last_error.into();
         let mut tx = self.pool.begin().await?;
+        // 达到最大重试次数或不可恢复错误时进入 dead letter，并把最后一次失败
+        // 作为 Core 事件写回任务时间线。
         sqlx::query(
             r#"
             update task_callback_outbox
@@ -188,6 +196,8 @@ impl TaskRepository {
         task_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<DateTime<Utc>, RepoError> {
+        // 终态回调需要等产物 hook 有机会先入库；没有产物预期的任务只等待
+        // 较短 settle delay，减少回调延迟。
         let delay = if self.task_expects_artifacts(tx, task_id).await?
             && !self.task_already_has_artifacts(tx, task_id).await?
         {
@@ -328,6 +338,7 @@ impl TaskRepository {
         reason: &str,
         deliver_after: DateTime<Utc>,
     ) -> Result<PgQueryResult, RepoError> {
+        // 数据库唯一约束负责最终去重；调用方仍先查一遍，减少无效 insert 和事件噪音。
         sqlx::query(
             r#"
             insert into task_callback_outbox (

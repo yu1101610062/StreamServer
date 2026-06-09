@@ -111,6 +111,8 @@ pub(super) fn build_resolved_task_json(
 }
 
 pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
+    // overlay 只保留用户请求中显式出现的字段；默认值由 build_resolved_task_json
+    // 与 TaskSpec::resolved() 统一补齐，避免把空值误持久化成用户选择。
     let mut overlay = serde_json::Map::new();
     overlay.insert(
         "type".to_string(),
@@ -119,6 +121,33 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
     overlay.insert("name".to_string(), Value::String(spec.name.clone()));
     overlay.insert("priority".to_string(), json!(spec.priority));
 
+    insert_overlay_section(&mut overlay, "common", common_overlay(spec));
+    insert_overlay_section(&mut overlay, "input", input_overlay(spec));
+    insert_overlay_section(&mut overlay, "process", process_overlay(spec));
+    insert_overlay_section(&mut overlay, "stream", stream_overlay(spec));
+    insert_overlay_section(&mut overlay, "expose", expose_overlay(spec));
+    insert_overlay_section(&mut overlay, "publish", publish_overlay(spec));
+    insert_overlay_section(&mut overlay, "record", record_overlay(spec));
+    insert_overlay_section(&mut overlay, "recovery", recovery_overlay(spec));
+    insert_overlay_section(&mut overlay, "schedule", schedule_overlay(spec));
+    insert_overlay_section(&mut overlay, "resource", resource_overlay(spec));
+
+    Value::Object(overlay)
+}
+
+fn insert_overlay_section(
+    overlay: &mut serde_json::Map<String, Value>,
+    key: &str,
+    section: Option<Value>,
+) {
+    if let Some(section) = section {
+        overlay.insert(key.to_string(), section);
+    }
+}
+
+fn common_overlay(spec: &TaskSpec) -> Option<Value> {
+    // common 字段承担审计和回调归属，空字符串不进入 overlay，
+    // 后续 validate() 会决定 created_by 是否必须存在。
     let mut common = serde_json::Map::new();
     if let Some(created_by) = spec
         .common
@@ -145,11 +174,11 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
     if !spec.common.labels.is_empty() {
         common.insert("labels".to_string(), json!(spec.common.labels));
     }
-    if !common.is_empty() {
-        overlay.insert("common".to_string(), Value::Object(common));
-    }
+    (!common.is_empty()).then_some(Value::Object(common))
+}
 
-    let input = overlay_optional_fields(&[
+fn input_overlay(spec: &TaskSpec) -> Option<Value> {
+    overlay_optional_fields(&[
         ("kind", spec.input.kind.map(|value| json!(value))),
         (
             "source_mode",
@@ -185,34 +214,31 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
         ),
         ("tcp_mode", spec.input.tcp_mode.map(|value| json!(value))),
         ("ssrc", spec.input.ssrc.map(|value| json!(value))),
-    ]);
-    if let Some(input) = input {
-        overlay.insert("input".to_string(), input);
-    }
+    ])
+}
 
-    let process = overlay_optional_fields(&[
+fn process_overlay(spec: &TaskSpec) -> Option<Value> {
+    overlay_optional_fields(&[
         ("mode", spec.process.mode.as_ref().map(|value| json!(value))),
         ("bitrate", spec.process.bitrate.map(|value| json!(value))),
         ("fps", spec.process.fps.map(|value| json!(value))),
         ("gop", spec.process.gop.map(|value| json!(value))),
-    ]);
-    if let Some(process) = process {
-        overlay.insert("process".to_string(), process);
-    }
+    ])
+}
 
-    let stream = overlay_optional_fields(&[
+fn stream_overlay(spec: &TaskSpec) -> Option<Value> {
+    overlay_optional_fields(&[
         ("app", spec.stream.app.as_ref().map(|value| json!(value))),
         ("name", spec.stream.name.as_ref().map(|value| json!(value))),
         (
             "vhost",
             spec.stream.vhost.as_ref().map(|value| json!(value)),
         ),
-    ]);
-    if let Some(stream) = stream {
-        overlay.insert("stream".to_string(), stream);
-    }
+    ])
+}
 
-    let expose = overlay_optional_fields(&[
+fn expose_overlay(spec: &TaskSpec) -> Option<Value> {
+    overlay_optional_fields(&[
         (
             "enable_rtsp",
             spec.expose.enable_rtsp.map(|value| json!(value)),
@@ -237,12 +263,13 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
             "stop_on_no_reader",
             spec.expose.stop_on_no_reader.map(|value| json!(value)),
         ),
-    ]);
-    if let Some(expose) = expose {
-        overlay.insert("expose".to_string(), expose);
-    }
+    ])
+}
 
-    let publish = overlay_optional_fields(&[
+fn publish_overlay(spec: &TaskSpec) -> Option<Value> {
+    // publish 字段在 stream_bridge 和 file_transcode 中含义不同；
+    // 这里只保存原始选择，不在组装阶段做跨任务类型判断。
+    overlay_optional_fields(&[
         ("kind", spec.publish.kind.map(|value| json!(value))),
         ("url", spec.publish.url.as_ref().map(|value| json!(value))),
         (
@@ -277,12 +304,11 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
             "format",
             spec.publish.format.as_ref().map(|value| json!(value)),
         ),
-    ]);
-    if let Some(publish) = publish {
-        overlay.insert("publish".to_string(), publish);
-    }
+    ])
+}
 
-    let record = overlay_optional_fields(&[
+fn record_overlay(spec: &TaskSpec) -> Option<Value> {
+    overlay_optional_fields(&[
         ("enabled", spec.record.enabled.map(|value| json!(value))),
         ("format", spec.record.format.map(|value| json!(value))),
         (
@@ -298,12 +324,11 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
             spec.record.save_path.as_ref().map(|value| json!(value)),
         ),
         ("as_player", spec.record.as_player.map(|value| json!(value))),
-    ]);
-    if let Some(record) = record {
-        overlay.insert("record".to_string(), record);
-    }
+    ])
+}
 
-    let recovery = overlay_optional_fields(&[
+fn recovery_overlay(spec: &TaskSpec) -> Option<Value> {
+    overlay_optional_fields(&[
         ("policy", spec.recovery.policy.map(|value| json!(value))),
         (
             "resume_mode",
@@ -315,11 +340,12 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
                 .max_consecutive_failures
                 .map(|value| json!(value)),
         ),
-    ]);
-    if let Some(recovery) = recovery {
-        overlay.insert("recovery".to_string(), recovery);
-    }
+    ])
+}
 
+fn schedule_overlay(spec: &TaskSpec) -> Option<Value> {
+    // schedule 为空时保持缺省 immediate 语义；cron 空字符串不写入 overlay，
+    // 避免覆盖配置中的默认调度方式。
     let mut schedule = serde_json::Map::new();
     if let Some(start_mode) = spec.schedule.start_mode {
         schedule.insert("start_mode".to_string(), json!(start_mode));
@@ -335,10 +361,10 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
     {
         schedule.insert("cron".to_string(), json!(cron));
     }
-    if !schedule.is_empty() {
-        overlay.insert("schedule".to_string(), Value::Object(schedule));
-    }
+    (!schedule.is_empty()).then_some(Value::Object(schedule))
+}
 
+fn resource_overlay(spec: &TaskSpec) -> Option<Value> {
     let mut resource = serde_json::Map::new();
     if !spec.resource.required_labels.is_empty() {
         resource.insert(
@@ -346,14 +372,11 @@ pub(super) fn task_spec_overlay(spec: &TaskSpec) -> Value {
             json!(spec.resource.required_labels),
         );
     }
-    if !resource.is_empty() {
-        overlay.insert("resource".to_string(), Value::Object(resource));
-    }
-
-    Value::Object(overlay)
+    (!resource.is_empty()).then_some(Value::Object(resource))
 }
 
 fn overlay_optional_fields(fields: &[(&str, Option<Value>)]) -> Option<Value> {
+    // Option::None 表示请求未显式设置该字段，而不是设置为 JSON null。
     let mut object = serde_json::Map::new();
     for (key, value) in fields {
         if let Some(value) = value {

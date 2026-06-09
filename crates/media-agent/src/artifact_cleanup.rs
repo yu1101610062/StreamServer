@@ -361,6 +361,8 @@ impl ArtifactCleanupManager {
         let strategy = ArtifactCleanupStrategy::from_settings(&self.inner.cleanup);
         let threshold = self.inner.cleanup.threshold_percent;
         let mut by_device: HashMap<u64, Vec<BucketObservation>> = HashMap::new();
+        // MP4 与 HLS bucket 可能共用同一块磁盘；按 device 聚合后统一判断阈值，
+        // 避免一个 bucket 清理后另一个 bucket 继续使用过期采样拒绝任务。
         for observation in observed {
             by_device
                 .entry(observation.device_id)
@@ -378,6 +380,8 @@ impl ArtifactCleanupManager {
             if self.inner.cleanup.enabled {
                 match strategy {
                     ArtifactCleanupStrategy::RejectOnly => {
+                        // reject_only 不自动删除文件，只在超过阈值时停止相关活跃任务
+                        // 并阻止新任务继续写入该卷。
                         if disk_percent >= threshold {
                             let reason = format!(
                                 "artifact volume usage {:.1}% exceeds threshold {:.1}%",
@@ -394,6 +398,7 @@ impl ArtifactCleanupManager {
                         }
                     }
                     ArtifactCleanupStrategy::DeleteOldestThenReject => {
+                        // 默认策略先尝试删除最旧产物，清理后仍超过阈值才进入阻塞。
                         if disk_percent >= threshold {
                             let cleanup_result = self.cleanup_volume_by_disk(
                                 &observations,
@@ -489,6 +494,8 @@ impl ArtifactCleanupManager {
         let mut deleted_task_ids = Vec::new();
         let mut deleted_running_paths = Vec::new();
 
+        // 先清理完整的非活跃任务目录；每删一个候选后都重新采样磁盘，
+        // 这样可以尽早停止并减少对历史产物的破坏。
         for candidate in candidates {
             if metric_percent < target_percent {
                 break;
@@ -518,6 +525,8 @@ impl ArtifactCleanupManager {
         }
 
         if metric_percent >= target_percent {
+            // 完整任务目录不足以释放空间时，再清理运行中 HLS 的过期 segment。
+            // MP4 和最新直播片段不进这里，避免破坏正在写入或播放的文件。
             let running_candidates = collect_running_cleanup_candidates(
                 observations,
                 active_handles,
@@ -801,6 +810,8 @@ fn collect_cleanup_candidates(
     let mut by_task_id = HashMap::<Uuid, CleanupCandidate>::new();
     let now = SystemTime::now();
 
+    // 同一任务可能在多个 bucket 下都有产物，按 task_id 聚合后作为一个删除单元，
+    // 避免只删 MP4 或只删 HLS 导致数据库仍指向半残留目录。
     for observation in observations {
         let entries = match fs::read_dir(&observation.node_dir) {
             Ok(entries) => entries,
@@ -835,6 +846,7 @@ fn collect_cleanup_candidates(
                 continue;
             }
             let last_write = latest_file_write_time(&path).unwrap_or(SystemTime::UNIX_EPOCH);
+            // 最近仍有写入的目录先跳过，给刚完成但尚未入库/回调的产物留缓冲时间。
             if now
                 .duration_since(last_write)
                 .is_ok_and(|age| age < CLEANUP_RECENT_WRITE_GRACE_PERIOD)

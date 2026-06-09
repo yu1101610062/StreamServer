@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 
 use serde::Deserialize;
 
@@ -190,14 +190,16 @@ impl Default for AgentArtifactCleanupSettings {
 
 impl Settings {
     pub fn load() -> anyhow::Result<Self> {
-        let environment =
-            std::env::var("STREAMSERVER_ENV").unwrap_or_else(|_| "development".into());
+        let environment = match std::env::var("STREAMSERVER_ENV") {
+            Ok(value) => value,
+            Err(_) => "development".into(),
+        };
         let builder = config::Config::builder()
             .add_source(config::File::with_name("config/base").required(false))
             .add_source(config::File::with_name(&format!("config/{environment}")).required(false));
 
         let mut file_settings = builder.build()?.try_deserialize::<FileSettings>()?;
-        apply_env_overrides(&mut file_settings);
+        apply_env_overrides(&mut file_settings)?;
 
         let settings = Self {
             environment,
@@ -333,7 +335,9 @@ impl Settings {
     }
 }
 
-fn apply_env_overrides(settings: &mut FileSettings) {
+fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
+    // 环境变量覆盖发生在文件配置反序列化之后、validate 之前；这里只负责把文本
+    // 转成字段值，跨字段依赖仍统一交给 validate()。
     if let Some(value) = env("AGENT_HTTP_ADDR") {
         settings.agent.http_addr = value;
     }
@@ -368,10 +372,10 @@ fn apply_env_overrides(settings: &mut FileSettings) {
         settings.agent.zlm_api_base = value;
     }
     if let Some(value) = env("ZLM_RTMP_PORT") {
-        settings.agent.zlm_rtmp_port = value.parse().unwrap_or(default_zlm_rtmp_port());
+        settings.agent.zlm_rtmp_port = parse_env_or_default(&value, default_zlm_rtmp_port);
     }
     if let Some(value) = env("ZLM_RTSP_PORT") {
-        settings.agent.zlm_rtsp_port = value.parse().unwrap_or(default_zlm_rtsp_port());
+        settings.agent.zlm_rtsp_port = parse_env_or_default(&value, default_zlm_rtsp_port);
     }
     if let Some(value) = env("ZLM_API_SECRET") {
         settings.agent.zlm_api_secret = value;
@@ -386,7 +390,7 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     }
     if let Some(value) = env("AGENT_HLS_RECORD_SEGMENT_SEC") {
         settings.agent.hls_record_segment_sec =
-            value.parse().unwrap_or(default_hls_record_segment_sec());
+            parse_env_or_default(&value, default_hls_record_segment_sec);
     }
     if let Some(value) = env("AGENT_STREAM_ADDR") {
         settings.agent.agent_stream_addr = value;
@@ -422,34 +426,30 @@ fn apply_env_overrides(settings: &mut FileSettings) {
         settings.agent.labels = split_csv(&value);
     }
     if let Some(value) = env("AGENT_MAX_RUNTIME_SLOTS") {
-        settings.agent.max_runtime_slots = value.parse().unwrap_or(default_max_runtime_slots());
+        settings.agent.max_runtime_slots = parse_env_or_default(&value, default_max_runtime_slots);
     }
     if let Some(value) = env("AGENT_RUNTIME_MANAGER_START_LIMIT") {
-        settings.agent.runtime_manager_start_limit = value
-            .parse()
-            .unwrap_or(default_runtime_manager_start_limit());
+        settings.agent.runtime_manager_start_limit =
+            parse_env_or_default(&value, default_runtime_manager_start_limit);
     }
     if let Some(value) = env("AGENT_RUNTIME_MANAGER_STOP_LIMIT") {
-        settings.agent.runtime_manager_stop_limit = value
-            .parse()
-            .unwrap_or(default_runtime_manager_stop_limit());
+        settings.agent.runtime_manager_stop_limit =
+            parse_env_or_default(&value, default_runtime_manager_stop_limit);
     }
     if let Some(value) = env("AGENT_RUNTIME_MANAGER_RECORDING_LIMIT") {
-        settings.agent.runtime_manager_recording_limit = value
-            .parse()
-            .unwrap_or(default_runtime_manager_recording_limit());
+        settings.agent.runtime_manager_recording_limit =
+            parse_env_or_default(&value, default_runtime_manager_recording_limit);
     }
     if let Some(value) = env("AGENT_RUNTIME_MANAGER_ADOPT_LIMIT") {
-        settings.agent.runtime_manager_adopt_limit = value
-            .parse()
-            .unwrap_or(default_runtime_manager_adopt_limit());
+        settings.agent.runtime_manager_adopt_limit =
+            parse_env_or_default(&value, default_runtime_manager_adopt_limit);
     }
     if let Some(value) = env("WORK_ROOT") {
         settings.agent.work_root = value;
     }
+    // 上传限制属于安全边界，解析失败必须让配置加载失败，不能静默退回默认值。
     if let Some(value) = env("UPLOAD_MAX_BYTES") {
-        settings.agent.upload_max_bytes =
-            value.parse().expect("UPLOAD_MAX_BYTES must be an integer");
+        settings.agent.upload_max_bytes = parse_required_env("UPLOAD_MAX_BYTES", &value)?;
     }
     if let Some(value) = env("UPLOAD_ALLOWED_EXTENSIONS") {
         settings.agent.upload_allowed_extensions = split_csv(&value)
@@ -458,9 +458,8 @@ fn apply_env_overrides(settings: &mut FileSettings) {
             .collect();
     }
     if let Some(value) = env("UPLOAD_PROBE_TIMEOUT_SEC") {
-        settings.agent.upload_probe_timeout_sec = value
-            .parse()
-            .expect("UPLOAD_PROBE_TIMEOUT_SEC must be an integer");
+        settings.agent.upload_probe_timeout_sec =
+            parse_required_env("UPLOAD_PROBE_TIMEOUT_SEC", &value)?;
     }
     if let Some(value) = env("PUBLIC_MEDIA_BASE_URL") {
         settings.agent.public_media_base_url = value;
@@ -473,17 +472,15 @@ fn apply_env_overrides(settings: &mut FileSettings) {
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
     if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT") {
-        settings.agent.artifact_cleanup.threshold_percent = value
-            .parse()
-            .unwrap_or(default_artifact_cleanup_threshold_percent());
+        settings.agent.artifact_cleanup.threshold_percent =
+            parse_env_or_default(&value, default_artifact_cleanup_threshold_percent);
     }
     if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_STRATEGY") {
         settings.agent.artifact_cleanup.strategy = value;
     }
     if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC") {
-        settings.agent.artifact_cleanup.check_interval_sec = value
-            .parse()
-            .unwrap_or(default_artifact_cleanup_check_interval_sec());
+        settings.agent.artifact_cleanup.check_interval_sec =
+            parse_env_or_default(&value, default_artifact_cleanup_check_interval_sec);
     }
     if let Some(value) = env("LOG_LEVEL") {
         settings.logging.level = value;
@@ -491,13 +488,35 @@ fn apply_env_overrides(settings: &mut FileSettings) {
     if let Some(value) = env("LOG_JSON") {
         settings.logging.json = matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
     }
+    Ok(())
 }
 
 fn env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    match std::env::var(name) {
+        Ok(value) => {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        }
+        Err(_) => None,
+    }
+}
+
+fn parse_required_env<T>(name: &str, value: &str) -> anyhow::Result<T>
+where
+    T: FromStr,
+{
+    T::from_str(value).map_err(|_| anyhow::anyhow!("{name} must be an integer"))
+}
+
+fn parse_env_or_default<T>(value: &str, default: impl FnOnce() -> T) -> T
+where
+    T: FromStr,
+{
+    // 兼容旧部署脚本：这些字段历史上解析失败会回落默认值，暂不改变行为。
+    match T::from_str(value) {
+        Ok(value) => value,
+        Err(_) => default(),
+    }
 }
 
 fn split_csv(value: &str) -> Vec<String> {

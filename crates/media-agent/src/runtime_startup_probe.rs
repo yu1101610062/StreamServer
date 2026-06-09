@@ -56,6 +56,8 @@ pub(crate) fn spawn_startup_probe_monitor(
                 let Some(pid) = handle.pid else {
                     return;
                 };
+                // 启动探测绑定底层进程生命周期；进程已退出时让进程监控路径负责终态，
+                // 这里不再额外制造启动失败事件。
                 if !is_pid_running(pid) {
                     return;
                 }
@@ -63,6 +65,8 @@ pub(crate) fn spawn_startup_probe_monitor(
                 let stream_status =
                     zlm_stream_status(&http_client, &settings, &startup_probe).await;
                 if let Ok(Some(stream_status)) = stream_status {
+                    // ZLM 已看到流后，先处理“上线但还不能宣告 running”的中间态：
+                    // 录像补启动、元数据回写和时长控制都可能要求继续轮询。
                     let wall_clock_duration = resolved_spec_from_handle(&handle)
                         .is_some_and(|spec| spec.stream_ingest_uses_wall_clock_record_duration());
                     let binding = stream_binding_from_handle(&handle)
@@ -73,6 +77,8 @@ pub(crate) fn spawn_startup_probe_monitor(
                     if let Some(recording) = live_relay_recording_from_handle(&handle)
                         .filter(should_start_live_relay_recording)
                     {
+                        // 录制启动失败不一定终止接入任务：配置允许降级时继续提供播放链路，
+                        // 但会把错误写入 runtime metadata 并上报 recording_degraded。
                         match start_stream_recording(
                             &http_client,
                             &settings,
@@ -206,6 +212,8 @@ pub(crate) fn spawn_startup_probe_monitor(
 
                     let startup_ready = live_relay_startup_ready(&active_handle);
                     if !startup_ready {
+                        // 某些 stream_ingest 需要等录像状态也稳定后才算启动成功；
+                        // 在 ready 前只提交快照，不把任务提升为 Running。
                         let duration_handle = active_handle.clone();
                         monitor_handle
                             .send_event(RuntimeInternalEvent::ApplyMonitorCommit(
@@ -271,6 +279,7 @@ pub(crate) fn spawn_startup_probe_monitor(
                             RuntimeMonitorCommit::new(active_handle, monitor_handle.generation())
                                 .with_persist(work_dir.clone(), success_check.clone())
                                 .with_notifications(notifications);
+                        // 首次 ready 走 StartupProbeSucceeded，之后的心跳式更新只做普通 commit。
                         if startup_completed {
                             monitor_handle
                                 .send_event(RuntimeInternalEvent::ApplyMonitorCommit(commit))
@@ -296,6 +305,8 @@ pub(crate) fn spawn_startup_probe_monitor(
                     sleep(STARTUP_PROBE_POLL_INTERVAL).await;
                     continue;
                 } else if !startup_completed && started_at.elapsed() >= STARTUP_PROBE_TIMEOUT {
+                    // 启动期超时只在尚未成功过时生效；成功后的长期在线维护交给
+                    // live relay/RTP 常态监控，避免两个监控器同时裁决同一 runtime。
                     let mut timeout_handle = handle.clone();
                     timeout_handle.metadata["startup_timeout"] = json!(true);
                     if sticky_reconnect_stream_ingest_from_handle(&timeout_handle) {
