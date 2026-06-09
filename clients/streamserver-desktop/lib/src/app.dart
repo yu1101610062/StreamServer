@@ -84,8 +84,9 @@ class _StreamServerDesktopAppState extends State<StreamServerDesktopApp> {
       AppSection.tasks => const TasksScreen(),
       AppSection.taskCreate => const TaskCreateScreen(),
       AppSection.taskDetail => const TaskDetailScreen(),
-      AppSection.streams => const StreamsScreen(),
-      AppSection.multicast => const StreamsScreen(schemaFilter: 'rtp'),
+      AppSection.streams => const StreamsScreen(key: ValueKey('streams')),
+      AppSection.multicast =>
+        const StreamsScreen(key: ValueKey('multicast'), schemaFilter: 'rtp'),
       AppSection.records => const RecordsScreen(),
       AppSection.artifacts => const ArtifactsScreen(),
       AppSection.uploads => const MediaUploadScreen(),

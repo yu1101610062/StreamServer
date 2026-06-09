@@ -294,18 +294,16 @@ class _CompactNavigation extends StatelessWidget {
         border: Border(bottom: BorderSide(color: Color(0xffe4e8f0))),
       ),
       child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: Row(
+        child: Wrap(
+          spacing: 8,
+          runSpacing: 8,
           children: _navItems.map((item) {
             final selected = current == item.section;
-            return Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: ChoiceChip(
-                selected: selected,
-                label: Text(item.label),
-                onSelected: (_) => onNavigate(item.section),
-              ),
+            return ChoiceChip(
+              selected: selected,
+              label: Text(item.label),
+              onSelected: (_) => onNavigate(item.section),
             );
           }).toList(),
         ),

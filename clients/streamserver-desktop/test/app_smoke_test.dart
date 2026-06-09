@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:streamserver_desktop/src/screens/screen_helpers.dart';
 import 'package:streamserver_desktop/src/utils.dart';
+import 'package:streamserver_desktop/src/widgets/embedded_player_panel.dart';
 
 void main() {
   test('shortId trims long ids', () {
@@ -21,8 +22,39 @@ void main() {
 
   test('cleanQuery drops empty values', () {
     expect(
-      cleanQuery({'page': 1, 'keyword': '', 'node_id': null, 'status': 'RUNNING'}),
+      cleanQuery(
+          {'page': 1, 'keyword': '', 'node_id': null, 'status': 'RUNNING'}),
       {'page': 1, 'status': 'RUNNING'},
+    );
+  });
+
+  test('playback cache skips live preview mp4 streams', () {
+    expect(
+      shouldCacheRemoteMediaForPlayback(Uri.parse(
+        'http://172.17.13.196/preview/preview-6647aeab.live.mp4',
+      )),
+      isFalse,
+    );
+    expect(
+      shouldCacheRemoteMediaForPlayback(Uri.parse(
+        'http://172.17.13.196/media/uploads/file.mp4',
+      )),
+      isTrue,
+    );
+  });
+
+  test('live media detection covers preview path and live query values', () {
+    expect(
+      isLikelyLiveHttpMedia(Uri.parse(
+        'http://172.17.13.196/preview/camera.mp4',
+      )),
+      isTrue,
+    );
+    expect(
+      isLikelyLiveHttpMedia(Uri.parse(
+        'http://172.17.13.196/media/file.mp4?source_mode=live',
+      )),
+      isTrue,
     );
   });
 }

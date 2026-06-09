@@ -10,6 +10,40 @@ import 'package:path_provider/path_provider.dart';
 
 import '../state.dart';
 
+enum _RangeProbeResult {
+  supported,
+  unsupported,
+  streamLike,
+}
+
+bool shouldCacheRemoteMediaForPlayback(Uri? uri) {
+  if (uri == null || !(uri.scheme == 'http' || uri.scheme == 'https')) {
+    return false;
+  }
+  if (isLikelyLiveHttpMedia(uri)) {
+    return false;
+  }
+  final path = uri.path.toLowerCase();
+  return path.endsWith('.mp4') ||
+      path.endsWith('.m4v') ||
+      path.endsWith('.mov');
+}
+
+bool isLikelyLiveHttpMedia(Uri uri) {
+  final path = uri.path.toLowerCase();
+  final segments = uri.pathSegments.map((segment) => segment.toLowerCase());
+  final queryValues = uri.queryParametersAll.entries.expand(
+    (entry) => [entry.key, ...entry.value].map((value) => value.toLowerCase()),
+  );
+
+  return path.endsWith('.live.mp4') ||
+      segments.contains('preview') ||
+      queryValues.any((value) =>
+          value == 'live' ||
+          value == 'source_mode=live' ||
+          value == 'stream_live');
+}
+
 class EmbeddedPlayerPanel extends StatefulWidget {
   const EmbeddedPlayerPanel({
     required this.url,
@@ -193,13 +227,17 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
 
   Future<String> _preparePlayableUrl(String url, int ticket) async {
     final uri = Uri.tryParse(url);
-    if (!_shouldCacheForPlayback(uri)) {
+    if (!shouldCacheRemoteMediaForPlayback(uri)) {
       return url;
     }
 
     _setOpenStatus(ticket, '正在检测服务端 Range 支持');
-    final supportsRange = await _supportsByteRange(uri!);
-    if (supportsRange) {
+    final rangeProbe = await _probeByteRange(uri!);
+    if (rangeProbe == _RangeProbeResult.supported) {
+      return url;
+    }
+    if (rangeProbe == _RangeProbeResult.streamLike) {
+      _setOpenStatus(ticket, '直播流不支持 Range，直接交给内嵌播放器打开');
       return url;
     }
     if (!mounted || ticket != openTicket) {
@@ -208,17 +246,7 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
     return _cacheRemoteMedia(uri, ticket);
   }
 
-  bool _shouldCacheForPlayback(Uri? uri) {
-    if (uri == null || !(uri.scheme == 'http' || uri.scheme == 'https')) {
-      return false;
-    }
-    final path = uri.path.toLowerCase();
-    return path.endsWith('.mp4') ||
-        path.endsWith('.m4v') ||
-        path.endsWith('.mov');
-  }
-
-  Future<bool> _supportsByteRange(Uri uri) async {
+  Future<_RangeProbeResult> _probeByteRange(Uri uri) async {
     final client = HttpClient()..connectionTimeout = const Duration(seconds: 3);
     try {
       final request = await client.getUrl(uri).timeout(
@@ -228,9 +256,15 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
       final response = await request.close().timeout(
             const Duration(seconds: 5),
           );
-      return response.statusCode == HttpStatus.partialContent;
+      if (response.statusCode == HttpStatus.partialContent) {
+        return _RangeProbeResult.supported;
+      }
+      if (response.statusCode == HttpStatus.ok && response.contentLength <= 0) {
+        return _RangeProbeResult.streamLike;
+      }
+      return _RangeProbeResult.unsupported;
     } catch (_) {
-      return true;
+      return _RangeProbeResult.supported;
     } finally {
       client.close(force: true);
     }

@@ -30,6 +30,15 @@ class _StreamsScreenState extends State<StreamsScreen> {
   }
 
   @override
+  void didUpdateWidget(covariant StreamsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.schemaFilter != widget.schemaFilter) {
+      schema = widget.schemaFilter ?? '';
+      refreshSeed++;
+    }
+  }
+
+  @override
   void dispose() {
     appController.dispose();
     streamController.dispose();
