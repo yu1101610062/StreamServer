@@ -296,20 +296,19 @@ workspace_version() {
 }
 
 prepare_frontend_ui() {
-  local frontend_args=()
-
   if [ -n "${PREBUILT_UI_DIR}" ]; then
     [ -f "${PREBUILT_UI_DIR}/index.html" ] || fail "PREBUILT_UI_DIR 不是有效前端静态资源目录: ${PREBUILT_UI_DIR}"
     return 0
   fi
 
   require_cmd node
-  if [ "${FRONTEND_SKIP_INSTALL}" -eq 1 ]; then
-    frontend_args+=(--skip-install)
-  fi
 
   log "构建前端静态资源"
-  node "${ROOT_DIR}/scripts/build-frontend-ui.mjs" "${frontend_args[@]}"
+  if [ "${FRONTEND_SKIP_INSTALL}" -eq 1 ]; then
+    node "${ROOT_DIR}/scripts/build-frontend-ui.mjs" --skip-install
+  else
+    node "${ROOT_DIR}/scripts/build-frontend-ui.mjs"
+  fi
   PREBUILT_UI_DIR="${ROOT_DIR}/crates/media-core/ui"
 }
 
