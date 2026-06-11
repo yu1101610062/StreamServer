@@ -256,6 +256,7 @@
 - `record.enabled = true` 时展示 `record.format`、`record.duration_sec`、`record.segment_sec`、`record.as_player` 等录制字段；录制目录由系统托管，不暴露自定义路径输入。
 - `schedule.start_mode = at|cron` 时仅展示对应调度字段。
 - `stream_ingest` 只展示 `stream.*` 和 `expose.*`，不再展示“推流目标 URL”。
+- `stream_ingest + source_mode=live` 即使用户关闭全部播放协议，提交/预览后的 `resolved_spec` 也会自动开启 `expose.enable_http_fmp4=true` 作为最小播放协议兜底；控制台应以最终 `resolved_spec` 预览为准。
 - `stream_bridge` / `file_transcode` 只展示 `publish.*`，不再展示 `stream.*` / `expose.*`。
 - `input.kind=hls|http_ts` 时必须显式展示 `input.source_mode`；其他输入类型按规则自动锁定 `live` 或 `vod`。
 - `input.kind=file` 时只展示“相对路径”输入框，页面需明确提示工作目录根是 `/data/media/work`，标准离线实例的宿主机映射目录是 `/home/streamserver/data/media/work`，前导 `/` 会被自动忽略。
