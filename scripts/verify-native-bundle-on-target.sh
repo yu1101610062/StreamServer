@@ -608,6 +608,7 @@ if [ -x "${ROOT}/runtime/zlm/MediaServer" ]; then
     export ZLM_RECORD_ROOT=\${tmp}/www/record
     export ZLM_SNAP_ROOT=\${tmp}/www/snap
     export ZLM_DEFAULT_PEM='${ROOT}/runtime/zlm/default.pem'
+    export AGENT_MP4_RECORD_SEGMENT_SEC=7200
     mkdir -p \"\${ZLM_WWW_ROOT}\" \"\${ZLM_RECORD_ROOT}\" \"\${ZLM_SNAP_ROOT}\"
     '${ROOT}/templates/common/zlm.render-config.sh' '${ROOT}/templates/common/zlm.config.ini.template' \"\${tmp}/zlm.ini\"
     if [ -d '${ROOT}/runtime/zlm/python' ]; then

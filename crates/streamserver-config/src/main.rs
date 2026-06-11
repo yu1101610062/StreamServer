@@ -95,6 +95,7 @@ const MANAGED_ORDER: &[&str] = &[
     "AGENT_ACCELERATION_MODE",
     "AGENT_LABELS",
     "AGENT_MAX_RUNTIME_SLOTS",
+    "AGENT_MP4_RECORD_SEGMENT_SEC",
     "AGENT_HLS_RECORD_SEGMENT_SEC",
     "AGENT_ARTIFACT_CLEANUP_ENABLED",
     "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT",
@@ -229,7 +230,7 @@ impl Page {
             Self::Basic => "基础部署",
             Self::Ports => "端口",
             Self::Storage => "存储布局",
-            Self::Hls => "HLS 录制",
+            Self::Hls => "录制分段",
             Self::Cleanup => "产物清理",
         }
     }
@@ -584,13 +585,22 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 help: "服务挂载源目录，只影响宿主机侧路径。用于 MP4/HLS 录制、转码和桥接文件产物，可挂载网络存储。",
             },
         ],
-        Page::Hls => &[FieldDef {
-            key: "AGENT_HLS_RECORD_SEGMENT_SEC",
-            label: "录制 HLS 分片",
-            kind: FieldKind::Choice(HLS_SEGMENT_CHOICES),
-            scope: FieldScope::Agent,
-            help: "只影响录制归档 HLS，不影响在线低延迟播放 HLS。任务接口显式传值时优先。",
-        }],
+        Page::Hls => &[
+            FieldDef {
+                key: "AGENT_MP4_RECORD_SEGMENT_SEC",
+                label: "录制 MP4 分段",
+                kind: FieldKind::Text,
+                scope: FieldScope::Agent,
+                help: "任务接口未显式传 record.segment_sec 时使用。默认 7200 秒。",
+            },
+            FieldDef {
+                key: "AGENT_HLS_RECORD_SEGMENT_SEC",
+                label: "录制 HLS 分片",
+                kind: FieldKind::Choice(HLS_SEGMENT_CHOICES),
+                scope: FieldScope::Agent,
+                help: "只影响录制归档 HLS，不影响在线低延迟播放 HLS。任务接口显式传值时优先。",
+            },
+        ],
         Page::Cleanup => &[
             FieldDef {
                 key: "AGENT_ARTIFACT_CLEANUP_ENABLED",
@@ -1502,6 +1512,7 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         default_if_missing(values, "AGENT_LABELS", mode);
         normalize_agent_labels(values);
         default_if_missing(values, "AGENT_MAX_RUNTIME_SLOTS", "0");
+        default_if_missing(values, "AGENT_MP4_RECORD_SEGMENT_SEC", "7200");
         default_if_missing(values, "AGENT_HLS_RECORD_SEGMENT_SEC", "60");
         default_if_missing(values, "AGENT_ARTIFACT_CLEANUP_ENABLED", "true");
         default_if_missing(values, "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT", "85");
@@ -1929,6 +1940,7 @@ fn required_text_field(key: &str) -> bool {
             | "ZLM_WWW_MOUNT_HOST_DIR"
             | "ZLM_OUTPUT_MOUNT_HOST_DIR"
             | "AGENT_MAX_RUNTIME_SLOTS"
+            | "AGENT_MP4_RECORD_SEGMENT_SEC"
             | "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT"
             | "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC"
     ) || is_port_key(key)
@@ -2009,6 +2021,16 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
             .trim()
             .parse::<u64>()
             .with_context(|| "AGENT_MAX_RUNTIME_SLOTS must be zero or a positive integer")?;
+    }
+
+    if let Some(value) = values.get("AGENT_MP4_RECORD_SEGMENT_SEC") {
+        let parsed = value
+            .trim()
+            .parse::<u32>()
+            .with_context(|| "AGENT_MP4_RECORD_SEGMENT_SEC must be an integer")?;
+        if parsed == 0 {
+            bail!("AGENT_MP4_RECORD_SEGMENT_SEC must be greater than 0");
+        }
     }
 
     Ok(())
@@ -2275,6 +2297,10 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
     (
         "ZLM_OUTPUT_MOUNT_HOST_DIR",
         "服务挂载源宿主机目录，用于录制和转码产物，可挂载网络存储。",
+    ),
+    (
+        "AGENT_MP4_RECORD_SEGMENT_SEC",
+        "录制 MP4 默认分段秒数，默认 7200。",
     ),
     (
         "AGENT_HLS_RECORD_SEGMENT_SEC",

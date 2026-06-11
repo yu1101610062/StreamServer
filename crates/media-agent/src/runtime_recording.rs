@@ -165,9 +165,7 @@ pub(crate) fn build_manual_live_relay_recording(
         root_path_mp4,
         root_path_hls,
         duration_sec: control.and_then(|control| control.duration_sec),
-        segment_sec: control
-            .and_then(|control| control.segment_sec)
-            .or(spec.record.segment_sec),
+        segment_sec: control.and_then(|control| control.segment_sec),
         as_player: control
             .and_then(|control| control.as_player)
             .or(spec.record.as_player)
@@ -277,4 +275,77 @@ pub(crate) fn should_auto_stop_live_relay_recording(
         && recording.stop_task_on_duration
         && !recording.auto_stop_requested
         && recording_duration_reached(recording, now)
+}
+
+#[cfg(test)]
+mod tests {
+    use media_domain::{RecordFormat, RecordingControlSpec};
+    use serde_json::json;
+
+    use super::*;
+
+    fn stream_ingest_spec(record_segment_sec: Option<u32>) -> TaskSpec {
+        let mut value = json!({
+            "type": "stream_ingest",
+            "name": "manual-recording-test",
+            "input": {
+                "kind": "rtsp",
+                "source_mode": "live",
+                "url": "rtsp://example/live"
+            },
+            "record": {
+                "enabled": false,
+                "format": "mp4"
+            }
+        });
+        if let Some(segment_sec) = record_segment_sec {
+            value["record"]["segment_sec"] = json!(segment_sec);
+        }
+        serde_json::from_value(value).expect("test task spec should deserialize")
+    }
+
+    #[test]
+    fn manual_recording_omitted_segment_does_not_inherit_task_record_segment() {
+        let settings = AgentSettings::default();
+        let spec = stream_ingest_spec(Some(30));
+        let control = RecordingControlSpec {
+            format: Some(RecordFormat::Mp4),
+            duration_sec: Some(180),
+            segment_sec: None,
+            as_player: None,
+        };
+
+        let recording = build_manual_live_relay_recording(
+            &settings,
+            Uuid::nil(),
+            &spec,
+            Some(&control),
+            "command-1",
+        );
+
+        assert_eq!(recording.duration_sec, Some(180));
+        assert_eq!(recording.segment_sec, None);
+    }
+
+    #[test]
+    fn manual_recording_uses_explicit_control_segment() {
+        let settings = AgentSettings::default();
+        let spec = stream_ingest_spec(Some(30));
+        let control = RecordingControlSpec {
+            format: Some(RecordFormat::Mp4),
+            duration_sec: Some(180),
+            segment_sec: Some(300),
+            as_player: None,
+        };
+
+        let recording = build_manual_live_relay_recording(
+            &settings,
+            Uuid::nil(),
+            &spec,
+            Some(&control),
+            "command-1",
+        );
+
+        assert_eq!(recording.segment_sec, Some(300));
+    }
 }
