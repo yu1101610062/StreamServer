@@ -19,6 +19,8 @@ require_env() {
   fi
 }
 
+export AGENT_MP4_RECORD_SEGMENT_SEC="${AGENT_MP4_RECORD_SEGMENT_SEC:-7200}"
+
 # ZLM 模板全部由环境变量渲染，缺任一关键值都直接失败，避免生成半有效配置。
 for key in \
   ZLM_API_SECRET \
@@ -47,7 +49,8 @@ for key in \
   ZLM_WWW_ROOT \
   ZLM_RECORD_ROOT \
   ZLM_SNAP_ROOT \
-  ZLM_DEFAULT_PEM; do
+  ZLM_DEFAULT_PEM \
+  AGENT_MP4_RECORD_SEGMENT_SEC; do
   require_env "${key}"
 done
 
@@ -79,4 +82,5 @@ sed \
   -e "s|__ZLM_RECORD_ROOT__|$(escape_sed_replacement "${ZLM_RECORD_ROOT}")|g" \
   -e "s|__ZLM_SNAP_ROOT__|$(escape_sed_replacement "${ZLM_SNAP_ROOT}")|g" \
   -e "s|__ZLM_DEFAULT_PEM__|$(escape_sed_replacement "${ZLM_DEFAULT_PEM}")|g" \
+  -e "s|__AGENT_MP4_RECORD_SEGMENT_SEC__|$(escape_sed_replacement "${AGENT_MP4_RECORD_SEGMENT_SEC}")|g" \
   "${template_file}" >"${output_file}"

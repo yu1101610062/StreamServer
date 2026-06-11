@@ -40,6 +40,7 @@ ffprobe_bin = "ffprobe"
 zlm_api_base = "http://127.0.0.1:8080"
 zlm_api_secret = ""
 zlm_auto_close_on_no_reader_enabled = false
+mp4_record_segment_sec = 7200
 hls_record_segment_sec = 60
 agent_stream_addr = "http://127.0.0.1:8081"
 output_mount_relative_prefix_mp4 = "output"

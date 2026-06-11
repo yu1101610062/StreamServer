@@ -16,7 +16,6 @@ use crate::{
 
 pub(crate) const ZLM_RUNTIME_VHOST: &str = "__defaultVhost__";
 const PROCESS_RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
-const DEFAULT_REALTIME_MP4_RECORD_SEGMENT_SEC: u32 = 7_200;
 
 pub(crate) async fn start_live_relay_recording(
     client: &Client,
@@ -29,7 +28,7 @@ pub(crate) async fn start_live_relay_recording(
             client,
             settings,
             "/index/api/startRecord",
-            &build_record_api_params(binding, recording, kind),
+            &build_record_api_params(settings, binding, recording, kind),
         )
         .await?;
     }
@@ -47,7 +46,7 @@ pub(crate) async fn stop_live_relay_recording(
             client,
             settings,
             "/index/api/stopRecord",
-            &build_record_api_params(binding, recording, kind),
+            &build_record_api_params(settings, binding, recording, kind),
         )
         .await?;
     }
@@ -280,6 +279,7 @@ pub(crate) fn extract_zlm_local_port(body: &Value) -> Option<u16> {
 }
 
 pub(crate) fn build_record_api_params(
+    settings: &AgentSettings,
     binding: &StreamBinding,
     recording: &LiveRelayRecording,
     kind: &ZlmRecordKind,
@@ -301,18 +301,17 @@ pub(crate) fn build_record_api_params(
     if matches!(kind, ZlmRecordKind::Mp4) {
         params.push((
             "max_second".to_string(),
-            mp4_record_max_second(recording).to_string(),
+            mp4_record_max_second(settings, recording).to_string(),
         ));
     }
     params
 }
 
-fn mp4_record_max_second(recording: &LiveRelayRecording) -> u32 {
+fn mp4_record_max_second(settings: &AgentSettings, recording: &LiveRelayRecording) -> u32 {
     recording
         .segment_sec
         .filter(|value| *value > 0)
-        .or(recording.duration_sec.filter(|value| *value > 0))
-        .unwrap_or(DEFAULT_REALTIME_MP4_RECORD_SEGMENT_SEC)
+        .unwrap_or(settings.mp4_record_segment_sec)
 }
 
 pub(crate) fn build_close_stream_params(
@@ -338,5 +337,100 @@ fn zlm_record_kind_code(kind: &ZlmRecordKind) -> u8 {
     match kind {
         ZlmRecordKind::Hls => 0,
         ZlmRecordKind::Mp4 => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mp4_recording(duration_sec: Option<u32>, segment_sec: Option<u32>) -> LiveRelayRecording {
+        LiveRelayRecording {
+            formats: vec![ZlmRecordKind::Mp4],
+            root_path_mp4: Some("/tmp/streamserver-record/mp4".to_string()),
+            root_path_hls: None,
+            duration_sec,
+            segment_sec,
+            as_player: false,
+            desired_enabled: true,
+            manual_control: false,
+            stop_task_on_duration: true,
+            control_command_id: None,
+            recording_started_at: None,
+            auto_stop_requested: false,
+            completion_reason: None,
+            started: false,
+            failed: false,
+        }
+    }
+
+    fn stream_binding() -> StreamBinding {
+        StreamBinding {
+            schema: Some("rtsp".to_string()),
+            vhost: ZLM_RUNTIME_VHOST.to_string(),
+            app: "live".to_string(),
+            stream: "camera01".to_string(),
+        }
+    }
+
+    fn settings(mp4_record_segment_sec: u32) -> AgentSettings {
+        AgentSettings {
+            mp4_record_segment_sec,
+            ..AgentSettings::default()
+        }
+    }
+
+    fn param_value(params: &[(String, String)], key: &str) -> Option<String> {
+        params
+            .iter()
+            .find_map(|(name, value)| (name == key).then(|| value.clone()))
+    }
+
+    #[test]
+    fn mp4_record_max_second_does_not_fall_back_to_duration() {
+        let settings = settings(7_200);
+        let recording = mp4_recording(Some(180), None);
+
+        assert_eq!(mp4_record_max_second(&settings, &recording), 7_200);
+
+        let params = build_record_api_params(
+            &settings,
+            &stream_binding(),
+            &recording,
+            &ZlmRecordKind::Mp4,
+        );
+        assert_eq!(param_value(&params, "max_second").as_deref(), Some("7200"));
+    }
+
+    #[test]
+    fn mp4_record_max_second_uses_explicit_segment() {
+        let settings = settings(600);
+        let recording = mp4_recording(Some(180), Some(300));
+
+        assert_eq!(mp4_record_max_second(&settings, &recording), 300);
+
+        let params = build_record_api_params(
+            &settings,
+            &stream_binding(),
+            &recording,
+            &ZlmRecordKind::Mp4,
+        );
+        assert_eq!(param_value(&params, "max_second").as_deref(), Some("300"));
+    }
+
+    #[test]
+    fn mp4_record_max_second_uses_agent_default_when_segment_is_missing() {
+        let settings = settings(600);
+        let recording = mp4_recording(Some(180), None);
+
+        assert_eq!(mp4_record_max_second(&settings, &recording), 600);
+
+        let params = build_record_api_params(
+            &settings,
+            &stream_binding(),
+            &recording,
+            &ZlmRecordKind::Mp4,
+        );
+        assert_eq!(param_value(&params, "max_second").as_deref(), Some("600"));
     }
 }

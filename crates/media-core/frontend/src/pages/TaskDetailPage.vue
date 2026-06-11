@@ -21,7 +21,7 @@ const recordingControlLoading = ref(false);
 const recordingForm = ref({
   format: "mp4" as "mp4" | "hls" | "both",
   duration_sec: "",
-  segment_sec: "7200",
+  segment_sec: "",
   as_player: false,
 });
 
@@ -392,7 +392,7 @@ async function stopRecording() {
           </el-select>
         </el-form-item>
         <el-form-item label="分段秒数">
-          <el-input v-model="recordingForm.segment_sec" placeholder="MP4 默认 7200，HLS 默认按节点配置" />
+          <el-input v-model="recordingForm.segment_sec" placeholder="不填则按节点配置" />
         </el-form-item>
         <el-form-item label="本次时长">
           <el-input v-model="recordingForm.duration_sec" placeholder="留空表示持续录制" />

@@ -68,6 +68,8 @@ pub struct AgentSettings {
     pub zlm_auto_close_on_no_reader_enabled: bool,
     #[serde(default = "default_allow_enhanced_rtmp_expose")]
     pub allow_enhanced_rtmp_expose: bool,
+    #[serde(default = "default_mp4_record_segment_sec")]
+    pub mp4_record_segment_sec: u32,
     #[serde(default = "default_hls_record_segment_sec")]
     pub hls_record_segment_sec: u32,
     #[serde(default = "default_agent_stream_addr")]
@@ -149,6 +151,7 @@ impl Default for AgentSettings {
             zlm_api_secret: String::new(),
             zlm_auto_close_on_no_reader_enabled: false,
             allow_enhanced_rtmp_expose: default_allow_enhanced_rtmp_expose(),
+            mp4_record_segment_sec: default_mp4_record_segment_sec(),
             hls_record_segment_sec: default_hls_record_segment_sec(),
             agent_stream_addr: default_agent_stream_addr(),
             primary_interface_name: String::new(),
@@ -310,6 +313,10 @@ impl Settings {
             "AGENT_ACCELERATION_MODE must be one of cpu/gpu"
         );
         anyhow::ensure!(
+            self.agent.mp4_record_segment_sec > 0,
+            "AGENT_MP4_RECORD_SEGMENT_SEC must be greater than 0"
+        );
+        anyhow::ensure!(
             matches!(self.agent.hls_record_segment_sec, 30 | 60),
             "AGENT_HLS_RECORD_SEGMENT_SEC must be one of 30/60"
         );
@@ -387,6 +394,10 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     if let Some(value) = env("AGENT_ALLOW_ENHANCED_RTMP_EXPOSE") {
         settings.agent.allow_enhanced_rtmp_expose =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
+    }
+    if let Some(value) = env("AGENT_MP4_RECORD_SEGMENT_SEC") {
+        settings.agent.mp4_record_segment_sec =
+            parse_env_or_default(&value, default_mp4_record_segment_sec);
     }
     if let Some(value) = env("AGENT_HLS_RECORD_SEGMENT_SEC") {
         settings.agent.hls_record_segment_sec =
@@ -643,6 +654,10 @@ fn default_acceleration_mode() -> String {
 
 fn default_allow_enhanced_rtmp_expose() -> bool {
     true
+}
+
+fn default_mp4_record_segment_sec() -> u32 {
+    7_200
 }
 
 fn default_hls_record_segment_sec() -> u32 {
