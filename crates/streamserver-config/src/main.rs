@@ -2026,7 +2026,7 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
     if let Some(value) = values.get("AGENT_MP4_RECORD_SEGMENT_SEC") {
         let parsed = value
             .trim()
-            .parse::<u64>()
+            .parse::<u32>()
             .with_context(|| "AGENT_MP4_RECORD_SEGMENT_SEC must be an integer")?;
         if parsed == 0 {
             bail!("AGENT_MP4_RECORD_SEGMENT_SEC must be greater than 0");
