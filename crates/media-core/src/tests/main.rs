@@ -1749,6 +1749,45 @@ async fn preview_task_returns_resolved_spec_without_persisting() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn preview_live_stream_ingest_falls_back_to_http_fmp4_when_expose_is_all_disabled()
+-> anyhow::Result<()> {
+    let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
+    let app = build_app(test_app_state(pool));
+    let mut payload = sample_create_task_payload("manual");
+    payload["expose"] = json!({
+        "enable_rtsp": false,
+        "enable_rtmp": false,
+        "enable_http_ts": false,
+        "enable_http_fmp4": false,
+        "enable_hls": false
+    });
+    payload["record"] = json!({
+        "enabled": false
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/tasks/preview")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&payload)?))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    let expose = &body["resolved_spec"]["expose"];
+    assert_eq!(expose["enable_rtsp"], json!(false));
+    assert_eq!(expose["enable_rtmp"], json!(false));
+    assert_eq!(expose["enable_http_ts"], json!(false));
+    assert_eq!(expose["enable_http_fmp4"], json!(true));
+    assert_eq!(expose["enable_hls"], json!(false));
+    Ok(())
+}
+
+#[tokio::test]
 async fn preview_task_preserves_record_duration_sec() -> anyhow::Result<()> {
     let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
     let app = build_app(test_app_state(pool));
@@ -3180,13 +3219,13 @@ async fn hls_record_hooks_only_persist_playlist_rows() -> anyhow::Result<()> {
         "type": "stream_ingest",
         "name": "live-hls-record",
         "common": {"created_by": "tester"},
-        "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
         "stream": {"app": "live", "name": "camera01"},
         "expose": {
             "enable_rtsp": false,
             "enable_rtmp": false,
             "enable_http_ts": false,
-            "enable_http_fmp4": false,
+            "enable_http_fmp4": true,
             "enable_hls": false
         },
         "process": {"mode": "copy_or_transcode"},
@@ -4981,7 +5020,7 @@ async fn late_record_hook_without_stream_binding_backfills_record_and_artifact_c
             "enable_rtsp": false,
             "enable_rtmp": false,
             "enable_http_ts": false,
-            "enable_http_fmp4": false,
+            "enable_http_fmp4": true,
             "enable_hls": false
         },
         "process": {"mode": "copy_or_transcode"},
@@ -5117,7 +5156,7 @@ async fn record_hook_prefers_task_id_from_managed_output_path_over_active_bindin
             "enable_rtsp": false,
             "enable_rtmp": false,
             "enable_http_ts": false,
-            "enable_http_fmp4": false,
+            "enable_http_fmp4": true,
             "enable_hls": false
         },
         "process": {"mode": "copy_or_transcode"},

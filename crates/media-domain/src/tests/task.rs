@@ -27,6 +27,14 @@ fn sample_task(task_type: TaskType) -> TaskSpec {
     }
 }
 
+fn disable_all_playback_expose(task: &mut TaskSpec) {
+    task.expose.enable_rtsp = Some(false);
+    task.expose.enable_rtmp = Some(false);
+    task.expose.enable_http_ts = Some(false);
+    task.expose.enable_http_fmp4 = Some(false);
+    task.expose.enable_hls = Some(false);
+}
+
 #[test]
 fn resolve_applies_documented_defaults() {
     let resolved = sample_task(TaskType::StreamIngest).resolved();
@@ -59,6 +67,36 @@ fn resolve_ignores_stream_ingest_record_save_path_override() {
 }
 
 #[test]
+fn resolved_stream_ingest_live_falls_back_to_http_fmp4_without_recording() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.record.enabled = Some(false);
+    disable_all_playback_expose(&mut task);
+
+    let resolved = task.resolved();
+
+    assert_eq!(resolved.expose.enable_rtsp, Some(false));
+    assert_eq!(resolved.expose.enable_rtmp, Some(false));
+    assert_eq!(resolved.expose.enable_http_ts, Some(false));
+    assert_eq!(resolved.expose.enable_http_fmp4, Some(true));
+    assert_eq!(resolved.expose.enable_hls, Some(false));
+}
+
+#[test]
+fn resolved_stream_ingest_live_falls_back_to_http_fmp4_with_recording() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.record.enabled = Some(true);
+    disable_all_playback_expose(&mut task);
+
+    let resolved = task.resolved();
+
+    assert_eq!(resolved.expose.enable_rtsp, Some(false));
+    assert_eq!(resolved.expose.enable_rtmp, Some(false));
+    assert_eq!(resolved.expose.enable_http_ts, Some(false));
+    assert_eq!(resolved.expose.enable_http_fmp4, Some(true));
+    assert_eq!(resolved.expose.enable_hls, Some(false));
+}
+
+#[test]
 fn resolved_stream_ingest_vod_record_mode_defaults_to_realtime_when_playback_is_exposed() {
     let mut task = sample_task(TaskType::StreamIngest);
     task.input.kind = Some(InputKind::HttpMp4);
@@ -81,14 +119,11 @@ fn resolved_stream_ingest_vod_record_mode_becomes_fast_when_all_playback_is_disa
     task.input.source_mode = Some(SourceMode::Vod);
     task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
     task.record.enabled = Some(true);
-    task.expose.enable_rtsp = Some(false);
-    task.expose.enable_rtmp = Some(false);
-    task.expose.enable_http_ts = Some(false);
-    task.expose.enable_http_fmp4 = Some(false);
-    task.expose.enable_hls = Some(false);
+    disable_all_playback_expose(&mut task);
 
     let resolved = task.resolved();
 
+    assert!(!resolved.expose.any_playback_enabled());
     assert_eq!(
         resolved.stream_ingest_record_mode(),
         Some(StreamIngestRecordMode::Fast)
@@ -178,11 +213,7 @@ fn vod_loop_playback_ingest_uses_sticky_reconnect_until_duration() {
     assert!(!task.resolved().stream_ingest_uses_sticky_reconnect());
 
     task.record.duration_sec = None;
-    task.expose.enable_rtsp = Some(false);
-    task.expose.enable_rtmp = Some(false);
-    task.expose.enable_http_ts = Some(false);
-    task.expose.enable_http_fmp4 = Some(false);
-    task.expose.enable_hls = Some(false);
+    disable_all_playback_expose(&mut task);
     assert!(!task.resolved().stream_ingest_uses_sticky_reconnect());
 }
 
@@ -357,11 +388,7 @@ fn validate_rejects_fast_record_loop_without_duration() {
     task.input.loop_enabled = Some(true);
     task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
     task.record.enabled = Some(true);
-    task.expose.enable_rtsp = Some(false);
-    task.expose.enable_rtmp = Some(false);
-    task.expose.enable_http_ts = Some(false);
-    task.expose.enable_http_fmp4 = Some(false);
-    task.expose.enable_hls = Some(false);
+    disable_all_playback_expose(&mut task);
 
     let error = task.validate().expect_err("validation should fail");
     assert!(

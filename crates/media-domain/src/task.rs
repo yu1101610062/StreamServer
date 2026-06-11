@@ -537,6 +537,12 @@ impl TaskSpec {
             resolved.expose.enable_http_fmp4 =
                 Some(resolved.expose.enable_http_fmp4.unwrap_or(true));
             resolved.expose.enable_hls = Some(resolved.expose.enable_hls.unwrap_or(false));
+            if resolved.input.source_mode == Some(SourceMode::Live)
+                && !resolved.expose.any_playback_enabled()
+            {
+                // 直播接入至少保留一个轻量 HTTP 播放协议，避免纯录制链路触发 ZLM MP4 时间轴异常。
+                resolved.expose.enable_http_fmp4 = Some(true);
+            }
             resolved.expose.stop_on_no_reader =
                 Some(resolved.expose.stop_on_no_reader.unwrap_or(false));
             resolved.record.enabled = Some(resolved.record.enabled.unwrap_or(false));

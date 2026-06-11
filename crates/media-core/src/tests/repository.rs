@@ -387,13 +387,13 @@ fn should_persist_record_file_hook_only_keeps_hls_record_playlists() {
             "type": "stream_ingest",
             "name": "record-hls",
             "common": {"created_by": "tester"},
-            "input": {"kind": "rtsp", "url": "rtsp://camera/live"},
+            "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
             "stream": {"app": "live", "name": "camera01"},
             "expose": {
                 "enable_rtsp": false,
                 "enable_rtmp": false,
                 "enable_http_ts": false,
-                "enable_http_fmp4": false,
+                "enable_http_fmp4": true,
                 "enable_hls": false
             },
             "process": {"mode": "copy_or_transcode"},

@@ -225,7 +225,7 @@
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；`ftp` 固定为 `vod`，其他输入类型按规则自动推断。
 - `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时关闭全部播放协议并启用录制，任务会进入快录分支，此时必须填写 `record.duration_sec` 作为快录终点。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
-- `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。对 `stream_ingest + source_mode=vod + record.enabled=true`，只要任一播放协议开启，任务就保持实时录制；全部关闭则切到快录且不再提供实时播放地址。
+- `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。对 `stream_ingest + source_mode=live`，如果外部显式关闭全部播放协议，`resolved_spec` 会自动开启 `expose.enable_http_fmp4=true` 作为最小兜底，其他协议保持关闭；直播流接入不会最终处于零 expose 状态。对 `stream_ingest + source_mode=vod + record.enabled=true`，只要任一播放协议开启，任务就保持实时录制；全部关闭则切到快录且不再提供实时播放地址。
 - `publish.kind` 表示任务直接写出的外部目标类型；当前支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`、`rtmp_push`。
 - `record.duration_sec` 表示总录制时长：`stream_ingest + source_mode=vod` 在实时分支按媒体时间截取、在快录分支作为离线处理的终点；`stream_ingest + source_mode=live` 按现实时间计时；到点后任务整体成功结束。
 - `record.segment_sec` 表示录像分段时长：MP4 录制未填写时默认 7200 秒（2 小时）分段；Agent 托管 HLS 录制未填写时使用节点 `AGENT_HLS_RECORD_SEGMENT_SEC`（默认 60，可配置 30/60）。

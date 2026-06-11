@@ -309,7 +309,7 @@ function fieldMeta(path: string): FieldMeta | null {
     { test: (value) => value === "stream.app", meta: { description: "内部应用名。", required: "stream_ingest 时建议填写" } },
     { test: (value) => value === "stream.name", meta: { description: "内部流名。", required: "stream_ingest 时建议填写" } },
     { test: (value) => value === "stream.vhost", meta: { description: "内部流所属 vhost。" } },
-    { test: (value) => value === "expose", meta: { description: "内部流对外播放协议开关。对 `stream_ingest + source_mode=vod + record.enabled=true`，任一协议开启都会保持实时录制；全部关闭则切到快录且不再提供实时流播放地址。" } },
+    { test: (value) => value === "expose", meta: { description: "内部流对外播放协议开关。对 `stream_ingest + source_mode=live`，若外部显式关闭全部播放协议，`resolved_spec` 会自动开启 `enable_http_fmp4=true` 作为最小兜底；对 `stream_ingest + source_mode=vod + record.enabled=true`，任一协议开启都会保持实时录制，全部关闭则切到快录且不再提供实时流播放地址。" } },
     { test: (value) => /^expose\./.test(value), meta: { description: "布尔开关，控制是否暴露对应协议。" } },
     { test: (value) => value === "publish", meta: { description: "显式输出目标定义。" } },
     {
@@ -789,7 +789,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     notes: [
       "这个接口不会创建任务，也不会占用节点资源。",
       "如果要让离线输入持续供流，可在 `stream_ingest + source_mode=vod` 时设置 `input.loop_enabled=true`。",
-      "当 `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全部关闭时，resolved_spec 会走快录语义；只要 expose 任一协议开启，就保持实时录制。",
+      "当 `stream_ingest + source_mode=live` 且 expose 全部关闭时，resolved_spec 会自动开启 HTTP-FMP4 兜底；当 `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全部关闭时，resolved_spec 会走快录语义。",
     ],
   },
   {
@@ -823,7 +823,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     },
     notes: [
       "`input.loop_enabled=true` 仅支持 `stream_ingest` 的离线输入；若同时配置 `record.duration_sec`，到时任务仍会自动成功结束。",
-      "`stream_ingest` 的 VOD 录制不会手动指定实时/快录，而是由 expose 自动判定：有播放协议就实时，没有播放协议就快录。",
+      "`stream_ingest` 的直播接入不会最终保持零 expose，外部全关时会默认开启 HTTP-FMP4；VOD 录制不会手动指定实时/快录，而是由 expose 自动判定。",
       "`resource.required_labels[]` 会做节点硬过滤；如果当前没有任何匹配标签的在线节点，任务会直接失败。",
     ],
   },
