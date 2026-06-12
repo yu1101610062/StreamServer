@@ -145,7 +145,7 @@ jobs:
           [Run]
           Filename: "{app}\streamserver_desktop.exe"; Description: "Launch StreamServer控制台"; Flags: nowait postinstall skipifsilent
           "@
-          Set-Content -LiteralPath $issPath -Value $iss -Encoding ASCII
+          Set-Content -LiteralPath $issPath -Value $iss -Encoding utf8BOM
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           & $iscc $issPath
           if ($LASTEXITCODE -ne 0) {
