@@ -1,7 +1,7 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -154,54 +154,67 @@ class _TasksScreenState extends State<TasksScreen> {
                           onDone: _refresh,
                         );
                       }
-                      final taskWidth = math.max(
-                          180.0, math.min(420.0, constraints.maxWidth * 0.34));
-                      final timeWidth = math.max(
-                          150.0, math.min(220.0, constraints.maxWidth * 0.18));
-                      return SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: DataTable(
-                          dataRowMinHeight: 56,
-                          dataRowMaxHeight: 136,
-                          columns: const [
-                            DataColumn(label: Text('任务')),
-                            DataColumn(label: Text('类型')),
-                            DataColumn(label: Text('状态')),
-                            DataColumn(label: Text('节点')),
-                            DataColumn(label: Text('创建者')),
-                            DataColumn(label: Text('更新时间')),
-                            DataColumn(label: Text('操作')),
-                          ],
-                          rows: rows.map((row) {
-                            return DataRow(
-                              cells: [
-                                DataCell(
-                                  WrappedTextCell(
-                                    value: row['name'],
-                                    maxWidth: taskWidth,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                  onTap: () =>
-                                      controller.openTask('${row['id']}'),
-                                ),
-                                DataCell(WrappedTextCell(
-                                    value: row['type'], maxWidth: 150)),
-                                DataCell(StatusBadge(status: row['status'])),
-                                DataCell(WrappedTextCell(
-                                    value: shortId(row['assigned_node_id'] ??
-                                        row['node_id']),
-                                    maxWidth: 96)),
-                                DataCell(WrappedTextCell(
-                                    value: row['created_by'], maxWidth: 120)),
-                                DataCell(WrappedTextCell(
-                                    value: row['updated_at'],
-                                    maxWidth: timeWidth)),
-                                DataCell(
-                                    _TaskActions(row: row, onDone: _refresh)),
-                              ],
-                            );
-                          }).toList(),
-                        ),
+                      return StreamDataGrid(
+                        height: 560,
+                        rows: rows,
+                        onSelected: (row) =>
+                            controller.openTask('${row['id']}'),
+                        onDoubleTap: (row) =>
+                            controller.openTask('${row['id']}'),
+                        onSecondaryTap: (row) =>
+                            _showTaskContextMenu(context, row, _refresh),
+                        columns: [
+                          StreamGridColumn(
+                            title: '任务',
+                            field: 'name',
+                            width: 260,
+                            enableRowChecked: true,
+                            renderer: (context, row, value) => gridTextCell(
+                              context,
+                              value,
+                              fontWeight: FontWeight.w800,
+                              maxWidth: 248,
+                            ),
+                          ),
+                          StreamGridColumn(
+                            title: '类型',
+                            field: 'type',
+                            width: 150,
+                            renderer: (context, row, value) =>
+                                gridTextCell(context, value, maxWidth: 140),
+                          ),
+                          StreamGridColumn(
+                            title: '状态',
+                            field: 'status',
+                            width: 130,
+                            renderer: (context, row, value) =>
+                                gridStatusCell(context, value),
+                          ),
+                          StreamGridColumn(
+                            title: '节点',
+                            field: 'assigned_node_id',
+                            width: 110,
+                            renderer: (context, row, value) => Text(shortId(
+                                row['assigned_node_id'] ?? row['node_id'])),
+                          ),
+                          const StreamGridColumn(
+                            title: '创建者',
+                            field: 'created_by',
+                            width: 120,
+                          ),
+                          const StreamGridColumn(
+                            title: '更新时间',
+                            field: 'updated_at',
+                            width: 210,
+                          ),
+                          StreamGridColumn(
+                            title: '操作',
+                            field: 'id',
+                            width: 128,
+                            renderer: (context, row, value) =>
+                                _TaskActionMenu(row: row, onDone: _refresh),
+                          ),
+                        ],
                       );
                     },
                   ),
@@ -213,6 +226,30 @@ class _TasksScreenState extends State<TasksScreen> {
       ],
     );
   }
+}
+
+Future<void> _showTaskContextMenu(
+  BuildContext context,
+  Map<String, Object?> row,
+  VoidCallback onDone,
+) async {
+  final overlay = Overlay.of(context).context.findRenderObject() as RenderBox?;
+  final size = overlay?.size ?? const Size(1, 1);
+  final selected = await showMenu<String>(
+    context: context,
+    position: RelativeRect.fromLTRB(size.width / 2, size.height / 2, 24, 24),
+    items: const [
+      PopupMenuItem(value: 'detail', child: Text('打开详情')),
+      PopupMenuItem(value: 'start', child: Text('启动')),
+      PopupMenuItem(value: 'stop', child: Text('停止')),
+      PopupMenuItem(value: 'cancel', child: Text('取消')),
+      PopupMenuItem(value: 'retry', child: Text('重试')),
+      PopupMenuItem(value: 'clone', child: Text('克隆')),
+      PopupMenuItem(value: 'delete', child: Text('删除')),
+    ],
+  );
+  if (selected == null || !context.mounted) return;
+  await _TaskActionMenu(row: row, onDone: onDone).run(context, selected);
 }
 
 class _CompactTaskList extends StatelessWidget {
@@ -422,6 +459,109 @@ class _TaskActions extends StatelessWidget {
   ) async {
     try {
       await controller.mutate(method, path);
+      if (context.mounted) showResult(context, '操作已提交');
+      onDone();
+    } catch (cause) {
+      if (context.mounted) showResult(context, cause.toString());
+    }
+  }
+}
+
+class _TaskActionMenu extends StatelessWidget {
+  const _TaskActionMenu({required this.row, required this.onDone});
+
+  final Map<String, Object?> row;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: '详情',
+          onPressed: () => AppScope.of(context).openTask('${row['id']}'),
+          icon: const Icon(LucideIcons.eye, size: 17),
+        ),
+        PopupMenuButton<String>(
+          tooltip: '更多操作',
+          onSelected: (value) => run(context, value),
+          itemBuilder: (context) => const [
+            PopupMenuItem(value: 'start', child: Text('启动')),
+            PopupMenuItem(value: 'stop', child: Text('停止')),
+            PopupMenuItem(value: 'cancel', child: Text('取消')),
+            PopupMenuItem(value: 'retry', child: Text('重试')),
+            PopupMenuItem(value: 'clone', child: Text('克隆')),
+            PopupMenuDivider(),
+            PopupMenuItem(value: 'delete', child: Text('删除')),
+          ],
+          child: const Padding(
+            padding: EdgeInsets.all(8),
+            child: Icon(LucideIcons.ellipsis, size: 18),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> run(BuildContext context, String value) async {
+    final controller = AppScope.of(context);
+    final id = '${row['id']}';
+    final name = textValue(row['name']);
+    if (value == 'detail') {
+      controller.openTask(id);
+      return;
+    }
+    final path = '/api/v1/tasks/$id';
+    String method = 'POST';
+    String requestPath = path;
+    bool confirm = false;
+    bool destructive = false;
+    String title = '';
+    switch (value) {
+      case 'start':
+        requestPath = '$path/start';
+        title = '启动任务';
+        break;
+      case 'stop':
+        requestPath = '$path/stop';
+        title = '停止任务';
+        confirm = true;
+        break;
+      case 'cancel':
+        requestPath = '$path/cancel';
+        title = '取消任务';
+        confirm = true;
+        break;
+      case 'retry':
+        requestPath = '$path/retry';
+        title = '重试任务';
+        break;
+      case 'clone':
+        requestPath = '$path/clone';
+        title = '克隆任务';
+        break;
+      case 'delete':
+        method = 'DELETE';
+        title = '删除任务';
+        confirm = true;
+        destructive = true;
+        break;
+      default:
+        return;
+    }
+    if (confirm) {
+      final ok = await confirmAction(
+        context,
+        title: title,
+        message: destructive ? '确认删除任务 $name？该操作不可撤销。' : '确认$title $name？',
+        confirmLabel: title.replaceAll('任务', ''),
+        destructive: destructive,
+      );
+      if (!ok || !context.mounted) return;
+    }
+    try {
+      await controller.mutate(method, requestPath);
       if (context.mounted) showResult(context, '操作已提交');
       onDone();
     } catch (cause) {

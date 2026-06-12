@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -96,53 +98,82 @@ class _NodesScreenState extends State<NodesScreen> {
                           controller, '/api/v1/nodes/${row['id']}/heartbeats'),
                     );
                   }
-                  return SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      dataRowMinHeight: 56,
-                      dataRowMaxHeight: 132,
-                      columns: const [
-                        DataColumn(label: Text('节点')),
-                        DataColumn(label: Text('健康')),
-                        DataColumn(label: Text('控制连接')),
-                        DataColumn(label: Text('媒体')),
-                        DataColumn(label: Text('CPU')),
-                        DataColumn(label: Text('内存')),
-                        DataColumn(label: Text('任务')),
-                        DataColumn(label: Text('标签')),
-                        DataColumn(label: Text('心跳')),
-                      ],
-                      rows: rows.map((row) {
-                        return DataRow(cells: [
-                          DataCell(WrappedTextCell(
-                              value: row['node_name'] ?? row['id'],
-                              maxWidth: 240)),
-                          DataCell(StatusBadge(
-                              status: row['healthy'] == true
-                                  ? 'healthy'
-                                  : 'unhealthy')),
-                          DataCell(StatusBadge(
-                              status: row['control_connected'] == true
-                                  ? 'connected'
-                                  : 'disconnected')),
-                          DataCell(StatusBadge(
-                              status: row['media_alive'] == true
-                                  ? 'alive'
-                                  : 'dead')),
-                          DataCell(Text(textValue(row['cpu_percent']))),
-                          DataCell(Text(textValue(row['mem_percent']))),
-                          DataCell(Text(textValue(row['running_tasks']))),
-                          DataCell(WrappedTextCell(
-                              value: row['labels'], maxWidth: 280)),
-                          DataCell(TextButton.icon(
-                            onPressed: () => _debug(controller,
-                                '/api/v1/nodes/${row['id']}/heartbeats'),
-                            icon: const Icon(Icons.history),
-                            label: const Text('查看'),
-                          )),
-                        ]);
-                      }).toList(),
-                    ),
+                  return StreamDataGrid(
+                    height: 560,
+                    rows: rows,
+                    columns: [
+                      StreamGridColumn(
+                        title: '节点',
+                        field: 'node_name',
+                        width: 230,
+                        renderer: (context, row, value) => gridTextCell(
+                          context,
+                          row['node_name'] ?? row['id'],
+                          fontWeight: FontWeight.w800,
+                          maxWidth: 220,
+                        ),
+                      ),
+                      StreamGridColumn(
+                        title: '健康',
+                        field: 'healthy',
+                        width: 120,
+                        renderer: (context, row, value) => StatusBadge(
+                          status:
+                              row['healthy'] == true ? 'healthy' : 'unhealthy',
+                        ),
+                      ),
+                      StreamGridColumn(
+                        title: '控制连接',
+                        field: 'control_connected',
+                        width: 130,
+                        renderer: (context, row, value) => StatusBadge(
+                          status: row['control_connected'] == true
+                              ? 'connected'
+                              : 'disconnected',
+                        ),
+                      ),
+                      StreamGridColumn(
+                        title: '媒体',
+                        field: 'media_alive',
+                        width: 100,
+                        renderer: (context, row, value) => StatusBadge(
+                          status: row['media_alive'] == true ? 'alive' : 'dead',
+                        ),
+                      ),
+                      const StreamGridColumn(
+                        title: 'CPU',
+                        field: 'cpu_percent',
+                        width: 90,
+                      ),
+                      const StreamGridColumn(
+                        title: '内存',
+                        field: 'mem_percent',
+                        width: 90,
+                      ),
+                      const StreamGridColumn(
+                        title: '任务',
+                        field: 'running_tasks',
+                        width: 90,
+                      ),
+                      StreamGridColumn(
+                        title: '标签',
+                        field: 'labels',
+                        width: 260,
+                        renderer: (context, row, value) =>
+                            gridTextCell(context, value, maxWidth: 250),
+                      ),
+                      StreamGridColumn(
+                        title: '心跳',
+                        field: 'id',
+                        width: 120,
+                        renderer: (context, row, value) => TextButton.icon(
+                          onPressed: () => _debug(controller,
+                              '/api/v1/nodes/${row['id']}/heartbeats'),
+                          icon: const Icon(LucideIcons.clock, size: 16),
+                          label: const Text('查看'),
+                        ),
+                      ),
+                    ],
                   );
                 },
               ),

@@ -2,7 +2,9 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
 
@@ -18,7 +20,13 @@ Map<String, Object?> cleanQuery(Map<String, Object?> query) {
 }
 
 void showResult(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      content: Text(message),
+    ),
+  );
 }
 
 Future<bool> confirmAction(
@@ -31,6 +39,7 @@ Future<bool> confirmAction(
   final result = await showDialog<bool>(
     context: context,
     builder: (context) => AlertDialog(
+      backgroundColor: context.streamColors.surface,
       title: Text(title),
       content: Text(message),
       actions: [
@@ -40,7 +49,8 @@ Future<bool> confirmAction(
         ),
         FilledButton(
           style: destructive
-              ? FilledButton.styleFrom(backgroundColor: Colors.red.shade700)
+              ? FilledButton.styleFrom(
+                  backgroundColor: context.streamColors.danger)
               : null,
           onPressed: () => Navigator.of(context).pop(true),
           child: Text(confirmLabel),
@@ -79,11 +89,16 @@ class FullUrlText extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.streamColors;
     return ConstrainedBox(
       constraints: BoxConstraints(maxWidth: maxWidth),
       child: SelectableText(
         textValue(value),
-        style: const TextStyle(fontSize: 12, height: 1.35),
+        style: TextStyle(
+          color: colors.textPrimary,
+          fontSize: 12,
+          height: 1.35,
+        ),
       ),
     );
   }
@@ -94,12 +109,14 @@ class PlayableUrlList extends StatelessWidget {
     required this.urls,
     this.title,
     this.maxWidth = 640,
+    this.maxVisibleItems = 3,
     super.key,
   });
 
   final List<String> urls;
   final String? title;
   final double maxWidth;
+  final int? maxVisibleItems;
 
   @override
   Widget build(BuildContext context) {
@@ -107,16 +124,148 @@ class PlayableUrlList extends StatelessWidget {
     if (cleanUrls.isEmpty) {
       return const Text('—');
     }
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: cleanUrls
-          .map((url) => PlayableUrlTile(
-                url: url,
-                title: title ?? url,
-                maxWidth: maxWidth,
-              ))
-          .toList(),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final availableWidth =
+            constraints.hasBoundedWidth ? constraints.maxWidth : maxWidth;
+        final width = availableWidth.clamp(180.0, maxWidth).toDouble();
+        final visibleCount = maxVisibleItems == null
+            ? cleanUrls.length
+            : math.min(maxVisibleItems!, cleanUrls.length);
+        final hiddenCount = cleanUrls.length - visibleCount;
+        return SizedBox(
+          width: width,
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (var index = 0; index < visibleCount; index++) ...[
+                  PlayableUrlTile(
+                    url: cleanUrls[index],
+                    title: title ?? cleanUrls[index],
+                    maxWidth: width,
+                  ),
+                  if (index != visibleCount - 1) const SizedBox(height: 8),
+                ],
+                if (hiddenCount > 0) ...[
+                  const SizedBox(height: 8),
+                  _MorePlayableUrlsButton(
+                    urls: cleanUrls,
+                    title: title,
+                    hiddenCount: hiddenCount,
+                    maxWidth: width,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _MorePlayableUrlsButton extends StatelessWidget {
+  const _MorePlayableUrlsButton({
+    required this.urls,
+    required this.hiddenCount,
+    required this.maxWidth,
+    this.title,
+  });
+
+  final List<String> urls;
+  final int hiddenCount;
+  final double maxWidth;
+  final String? title;
+
+  @override
+  Widget build(BuildContext context) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        style: TextButton.styleFrom(
+          minimumSize: const Size(0, 30),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+        onPressed: () => _showAll(context),
+        icon: const Icon(LucideIcons.listVideo, size: 16),
+        label: Text('还有 $hiddenCount 个地址'),
+      ),
+    );
+  }
+
+  Future<void> _showAll(BuildContext context) async {
+    final colors = context.streamColors;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        final size = MediaQuery.of(dialogContext).size;
+        return Dialog(
+          backgroundColor: colors.surface,
+          shape: RoundedRectangleBorder(
+            side: BorderSide(color: colors.border),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(
+              maxWidth: math.max(280, math.min(760, size.width - 48)),
+              maxHeight: math.max(260, size.height - 96),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(18),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          title == null ? '播放地址' : '播放地址 · $title',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: colors.textPrimary,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: '关闭',
+                        onPressed: () => Navigator.of(dialogContext).pop(),
+                        icon: const Icon(LucideIcons.x, size: 18),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Flexible(
+                    child: SingleChildScrollView(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          for (var index = 0; index < urls.length; index++) ...[
+                            PlayableUrlTile(
+                              url: urls[index],
+                              title: title ?? urls[index],
+                              maxWidth: math.min(700, maxWidth + 120),
+                            ),
+                            if (index != urls.length - 1)
+                              const SizedBox(height: 8),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -136,46 +285,58 @@ class PlayableUrlTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final enabled = isPlayableMediaUrl(url);
-    return ConstrainedBox(
-      constraints: BoxConstraints(maxWidth: maxWidth),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          color: const Color(0xfff8fafc),
-          border: Border.all(color: const Color(0xffd7deea)),
-          borderRadius: BorderRadius.circular(8),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              SelectableText(
-                url,
-                style: const TextStyle(fontSize: 12, height: 1.35),
-              ),
-              const SizedBox(height: 6),
-              Wrap(
-                spacing: 4,
-                runSpacing: 4,
-                crossAxisAlignment: WrapCrossAlignment.center,
+    final colors = context.streamColors;
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final availableWidth =
+            constraints.hasBoundedWidth ? constraints.maxWidth : maxWidth;
+        final width = availableWidth.clamp(180.0, maxWidth).toDouble();
+        return SizedBox(
+          width: width,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.surfaceAlt,
+              border: Border.all(color: colors.border),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
-                  TextButton.icon(
-                    onPressed: enabled ? () => _open(context) : null,
-                    icon: const Icon(Icons.play_arrow),
-                    label: const Text('播放'),
+                  SelectableText(
+                    url,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
                   ),
-                  IconButton(
-                    tooltip: '复制地址',
-                    onPressed: () => copyText(context, url),
-                    icon: const Icon(Icons.copy),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 4,
+                    runSpacing: 4,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      TextButton.icon(
+                        onPressed: enabled ? () => _open(context) : null,
+                        icon: const Icon(LucideIcons.circlePlay, size: 16),
+                        label: const Text('播放'),
+                      ),
+                      IconButton(
+                        tooltip: '复制地址',
+                        onPressed: () => copyText(context, url),
+                        icon: const Icon(LucideIcons.copy, size: 17),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
+            ),
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -199,24 +360,35 @@ class FilterBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 12,
-      runSpacing: 12,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        ...children,
-        FilledButton.icon(
-          onPressed: onApply,
-          icon: const Icon(Icons.filter_alt),
-          label: const Text('应用筛选'),
+    final colors = context.streamColors;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colors.surfaceAlt,
+        border: Border.all(color: colors.border),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          crossAxisAlignment: WrapCrossAlignment.center,
+          children: [
+            ...children,
+            FilledButton.icon(
+              onPressed: onApply,
+              icon: const Icon(LucideIcons.slidersHorizontal, size: 17),
+              label: const Text('应用筛选'),
+            ),
+            if (onReset != null)
+              OutlinedButton.icon(
+                onPressed: onReset,
+                icon: const Icon(LucideIcons.rotateCcw, size: 17),
+                label: const Text('重置'),
+              ),
+          ],
         ),
-        if (onReset != null)
-          OutlinedButton.icon(
-            onPressed: onReset,
-            icon: const Icon(Icons.clear),
-            label: const Text('重置'),
-          ),
-      ],
+      ),
     );
   }
 }
@@ -249,7 +421,10 @@ class SmallTextField extends StatelessWidget {
           child: TextField(
             controller: controller,
             obscureText: obscureText,
-            decoration: InputDecoration(labelText: label),
+            decoration: InputDecoration(
+              labelText: label,
+              prefixIcon: const Icon(LucideIcons.search, size: 16),
+            ),
             onSubmitted: onSubmitted,
           ),
         );
@@ -326,13 +501,13 @@ class PagerBar extends StatelessWidget {
         IconButton(
           tooltip: '上一页',
           onPressed: page <= 1 ? null : () => onPageChanged(page - 1),
-          icon: const Icon(Icons.chevron_left),
+          icon: const Icon(LucideIcons.chevronLeft),
         ),
         Text('第 $page / $maxPage 页，共 $total 条'),
         IconButton(
           tooltip: '下一页',
           onPressed: page >= maxPage ? null : () => onPageChanged(page + 1),
-          icon: const Icon(Icons.chevron_right),
+          icon: const Icon(LucideIcons.chevronRight),
         ),
       ],
     );

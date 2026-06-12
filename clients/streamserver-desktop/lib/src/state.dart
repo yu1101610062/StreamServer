@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 
 import 'bridge/native_bridge.dart';
 
@@ -19,6 +19,8 @@ enum AppSection {
   security,
   debug,
 }
+
+enum NavigationSource { controller, route }
 
 class ServerProfile {
   const ServerProfile({
@@ -50,6 +52,9 @@ class AppController extends ChangeNotifier {
   AppController(this._bridge);
 
   final NativeBridge _bridge;
+  final ChangeNotifier _routerNotifier = ChangeNotifier();
+
+  Listenable get routerListenable => _routerNotifier;
 
   ServerProfile? server;
   List<ServerProfile> serverProfiles = const [];
@@ -57,6 +62,12 @@ class AppController extends ChangeNotifier {
   String refreshToken = '';
   Map<String, Object?>? session;
   AppSection currentSection = AppSection.overview;
+  NavigationSource navigationSource = NavigationSource.controller;
+  ThemeMode themeMode = ThemeMode.light;
+  int autoRefreshSeconds = 5;
+  int viewRefreshSeed = 0;
+  bool inspectorVisible = true;
+  String? inspectorNodeId;
   String? selectedTaskId;
   String? activeMediaUrl;
   String? activeMediaTitle;
@@ -71,6 +82,12 @@ class AppController extends ChangeNotifier {
   String get role => (session?['role'] as String?) ?? 'unknown';
   String get environment => (session?['environment'] as String?) ?? 'desktop';
 
+  @override
+  void dispose() {
+    _routerNotifier.dispose();
+    super.dispose();
+  }
+
   Future<void> initialize() async {
     if (initialized) return;
     busy = true;
@@ -78,6 +95,7 @@ class AppController extends ChangeNotifier {
     try {
       _loadLocalStore();
       _migrateLegacyLocalStoreIfNeeded();
+      _loadPreferences();
       serverProfiles = _readServerProfiles();
       final activeServerId =
           _readLocalStoreString('active_server_id') ?? _firstServerProfileId();
@@ -91,7 +109,7 @@ class AppController extends ChangeNotifier {
 
       if (server != null && refreshToken.isNotEmpty) {
         try {
-          final tokens = _bridge.call('auth.refresh', {
+          final tokens = await NativeBridge.callOnWorker('auth.refresh', {
             'server': server!.toJson(),
             'refresh_token': refreshToken,
           });
@@ -101,7 +119,7 @@ class AppController extends ChangeNotifier {
           if (refreshToken != previousRefreshToken) {
             _writeStoreValue('refresh_token', refreshToken);
           }
-          session = _bridge.call('auth.me', {
+          session = await NativeBridge.callOnWorker('auth.me', {
             'server': server!.toJson(),
             'access_token': accessToken,
           });
@@ -115,6 +133,7 @@ class AppController extends ChangeNotifier {
     } finally {
       initialized = true;
       busy = false;
+      _notifyRouter();
       notifyListeners();
     }
   }
@@ -130,7 +149,7 @@ class AppController extends ChangeNotifier {
       _writeLocalStoreValue('server_profiles',
           serverProfiles.map((item) => item.toJson()).toList());
       _writeLocalStoreValue('active_server_id', server!.id);
-      final tokens = _bridge.call('auth.login', {
+      final tokens = await NativeBridge.callOnWorker('auth.login', {
         'server': server!.toJson(),
         'body': {
           'username': username,
@@ -142,11 +161,12 @@ class AppController extends ChangeNotifier {
       if (refreshToken.isNotEmpty) {
         _writeStoreValue('refresh_token', refreshToken);
       }
-      session = _bridge.call('auth.me', {
+      session = await NativeBridge.callOnWorker('auth.me', {
         'server': server!.toJson(),
         'access_token': accessToken,
       });
       currentSection = AppSection.overview;
+      _notifyRouter();
     });
   }
 
@@ -166,7 +186,7 @@ class AppController extends ChangeNotifier {
     if (active == null) {
       throw NativeBridgeError('server is not configured');
     }
-    final response = _bridge.call('api.request', {
+    final response = await NativeBridge.callOnWorker('api.request', {
       'server': active.toJson(),
       'access_token': accessToken,
       'refresh_token': refreshToken,
@@ -217,7 +237,7 @@ class AppController extends ChangeNotifier {
     if (active == null) {
       throw NativeBridgeError('server is not configured');
     }
-    return _bridge.call('upload.media', {
+    return NativeBridge.callOnWorker('upload.media', {
       'server': active.toJson(),
       'access_token': accessToken,
       'file_path': filePath,
@@ -237,20 +257,20 @@ class AppController extends ChangeNotifier {
   }
 
   Future<Map<String, Object?>> openExternalMedia(String url) async {
-    return _bridge.call('media_player.open_external', {
+    return NativeBridge.callOnWorker('media_player.open_external', {
       'body': {'url': url},
     });
   }
 
   Future<Map<String, Object?>> stopMedia(String sessionId) async {
-    return _bridge.call('media_player.stop', {
+    return NativeBridge.callOnWorker('media_player.stop', {
       'body': {'session_id': sessionId},
     });
   }
 
   Future<Map<String, Object?>> snapshotMedia(String sessionId,
       {String? outputPath}) async {
-    return _bridge.call('media_player.snapshot', {
+    return NativeBridge.callOnWorker('media_player.snapshot', {
       'body': {
         'session_id': sessionId,
         if (outputPath != null && outputPath.isNotEmpty)
@@ -260,7 +280,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<Map<String, Object?>> openMediaProbe() async {
-    return _bridge.call('media_player.probe', {});
+    return NativeBridge.callOnWorker('media_player.probe', {});
   }
 
   Future<List<Map<String, Object?>>> scanServers({
@@ -309,20 +329,87 @@ class AppController extends ChangeNotifier {
     if (active == null) {
       throw NativeBridgeError('server is not configured');
     }
-    return _bridge.call('diagnostics.probe', {
+    return NativeBridge.callOnWorker('diagnostics.probe', {
       'server': active.toJson(),
       'access_token': accessToken,
     });
   }
 
   void navigate(AppSection section) {
+    if (currentSection == section &&
+        navigationSource == NavigationSource.controller) {
+      return;
+    }
+    navigationSource = NavigationSource.controller;
     currentSection = section;
+    _notifyRouter();
     notifyListeners();
   }
 
   void openTask(String taskId) {
+    if (selectedTaskId == taskId && currentSection == AppSection.taskDetail) {
+      return;
+    }
     selectedTaskId = taskId;
+    navigationSource = NavigationSource.controller;
     currentSection = AppSection.taskDetail;
+    _notifyRouter();
+    notifyListeners();
+  }
+
+  void selectTask(String taskId) {
+    if (selectedTaskId == taskId) return;
+    selectedTaskId = taskId;
+    notifyListeners();
+  }
+
+  void syncSectionFromRoute(AppSection section) {
+    if (currentSection == section &&
+        navigationSource == NavigationSource.route) {
+      return;
+    }
+    currentSection = section;
+    navigationSource = NavigationSource.route;
+  }
+
+  void setThemeMode(ThemeMode mode) {
+    if (themeMode == mode) return;
+    themeMode = mode;
+    _writeLocalStoreValue('theme_mode', mode.name);
+    notifyListeners();
+  }
+
+  void toggleThemeMode() {
+    setThemeMode(
+        themeMode == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark);
+  }
+
+  void setAutoRefreshSeconds(int seconds) {
+    if (autoRefreshSeconds == seconds) return;
+    autoRefreshSeconds = seconds;
+    _writeLocalStoreValue('auto_refresh_seconds', seconds);
+    notifyListeners();
+  }
+
+  void notifyCurrentView() {
+    viewRefreshSeed++;
+    notifyListeners();
+  }
+
+  void setInspectorVisible(bool visible) {
+    if (inspectorVisible == visible) return;
+    inspectorVisible = visible;
+    _writeLocalStoreValue('inspector_visible', visible);
+    notifyListeners();
+  }
+
+  void toggleInspectorVisible() {
+    setInspectorVisible(!inspectorVisible);
+  }
+
+  void selectInspectorNode(String? nodeId) {
+    if (inspectorNodeId == nodeId) return;
+    inspectorNodeId = nodeId;
     notifyListeners();
   }
 
@@ -330,10 +417,10 @@ class AppController extends ChangeNotifier {
     await _run(() async {
       if (server != null && refreshToken.isNotEmpty) {
         try {
-          _bridge.call('auth.logout', {
-            'server': server!.toJson(),
-            'access_token': accessToken,
-            'refresh_token': refreshToken,
+            await NativeBridge.callOnWorker('auth.logout', {
+              'server': server!.toJson(),
+              'access_token': accessToken,
+              'refresh_token': refreshToken,
           });
         } catch (_) {
           // Logout should clear local state even when the remote token is already invalid.
@@ -344,8 +431,14 @@ class AppController extends ChangeNotifier {
       refreshToken = '';
       session = null;
       selectedTaskId = null;
+      navigationSource = NavigationSource.controller;
       currentSection = AppSection.overview;
+      _notifyRouter();
     });
+  }
+
+  void _notifyRouter() {
+    _routerNotifier.notifyListeners();
   }
 
   Future<void> _run(Future<void> Function() action) async {
@@ -401,6 +494,19 @@ class AppController extends ChangeNotifier {
           : <String, Object?>{};
     } catch (_) {
       _localStore = {};
+    }
+  }
+
+  void _loadPreferences() {
+    final storedTheme = _readLocalStoreString('theme_mode');
+    themeMode = storedTheme == 'dark' ? ThemeMode.dark : ThemeMode.light;
+    final refresh = _localStore['auto_refresh_seconds'];
+    if (refresh is num) {
+      autoRefreshSeconds = refresh.toInt();
+    }
+    final storedInspectorVisible = _localStore['inspector_visible'];
+    if (storedInspectorVisible is bool) {
+      inspectorVisible = storedInspectorVisible;
     }
   }
 

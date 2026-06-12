@@ -4,10 +4,12 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../core/theme/stream_theme.dart';
 import '../state.dart';
 
 enum _RangeProbeResult {
@@ -93,6 +95,7 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
   @override
   Widget build(BuildContext context) {
     final title = widget.title ?? widget.url;
+    final colors = context.streamColors;
     return LayoutBuilder(
       builder: (context, constraints) {
         final compact = constraints.maxWidth < 820;
@@ -138,9 +141,20 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
         return Padding(
           padding:
               EdgeInsets.fromLTRB(horizontalPadding, 12, horizontalPadding, 0),
-          child: Card(
-            elevation: 0,
-            color: Colors.white,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: colors.surface,
+              border: Border.all(color: colors.border),
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black
+                      .withValues(alpha: context.isDarkMode ? 0.22 : 0.06),
+                  blurRadius: 20,
+                  offset: const Offset(0, 10),
+                ),
+              ],
+            ),
             child: Padding(
               padding: EdgeInsets.all(cardPadding),
               child: Column(
@@ -148,7 +162,8 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
                 children: [
                   Row(
                     children: [
-                      const Icon(Icons.smart_display, color: Color(0xff1463ff)),
+                      Icon(LucideIcons.circlePlay,
+                          color: colors.primary, size: 18),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
@@ -161,12 +176,12 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
                       IconButton(
                         tooltip: '复制地址',
                         onPressed: () => _copy(widget.url),
-                        icon: const Icon(Icons.copy),
+                        icon: const Icon(LucideIcons.copy, size: 18),
                       ),
                       IconButton(
                         tooltip: '关闭播放器',
                         onPressed: AppScope.of(context).closeMediaPlayer,
-                        icon: const Icon(Icons.close),
+                        icon: const Icon(LucideIcons.x, size: 18),
                       ),
                     ],
                   ),
@@ -177,7 +192,17 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
                         width: double.infinity,
                         child: video),
                     const SizedBox(height: 12),
-                    controls,
+                    DecoratedBox(
+                      decoration: BoxDecoration(
+                        color: colors.surfaceAlt,
+                        border: Border.all(color: colors.border),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.all(12),
+                        child: controls,
+                      ),
+                    ),
                   ] else
                     Row(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -187,7 +212,20 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
                           child: SizedBox(height: videoHeight, child: video),
                         ),
                         const SizedBox(width: 16),
-                        SizedBox(width: 320, child: controls),
+                        SizedBox(
+                          width: 320,
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: colors.surfaceAlt,
+                              border: Border.all(color: colors.border),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: controls,
+                            ),
+                          ),
+                        ),
                       ],
                     ),
                 ],
@@ -464,6 +502,7 @@ class _PlayerControls extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.streamColors;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -471,7 +510,7 @@ class _PlayerControls extends StatelessWidget {
           controller: screenshotPathController,
           decoration: const InputDecoration(
             labelText: '截图输出路径',
-            prefixIcon: Icon(Icons.folder),
+            prefixIcon: Icon(LucideIcons.folder),
           ),
         ),
         const SizedBox(height: 12),
@@ -486,17 +525,17 @@ class _PlayerControls extends StatelessWidget {
                       dimension: 16,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Icon(Icons.camera),
+                  : const Icon(LucideIcons.camera),
               label: const Text('截图'),
             ),
             OutlinedButton.icon(
               onPressed: onOpenExternal,
-              icon: const Icon(Icons.open_in_new),
+              icon: const Icon(LucideIcons.externalLink),
               label: const Text('外部播放'),
             ),
             OutlinedButton.icon(
               onPressed: onStop,
-              icon: const Icon(Icons.stop),
+              icon: const Icon(LucideIcons.square),
               label: const Text('停止'),
             ),
           ],
@@ -505,7 +544,7 @@ class _PlayerControls extends StatelessWidget {
           const SizedBox(height: 12),
           SelectableText(
             status,
-            style: const TextStyle(color: Color(0xff5b6477)),
+            style: TextStyle(color: colors.textSecondary, fontSize: 12),
           ),
         ],
       ],

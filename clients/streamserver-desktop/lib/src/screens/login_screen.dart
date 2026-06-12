@@ -1,7 +1,9 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/theme/stream_theme.dart';
 import '../state.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -17,6 +19,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final passwordController = TextEditingController();
   final manualHostController = TextEditingController(text: '172.17.13.196');
   final manualPortController = TextEditingController(text: '8080');
+  final passwordFocusNode = FocusNode();
   String manualProtocol = 'http';
   List<Map<String, Object?>> discoveredServers = const [];
   bool scanning = false;
@@ -31,6 +34,7 @@ class _LoginScreenState extends State<LoginScreen> {
     passwordController.dispose();
     manualHostController.dispose();
     manualPortController.dispose();
+    passwordFocusNode.dispose();
     super.dispose();
   }
 
@@ -38,141 +42,172 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget build(BuildContext context) {
     final controller = AppScope.of(context);
     final profiles = controller.serverProfiles;
+    final colors = context.streamColors;
     return Scaffold(
+      backgroundColor: colors.appBackground,
       body: LayoutBuilder(
         builder: (context, constraints) {
           final compact = constraints.maxWidth < 560;
           final outerPadding = compact ? 12.0 : 24.0;
           final cardPadding = compact ? 18.0 : 28.0;
-          return SafeArea(
-            child: SingleChildScrollView(
-              padding: EdgeInsets.all(outerPadding),
-              child: ConstrainedBox(
-                constraints: BoxConstraints(
-                  minHeight:
-                      math.max(0, constraints.maxHeight - outerPadding * 2),
-                ),
-                child: Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 880),
-                    child: Card(
-                      elevation: 0,
-                      color: Colors.white,
-                      child: Padding(
-                        padding: EdgeInsets.all(cardPadding),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text(
-                              'STREAMSERVER',
-                              style: TextStyle(
-                                color: Color(0xff1463ff),
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 1.2,
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Text('桌面控制台',
-                                style:
-                                    Theme.of(context).textTheme.headlineMedium),
-                            const SizedBox(height: 24),
-                            TextField(
-                              controller: serverController,
-                              decoration: const InputDecoration(
-                                labelText: 'Core 地址',
-                                prefixIcon: Icon(Icons.dns),
-                              ),
-                            ),
-                            if (profiles.isNotEmpty) ...[
-                              const SizedBox(height: 8),
-                              DropdownButtonFormField<String>(
-                                initialValue: profiles.any((item) =>
-                                        item.baseUrl == serverController.text)
-                                    ? serverController.text
-                                    : null,
-                                decoration: const InputDecoration(
-                                  labelText: '已保存服务器',
-                                  prefixIcon: Icon(Icons.storage),
-                                ),
-                                items: profiles
-                                    .map((profile) => DropdownMenuItem(
-                                          value: profile.baseUrl,
-                                          child: Text(
-                                            profile.name,
-                                            maxLines: 1,
-                                            overflow: TextOverflow.ellipsis,
-                                          ),
-                                        ))
-                                    .toList(),
-                                onChanged: (value) {
-                                  if (value != null) {
-                                    final profile = profiles.firstWhere(
-                                        (item) => item.baseUrl == value);
-                                    controller.selectServer(profile);
-                                    serverController.text = profile.baseUrl;
-                                  }
-                                },
-                              ),
-                            ],
-                            const SizedBox(height: 12),
-                            _DiscoveryPanel(
-                              scanning: scanning,
-                              probing: probing,
-                              status: scanStatus,
-                              results: discoveredServers,
-                              manualProtocol: manualProtocol,
-                              manualHostController: manualHostController,
-                              manualPortController: manualPortController,
-                              onProtocolChanged: (value) =>
-                                  setState(() => manualProtocol = value),
-                              onScan: () => _scan(controller),
-                              onSelect: (baseUrl) => setState(
-                                  () => serverController.text = baseUrl),
-                              onProbe: () => _probe(controller),
-                            ),
-                            const SizedBox(height: 12),
-                            TextField(
-                              controller: usernameController,
-                              decoration: const InputDecoration(
-                                labelText: '用户名',
-                                prefixIcon: Icon(Icons.person),
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                            TextField(
-                              controller: passwordController,
-                              obscureText: true,
-                              decoration: const InputDecoration(
-                                labelText: '密码',
-                                prefixIcon: Icon(Icons.lock),
-                              ),
-                              onSubmitted: (_) => _login(controller),
-                            ),
-                            if (error != null) ...[
-                              const SizedBox(height: 12),
-                              Text(error!,
-                                  style: const TextStyle(
-                                      color: Color(0xffcc334f))),
-                            ],
-                            const SizedBox(height: 20),
-                            SizedBox(
-                              width: double.infinity,
-                              child: FilledButton.icon(
-                                onPressed: controller.busy
-                                    ? null
-                                    : () => _login(controller),
-                                icon: controller.busy
-                                    ? const SizedBox.square(
-                                        dimension: 16,
-                                        child: CircularProgressIndicator(
-                                            strokeWidth: 2),
-                                      )
-                                    : const Icon(Icons.login),
-                                label: const Text('连接并登录'),
-                              ),
+          return DecoratedBox(
+            decoration: BoxDecoration(color: colors.appBackground),
+            child: SafeArea(
+              child: SingleChildScrollView(
+                padding: EdgeInsets.all(outerPadding),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    minHeight:
+                        math.max(0, constraints.maxHeight - outerPadding * 2),
+                  ),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 880),
+                      child: DecoratedBox(
+                        decoration: BoxDecoration(
+                          color: colors.surface,
+                          border: Border.all(color: colors.border),
+                          borderRadius: BorderRadius.circular(14),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.28),
+                              blurRadius: 28,
+                              offset: const Offset(0, 18),
                             ),
                           ],
+                        ),
+                        child: Padding(
+                          padding: EdgeInsets.all(cardPadding),
+                          child: DefaultTextStyle(
+                            style: TextStyle(color: colors.textPrimary),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'STREAMSERVER',
+                                  style: TextStyle(
+                                    color: colors.primary,
+                                    fontWeight: FontWeight.w800,
+                                    letterSpacing: 1.2,
+                                  ),
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  '桌面控制台',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .headlineMedium
+                                      ?.copyWith(
+                                        color: colors.textPrimary,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                ),
+                                const SizedBox(height: 24),
+                                TextField(
+                                  controller: serverController,
+                                  textInputAction: TextInputAction.next,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Core 地址',
+                                    prefixIcon: Icon(LucideIcons.server),
+                                  ),
+                                ),
+                                if (profiles.isNotEmpty) ...[
+                                  const SizedBox(height: 8),
+                                  DropdownButtonFormField<String>(
+                                    initialValue: profiles.any((item) =>
+                                            item.baseUrl ==
+                                            serverController.text)
+                                        ? serverController.text
+                                        : null,
+                                    decoration: const InputDecoration(
+                                      labelText: '已保存服务器',
+                                      prefixIcon: Icon(LucideIcons.database),
+                                    ),
+                                    items: profiles
+                                        .map((profile) => DropdownMenuItem(
+                                              value: profile.baseUrl,
+                                              child: Text(
+                                                profile.name,
+                                                maxLines: 1,
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            ))
+                                        .toList(),
+                                    onChanged: (value) {
+                                      if (value != null) {
+                                        final profile = profiles.firstWhere(
+                                            (item) => item.baseUrl == value);
+                                        controller.selectServer(profile);
+                                        serverController.text = profile.baseUrl;
+                                      }
+                                    },
+                                  ),
+                                ],
+                                const SizedBox(height: 12),
+                                _DiscoveryPanel(
+                                  scanning: scanning,
+                                  probing: probing,
+                                  status: scanStatus,
+                                  results: discoveredServers,
+                                  manualProtocol: manualProtocol,
+                                  manualHostController: manualHostController,
+                                  manualPortController: manualPortController,
+                                  onProtocolChanged: (value) =>
+                                      setState(() => manualProtocol = value),
+                                  onScan: () => _scan(controller),
+                                  onSelect: (baseUrl) => setState(
+                                      () => serverController.text = baseUrl),
+                                  onProbe: () => _probe(controller),
+                                ),
+                                const SizedBox(height: 12),
+                                TextField(
+                                  controller: usernameController,
+                                  textInputAction: TextInputAction.next,
+                                  decoration: const InputDecoration(
+                                    labelText: '用户名',
+                                    prefixIcon: Icon(LucideIcons.user),
+                                  ),
+                                  onSubmitted: (_) =>
+                                      passwordFocusNode.requestFocus(),
+                                ),
+                                const SizedBox(height: 12),
+                                TextField(
+                                  controller: passwordController,
+                                  focusNode: passwordFocusNode,
+                                  obscureText: true,
+                                  textInputAction: TextInputAction.done,
+                                  decoration: const InputDecoration(
+                                    labelText: '密码',
+                                    prefixIcon: Icon(LucideIcons.lock),
+                                  ),
+                                  onSubmitted: (_) => _submitLogin(controller),
+                                ),
+                                if (error != null) ...[
+                                  const SizedBox(height: 12),
+                                  Text(error!,
+                                      style: TextStyle(color: colors.danger)),
+                                ],
+                                const SizedBox(height: 20),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: FilledButton.icon(
+                                    onPressed: controller.busy
+                                        ? null
+                                        : () => _submitLogin(controller),
+                                    icon: controller.busy
+                                        ? const SizedBox.square(
+                                            dimension: 16,
+                                            child: CircularProgressIndicator(
+                                                strokeWidth: 2),
+                                          )
+                                        : const Icon(LucideIcons.logIn),
+                                    label: const Text('连接并登录'),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ),
                       ),
                     ),
@@ -184,6 +219,11 @@ class _LoginScreenState extends State<LoginScreen> {
         },
       ),
     );
+  }
+
+  Future<void> _submitLogin(AppController controller) async {
+    if (controller.busy) return;
+    await _login(controller);
   }
 
   Future<void> _login(AppController controller) async {
@@ -343,6 +383,7 @@ class _DiscoveryPanel extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.streamColors;
     return LayoutBuilder(
       builder: (context, constraints) {
         final narrow = constraints.maxWidth < 560;
@@ -356,8 +397,8 @@ class _DiscoveryPanel extends StatelessWidget {
         final portWidth = narrow ? fullWidth : 120.0;
         return DecoratedBox(
           decoration: BoxDecoration(
-            color: const Color(0xfff6f8fc),
-            border: Border.all(color: const Color(0xffe4e8f0)),
+            color: colors.surfaceAlt.withValues(alpha: 0.72),
+            border: Border.all(color: colors.border),
             borderRadius: BorderRadius.circular(8),
           ),
           child: Padding(
@@ -371,10 +412,15 @@ class _DiscoveryPanel extends StatelessWidget {
                   alignment: WrapAlignment.spaceBetween,
                   crossAxisAlignment: WrapCrossAlignment.center,
                   children: [
-                    const SizedBox(
+                    SizedBox(
                       width: 220,
-                      child: Text('服务器发现',
-                          style: TextStyle(fontWeight: FontWeight.w700)),
+                      child: Text(
+                        '服务器发现',
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
                     ),
                     OutlinedButton.icon(
                       onPressed: scanning ? null : onScan,
@@ -383,7 +429,7 @@ class _DiscoveryPanel extends StatelessWidget {
                               dimension: 16,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : const Icon(Icons.radar),
+                          : const Icon(LucideIcons.radar),
                       label: Text(scanning ? '扫描中' : '扫描局域网'),
                     ),
                   ],
@@ -434,7 +480,7 @@ class _DiscoveryPanel extends StatelessWidget {
                               dimension: 16,
                               child: CircularProgressIndicator(strokeWidth: 2),
                             )
-                          : const Icon(Icons.travel_explore),
+                          : const Icon(LucideIcons.searchCheck),
                       label: Text(probing ? '探测中' : '探测'),
                     ),
                   ],
@@ -444,9 +490,13 @@ class _DiscoveryPanel extends StatelessWidget {
                   if (scanning) const LinearProgressIndicator(minHeight: 3),
                   if (status.isNotEmpty) ...[
                     const SizedBox(height: 8),
-                    Text(status,
-                        style: const TextStyle(
-                            color: Color(0xff5b6477), fontSize: 12)),
+                    Text(
+                      status,
+                      style: TextStyle(
+                        color: colors.textSecondary,
+                        fontSize: 12,
+                      ),
+                    ),
                   ],
                 ],
                 if (results.isNotEmpty) ...[
@@ -460,7 +510,7 @@ class _DiscoveryPanel extends StatelessWidget {
                         children: results.map((row) {
                           final baseUrl = '${row['base_url']}';
                           return ActionChip(
-                            avatar: const Icon(Icons.dns, size: 18),
+                            avatar: const Icon(LucideIcons.server, size: 18),
                             label: Text(
                                 '$baseUrl · ${row['latency_ms'] ?? '-'}ms'),
                             onPressed: () => onSelect(baseUrl),
