@@ -17,7 +17,8 @@ class OverviewScreen extends StatelessWidget {
     return AsyncDataPanel(
       loader: (controller) async {
         final results = await Future.wait<Map<String, Object?>>([
-          _loadAllTasks(controller),
+          _loadOverviewTaskSample(controller),
+          _loadTaskStatusTotals(controller),
           controller.api('GET', '/api/v1/streams'),
           controller.api('GET', '/api/v1/records',
               query: const {'page_size': 1}),
@@ -28,13 +29,15 @@ class OverviewScreen extends StatelessWidget {
               query: const {'page_size': 1}),
         ]);
         final tasks = results[0];
-        final streams = results[1];
-        final records = results[2];
-        final artifacts = results[3];
-        final nodes = results[4];
-        final uploads = results[5];
+        final taskStatusTotals = results[1];
+        final streams = results[2];
+        final records = results[3];
+        final artifacts = results[4];
+        final nodes = results[5];
+        final uploads = results[6];
         return {
           'tasks': tasks,
+          'task_status_totals': taskStatusTotals,
           'streams': streams['value'],
           'records': records,
           'artifacts': artifacts,
@@ -45,6 +48,8 @@ class OverviewScreen extends StatelessWidget {
       builder: (context, data) {
         final map = (data as Map).cast<String, Object?>();
         final taskPage = (map['tasks'] as Map).cast<String, Object?>();
+        final taskStatusTotals =
+            (map['task_status_totals'] as Map).cast<String, Object?>();
         final tasks = rowsFrom(taskPage['items']);
         final nodes = rowsFrom(map['nodes']);
         final records = (map['records'] as Map).cast<String, Object?>();
@@ -54,10 +59,12 @@ class OverviewScreen extends StatelessWidget {
         final uploadTotal = (uploads['total'] as num?)?.toInt() ?? 0;
         final healthyNodes =
             nodes.where((node) => node['healthy'] == true).length;
-        final runningTasks =
-            _countStatus(tasks, const ['RUNNING', 'STARTING', 'RECOVERING']);
-        final failedTasks = _countStatus(tasks, const ['FAILED', 'LOST']);
-        final statusEntries = _buildStatusEntries(tasks, totalTasks);
+        final runningTasks = _sumStatusTotals(
+            taskStatusTotals, const ['RUNNING', 'STARTING', 'RECOVERING']);
+        final failedTasks =
+            _sumStatusTotals(taskStatusTotals, const ['FAILED', 'LOST']);
+        final statusEntries =
+            _buildStatusEntries(taskStatusTotals, totalTasks);
         return LayoutBuilder(
           builder: (context, constraints) {
             final wide = constraints.maxWidth >= 1180;
@@ -1197,7 +1204,9 @@ class _RecentTaskCards extends StatelessWidget {
   }
 }
 
-Future<Map<String, Object?>> _loadAllTasks(AppController controller) async {
+Future<Map<String, Object?>> _loadOverviewTaskSample(
+  AppController controller,
+) async {
   const pageSize = 100;
   final first = await controller.api(
     'GET',
@@ -1212,55 +1221,59 @@ Future<Map<String, Object?>> _loadAllTasks(AppController controller) async {
   final firstPage = (first as Map).cast<String, Object?>();
   final firstItems = rowsFrom(firstPage['items']);
   final total = (firstPage['total'] as num?)?.toInt() ?? firstItems.length;
-  final pageCount = math.max(1, (total + pageSize - 1) ~/ pageSize);
-  final items = <Map<String, Object?>>[...firstItems];
-  if (pageCount > 1) {
-    final pages = await Future.wait([
-      for (var page = 2; page <= pageCount; page++)
-        controller.api(
-          'GET',
-          '/api/v1/tasks',
-          query: {
-            'page': page,
-            'page_size': pageSize,
-            'sort_by': 'created_at',
-            'sort_order': 'desc',
-          },
-        ),
-    ]);
-    for (final page in pages) {
-      final payload = (page as Map).cast<String, Object?>();
-      items.addAll(rowsFrom(payload['items']));
-    }
-  }
   return {
     ...firstPage,
-    'items': items,
+    'items': firstItems,
     'total': total,
+    'sample_limit': pageSize,
   };
 }
 
-int _countStatus(List<Map<String, Object?>> rows, List<String> statuses) {
-  final values = statuses.map((value) => value.toUpperCase()).toSet();
-  return rows.where((row) {
-    final status = textValue(row['status']).toUpperCase();
-    return values.contains(status);
-  }).length;
+Future<Map<String, Object?>> _loadTaskStatusTotals(
+  AppController controller,
+) async {
+  final entries = await Future.wait([
+    for (final status in _overviewStatusKeys)
+      _loadTaskStatusTotal(controller, status),
+  ]);
+  return {
+    for (final entry in entries) entry.key: entry.value,
+  };
 }
 
-List<_StatusCount> _buildStatusEntries(
-  List<Map<String, Object?>> tasks,
-  int total,
-) {
+Future<MapEntry<String, int>> _loadTaskStatusTotal(
+  AppController controller,
+  String status,
+) async {
+  final page = await controller.api(
+    'GET',
+    '/api/v1/tasks',
+    query: {
+      'page': 1,
+      'page_size': 1,
+      'status': status,
+    },
+  );
+  final total =
+      ((page as Map).cast<String, Object?>()['total'] as num?)?.toInt() ?? 0;
+  return MapEntry(status, total);
+}
+
+int _sumStatusTotals(Map<String, Object?> totals, List<String> statuses) {
+  return statuses.fold<int>(0, (sum, status) {
+    return sum + ((totals[status.toUpperCase()] as num?)?.toInt() ?? 0);
+  });
+}
+
+List<_StatusCount> _buildStatusEntries(Map<String, Object?> totals, int total) {
   final counts = <String, int>{};
-  for (final task in tasks) {
-    final rawStatus = textValue(task['status']).trim();
-    final status = rawStatus.isEmpty ? 'UNKNOWN' : rawStatus.toUpperCase();
-    counts[status] = (counts[status] ?? 0) + 1;
+  for (final status in _overviewStatusKeys) {
+    final count = (totals[status] as num?)?.toInt() ?? 0;
+    if (count > 0) counts[status] = count;
   }
-  final loadedTotal = counts.values.fold<int>(0, (sum, value) => sum + value);
-  if (total > loadedTotal) {
-    counts['UNLOADED'] = total - loadedTotal;
+  final countedTotal = counts.values.fold<int>(0, (sum, value) => sum + value);
+  if (total > countedTotal) {
+    counts['UNKNOWN'] = total - countedTotal;
   }
   final entries = counts.entries
       .map((entry) => _StatusCount(status: entry.key, count: entry.value))
@@ -1275,6 +1288,22 @@ List<_StatusCount> _buildStatusEntries(
   });
   return entries;
 }
+
+const _overviewStatusKeys = [
+  'CREATED',
+  'VALIDATING',
+  'QUEUED',
+  'STARTING',
+  'RUNNING',
+  'STOPPING',
+  'RECOVERING',
+  'SUCCEEDED',
+  'COMPLETED',
+  'FAILED',
+  'LOST',
+  'CANCELED',
+  'CANCELLED',
+];
 
 int _statusSortRank(String status) {
   const order = [

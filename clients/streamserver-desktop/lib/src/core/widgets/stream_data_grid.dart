@@ -63,6 +63,15 @@ class StreamDataGrid extends StatelessWidget {
       );
     }
     final colors = context.streamColors;
+    final sourcesByKey = <Key, Map<String, Object?>>{};
+    Map<String, Object?> sourceFromRow(PlutoRow row) {
+      final source = sourcesByKey[row.key];
+      if (source != null) return source;
+      final index = row.sortIdx;
+      if (index >= 0 && index < rows.length) return rows[index];
+      return <String, Object?>{};
+    }
+
     final plutoColumns = columns
         .map(
           (column) => PlutoColumn(
@@ -81,7 +90,7 @@ class StreamDataGrid extends StatelessWidget {
             renderer: column.renderer == null
                 ? null
                 : (rendererContext) {
-                    final source = _sourceFromRow(rendererContext.row);
+                    final source = sourceFromRow(rendererContext.row);
                     return Align(
                       alignment: Alignment.centerLeft,
                       child: column.renderer!(
@@ -94,17 +103,22 @@ class StreamDataGrid extends StatelessWidget {
           ),
         )
         .toList();
-    final plutoRows = rows
-        .map(
-          (row) => PlutoRow(
-            cells: {
-              '__source': PlutoCell(value: row),
-              for (final column in columns)
-                column.field: PlutoCell(value: row[column.field] ?? ''),
-            },
-          ),
-        )
-        .toList();
+    final plutoRows = <PlutoRow>[];
+    for (var index = 0; index < rows.length; index++) {
+      final row = rows[index];
+      final key = ValueKey<Object>('stream-grid-row-$index-${row['id'] ?? ''}');
+      sourcesByKey[key] = row;
+      plutoRows.add(
+        PlutoRow(
+          key: key,
+          sortIdx: index,
+          cells: {
+            for (final column in columns)
+              column.field: PlutoCell(value: row[column.field] ?? ''),
+          },
+        ),
+      );
+    }
     return SizedBox(
       height: height,
       child: ClipRRect(
@@ -116,12 +130,12 @@ class StreamDataGrid extends StatelessWidget {
           onSelected: (event) {
             final row = event.row;
             if (row == null) return;
-            onSelected?.call(_sourceFromRow(row));
+            onSelected?.call(sourceFromRow(row));
           },
           onRowDoubleTap: (event) =>
-              onDoubleTap?.call(_sourceFromRow(event.row)),
+              onDoubleTap?.call(sourceFromRow(event.row)),
           onRowSecondaryTap: (event) =>
-              onSecondaryTap?.call(_sourceFromRow(event.row)),
+              onSecondaryTap?.call(sourceFromRow(event.row)),
           configuration: PlutoGridConfiguration(
             tabKeyAction: PlutoGridTabKeyAction.moveToNextOnEdge,
             columnSize: const PlutoGridColumnSizeConfig(
@@ -160,13 +174,6 @@ class StreamDataGrid extends StatelessWidget {
         ),
       ),
     );
-  }
-
-  Map<String, Object?> _sourceFromRow(PlutoRow row) {
-    final value = row.cells['__source']?.value;
-    if (value is Map<String, Object?>) return value;
-    if (value is Map) return value.cast<String, Object?>();
-    return <String, Object?>{};
   }
 }
 
