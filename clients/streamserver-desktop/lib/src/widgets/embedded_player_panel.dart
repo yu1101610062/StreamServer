@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -39,11 +40,30 @@ bool isLikelyLiveHttpMedia(Uri uri) {
   );
 
   return path.endsWith('.live.mp4') ||
+      path.endsWith('.live.flv') ||
+      path.endsWith('.live.ts') ||
+      path.endsWith('.m3u8') ||
       segments.contains('preview') ||
-      queryValues.any((value) =>
-          value == 'live' ||
-          value == 'source_mode=live' ||
-          value == 'stream_live');
+      segments.contains('hls.m3u8') ||
+      queryValues.any((value) => value == 'live' || value == 'stream_live');
+}
+
+bool isLikelyLivePlaybackUrl(Uri? uri) {
+  if (uri == null) return false;
+  final scheme = uri.scheme.toLowerCase();
+  if (const {
+    'rtmp',
+    'rtmps',
+    'rtmpt',
+    'rtmpte',
+    'rtmpe',
+    'rtsp',
+    'rtp',
+    'udp',
+  }.contains(scheme)) {
+    return true;
+  }
+  return (scheme == 'http' || scheme == 'https') && isLikelyLiveHttpMedia(uri);
 }
 
 class EmbeddedPlayerPanel extends StatefulWidget {
@@ -63,17 +83,44 @@ class EmbeddedPlayerPanel extends StatefulWidget {
 class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
   late final Player player;
   late final VideoController videoController;
+  final playerSubscriptions = <StreamSubscription<dynamic>>[];
   final screenshotPathController = TextEditingController();
   String status = '';
   bool opening = false;
   bool takingSnapshot = false;
   int openTicket = 0;
+  bool playbackPlaying = false;
+  bool playbackBuffering = false;
+  String? playbackError;
+  int? videoWidth;
+  int? videoHeight;
 
   @override
   void initState() {
     super.initState();
-    player = Player();
+    player = Player(
+      configuration: const PlayerConfiguration(
+        protocolWhitelist: [
+          'udp',
+          'rtp',
+          'rtmp',
+          'rtmps',
+          'rtmpt',
+          'rtmpte',
+          'rtmpe',
+          'rtsp',
+          'tcp',
+          'tls',
+          'data',
+          'file',
+          'http',
+          'https',
+          'crypto',
+        ],
+      ),
+    );
     videoController = VideoController(player);
+    _attachPlayerListeners();
     Future.microtask(() => _open(widget.url));
   }
 
@@ -87,9 +134,71 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
 
   @override
   void dispose() {
+    for (final subscription in playerSubscriptions) {
+      subscription.cancel();
+    }
     screenshotPathController.dispose();
     player.dispose();
     super.dispose();
+  }
+
+  void _attachPlayerListeners() {
+    void listen<T>(Stream<T> stream, void Function(T value) onData) {
+      playerSubscriptions.add(stream.listen(onData));
+    }
+
+    listen<String>(player.stream.error, (message) {
+      playbackError = message;
+      _setPlaybackStatus('播放错误：$message');
+    });
+    listen<bool>(player.stream.playing, (playing) {
+      playbackPlaying = playing;
+      if (playing && playbackError == null) {
+        _setPlaybackStatus(_playingStatus());
+      }
+    });
+    listen<bool>(player.stream.buffering, (buffering) {
+      playbackBuffering = buffering;
+      if (playbackError != null) return;
+      if (buffering) {
+        _setPlaybackStatus('正在缓冲');
+      } else if (playbackPlaying) {
+        _setPlaybackStatus(_playingStatus());
+      }
+    });
+    listen<bool>(player.stream.completed, (completed) {
+      if (completed && playbackError == null) {
+        _setPlaybackStatus('播放结束');
+      }
+    });
+    listen<int?>(player.stream.width, (width) {
+      videoWidth = width;
+      if (playbackError == null && playbackPlaying) {
+        _setPlaybackStatus(_playingStatus());
+      }
+    });
+    listen<int?>(player.stream.height, (height) {
+      videoHeight = height;
+      if (playbackError == null && playbackPlaying) {
+        _setPlaybackStatus(_playingStatus());
+      }
+    });
+  }
+
+  String _playingStatus() {
+    final width = videoWidth;
+    final height = videoHeight;
+    final suffix = width != null && height != null ? ' (${width}x$height)' : '';
+    if (playbackBuffering) {
+      return '正在缓冲$suffix';
+    }
+    return '内嵌播放器播放中$suffix';
+  }
+
+  void _setPlaybackStatus(String value) {
+    if (mounted) {
+      setState(() => status = value);
+    }
   }
 
   @override
@@ -246,10 +355,16 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
     try {
       final playableUrl = await _preparePlayableUrl(url, ticket);
       if (!mounted || ticket != openTicket) return;
+      playbackError = null;
+      playbackPlaying = false;
+      playbackBuffering = false;
+      videoWidth = null;
+      videoHeight = null;
+      await _configureNativePlayback(playableUrl);
       await player.open(Media(playableUrl), play: true);
-      if (mounted) {
+      if (mounted && playbackError == null) {
         setState(() {
-          status = '内嵌 libmpv 播放中';
+          status = playbackPlaying ? _playingStatus() : '播放器已打开，正在等待视频帧';
         });
       }
     } catch (error) {
@@ -261,6 +376,13 @@ class _EmbeddedPlayerPanelState extends State<EmbeddedPlayerPanel> {
         setState(() => opening = false);
       }
     }
+  }
+
+  Future<void> _configureNativePlayback(String url) async {
+    final native = player.platform;
+    if (native is! NativePlayer) return;
+    final liveLike = isLikelyLivePlaybackUrl(Uri.tryParse(url));
+    await native.setProperty('cache-on-disk', liveLike ? 'no' : 'yes');
   }
 
   Future<String> _preparePlayableUrl(String url, int ticket) async {

@@ -68,21 +68,27 @@ GoRouter buildAppRouter(AppController controller) {
           child: LoginScreen(),
         ),
       ),
-      for (final entry in _routes.entries)
-        GoRoute(
-          path: entry.value,
-          pageBuilder: (context, state) {
-            controller.syncSectionFromRoute(entry.key);
-            return NoTransitionPage(
-              key: state.pageKey,
-              child: AppShell(
-                current: entry.key,
-                onNavigate: (section) => context.go(sectionPath(section)),
+      ShellRoute(
+        builder: (context, state, child) {
+          final section = sectionFromPath(state.uri.path);
+          controller.syncSectionFromRoute(section);
+          return AppShell(
+            current: section,
+            onNavigate: (section) => context.go(sectionPath(section)),
+            child: child,
+          );
+        },
+        routes: [
+          for (final entry in _routes.entries)
+            GoRoute(
+              path: entry.value,
+              pageBuilder: (context, state) => NoTransitionPage(
+                key: state.pageKey,
                 child: screenFor(entry.key),
               ),
-            );
-          },
-        ),
+            ),
+        ],
+      ),
     ],
   );
 }
@@ -105,6 +111,15 @@ Widget screenFor(AppSection section) {
 }
 
 String sectionPath(AppSection section) => _routes[section] ?? '/overview';
+
+AppSection sectionFromPath(String path) {
+  return _routes.entries
+      .firstWhere(
+        (entry) => entry.value == path,
+        orElse: () => const MapEntry(AppSection.overview, '/overview'),
+      )
+      .key;
+}
 
 const _routes = {
   AppSection.overview: '/overview',

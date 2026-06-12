@@ -11,6 +11,8 @@ typedef StreamCellRenderer = Widget Function(
   Object? value,
 );
 
+typedef StreamRowKeyResolver = Object? Function(Map<String, Object?> row);
+
 class StreamGridColumn {
   const StreamGridColumn({
     required this.title,
@@ -38,6 +40,9 @@ class StreamDataGrid extends StatelessWidget {
     this.onSelected,
     this.onDoubleTap,
     this.onSecondaryTap,
+    this.onCheckedRowsChanged,
+    this.checkedRowKeys = const {},
+    this.rowKey,
     super.key,
   });
 
@@ -48,6 +53,9 @@ class StreamDataGrid extends StatelessWidget {
   final ValueChanged<Map<String, Object?>>? onSelected;
   final ValueChanged<Map<String, Object?>>? onDoubleTap;
   final ValueChanged<Map<String, Object?>>? onSecondaryTap;
+  final ValueChanged<List<Map<String, Object?>>>? onCheckedRowsChanged;
+  final Set<Object> checkedRowKeys;
+  final StreamRowKeyResolver? rowKey;
 
   @override
   Widget build(BuildContext context) {
@@ -64,12 +72,21 @@ class StreamDataGrid extends StatelessWidget {
     }
     final colors = context.streamColors;
     final sourcesByKey = <Key, Map<String, Object?>>{};
+    PlutoGridStateManager? gridStateManager;
     Map<String, Object?> sourceFromRow(PlutoRow row) {
       final source = sourcesByKey[row.key];
       if (source != null) return source;
       final index = row.sortIdx;
       if (index >= 0 && index < rows.length) return rows[index];
       return <String, Object?>{};
+    }
+
+    void emitCheckedRows(PlutoGridStateManager stateManager) {
+      final checkedRows = stateManager.checkedRows
+          .map(sourceFromRow)
+          .where((row) => row.isNotEmpty)
+          .toList();
+      onCheckedRowsChanged?.call(checkedRows);
     }
 
     final plutoColumns = columns
@@ -106,12 +123,14 @@ class StreamDataGrid extends StatelessWidget {
     final plutoRows = <PlutoRow>[];
     for (var index = 0; index < rows.length; index++) {
       final row = rows[index];
+      final rowKeyValue = rowKey?.call(row) ?? row['id'] ?? index;
       final key = ValueKey<Object>('stream-grid-row-$index-${row['id'] ?? ''}');
       sourcesByKey[key] = row;
       plutoRows.add(
         PlutoRow(
           key: key,
           sortIdx: index,
+          checked: checkedRowKeys.contains(rowKeyValue),
           cells: {
             for (final column in columns)
               column.field: PlutoCell(value: row[column.field] ?? ''),
@@ -136,6 +155,16 @@ class StreamDataGrid extends StatelessWidget {
               onDoubleTap?.call(sourceFromRow(event.row)),
           onRowSecondaryTap: (event) =>
               onSecondaryTap?.call(sourceFromRow(event.row)),
+          onLoaded: onCheckedRowsChanged == null
+              ? null
+              : (event) => gridStateManager = event.stateManager,
+          onRowChecked: onCheckedRowsChanged == null
+              ? null
+              : (event) {
+                  final stateManager = gridStateManager;
+                  if (stateManager == null) return;
+                  emitCheckedRows(stateManager);
+                },
           configuration: PlutoGridConfiguration(
             tabKeyAction: PlutoGridTabKeyAction.moveToNextOnEdge,
             columnSize: const PlutoGridColumnSizeConfig(
