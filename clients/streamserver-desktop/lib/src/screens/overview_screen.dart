@@ -1245,17 +1245,22 @@ Future<MapEntry<String, int>> _loadTaskStatusTotal(
   AppController controller,
   String status,
 ) async {
-  final page = await controller.api(
-    'GET',
-    '/api/v1/tasks',
-    query: {
-      'page': 1,
-      'page_size': 1,
-      'status': status,
-    },
-  );
-  final total =
-      ((page as Map).cast<String, Object?>()['total'] as num?)?.toInt() ?? 0;
+  var total = 0;
+  try {
+    final page = await controller.api(
+      'GET',
+      '/api/v1/tasks',
+      query: {
+        'page': 1,
+        'page_size': 1,
+        'status': status,
+      },
+    );
+    total =
+        ((page as Map).cast<String, Object?>()['total'] as num?)?.toInt() ?? 0;
+  } catch (_) {
+    total = 0;
+  }
   return MapEntry(status, total);
 }
 
@@ -1293,16 +1298,16 @@ const _overviewStatusKeys = [
   'CREATED',
   'VALIDATING',
   'QUEUED',
+  'DISPATCHING',
   'STARTING',
   'RUNNING',
   'STOPPING',
   'RECOVERING',
+  'RECLAIMING',
   'SUCCEEDED',
-  'COMPLETED',
   'FAILED',
   'LOST',
   'CANCELED',
-  'CANCELLED',
 ];
 
 int _statusSortRank(String status) {
@@ -1310,10 +1315,12 @@ int _statusSortRank(String status) {
     'CREATED',
     'VALIDATING',
     'QUEUED',
+    'DISPATCHING',
     'STARTING',
     'RUNNING',
     'STOPPING',
     'RECOVERING',
+    'RECLAIMING',
     'SUCCEEDED',
     'COMPLETED',
     'FAILED',
@@ -1349,12 +1356,16 @@ Color _statusColor(String status, StreamColors colors, int index) {
       return const Color(0xff06b6d4);
     case 'QUEUED':
       return const Color(0xff0ea5e9);
+    case 'DISPATCHING':
+      return const Color(0xff38bdf8);
     case 'STARTING':
       return const Color(0xffa855f7);
     case 'STOPPING':
       return colors.orange;
     case 'RECOVERING':
       return const Color(0xffc084fc);
+    case 'RECLAIMING':
+      return const Color(0xfff59e0b);
     default:
       final palette = [
         colors.purple,
@@ -1392,12 +1403,16 @@ String _statusDisplayName(String status) {
       return '校验中';
     case 'QUEUED':
       return '排队中';
+    case 'DISPATCHING':
+      return '分发中';
     case 'STARTING':
       return '启动中';
     case 'STOPPING':
       return '停止中';
     case 'RECOVERING':
       return '恢复中';
+    case 'RECLAIMING':
+      return '回收中';
     case 'UNKNOWN':
       return '未知';
     case 'UNLOADED':
