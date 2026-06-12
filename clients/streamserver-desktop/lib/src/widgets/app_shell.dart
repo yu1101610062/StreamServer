@@ -124,6 +124,7 @@ class _MainContent extends StatelessWidget {
             padding: EdgeInsets.fromLTRB(
                 compact ? 12 : 24, 14, compact ? 12 : 18, 0),
             child: EmbeddedPlayerPanel(
+              key: const ValueKey('embedded-media-player'),
               url: controller.activeMediaUrl!,
               title: controller.activeMediaTitle,
             ),

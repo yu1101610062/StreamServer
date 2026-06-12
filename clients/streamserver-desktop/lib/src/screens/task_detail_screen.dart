@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import '../core/theme/stream_theme.dart';
@@ -115,14 +117,17 @@ class _TaskDetailScreenState extends State<TaskDetailScreen> {
                           height: 560,
                           child: TabBarView(
                             children: [
-                              _Overview(detail),
-                              _EventsTable(events),
-                              _LogsTable(logs),
-                              _StreamsTable(streams),
-                              _RecordsTable(records),
-                              _ArtifactsTable(artifacts),
-                              SingleChildScrollView(
-                                  child: SelectableText(prettyJson(detail))),
+                              _KeepAliveTab(child: _Overview(detail)),
+                              _KeepAliveTab(child: _EventsTable(events)),
+                              _KeepAliveTab(child: _LogsTable(logs)),
+                              _KeepAliveTab(child: _StreamsTable(streams)),
+                              _KeepAliveTab(child: _RecordsTable(records)),
+                              _KeepAliveTab(child: _ArtifactsTable(artifacts)),
+                              _KeepAliveTab(
+                                child: SingleChildScrollView(
+                                  child: SelectableText(prettyJson(detail)),
+                                ),
+                              ),
                             ],
                           ),
                         ),
@@ -329,7 +334,7 @@ class _StreamsTable extends StatelessWidget {
           row['schema'],
           title,
           row['viewer_count'],
-          PlayableUrlList(urls: urls, title: title),
+          PlayableUrlList(urls: urls, title: title, maxVisibleItems: 2),
         ];
       }).toList(),
     );
@@ -393,6 +398,10 @@ class _ArtifactsTable extends StatelessWidget {
 class _SimpleTable extends StatelessWidget {
   const _SimpleTable({required this.columns, required this.rows});
 
+  static const double _tablePadding = 12;
+  static const double _horizontalMargin = 16;
+  static const double _columnSpacing = 20;
+
   final List<String> columns;
   final List<List<Object?>> rows;
 
@@ -406,37 +415,129 @@ class _SimpleTable extends StatelessWidget {
         if (constraints.maxWidth < 760) {
           return _CompactSimpleTable(columns: columns, rows: rows);
         }
-        final cellWidth = constraints.maxWidth < 760 ? 220.0 : 340.0;
+        final contentWidth = math.max(
+          320.0,
+          constraints.maxWidth -
+              _tablePadding * 2 -
+              _horizontalMargin * 2 -
+              _columnSpacing * math.max(0, columns.length - 1),
+        );
+        final widths = _columnWidths(columns, contentWidth);
+        final tableWidth =
+            widths.fold<double>(0, (total, width) => total + width) +
+                _horizontalMargin * 2 +
+                _columnSpacing * math.max(0, columns.length - 1);
         return SingleChildScrollView(
-          padding: const EdgeInsets.all(12),
+          padding: const EdgeInsets.all(_tablePadding),
           scrollDirection: Axis.horizontal,
-          child: DataTable(
-            dataRowMinHeight: 52,
-            dataRowMaxHeight: 280,
-            columns: columns
-                .map((column) => DataColumn(label: Text(column)))
-                .toList(),
-            rows: rows.map((row) {
-              return DataRow(
-                cells: row.asMap().entries.map((entry) {
-                  final column = columns[entry.key];
-                  final value = entry.value;
-                  if (column.contains('状态') ||
-                      column.toLowerCase().contains('status')) {
-                    return DataCell(StatusBadge(status: value));
-                  }
-                  if (value is Widget) {
-                    return DataCell(value);
-                  }
-                  return DataCell(WrappedTextCell(
-                      value: value, maxWidth: cellWidth, selectable: true));
-                }).toList(),
-              );
-            }).toList(),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minWidth: tableWidth),
+            child: DataTable(
+              horizontalMargin: _horizontalMargin,
+              columnSpacing: _columnSpacing,
+              dataRowMinHeight: 52,
+              dataRowMaxHeight: 280,
+              columns: columns.asMap().entries.map((entry) {
+                return DataColumn(
+                  label: SizedBox(
+                    width: widths[entry.key],
+                    child: Text(entry.value),
+                  ),
+                );
+              }).toList(),
+              rows: rows.map((row) {
+                return DataRow(
+                  cells: row.asMap().entries.map((entry) {
+                    final column = columns[entry.key];
+                    final value = entry.value;
+                    final cellWidth = widths[entry.key];
+                    final Widget child;
+                    if (column.contains('状态') ||
+                        column.toLowerCase().contains('status')) {
+                      child = StatusBadge(status: value);
+                    } else if (value is Widget) {
+                      child = value;
+                    } else {
+                      child = WrappedTextCell(
+                        value: value,
+                        maxWidth: cellWidth,
+                        selectable: true,
+                      );
+                    }
+                    return DataCell(
+                      SizedBox(width: cellWidth, child: child),
+                    );
+                  }).toList(),
+                );
+              }).toList(),
+            ),
           ),
         );
       },
     );
+  }
+
+  List<double> _columnWidths(List<String> columns, double contentWidth) {
+    final minimums = columns.map(_minimumColumnWidth).toList();
+    final minimumTotal =
+        minimums.fold<double>(0, (total, width) => total + width);
+    if (minimumTotal >= contentWidth) {
+      return minimums;
+    }
+    final flexes = columns.map(_columnFlex).toList();
+    final flexTotal = flexes.fold<double>(0, (total, flex) => total + flex);
+    final extra = contentWidth - minimumTotal;
+    return [
+      for (var index = 0; index < columns.length; index++)
+        minimums[index] + extra * (flexes[index] / flexTotal),
+    ];
+  }
+
+  double _minimumColumnWidth(String column) {
+    if (_isUrlColumn(column)) return 520;
+    if (column.contains('Payload') || column.contains('日志')) return 420;
+    if (column.contains('路径')) return 340;
+    if (column.contains('App/Stream') || column.contains('文件')) return 220;
+    if (column.contains('时间')) return 190;
+    if (column.contains('类型') || column.contains('来源')) return 150;
+    if (column.contains('流')) return 220;
+    if (column.contains('观众') || column.contains('大小')) return 100;
+    return 140;
+  }
+
+  double _columnFlex(String column) {
+    if (_isUrlColumn(column)) return 3.4;
+    if (column.contains('Payload') || column.contains('日志')) return 2.6;
+    if (column.contains('路径')) return 2;
+    if (column.contains('App/Stream') || column.contains('文件')) return 1.4;
+    return 0.8;
+  }
+
+  bool _isUrlColumn(String column) {
+    return column.contains('播放地址') ||
+        column.toUpperCase() == 'HTTP' ||
+        column.toUpperCase().contains('URL');
+  }
+}
+
+class _KeepAliveTab extends StatefulWidget {
+  const _KeepAliveTab({required this.child});
+
+  final Widget child;
+
+  @override
+  State<_KeepAliveTab> createState() => _KeepAliveTabState();
+}
+
+class _KeepAliveTabState extends State<_KeepAliveTab>
+    with AutomaticKeepAliveClientMixin {
+  @override
+  bool get wantKeepAlive => true;
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+    return widget.child;
   }
 }
 

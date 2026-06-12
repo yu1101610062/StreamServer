@@ -261,6 +261,9 @@ class AppController extends ChangeNotifier {
   }
 
   void playMedia(String url, {String? title}) {
+    if (activeMediaUrl == url && activeMediaTitle == title) {
+      return;
+    }
     activeMediaUrl = url;
     activeMediaTitle = title;
     notifyListeners();
