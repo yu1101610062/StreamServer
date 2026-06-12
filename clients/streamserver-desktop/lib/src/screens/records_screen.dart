@@ -296,19 +296,7 @@ class _RecordMeta extends StatelessWidget {
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 320),
       child: RichText(
-        text: TextSpan(
-          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
-          children: [
-            TextSpan(
-              text: '$label：',
-              style: const TextStyle(
-                color: Color(0xff5b6477),
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            TextSpan(text: textValue(value)),
-          ],
-        ),
+        text: metadataTextSpan(context, label: label, value: value),
         softWrap: true,
       ),
     );

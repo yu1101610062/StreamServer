@@ -5,6 +5,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
+import '../widgets/app_select_field.dart';
 import '../widgets/data_panel.dart';
 import 'screen_helpers.dart';
 
@@ -302,6 +303,7 @@ class _UploadIconActions extends StatelessWidget {
   Widget build(BuildContext context) {
     final hasUrl = url.startsWith('http://') || url.startsWith('https://');
     final deleted = row['status'] == 'deleted' || row['file_deleted'] == true;
+    final anchorController = MenuController();
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -315,18 +317,54 @@ class _UploadIconActions extends StatelessWidget {
           onPressed: hasUrl ? () => copyText(context, url) : null,
           icon: const Icon(LucideIcons.copy, size: 17),
         ),
-        PopupMenuButton<String>(
-          tooltip: '更多',
-          onSelected:
-              deleted ? null : (value) => _delete(context, value == 'file'),
-          itemBuilder: (context) => const [
-            PopupMenuItem(value: 'ledger', child: Text('删除台账')),
-            PopupMenuItem(value: 'file', child: Text('删除文件')),
+        MenuAnchor(
+          controller: anchorController,
+          alignmentOffset: const Offset(-128, 6),
+          style: streamMenuStyle(context, minWidth: 156),
+          menuChildren: [
+            StreamMenuOption(
+              width: 156,
+              label: '删除台账',
+              icon: LucideIcons.trash2,
+              destructive: true,
+              onPressed: deleted
+                  ? null
+                  : () {
+                      anchorController.close();
+                      _delete(context, false);
+                    },
+            ),
+            StreamMenuOption(
+              width: 156,
+              label: '删除文件',
+              icon: LucideIcons.trash,
+              destructive: true,
+              onPressed: deleted
+                  ? null
+                  : () {
+                      anchorController.close();
+                      _delete(context, true);
+                    },
+            ),
           ],
-          child: const Padding(
-            padding: EdgeInsets.all(8),
-            child: Icon(LucideIcons.ellipsis, size: 18),
-          ),
+          builder: (context, menuController, child) {
+            return Tooltip(
+              message: '更多',
+              waitDuration: const Duration(milliseconds: 450),
+              child: IconButton(
+                onPressed: deleted
+                    ? null
+                    : () {
+                        if (menuController.isOpen) {
+                          menuController.close();
+                        } else {
+                          menuController.open();
+                        }
+                      },
+                icon: const Icon(LucideIcons.ellipsis, size: 18),
+              ),
+            );
+          },
         ),
       ],
     );
@@ -356,10 +394,14 @@ class _UploadIconActions extends StatelessWidget {
         '/api/v1/uploads/media/${row['id']}',
         query: {'delete_file': deleteFile},
       );
-      if (context.mounted) showResult(context, '删除请求已提交');
+      if (context.mounted) {
+        showResult(context, '删除请求已提交', tone: InlineStatusTone.success);
+      }
       onDone();
     } catch (cause) {
-      if (context.mounted) showResult(context, cause.toString());
+      if (context.mounted) {
+        showResult(context, cause.toString(), tone: InlineStatusTone.danger);
+      }
     }
   }
 }
@@ -448,19 +490,7 @@ class _UploadMeta extends StatelessWidget {
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 280),
       child: RichText(
-        text: TextSpan(
-          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
-          children: [
-            TextSpan(
-              text: '$label：',
-              style: const TextStyle(
-                color: Color(0xff5b6477),
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            TextSpan(text: textValue(value)),
-          ],
-        ),
+        text: metadataTextSpan(context, label: label, value: value),
         softWrap: true,
       ),
     );
@@ -530,10 +560,14 @@ class _UploadActions extends StatelessWidget {
         '/api/v1/uploads/media/${row['id']}',
         query: {'delete_file': deleteFile},
       );
-      if (context.mounted) showResult(context, '删除请求已提交');
+      if (context.mounted) {
+        showResult(context, '删除请求已提交', tone: InlineStatusTone.success);
+      }
       onDone();
     } catch (cause) {
-      if (context.mounted) showResult(context, cause.toString());
+      if (context.mounted) {
+        showResult(context, cause.toString(), tone: InlineStatusTone.danger);
+      }
     }
   }
 }

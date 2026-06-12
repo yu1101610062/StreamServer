@@ -17,7 +17,6 @@ enum AppSection {
   uploads,
   nodes,
   security,
-  debug,
 }
 
 enum NavigationSource { controller, route }
@@ -144,11 +143,7 @@ class AppController extends ChangeNotifier {
     required String password,
   }) async {
     await _run(() async {
-      server = ServerProfile(id: baseUrl, name: baseUrl, baseUrl: baseUrl);
-      _upsertServerProfile(server!);
-      _writeLocalStoreValue('server_profiles',
-          serverProfiles.map((item) => item.toJson()).toList());
-      _writeLocalStoreValue('active_server_id', server!.id);
+      _activateServerProfile(baseUrl);
       final tokens = await NativeBridge.callOnWorker('auth.login', {
         'server': server!.toJson(),
         'body': {
@@ -165,6 +160,27 @@ class AppController extends ChangeNotifier {
         'server': server!.toJson(),
         'access_token': accessToken,
       });
+      currentSection = AppSection.overview;
+      _notifyRouter();
+    });
+  }
+
+  Future<void> loginWithoutAuth({
+    required String baseUrl,
+  }) async {
+    await _run(() async {
+      _activateServerProfile(baseUrl);
+      accessToken = '';
+      refreshToken = '';
+      _deleteStoreValueIfPresent('refresh_token');
+      final me = await NativeBridge.callOnWorker('auth.me', {
+        'server': server!.toJson(),
+        'access_token': '',
+      });
+      if (me['auth_enabled'] != false) {
+        throw NativeBridgeError('服务端仍启用了鉴权，请切换为账号密码模式。');
+      }
+      session = me;
       currentSection = AppSection.overview;
       _notifyRouter();
     });
@@ -417,10 +433,10 @@ class AppController extends ChangeNotifier {
     await _run(() async {
       if (server != null && refreshToken.isNotEmpty) {
         try {
-            await NativeBridge.callOnWorker('auth.logout', {
-              'server': server!.toJson(),
-              'access_token': accessToken,
-              'refresh_token': refreshToken,
+          await NativeBridge.callOnWorker('auth.logout', {
+            'server': server!.toJson(),
+            'access_token': accessToken,
+            'refresh_token': refreshToken,
           });
         } catch (_) {
           // Logout should clear local state even when the remote token is already invalid.
@@ -478,6 +494,21 @@ class AppController extends ChangeNotifier {
     final next = serverProfiles.where((item) => item.id != profile.id).toList();
     next.insert(0, profile);
     serverProfiles = next.take(12).toList();
+  }
+
+  void _activateServerProfile(String baseUrl) {
+    final normalizedBaseUrl = baseUrl.trim();
+    server = ServerProfile(
+      id: normalizedBaseUrl,
+      name: normalizedBaseUrl,
+      baseUrl: normalizedBaseUrl,
+    );
+    _upsertServerProfile(server!);
+    _writeLocalStoreValue(
+      'server_profiles',
+      serverProfiles.map((item) => item.toJson()).toList(),
+    );
+    _writeLocalStoreValue('active_server_id', server!.id);
   }
 
   void _loadLocalStore() {
@@ -616,6 +647,14 @@ class AppController extends ChangeNotifier {
 
   void _deleteStoreValue(String key) {
     _bridge.call('secure_store.delete', {'key': key});
+  }
+
+  void _deleteStoreValueIfPresent(String key) {
+    try {
+      _deleteStoreValue(key);
+    } catch (_) {
+      // Secure store cleanup should not block an explicit unauthenticated login.
+    }
   }
 
   T? _firstOrNull<T>(Iterable<T> values) {

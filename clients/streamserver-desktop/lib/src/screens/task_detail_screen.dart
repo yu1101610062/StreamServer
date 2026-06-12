@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -232,13 +233,19 @@ class _TaskOperations extends StatelessWidget {
       await controller.mutate(method, path, body: body);
       onDone();
       if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('$title 已提交')));
+        showResult(
+          context,
+          '$title 已提交',
+          tone: InlineStatusTone.success,
+        );
       }
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(error.toString())));
+        showResult(
+          context,
+          error.toString(),
+          tone: InlineStatusTone.danger,
+        );
       }
     }
   }
@@ -484,6 +491,7 @@ class _CompactSimpleCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.streamColors;
     final isStatus =
         label.contains('状态') || label.toLowerCase().contains('status');
     return Column(
@@ -491,8 +499,8 @@ class _CompactSimpleCell extends StatelessWidget {
       children: [
         Text(
           label,
-          style: const TextStyle(
-            color: Color(0xff5b6477),
+          style: TextStyle(
+            color: colors.textSecondary,
             fontSize: 12,
             fontWeight: FontWeight.w600,
           ),
@@ -503,8 +511,10 @@ class _CompactSimpleCell extends StatelessWidget {
         else if (value is Widget)
           value as Widget
         else
-          SelectableText(textValue(value),
-              style: const TextStyle(fontSize: 13)),
+          SelectableText(
+            textValue(value),
+            style: TextStyle(color: colors.textPrimary, fontSize: 13),
+          ),
       ],
     );
   }

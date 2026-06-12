@@ -57,24 +57,6 @@ class _NodesScreenState extends State<NodesScreen> {
                 options: const ['', 'healthy', 'unhealthy'],
                 onChanged: (value) => setState(() => healthFilter = value),
               ),
-              OutlinedButton.icon(
-                onPressed: () =>
-                    _debug(controller, '/api/v1/debug/zlm/statistic'),
-                icon: const Icon(Icons.query_stats),
-                label: const Text('ZLM 统计'),
-              ),
-              OutlinedButton.icon(
-                onPressed: () =>
-                    _debug(controller, '/api/v1/debug/zlm/threads-load'),
-                icon: const Icon(Icons.speed),
-                label: const Text('线程负载'),
-              ),
-              OutlinedButton.icon(
-                onPressed: () =>
-                    _debug(controller, '/api/v1/debug/zlm/work-threads-load'),
-                icon: const Icon(Icons.memory),
-                label: const Text('工作线程'),
-              ),
             ],
           ),
         ),
@@ -303,19 +285,7 @@ class _NodeMeta extends StatelessWidget {
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 300),
       child: RichText(
-        text: TextSpan(
-          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
-          children: [
-            TextSpan(
-              text: '$label：',
-              style: const TextStyle(
-                color: Color(0xff5b6477),
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            TextSpan(text: textValue(value)),
-          ],
-        ),
+        text: metadataTextSpan(context, label: label, value: value),
         softWrap: true,
       ),
     );

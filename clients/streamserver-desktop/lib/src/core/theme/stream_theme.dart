@@ -177,6 +177,39 @@ class StreamTheme {
         ),
       ),
       dividerTheme: DividerThemeData(color: colors.border, thickness: 1),
+      menuTheme: MenuThemeData(
+        style: MenuStyle(
+          backgroundColor: WidgetStatePropertyAll(colors.surface),
+          surfaceTintColor: const WidgetStatePropertyAll(Colors.transparent),
+          elevation: const WidgetStatePropertyAll(10),
+          shadowColor: WidgetStatePropertyAll(
+            Colors.black
+                .withValues(alpha: brightness == Brightness.dark ? 0.34 : 0.14),
+          ),
+          padding:
+              const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 6)),
+          side: WidgetStatePropertyAll(BorderSide(color: colors.border)),
+          shape: WidgetStatePropertyAll(
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          ),
+        ),
+      ),
+      popupMenuTheme: PopupMenuThemeData(
+        color: colors.surface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 10,
+        shadowColor: Colors.black
+            .withValues(alpha: brightness == Brightness.dark ? 0.34 : 0.14),
+        shape: RoundedRectangleBorder(
+          side: BorderSide(color: colors.border),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        textStyle: TextStyle(
+          color: colors.textPrimary,
+          fontSize: 13,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
       inputDecorationTheme: InputDecorationTheme(
         isDense: true,
         filled: true,
