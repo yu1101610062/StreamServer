@@ -739,7 +739,13 @@ const _taskOperationConfigs = [
   _TaskOperationConfig(
     key: 'stop',
     label: '停止',
-    supportedStatuses: ['DISPATCHING', 'STARTING', 'RUNNING', 'RECOVERING'],
+    supportedStatuses: [
+      'DISPATCHING',
+      'STARTING',
+      'RUNNING',
+      'RECOVERING',
+      'LOST'
+    ],
     icon: LucideIcons.square,
   ),
   _TaskOperationConfig(
