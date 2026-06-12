@@ -407,6 +407,7 @@ _StatusTone _statusTone(String value) {
       return const _StatusTone(
           Color(0xff175cd3), Color(0xffeff8ff), Color(0xff84caff));
     case 'VALIDATING':
+    case 'DISPATCHING':
     case 'STARTING':
       return const _StatusTone(
           Color(0xff026aa2), Color(0xfff0f9ff), Color(0xff7cd4fd));
@@ -424,6 +425,7 @@ _StatusTone _statusTone(String value) {
       return const _StatusTone(
           Color(0xff175cd3), Color(0xffeff8ff), Color(0xff84caff));
     case 'RECOVERING':
+    case 'RECLAIMING':
       return const _StatusTone(
           Color(0xff6941c6), Color(0xfff4f3ff), Color(0xffbdb4fe));
     default:
@@ -458,6 +460,8 @@ String _statusLabel(String value) {
       return '已创建';
     case 'VALIDATING':
       return '校验中';
+    case 'DISPATCHING':
+      return '分发中';
     case 'STARTING':
       return '启动中';
     case 'STOPPING':
@@ -476,6 +480,8 @@ String _statusLabel(String value) {
       return '上传中';
     case 'RECOVERING':
       return '恢复中';
+    case 'RECLAIMING':
+      return '回收中';
     case 'HEALTHY':
       return '健康';
     case 'UNHEALTHY':
