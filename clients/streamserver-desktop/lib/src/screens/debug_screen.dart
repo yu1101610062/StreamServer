@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -48,130 +49,190 @@ class _DebugScreenState extends State<DebugScreen> {
   @override
   Widget build(BuildContext context) {
     final controller = AppScope.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const PageHeader(
-          title: '调试台',
-          description: '运行 Core 健康探测、播放器后端探测和 ZLM 常用调试接口。',
-        ),
-        Surface(
-          child: Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              FilledButton.icon(
-                onPressed: running ? null : () => _run(() => controller.diagnostics()),
-                icon: const Icon(Icons.health_and_safety),
-                label: const Text('Core 探测'),
-              ),
-              OutlinedButton.icon(
-                onPressed: running ? null : () => _nativePlayerProbe(controller),
-                icon: const Icon(Icons.video_settings),
-                label: const Text('播放器探测'),
-              ),
-              _debugButton(controller, '/api/v1/debug/zlm/media', Icons.live_tv, 'ZLM 媒体'),
-              _debugButton(controller, '/api/v1/debug/zlm/sessions', Icons.people, '会话'),
-              _debugButton(controller, '/api/v1/debug/zlm/players', Icons.smart_display, '播放器'),
-              _debugButton(controller, '/api/v1/debug/zlm/statistic', Icons.query_stats, '统计'),
-              _debugButton(controller, '/api/v1/debug/zlm/threads-load', Icons.speed, '线程负载'),
-              _debugButton(controller, '/api/v1/debug/zlm/work-threads-load', Icons.memory, '工作线程'),
-              _debugButton(controller, '/api/v1/debug/hooks', Icons.webhook, 'Hook 事件'),
-            ],
-          ),
-        ),
-        const SizedBox(height: 12),
-        Surface(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('ZLM 操作', style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                crossAxisAlignment: WrapCrossAlignment.center,
+    return Theme(
+      data: StreamTheme.dark(),
+      child: Builder(builder: (context) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const PageHeader(
+              title: '调试台',
+              description: '运行 Core 健康探测、播放器后端探测和 ZLM 常用调试接口。',
+            ),
+            Surface(
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
                 children: [
-                  SmallTextField(controller: nodeController, label: '节点 ID'),
-                  SmallTextField(controller: schemaController, label: '协议', width: 140),
-                  SmallTextField(controller: vhostController, label: 'Vhost'),
-                  SmallTextField(controller: appController, label: 'App'),
-                  SmallTextField(controller: streamController, label: 'Stream'),
-                  SmallTextField(controller: sessionController, label: 'Session ID'),
                   FilledButton.icon(
-                    onPressed: running ? null : () => _kickSession(controller),
-                    icon: const Icon(Icons.person_remove),
-                    label: const Text('踢会话'),
+                    onPressed: running
+                        ? null
+                        : () => _run(() => controller.diagnostics()),
+                    icon: const Icon(Icons.health_and_safety),
+                    label: const Text('Core 探测'),
                   ),
-                  SmallTextField(controller: localPortController, label: '本地端口', width: 160),
-                  SmallTextField(controller: peerIpController, label: 'Peer IP'),
-                  FilledButton.icon(
-                    onPressed: running ? null : () => _kickSessions(controller),
-                    icon: const Icon(Icons.group_remove),
-                    label: const Text('批量踢会话'),
+                  OutlinedButton.icon(
+                    onPressed:
+                        running ? null : () => _nativePlayerProbe(controller),
+                    icon: const Icon(Icons.video_settings),
+                    label: const Text('播放器探测'),
+                  ),
+                  _debugButton(controller, '/api/v1/debug/zlm/media',
+                      Icons.live_tv, 'ZLM 媒体'),
+                  _debugButton(controller, '/api/v1/debug/zlm/sessions',
+                      Icons.people, '会话'),
+                  _debugButton(controller, '/api/v1/debug/zlm/players',
+                      Icons.smart_display, '播放器'),
+                  _debugButton(controller, '/api/v1/debug/zlm/statistic',
+                      Icons.query_stats, '统计'),
+                  _debugButton(controller, '/api/v1/debug/zlm/threads-load',
+                      Icons.speed, '线程负载'),
+                  _debugButton(
+                      controller,
+                      '/api/v1/debug/zlm/work-threads-load',
+                      Icons.memory,
+                      '工作线程'),
+                  _debugButton(controller, '/api/v1/debug/hooks', Icons.webhook,
+                      'Hook 事件'),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+            Surface(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('ZLM 操作',
+                      style: TextStyle(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      SmallTextField(
+                          controller: nodeController, label: '节点 ID'),
+                      SmallTextField(
+                          controller: schemaController,
+                          label: '协议',
+                          width: 140),
+                      SmallTextField(
+                          controller: vhostController, label: 'Vhost'),
+                      SmallTextField(controller: appController, label: 'App'),
+                      SmallTextField(
+                          controller: streamController, label: 'Stream'),
+                      SmallTextField(
+                          controller: sessionController, label: 'Session ID'),
+                      FilledButton.icon(
+                        onPressed:
+                            running ? null : () => _kickSession(controller),
+                        icon: const Icon(Icons.person_remove),
+                        label: const Text('踢会话'),
+                      ),
+                      SmallTextField(
+                          controller: localPortController,
+                          label: '本地端口',
+                          width: 160),
+                      SmallTextField(
+                          controller: peerIpController, label: 'Peer IP'),
+                      FilledButton.icon(
+                        onPressed:
+                            running ? null : () => _kickSessions(controller),
+                        icon: const Icon(Icons.group_remove),
+                        label: const Text('批量踢会话'),
+                      ),
+                    ],
                   ),
                 ],
               ),
-            ],
-          ),
-        ),
-        const SizedBox(height: 12),
-        Surface(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('本地播放器', style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 12),
-              Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                crossAxisAlignment: WrapCrossAlignment.center,
+            ),
+            const SizedBox(height: 12),
+            Surface(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  SmallTextField(controller: playerSessionController, label: 'Session ID'),
-                  SmallTextField(controller: snapshotPathController, label: '截图输出路径', width: 360),
-                  FilledButton.icon(
-                    onPressed: running ? null : () => _stopPlayer(controller),
-                    icon: const Icon(Icons.stop),
-                    label: const Text('停止播放'),
+                  const Text('本地播放器',
+                      style: TextStyle(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      SmallTextField(
+                          controller: playerSessionController,
+                          label: 'Session ID'),
+                      SmallTextField(
+                          controller: snapshotPathController,
+                          label: '截图输出路径',
+                          width: 360),
+                      FilledButton.icon(
+                        onPressed:
+                            running ? null : () => _stopPlayer(controller),
+                        icon: const Icon(Icons.stop),
+                        label: const Text('停止播放'),
+                      ),
+                      FilledButton.icon(
+                        onPressed:
+                            running ? null : () => _snapshotPlayer(controller),
+                        icon: const Icon(Icons.camera),
+                        label: const Text('本地截图'),
+                      ),
+                    ],
                   ),
-                  FilledButton.icon(
-                    onPressed: running ? null : () => _snapshotPlayer(controller),
-                    icon: const Icon(Icons.camera),
-                    label: const Text('本地截图'),
+                  const SizedBox(height: 18),
+                  const Text('截图探测',
+                      style: TextStyle(fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 12,
+                    runSpacing: 12,
+                    crossAxisAlignment: WrapCrossAlignment.center,
+                    children: [
+                      SmallTextField(
+                          controller: snapUrlController,
+                          label: '播放 URL',
+                          width: 520),
+                      SmallTextField(
+                          controller: timeoutController,
+                          label: '超时秒',
+                          width: 120),
+                      FilledButton.icon(
+                        onPressed: running ? null : () => _snap(controller),
+                        icon: const Icon(Icons.photo_camera),
+                        label: const Text('截图'),
+                      ),
+                    ],
                   ),
                 ],
               ),
-              const SizedBox(height: 18),
-              const Text('截图探测', style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            if (output.isNotEmpty) ...[
               const SizedBox(height: 12),
-              Wrap(
-                spacing: 12,
-                runSpacing: 12,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  SmallTextField(controller: snapUrlController, label: '播放 URL', width: 520),
-                  SmallTextField(controller: timeoutController, label: '超时秒', width: 120),
-                  FilledButton.icon(
-                    onPressed: running ? null : () => _snap(controller),
-                    icon: const Icon(Icons.photo_camera),
-                    label: const Text('截图'),
+              Surface(
+                child: SelectableText(
+                  output,
+                  style: const TextStyle(
+                    fontFamily: 'Menlo',
+                    fontSize: 12,
+                    height: 1.45,
                   ),
-                ],
+                ),
               ),
             ],
-          ),
-        ),
-        if (output.isNotEmpty) ...[
-          const SizedBox(height: 12),
-          Surface(child: SelectableText(output)),
-        ],
-      ],
+          ],
+        );
+      }),
     );
   }
 
-  Widget _debugButton(AppController controller, String path, IconData icon, String label) {
+  Widget _debugButton(
+      AppController controller, String path, IconData icon, String label) {
     return OutlinedButton.icon(
-      onPressed: running ? null : () => _run(() => controller.api('GET', path, query: _debugQuery(path))),
+      onPressed: running
+          ? null
+          : () =>
+              _run(() => controller.api('GET', path, query: _debugQuery(path))),
       icon: Icon(icon),
       label: Text(label),
     );
@@ -262,7 +323,8 @@ class _DebugScreenState extends State<DebugScreen> {
   }
 
   Future<void> _snapshotPlayer(AppController controller) async {
-    await _run(() => controller.snapshotMedia(playerSessionController.text, outputPath: snapshotPathController.text));
+    await _run(() => controller.snapshotMedia(playerSessionController.text,
+        outputPath: snapshotPathController.text));
   }
 
   Future<void> _run(Future<Object?> Function() action) async {

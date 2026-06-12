@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -122,43 +124,67 @@ class _ArtifactsScreenState extends State<ArtifactsScreen> {
                       if (constraints.maxWidth < 820) {
                         return _CompactArtifactsList(rows);
                       }
-                      return SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: DataTable(
-                          dataRowMinHeight: 56,
-                          dataRowMaxHeight: 160,
-                          columns: const [
-                            DataColumn(label: Text('类型')),
-                            DataColumn(label: Text('任务')),
-                            DataColumn(label: Text('文件名')),
-                            DataColumn(label: Text('路径')),
-                            DataColumn(label: Text('大小')),
-                            DataColumn(label: Text('HTTP 地址')),
-                            DataColumn(label: Text('操作')),
-                          ],
-                          rows: rows.map((row) {
-                            final url = '${row['http_url'] ?? ''}';
-                            return DataRow(cells: [
-                              DataCell(WrappedTextCell(
-                                  value: row['artifact_kind'], maxWidth: 180)),
-                              DataCell(WrappedTextCell(
-                                  value: row['task_name'] ?? row['task_id'],
-                                  maxWidth: 240)),
-                              DataCell(WrappedTextCell(
-                                  value: row['file_name'], maxWidth: 240)),
-                              DataCell(WrappedTextCell(
-                                  value: row['file_path'],
-                                  maxWidth: 360,
-                                  selectable: true)),
-                              DataCell(Text(bytesLabel(row['file_size']))),
-                              DataCell(WrappedTextCell(
-                                  value: row['http_url'],
-                                  maxWidth: 420,
-                                  selectable: true)),
-                              DataCell(_ArtifactActions(url: url)),
-                            ]);
-                          }).toList(),
-                        ),
+                      return StreamDataGrid(
+                        height: 600,
+                        rowHeight: 96,
+                        rows: rows,
+                        columns: [
+                          const StreamGridColumn(
+                            title: '类型',
+                            field: 'artifact_kind',
+                            width: 170,
+                          ),
+                          StreamGridColumn(
+                            title: '任务',
+                            field: 'task_id',
+                            width: 220,
+                            renderer: (context, row, value) => gridTextCell(
+                              context,
+                              row['task_name'] ?? row['task_id'],
+                              maxWidth: 210,
+                            ),
+                          ),
+                          StreamGridColumn(
+                            title: '文件名',
+                            field: 'file_name',
+                            width: 230,
+                            renderer: (context, row, value) => gridTextCell(
+                              context,
+                              value,
+                              fontWeight: FontWeight.w800,
+                              maxWidth: 220,
+                            ),
+                          ),
+                          StreamGridColumn(
+                            title: '路径',
+                            field: 'file_path',
+                            width: 320,
+                            renderer: (context, row, value) =>
+                                gridTextCell(context, value, maxWidth: 310),
+                          ),
+                          StreamGridColumn(
+                            title: '大小',
+                            field: 'file_size',
+                            width: 110,
+                            renderer: (context, row, value) =>
+                                Text(bytesLabel(row['file_size'])),
+                          ),
+                          StreamGridColumn(
+                            title: 'HTTP 地址',
+                            field: 'http_url',
+                            width: 460,
+                            renderer: (context, row, value) =>
+                                FullUrlText(value: value, maxWidth: 440),
+                          ),
+                          StreamGridColumn(
+                            title: '操作',
+                            field: 'http_url',
+                            width: 110,
+                            renderer: (context, row, value) =>
+                                _ArtifactIconActions(
+                                    url: '${row['http_url'] ?? ''}'),
+                          ),
+                        ],
                       );
                     },
                   ),
@@ -169,6 +195,37 @@ class _ArtifactsScreenState extends State<ArtifactsScreen> {
         ),
       ],
     );
+  }
+}
+
+class _ArtifactIconActions extends StatelessWidget {
+  const _ArtifactIconActions({required this.url});
+
+  final String url;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = url.startsWith('http://') || url.startsWith('https://');
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: '打开',
+          onPressed: enabled ? () => _open(context) : null,
+          icon: const Icon(LucideIcons.circlePlay, size: 17),
+        ),
+        IconButton(
+          tooltip: '复制地址',
+          onPressed: enabled ? () => copyText(context, url) : null,
+          icon: const Icon(LucideIcons.copy, size: 17),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _open(BuildContext context) async {
+    AppScope.of(context).playMedia(url, title: '文件产物播放');
+    showResult(context, '已打开内嵌播放器');
   }
 }
 

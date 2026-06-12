@@ -1,7 +1,9 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -158,172 +160,231 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
           title: '新建任务',
           description: '覆盖输入、处理、协议暴露、发布、录制、恢复、调度和资源标签；专家模式仍可直接提交 JSON。',
         ),
-        Surface(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SegmentedButton<String>(
-                segments: const [
-                  ButtonSegment(value: 'live-ingest', label: Text('实时流接入')),
-                  ButtonSegment(value: 'ingest-record', label: Text('接入并录制')),
-                  ButtonSegment(value: 'bridge-out', label: Text('桥接输出')),
-                  ButtonSegment(value: 'file-transcode', label: Text('离线转码')),
-                  ButtonSegment(value: 'expert', label: Text('专家 JSON')),
-                ],
-                selected: {scenario},
-                onSelectionChanged: (value) => _applyScenario(value.first),
-              ),
-              const SizedBox(height: 16),
-              if (scenario == 'expert')
-                TextField(
-                  controller: expertController,
-                  minLines: 16,
-                  maxLines: 28,
-                  decoration: const InputDecoration(labelText: '任务 JSON'),
-                )
-              else
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const _SectionTitle('基础信息'),
-                    _Grid([
-                      _TextFieldBox('任务名称', nameController),
-                      _TextFieldBox('优先级', priorityController),
-                      _TextFieldBox('创建者', createdByController),
-                      _TextFieldBox('回调 URL', callbackController, width: 420),
-                      _TextFieldBox('业务标签，逗号分隔', labelsController, width: 420),
-                    ]),
-                    const _SectionTitle('输入与处理'),
-                    _Grid([
-                      _SelectBox(
-                          '任务类型',
-                          taskType,
-                          ['stream_ingest', 'stream_bridge', 'file_transcode'],
-                          (value) => setState(() => taskType = value)),
-                      _SelectBox(
-                          '输入类型',
-                          inputKind,
-                          [
-                            'rtsp',
-                            'rtmp',
-                            'hls',
-                            'http_flv',
-                            'http_ts',
-                            'http_mp4',
-                            'ftp',
-                            'file',
-                            'udp_mpegts_multicast',
-                            'rtp_multicast',
-                            'gb_rtp'
-                          ],
-                          (value) => setState(() => inputKind = value)),
-                      _SelectBox('源模式', sourceMode, ['live', 'vod'],
-                          (value) => setState(() => sourceMode = value)),
-                      _SelectBox(
-                          '处理模式',
-                          processMode,
-                          ['copy_or_transcode', 'copy', 'transcode'],
-                          (value) => setState(() => processMode = value)),
-                      if (taskInputUsesUrl(inputKind))
-                        _TextFieldBox('输入 URL / 文件路径', sourceController,
-                            width: 520),
-                      if (taskInputUsesGroup(inputKind))
-                        _TextFieldBox('输入组播地址', inputGroupController),
-                      if (taskInputUsesPort(inputKind))
-                        _TextFieldBox(
-                            inputKind == 'gb_rtp' ? 'GB RTP 监听端口' : '输入端口',
-                            inputPortController),
-                      _SwitchBox('循环 VOD', loopEnabled,
-                          (value) => setState(() => loopEnabled = value)),
-                    ]),
-                    const _SectionTitle('内部流与播放协议'),
-                    _Grid([
-                      _TextFieldBox('App', streamAppController),
-                      _TextFieldBox('Stream', streamNameController),
-                      _TextFieldBox('Vhost', vhostController),
-                      _SwitchBox('RTSP', enableRtsp,
-                          (value) => setState(() => enableRtsp = value)),
-                      _SwitchBox('RTMP', enableRtmp,
-                          (value) => setState(() => enableRtmp = value)),
-                      _SwitchBox('HTTP-TS', enableHttpTs,
-                          (value) => setState(() => enableHttpTs = value)),
-                      _SwitchBox('HTTP-FMP4', enableHttpFmp4,
-                          (value) => setState(() => enableHttpFmp4 = value)),
-                      _SwitchBox('HLS', enableHls,
-                          (value) => setState(() => enableHls = value)),
-                    ]),
-                    const _SectionTitle('发布与网络'),
-                    _Grid([
-                      _SelectBox(
-                          '发布类型',
-                          publishKind,
-                          [
-                            '',
-                            'file',
-                            'udp_mpegts_multicast',
-                            'rtp_multicast',
-                            'rtmp_push'
-                          ],
-                          (value) => setState(() => publishKind = value)),
-                      _SelectBox(
-                          '文件格式',
-                          publishFormat,
-                          ['', 'mp4', 'hls', 'mpegts', 'flv'],
-                          (value) => setState(() => publishFormat = value)),
-                      _TextFieldBox('发布 URL / 文件路径', publishUrlController,
-                          width: 420),
-                      _TextFieldBox('组播地址', publishGroupController),
-                      _TextFieldBox('端口', publishPortController),
-                      _TextFieldBox('网卡名', interfaceNameController),
-                      _TextFieldBox('绑定 IP', interfaceIpController),
-                      _TextFieldBox('TTL', ttlController),
-                    ]),
-                    const _SectionTitle('录制、恢复与调度'),
-                    _Grid([
-                      _SwitchBox('启用录制', recordEnabled,
-                          (value) => setState(() => recordEnabled = value)),
-                      _SelectBox('录制格式', recordFormat, ['mp4', 'hls', 'both'],
-                          (value) => setState(() => recordFormat = value)),
-                      _TextFieldBox('录制时长秒', durationController),
-                      _TextFieldBox('分段秒', segmentController),
-                      _SwitchBox('按播放器模式录制', recordAsPlayer,
-                          (value) => setState(() => recordAsPlayer = value)),
-                      _SelectBox('恢复策略', recoveryPolicy, ['auto', 'none'],
-                          (value) => setState(() => recoveryPolicy = value)),
-                      _SelectBox(
-                          '启动模式',
-                          startMode,
-                          ['immediate', 'manual', 'at', 'cron'],
-                          (value) => setState(() => startMode = value)),
-                      _TextFieldBox('启动时间 RFC3339', startAtController),
-                      _TextFieldBox('Cron', cronController),
-                      _TextFieldBox('节点标签要求，逗号分隔', requiredLabelsController,
-                          width: 420),
-                    ]),
-                  ],
-                ),
-              const SizedBox(height: 16),
-              Wrap(
-                spacing: 8,
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final wide = constraints.maxWidth >= 1040;
+            final selector = _ScenarioSelector(
+              value: scenario,
+              onChanged: _applyScenario,
+            );
+            final form = scenario == 'expert'
+                ? _ExpertTaskForm(
+                    controller: expertController,
+                    result: result,
+                    onPreview: () => _run(context, () => _preview(controller)),
+                    onCreate: () => _run(context, () => _create(controller)),
+                  )
+                : _GuidedTaskForm(
+                    result: result,
+                    children: [
+                      _FormSection(
+                        title: '基础信息',
+                        description: '定义任务名称、优先级、创建者和业务侧回调信息。',
+                        icon: LucideIcons.badgeInfo,
+                        children: [
+                          _TextFieldBox('任务名称', nameController),
+                          _TextFieldBox('优先级', priorityController),
+                          _TextFieldBox('创建者', createdByController),
+                          _TextFieldBox('回调 URL', callbackController),
+                          _TextFieldBox('业务标签，逗号分隔', labelsController),
+                        ],
+                      ),
+                      _FormSection(
+                        title: '输入与处理',
+                        description: '选择输入来源、源类型和处理策略；组播和 GB RTP 会显示地址/端口字段。',
+                        icon: LucideIcons.radioReceiver,
+                        children: [
+                          _SelectBox(
+                            '任务类型',
+                            taskType,
+                            const [
+                              'stream_ingest',
+                              'stream_bridge',
+                              'file_transcode'
+                            ],
+                            (value) => setState(() => taskType = value),
+                          ),
+                          _SelectBox(
+                            '输入类型',
+                            inputKind,
+                            const [
+                              'rtsp',
+                              'rtmp',
+                              'hls',
+                              'http_flv',
+                              'http_ts',
+                              'http_mp4',
+                              'ftp',
+                              'file',
+                              'udp_mpegts_multicast',
+                              'rtp_multicast',
+                              'gb_rtp'
+                            ],
+                            (value) => setState(() => inputKind = value),
+                          ),
+                          _SelectBox(
+                            '源模式',
+                            sourceMode,
+                            const ['live', 'vod'],
+                            (value) => setState(() => sourceMode = value),
+                          ),
+                          _SelectBox(
+                            '处理模式',
+                            processMode,
+                            const ['copy_or_transcode', 'copy', 'transcode'],
+                            (value) => setState(() => processMode = value),
+                          ),
+                          if (taskInputUsesUrl(inputKind))
+                            _TextFieldBox('输入 URL / 文件路径', sourceController),
+                          if (taskInputUsesGroup(inputKind))
+                            _TextFieldBox('输入组播地址', inputGroupController),
+                          if (taskInputUsesPort(inputKind))
+                            _TextFieldBox(
+                              inputKind == 'gb_rtp' ? 'GB RTP 监听端口' : '输入端口',
+                              inputPortController,
+                            ),
+                          _SwitchBox(
+                            '循环 VOD',
+                            loopEnabled,
+                            (value) => setState(() => loopEnabled = value),
+                          ),
+                        ],
+                      ),
+                      _FormSection(
+                        title: '内部流与播放协议',
+                        description: '配置 StreamServer 内部流命名和对外播放协议。',
+                        icon: LucideIcons.playSquare,
+                        children: [
+                          _TextFieldBox('App', streamAppController),
+                          _TextFieldBox('Stream', streamNameController),
+                          _TextFieldBox('Vhost', vhostController),
+                          _SwitchBox(
+                            'RTSP',
+                            enableRtsp,
+                            (value) => setState(() => enableRtsp = value),
+                          ),
+                          _SwitchBox(
+                            'RTMP',
+                            enableRtmp,
+                            (value) => setState(() => enableRtmp = value),
+                          ),
+                          _SwitchBox(
+                            'HTTP-TS',
+                            enableHttpTs,
+                            (value) => setState(() => enableHttpTs = value),
+                          ),
+                          _SwitchBox(
+                            'HTTP-FMP4',
+                            enableHttpFmp4,
+                            (value) => setState(() => enableHttpFmp4 = value),
+                          ),
+                          _SwitchBox(
+                            'HLS',
+                            enableHls,
+                            (value) => setState(() => enableHls = value),
+                          ),
+                        ],
+                      ),
+                      _FormSection(
+                        title: '发布与网络',
+                        description: '发布到文件、组播或 RTMP 推流时填写，未设置则仅创建内部流。',
+                        icon: LucideIcons.network,
+                        children: [
+                          _SelectBox(
+                            '发布类型',
+                            publishKind,
+                            const [
+                              '',
+                              'file',
+                              'udp_mpegts_multicast',
+                              'rtp_multicast',
+                              'rtmp_push'
+                            ],
+                            (value) => setState(() => publishKind = value),
+                          ),
+                          _SelectBox(
+                            '文件格式',
+                            publishFormat,
+                            const ['', 'mp4', 'hls', 'mpegts', 'flv'],
+                            (value) => setState(() => publishFormat = value),
+                          ),
+                          _TextFieldBox('发布 URL / 文件路径', publishUrlController),
+                          _TextFieldBox('组播地址', publishGroupController),
+                          _TextFieldBox('端口', publishPortController),
+                          _TextFieldBox('网卡名', interfaceNameController),
+                          _TextFieldBox('绑定 IP', interfaceIpController),
+                          _TextFieldBox('TTL', ttlController),
+                        ],
+                      ),
+                      _FormSection(
+                        title: '录制、恢复与调度',
+                        description: '设置录制参数、恢复策略、启动模式和节点资源标签。',
+                        icon: LucideIcons.calendarClock,
+                        children: [
+                          _SwitchBox(
+                            '启用录制',
+                            recordEnabled,
+                            (value) => setState(() => recordEnabled = value),
+                          ),
+                          _SelectBox(
+                            '录制格式',
+                            recordFormat,
+                            const ['mp4', 'hls', 'both'],
+                            (value) => setState(() => recordFormat = value),
+                          ),
+                          _TextFieldBox('录制时长秒', durationController),
+                          _TextFieldBox('分段秒', segmentController),
+                          _SwitchBox(
+                            '按播放器模式录制',
+                            recordAsPlayer,
+                            (value) => setState(() => recordAsPlayer = value),
+                          ),
+                          _SelectBox(
+                            '恢复策略',
+                            recoveryPolicy,
+                            const ['auto', 'none'],
+                            (value) => setState(() => recoveryPolicy = value),
+                          ),
+                          _SelectBox(
+                            '启动模式',
+                            startMode,
+                            const ['immediate', 'manual', 'at', 'cron'],
+                            (value) => setState(() => startMode = value),
+                          ),
+                          _TextFieldBox('启动时间 RFC3339', startAtController),
+                          _TextFieldBox('Cron', cronController),
+                          _TextFieldBox(
+                              '节点标签要求，逗号分隔', requiredLabelsController),
+                        ],
+                      ),
+                      _ActionSection(
+                        result: result,
+                        onPreview: () =>
+                            _run(context, () => _preview(controller)),
+                        onCreate: () =>
+                            _run(context, () => _create(controller)),
+                      ),
+                    ],
+                  );
+            if (!wide) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  OutlinedButton.icon(
-                    onPressed: () => _run(context, () => _preview(controller)),
-                    icon: const Icon(Icons.visibility),
-                    label: const Text('规格预览'),
-                  ),
-                  FilledButton.icon(
-                    onPressed: () => _run(context, () => _create(controller)),
-                    icon: const Icon(Icons.playlist_add),
-                    label: const Text('创建任务'),
-                  ),
+                  selector,
+                  const SizedBox(height: 14),
+                  form,
                 ],
-              ),
-              if (result != null) ...[
-                const SizedBox(height: 16),
-                SelectableText(result!),
+              );
+            }
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SizedBox(width: 260, child: selector),
+                const SizedBox(width: 16),
+                Expanded(child: form),
               ],
-            ],
-          ),
+            );
+          },
         ),
       ],
     );
@@ -478,46 +539,363 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
   }
 }
 
-class _SectionTitle extends StatelessWidget {
-  const _SectionTitle(this.text);
+class _ScenarioSelector extends StatelessWidget {
+  const _ScenarioSelector({required this.value, required this.onChanged});
 
-  final String text;
+  final String value;
+  final ValueChanged<String> onChanged;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 16, bottom: 8),
-      child: Text(text,
-          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+    final colors = context.streamColors;
+    final items = const [
+      _ScenarioSpec(
+        value: 'live-ingest',
+        title: '实时流接入',
+        description: 'RTSP/RTMP/HLS 等在线流进入 StreamServer。',
+        icon: LucideIcons.radio,
+      ),
+      _ScenarioSpec(
+        value: 'ingest-record',
+        title: '接入并录制',
+        description: '创建在线流并同步启用录制参数。',
+        icon: LucideIcons.video,
+      ),
+      _ScenarioSpec(
+        value: 'bridge-out',
+        title: '桥接输出',
+        description: '接入后发布到文件、组播或 RTMP。',
+        icon: LucideIcons.workflow,
+      ),
+      _ScenarioSpec(
+        value: 'file-transcode',
+        title: '离线转码',
+        description: '本地/远端文件转码并输出产物。',
+        icon: LucideIcons.fileVideo,
+      ),
+      _ScenarioSpec(
+        value: 'expert',
+        title: '专家 JSON',
+        description: '直接提交完整任务 JSON。',
+        icon: LucideIcons.braces,
+      ),
+    ];
+    return Surface(
+      padding: const EdgeInsets.all(14),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final horizontal = constraints.maxWidth > 520;
+          final children = [
+            for (final item in items)
+              _ScenarioOption(
+                item: item,
+                selected: value == item.value,
+                onTap: () => onChanged(item.value),
+              ),
+          ];
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                '任务场景',
+                style: TextStyle(
+                  color: colors.textPrimary,
+                  fontWeight: FontWeight.w900,
+                  fontSize: 15,
+                ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                '先选任务意图，再补齐必要参数。',
+                style: TextStyle(color: colors.textSecondary, fontSize: 12),
+              ),
+              const SizedBox(height: 12),
+              if (horizontal)
+                Wrap(spacing: 10, runSpacing: 10, children: children)
+              else
+                Column(children: children),
+            ],
+          );
+        },
+      ),
     );
   }
 }
 
-class _Grid extends StatelessWidget {
-  const _Grid(this.children);
+class _ScenarioSpec {
+  const _ScenarioSpec({
+    required this.value,
+    required this.title,
+    required this.description,
+    required this.icon,
+  });
 
-  final List<Widget> children;
+  final String value;
+  final String title;
+  final String description;
+  final IconData icon;
+}
+
+class _ScenarioOption extends StatelessWidget {
+  const _ScenarioOption({
+    required this.item,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final _ScenarioSpec item;
+  final bool selected;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return Wrap(spacing: 12, runSpacing: 12, children: children);
+    final colors = context.streamColors;
+    return InkWell(
+      borderRadius: BorderRadius.circular(10),
+      onTap: onTap,
+      child: Container(
+        width: 232,
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: selected
+              ? colors.primary.withValues(alpha: 0.14)
+              : colors.surfaceAlt.withValues(alpha: 0.72),
+          border: Border.all(
+            color: selected ? colors.primary : colors.border,
+            width: selected ? 1.2 : 1,
+          ),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 34,
+              height: 34,
+              decoration: BoxDecoration(
+                color: selected
+                    ? colors.primary.withValues(alpha: 0.22)
+                    : colors.surface,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(
+                selected ? LucideIcons.check : item.icon,
+                size: 17,
+                color: selected ? colors.primary : colors.textSecondary,
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    item.title,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    item.description,
+                    style: TextStyle(
+                      color: colors.textSecondary,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _GuidedTaskForm extends StatelessWidget {
+  const _GuidedTaskForm({required this.children, required this.result});
+
+  final List<Widget> children;
+  final String? result;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        for (var index = 0; index < children.length; index++) ...[
+          children[index],
+          if (index != children.length - 1) const SizedBox(height: 14),
+        ],
+      ],
+    );
+  }
+}
+
+class _ExpertTaskForm extends StatelessWidget {
+  const _ExpertTaskForm({
+    required this.controller,
+    required this.onPreview,
+    required this.onCreate,
+    this.result,
+  });
+
+  final TextEditingController controller;
+  final VoidCallback onPreview;
+  final VoidCallback onCreate;
+  final String? result;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        _FormSection(
+          title: '专家 JSON',
+          description: '适合从 Web 管理台或 API 文档复制完整任务规格后直接调整提交。',
+          icon: LucideIcons.braces,
+          forceSingleColumn: true,
+          children: [
+            TextField(
+              controller: controller,
+              minLines: 18,
+              maxLines: 28,
+              style: const TextStyle(fontFamily: 'Menlo', fontSize: 12),
+              decoration: const InputDecoration(labelText: '任务 JSON'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        _ActionSection(
+          result: result,
+          onPreview: onPreview,
+          onCreate: onCreate,
+        ),
+      ],
+    );
+  }
+}
+
+class _FormSection extends StatelessWidget {
+  const _FormSection({
+    required this.title,
+    required this.description,
+    required this.icon,
+    required this.children,
+    this.forceSingleColumn = false,
+  });
+
+  final String title;
+  final String description;
+  final IconData icon;
+  final List<Widget> children;
+  final bool forceSingleColumn;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.streamColors;
+    return Surface(
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: colors.primary.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(icon, color: colors.primary, size: 17),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      description,
+                      style: TextStyle(
+                        color: colors.textSecondary,
+                        fontSize: 12,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _FormGrid(
+            forceSingleColumn: forceSingleColumn,
+            children: children,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FormGrid extends StatelessWidget {
+  const _FormGrid({
+    required this.children,
+    this.forceSingleColumn = false,
+  });
+
+  final List<Widget> children;
+  final bool forceSingleColumn;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final columns = forceSingleColumn
+            ? 1
+            : constraints.maxWidth >= 900
+                ? 3
+                : constraints.maxWidth >= 620
+                    ? 2
+                    : 1;
+        final width = (constraints.maxWidth - 12 * (columns - 1)) / columns;
+        return Wrap(
+          spacing: 12,
+          runSpacing: 12,
+          children: [
+            for (final child in children) SizedBox(width: width, child: child),
+          ],
+        );
+      },
+    );
   }
 }
 
 class _TextFieldBox extends StatelessWidget {
-  const _TextFieldBox(this.label, this.controller, {this.width = 220});
+  const _TextFieldBox(this.label, this.controller);
 
   final String label;
   final TextEditingController controller;
-  final double width;
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-        width: width,
-        child: TextField(
-            controller: controller,
-            decoration: InputDecoration(labelText: label)));
+    return TextField(
+      controller: controller,
+      decoration: InputDecoration(labelText: label),
+    );
   }
 }
 
@@ -531,19 +909,16 @@ class _SelectBox extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 220,
-      child: DropdownButtonFormField<String>(
-        initialValue: options.contains(value) ? value : options.first,
-        decoration: InputDecoration(labelText: label),
-        items: options
-            .map((item) => DropdownMenuItem(
-                value: item, child: Text(item.isEmpty ? '不设置' : item)))
-            .toList(),
-        onChanged: (value) {
-          if (value != null) onChanged(value);
-        },
-      ),
+    return DropdownButtonFormField<String>(
+      initialValue: options.contains(value) ? value : options.first,
+      decoration: InputDecoration(labelText: label),
+      items: options
+          .map((item) => DropdownMenuItem(
+              value: item, child: Text(item.isEmpty ? '不设置' : item)))
+          .toList(),
+      onChanged: (value) {
+        if (value != null) onChanged(value);
+      },
     );
   }
 }
@@ -557,13 +932,107 @@ class _SwitchBox extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 180,
-      child: SwitchListTile(
-        contentPadding: EdgeInsets.zero,
-        title: Text(label),
-        value: value,
-        onChanged: onChanged,
+    final colors = context.streamColors;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color:
+            colors.surfaceAlt.withValues(alpha: context.isDarkMode ? 0.6 : 0.9),
+        border: Border.all(color: colors.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: colors.textPrimary,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            Switch(value: value, onChanged: onChanged),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ActionSection extends StatelessWidget {
+  const _ActionSection({
+    required this.onPreview,
+    required this.onCreate,
+    this.result,
+  });
+
+  final VoidCallback onPreview;
+  final VoidCallback onCreate;
+  final String? result;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.streamColors;
+    return Surface(
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          LayoutBuilder(
+            builder: (context, constraints) {
+              final compact = constraints.maxWidth < 560;
+              final actions = [
+                OutlinedButton.icon(
+                  onPressed: onPreview,
+                  icon: const Icon(LucideIcons.eye, size: 17),
+                  label: const Text('规格预览'),
+                ),
+                FilledButton.icon(
+                  onPressed: onCreate,
+                  icon: const Icon(LucideIcons.listPlus, size: 17),
+                  label: const Text('创建任务'),
+                ),
+              ];
+              return compact
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: actions,
+                    )
+                  : Row(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        actions.first,
+                        const SizedBox(width: 10),
+                        actions.last,
+                      ],
+                    );
+            },
+          ),
+          if (result != null) ...[
+            const SizedBox(height: 14),
+            DecoratedBox(
+              decoration: BoxDecoration(
+                color: colors.sidebar,
+                border: Border.all(color: colors.border),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: SelectableText(
+                  result!,
+                  style: const TextStyle(
+                    color: Color(0xffe5e7eb),
+                    fontSize: 12,
+                    height: 1.35,
+                    fontFamily: 'Menlo',
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }

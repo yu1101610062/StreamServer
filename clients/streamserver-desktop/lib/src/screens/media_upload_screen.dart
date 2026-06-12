@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:file_selector/file_selector.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -174,45 +176,72 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
                           onDone: _refresh,
                         );
                       }
-                      final nameWidth =
-                          constraints.maxWidth < 760 ? 180.0 : 260.0;
-                      final urlWidth =
-                          constraints.maxWidth < 760 ? 240.0 : 420.0;
-                      return SingleChildScrollView(
-                        scrollDirection: Axis.horizontal,
-                        child: DataTable(
-                          dataRowMinHeight: 56,
-                          dataRowMaxHeight: 132,
-                          columns: const [
-                            DataColumn(label: Text('文件')),
-                            DataColumn(label: Text('节点')),
-                            DataColumn(label: Text('大小')),
-                            DataColumn(label: Text('时长')),
-                            DataColumn(label: Text('状态')),
-                            DataColumn(label: Text('HTTP 地址')),
-                            DataColumn(label: Text('操作')),
-                          ],
-                          rows: rows.map((row) {
-                            final url = '${row['http_url'] ?? ''}';
-                            return DataRow(cells: [
-                              DataCell(WrappedTextCell(
-                                  value: row['file_name'],
-                                  maxWidth: nameWidth)),
-                              DataCell(WrappedTextCell(
-                                  value: row['node_name'] ?? row['node_id'],
-                                  maxWidth: 180)),
-                              DataCell(Text(bytesLabel(row['file_size']))),
-                              DataCell(Text('${row['duration_sec'] ?? 0}s')),
-                              DataCell(StatusBadge(status: row['status'])),
-                              DataCell(WrappedTextCell(
-                                  value: row['http_url'],
-                                  maxWidth: urlWidth,
-                                  selectable: true)),
-                              DataCell(_UploadActions(
-                                  row: row, url: url, onDone: _refresh)),
-                            ]);
-                          }).toList(),
-                        ),
+                      return StreamDataGrid(
+                        height: 600,
+                        rowHeight: 96,
+                        rows: rows,
+                        columns: [
+                          StreamGridColumn(
+                            title: '文件',
+                            field: 'file_name',
+                            width: 240,
+                            renderer: (context, row, value) => gridTextCell(
+                              context,
+                              value,
+                              fontWeight: FontWeight.w800,
+                              maxWidth: 230,
+                            ),
+                          ),
+                          StreamGridColumn(
+                            title: '节点',
+                            field: 'node_id',
+                            width: 180,
+                            renderer: (context, row, value) => gridTextCell(
+                              context,
+                              row['node_name'] ?? row['node_id'],
+                              maxWidth: 170,
+                            ),
+                          ),
+                          StreamGridColumn(
+                            title: '大小',
+                            field: 'file_size',
+                            width: 110,
+                            renderer: (context, row, value) =>
+                                Text(bytesLabel(row['file_size'])),
+                          ),
+                          StreamGridColumn(
+                            title: '时长',
+                            field: 'duration_sec',
+                            width: 90,
+                            renderer: (context, row, value) =>
+                                Text('${row['duration_sec'] ?? 0}s'),
+                          ),
+                          StreamGridColumn(
+                            title: '状态',
+                            field: 'status',
+                            width: 120,
+                            renderer: (context, row, value) =>
+                                StatusBadge(status: value),
+                          ),
+                          StreamGridColumn(
+                            title: 'HTTP 地址',
+                            field: 'http_url',
+                            width: 430,
+                            renderer: (context, row, value) =>
+                                FullUrlText(value: value, maxWidth: 410),
+                          ),
+                          StreamGridColumn(
+                            title: '操作',
+                            field: 'id',
+                            width: 150,
+                            renderer: (context, row, value) =>
+                                _UploadIconActions(
+                              row: row,
+                              url: '${row['http_url'] ?? ''}',
+                              onDone: _refresh,
+                            ),
+                          ),
+                        ],
                       );
                     },
                   ),
@@ -254,6 +283,83 @@ class _MediaUploadScreenState extends State<MediaUploadScreen> {
       setState(() => result = cause.toString());
     } finally {
       if (mounted) setState(() => uploading = false);
+    }
+  }
+}
+
+class _UploadIconActions extends StatelessWidget {
+  const _UploadIconActions({
+    required this.row,
+    required this.url,
+    required this.onDone,
+  });
+
+  final Map<String, Object?> row;
+  final String url;
+  final VoidCallback onDone;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasUrl = url.startsWith('http://') || url.startsWith('https://');
+    final deleted = row['status'] == 'deleted' || row['file_deleted'] == true;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        IconButton(
+          tooltip: '播放',
+          onPressed: hasUrl ? () => _open(context) : null,
+          icon: const Icon(LucideIcons.circlePlay, size: 17),
+        ),
+        IconButton(
+          tooltip: '复制地址',
+          onPressed: hasUrl ? () => copyText(context, url) : null,
+          icon: const Icon(LucideIcons.copy, size: 17),
+        ),
+        PopupMenuButton<String>(
+          tooltip: '更多',
+          onSelected:
+              deleted ? null : (value) => _delete(context, value == 'file'),
+          itemBuilder: (context) => const [
+            PopupMenuItem(value: 'ledger', child: Text('删除台账')),
+            PopupMenuItem(value: 'file', child: Text('删除文件')),
+          ],
+          child: const Padding(
+            padding: EdgeInsets.all(8),
+            child: Icon(LucideIcons.ellipsis, size: 18),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _open(BuildContext context) async {
+    AppScope.of(context).playMedia(url, title: textValue(row['file_name']));
+    showResult(context, '已打开内嵌播放器');
+  }
+
+  Future<void> _delete(BuildContext context, bool deleteFile) async {
+    final name = textValue(row['file_name']);
+    final confirmed = await confirmAction(
+      context,
+      title: deleteFile ? '删除上传文件' : '删除上传台账',
+      message: deleteFile
+          ? '确认删除 $name 的台账并同步删除底层文件？这可能影响历史任务和外部引用。'
+          : '确认仅删除 $name 的上传台账？底层文件会保留。',
+      confirmLabel: deleteFile ? '删文件' : '删台账',
+      destructive: true,
+    );
+    if (!confirmed || !context.mounted) return;
+    final controller = AppScope.of(context);
+    try {
+      await controller.api(
+        'DELETE',
+        '/api/v1/uploads/media/${row['id']}',
+        query: {'delete_file': deleteFile},
+      );
+      if (context.mounted) showResult(context, '删除请求已提交');
+      onDone();
+    } catch (cause) {
+      if (context.mounted) showResult(context, cause.toString());
     }
   }
 }

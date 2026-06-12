@@ -1,5 +1,9 @@
-import 'package:flutter/material.dart';
+import 'dart:math' as math;
 
+import 'package:flutter/material.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+
+import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
@@ -133,49 +137,88 @@ class _StreamsScreenState extends State<StreamsScreen> {
                       onDone: _refresh,
                     );
                   }
-                  return SingleChildScrollView(
-                    scrollDirection: Axis.horizontal,
-                    child: DataTable(
-                      dataRowMinHeight: 56,
-                      dataRowMaxHeight: 132,
-                      columns: const [
-                        DataColumn(label: Text('协议')),
-                        DataColumn(label: Text('应用/流')),
-                        DataColumn(label: Text('任务')),
-                        DataColumn(label: Text('节点')),
-                        DataColumn(label: Text('观众')),
-                        DataColumn(label: Text('码率')),
-                        DataColumn(label: Text('播放地址')),
-                        DataColumn(label: Text('操作')),
-                      ],
-                      rows: rows.map((row) {
-                        final urls =
-                            (row['play_urls'] as List?)?.cast<Object?>() ??
-                                const [];
-                        return DataRow(
-                          cells: [
-                            DataCell(Text(textValue(row['schema']))),
-                            DataCell(WrappedTextCell(
-                                value: '${row['app']}/${row['stream']}',
-                                maxWidth: 240)),
-                            DataCell(WrappedTextCell(
-                                value: row['task_name'] ?? row['task_id'],
-                                maxWidth: 240)),
-                            DataCell(Text(shortId(row['node_id']))),
-                            DataCell(Text(textValue(row['viewer_count']))),
-                            DataCell(Text('${row['bitrate_kbps'] ?? 0} kbps')),
-                            DataCell(Wrap(
-                                spacing: 4,
-                                runSpacing: 4,
-                                children: urls
-                                    .map((url) => _PlayButton(url: '$url'))
-                                    .toList())),
-                            DataCell(
-                                _CloseStreamButton(row: row, onDone: _refresh)),
-                          ],
-                        );
-                      }).toList(),
-                    ),
+                  return StreamDataGrid(
+                    height: _streamGridHeight(context),
+                    rowHeight: 244,
+                    rows: rows,
+                    columns: [
+                      const StreamGridColumn(
+                        title: '协议',
+                        field: 'schema',
+                        width: 100,
+                      ),
+                      StreamGridColumn(
+                        title: '应用/流',
+                        field: 'stream',
+                        width: 230,
+                        renderer: (context, row, value) => gridTextCell(
+                          context,
+                          '${row['app']}/${row['stream']}',
+                          fontWeight: FontWeight.w800,
+                          maxWidth: 220,
+                        ),
+                      ),
+                      StreamGridColumn(
+                        title: '任务',
+                        field: 'task_id',
+                        width: 220,
+                        renderer: (context, row, value) => gridTextCell(
+                          context,
+                          row['task_name'] ?? row['task_id'],
+                          maxWidth: 210,
+                        ),
+                      ),
+                      StreamGridColumn(
+                        title: '节点',
+                        field: 'node_id',
+                        width: 100,
+                        renderer: (context, row, value) =>
+                            Text(shortId(row['node_id'])),
+                      ),
+                      const StreamGridColumn(
+                        title: '观众',
+                        field: 'viewer_count',
+                        width: 80,
+                      ),
+                      StreamGridColumn(
+                        title: '码率',
+                        field: 'bitrate_kbps',
+                        width: 110,
+                        renderer: (context, row, value) =>
+                            Text('${row['bitrate_kbps'] ?? 0} kbps'),
+                      ),
+                      StreamGridColumn(
+                        title: '播放地址',
+                        field: 'play_urls',
+                        width: 620,
+                        minWidth: 420,
+                        renderer: (context, row, value) {
+                          final urls = (row['play_urls'] as List?)
+                                  ?.map((url) => '$url')
+                                  .toList() ??
+                              const <String>[];
+                          return PlayableUrlList(
+                            urls: urls,
+                            title: '${row['app']}/${row['stream']}',
+                            maxWidth: 580,
+                            maxVisibleItems: 2,
+                          );
+                        },
+                      ),
+                      StreamGridColumn(
+                        title: '操作',
+                        field: 'id',
+                        width: 110,
+                        minWidth: 96,
+                        renderer: (context, row, value) => TextButton.icon(
+                          onPressed: () =>
+                              _CloseStreamButton(row: row, onDone: _refresh)
+                                  .close(context),
+                          icon: const Icon(LucideIcons.link2Off, size: 16),
+                          label: const Text('关流'),
+                        ),
+                      ),
+                    ],
                   );
                 },
               ),
@@ -185,6 +228,24 @@ class _StreamsScreenState extends State<StreamsScreen> {
       ],
     );
   }
+}
+
+double _streamGridHeight(BuildContext context) {
+  final height = MediaQuery.sizeOf(context).height;
+  final topChrome = 34.0;
+  final topCommand = height < 720 ? 72.0 : 86.0;
+  const contentPadding = 46.0;
+  const pageHeader = 74.0;
+  const filterPanel = 150.0;
+  const gapsAndMargins = 44.0;
+  final available = height -
+      topChrome -
+      topCommand -
+      contentPadding -
+      pageHeader -
+      filterPanel -
+      gapsAndMargins;
+  return math.max(420.0, available);
 }
 
 class _CompactStreamsList extends StatelessWidget {
@@ -252,10 +313,10 @@ class _CompactStreamItem extends StatelessWidget {
         ),
         if (urls.isNotEmpty) ...[
           const SizedBox(height: 8),
-          Wrap(
-            spacing: 4,
-            runSpacing: 4,
-            children: urls.map((url) => _PlayButton(url: '$url')).toList(),
+          PlayableUrlList(
+            urls: urls.map((url) => '$url').toList(),
+            title: '${row['app']}/${row['stream']}',
+            maxVisibleItems: 3,
           ),
         ],
         const SizedBox(height: 8),
@@ -295,44 +356,6 @@ class _StreamMeta extends StatelessWidget {
   }
 }
 
-class _PlayButton extends StatelessWidget {
-  const _PlayButton({required this.url});
-
-  final String url;
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 2,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        TextButton.icon(
-          onPressed: () => _open(context),
-          icon: const Icon(Icons.play_arrow),
-          label: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 320),
-            child: Text(
-              url,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ),
-        IconButton(
-          tooltip: '复制地址',
-          onPressed: () => copyText(context, url),
-          icon: const Icon(Icons.copy),
-        ),
-      ],
-    );
-  }
-
-  Future<void> _open(BuildContext context) async {
-    AppScope.of(context).playMedia(url, title: url);
-    showResult(context, '已打开内嵌播放器');
-  }
-}
-
 class _CloseStreamButton extends StatelessWidget {
   const _CloseStreamButton({required this.row, required this.onDone});
 
@@ -342,13 +365,13 @@ class _CloseStreamButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return TextButton.icon(
-      onPressed: () => _close(context),
+      onPressed: () => close(context),
       icon: const Icon(Icons.link_off),
       label: const Text('关流'),
     );
   }
 
-  Future<void> _close(BuildContext context) async {
+  Future<void> close(BuildContext context) async {
     final confirmed = await confirmAction(
       context,
       title: '关闭在线流',
