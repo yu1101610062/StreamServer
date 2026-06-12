@@ -1,15 +1,15 @@
 import 'dart:async';
-import 'dart:io' show Platform;
 
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-import 'package:window_manager/window_manager.dart';
 
 import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
+import 'app_select_field.dart';
 import 'data_panel.dart';
 import 'embedded_player_panel.dart';
+import 'window_chrome_bar.dart';
 
 class AppShell extends StatelessWidget {
   const AppShell({
@@ -49,7 +49,7 @@ class AppShell extends StatelessWidget {
               : null,
           body: Column(
             children: [
-              const _WindowChromeBar(),
+              const WindowChromeBar(),
               Expanded(
                 child: Row(
                   children: [
@@ -100,79 +100,6 @@ class AppShell extends StatelessWidget {
           ),
         );
       },
-    );
-  }
-}
-
-class _WindowChromeBar extends StatelessWidget {
-  const _WindowChromeBar();
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = context.streamColors;
-    final brightness = Theme.of(context).brightness;
-    final isMacOS = Platform.isMacOS;
-    return Container(
-      height: 34,
-      decoration: BoxDecoration(
-        color: colors.sidebar,
-        border: Border(
-          bottom: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
-        ),
-      ),
-      child: Row(
-        children: [
-          Expanded(
-            child: DragToMoveArea(
-              child: Padding(
-                padding: EdgeInsets.only(left: isMacOS ? 76 : 16),
-                child: Row(
-                  children: [
-                    Icon(LucideIcons.circlePlay,
-                        color: colors.primary, size: 15),
-                    const SizedBox(width: 8),
-                    const Text(
-                      'StreamServer 控制台',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 13,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          if (!isMacOS) ...[
-            WindowCaptionButton.minimize(
-              brightness: brightness,
-              onPressed: () => windowManager.minimize(),
-            ),
-            FutureBuilder<bool>(
-              future: windowManager.isMaximized(),
-              builder: (context, snapshot) {
-                if (snapshot.data == true) {
-                  return WindowCaptionButton.unmaximize(
-                    brightness: brightness,
-                    onPressed: () => windowManager.unmaximize(),
-                  );
-                }
-                return WindowCaptionButton.maximize(
-                  brightness: brightness,
-                  onPressed: () => windowManager.maximize(),
-                );
-              },
-            ),
-            WindowCaptionButton.close(
-              brightness: brightness,
-              onPressed: () => windowManager.close(),
-            ),
-          ],
-        ],
-      ),
     );
   }
 }
@@ -239,8 +166,7 @@ class _TopCommandBar extends StatelessWidget {
         height: compact ? 72 : 86,
         padding: EdgeInsets.symmetric(horizontal: compact ? 12 : 28),
         decoration: BoxDecoration(
-          color: alpha(colors.surface, context.isDarkMode ? 0.82 : 0.92),
-          border: Border(bottom: BorderSide(color: colors.border)),
+          color: colors.appBackground,
         ),
         child: Row(
           children: [
@@ -382,22 +308,91 @@ class _AutoRefresh extends StatelessWidget {
         const SizedBox(width: 7),
         Text('自动刷新', style: TextStyle(color: colors.textSecondary)),
         const SizedBox(width: 8),
-        DropdownButtonHideUnderline(
-          child: DropdownButton<int>(
-            value: controller.autoRefreshSeconds,
-            borderRadius: BorderRadius.circular(8),
-            items: const [
-              DropdownMenuItem(value: 0, child: Text('关闭')),
-              DropdownMenuItem(value: 5, child: Text('5s')),
-              DropdownMenuItem(value: 10, child: Text('10s')),
-              DropdownMenuItem(value: 30, child: Text('30s')),
-            ],
-            onChanged: (value) {
-              if (value != null) controller.setAutoRefreshSeconds(value);
-            },
-          ),
+        _AutoRefreshMenu(
+          value: controller.autoRefreshSeconds,
+          onChanged: controller.setAutoRefreshSeconds,
         ),
       ],
+    );
+  }
+}
+
+class _AutoRefreshMenu extends StatelessWidget {
+  const _AutoRefreshMenu({
+    required this.value,
+    required this.onChanged,
+  });
+
+  final int value;
+  final ValueChanged<int> onChanged;
+
+  String get _label => value <= 0 ? '关闭' : '${value}s';
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.streamColors;
+    final anchorController = MenuController();
+    return MenuAnchor(
+      controller: anchorController,
+      alignmentOffset: const Offset(0, 6),
+      style: streamMenuStyle(context, minWidth: 104),
+      menuChildren: [
+        for (final option in const [0, 5, 10, 30])
+          StreamMenuOption(
+            width: 104,
+            label: option <= 0 ? '关闭' : '${option}s',
+            icon: option == value ? LucideIcons.check : LucideIcons.timer,
+            selected: option == value,
+            onPressed: () {
+              anchorController.close();
+              onChanged(option);
+            },
+          ),
+      ],
+      builder: (context, menuController, child) {
+        return SizedBox(
+          width: 68,
+          height: 34,
+          child: Material(
+            color: colors.surface,
+            shape: RoundedRectangleBorder(
+              side: BorderSide(color: colors.border),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () {
+                if (menuController.isOpen) {
+                  menuController.close();
+                } else {
+                  menuController.open();
+                }
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 9),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      _label,
+                      style: TextStyle(
+                        color: colors.textPrimary,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    Icon(
+                      LucideIcons.chevronDown,
+                      color: colors.textSecondary,
+                      size: 15,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -594,55 +589,91 @@ class _UserMenu extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = context.streamColors;
-    return PopupMenuButton<String>(
-      tooltip: '用户菜单',
-      onSelected: (value) {
-        if (value == 'logout') controller.logout();
-      },
-      itemBuilder: (context) => const [
-        PopupMenuItem(value: 'logout', child: Text('退出登录')),
+    final anchorController = MenuController();
+    return MenuAnchor(
+      controller: anchorController,
+      alignmentOffset: const Offset(-116, 8),
+      style: streamMenuStyle(context, minWidth: 150),
+      menuChildren: [
+        StreamMenuOption(
+          width: 150,
+          label: '退出登录',
+          icon: LucideIcons.logOut,
+          destructive: true,
+          onPressed: () {
+            anchorController.close();
+            controller.logout();
+          },
+        ),
       ],
-      child: Row(
-        children: [
-          CircleAvatar(
-            radius: 17,
-            backgroundColor: colors.primary,
-            child: Text(
-              controller.subject.isEmpty
-                  ? 'A'
-                  : controller.subject.characters.first.toUpperCase(),
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.w800,
+      builder: (context, menuController, child) {
+        return Tooltip(
+          message: '用户菜单',
+          waitDuration: const Duration(milliseconds: 450),
+          child: Material(
+            color: Colors.transparent,
+            borderRadius: BorderRadius.circular(18),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(18),
+              onTap: () {
+                if (menuController.isOpen) {
+                  menuController.close();
+                } else {
+                  menuController.open();
+                }
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
+                child: Row(
+                  children: [
+                    CircleAvatar(
+                      radius: 17,
+                      backgroundColor: colors.primary,
+                      child: Text(
+                        controller.subject.isEmpty
+                            ? 'A'
+                            : controller.subject.characters.first.toUpperCase(),
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                    ),
+                    if (MediaQuery.sizeOf(context).width >= 1040) ...[
+                      const SizedBox(width: 9),
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 116),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              controller.subject,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.w800),
+                            ),
+                            Text(
+                              controller.role,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: colors.textSecondary,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
               ),
             ),
           ),
-          if (MediaQuery.sizeOf(context).width >= 1040) ...[
-            const SizedBox(width: 9),
-            ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 116),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    controller.subject,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontWeight: FontWeight.w800),
-                  ),
-                  Text(
-                    controller.role,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: colors.textSecondary, fontSize: 11),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -659,11 +690,10 @@ class _Sidebar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = context.streamColors;
+    final lightMode = !context.isDarkMode;
     return Container(
       decoration: BoxDecoration(
-        color: colors.sidebar,
-        border: Border(
-            right: BorderSide(color: Colors.white.withValues(alpha: 0.08))),
+        color: lightMode ? colors.appBackground : colors.sidebar,
       ),
       child: SafeArea(
         child: Padding(
@@ -694,13 +724,13 @@ class _Sidebar extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 10),
-                  const Expanded(
+                  Expanded(
                     child: Text(
                       'StreamServer 控制台',
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: TextStyle(
-                        color: Colors.white,
+                        color: lightMode ? colors.textPrimary : Colors.white,
                         fontSize: 16,
                         fontWeight: FontWeight.w800,
                       ),
@@ -742,10 +772,13 @@ class _NavGroupTitle extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final colors = context.streamColors;
     return Text(
       label,
       style: TextStyle(
-        color: Colors.white.withValues(alpha: 0.45),
+        color: context.isDarkMode
+            ? Colors.white.withValues(alpha: 0.45)
+            : colors.textMuted,
         fontSize: 12,
         fontWeight: FontWeight.w700,
       ),
@@ -767,6 +800,11 @@ class _NavButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = context.streamColors;
+    final lightMode = !context.isDarkMode;
+    final unselectedIconColor =
+        lightMode ? colors.textSecondary : Colors.white.withValues(alpha: 0.78);
+    final unselectedTextColor =
+        lightMode ? colors.textPrimary : Colors.white.withValues(alpha: 0.86);
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
       child: Material(
@@ -780,9 +818,7 @@ class _NavButton extends StatelessWidget {
             decoration: BoxDecoration(
               color: selected ? colors.primary : Colors.transparent,
               border: Border.all(
-                color: selected
-                    ? Colors.white.withValues(alpha: 0.08)
-                    : Colors.transparent,
+                color: selected ? colors.primary : Colors.transparent,
               ),
               borderRadius: BorderRadius.circular(8),
             ),
@@ -791,9 +827,7 @@ class _NavButton extends StatelessWidget {
                 Icon(
                   item.icon,
                   size: 18,
-                  color: selected
-                      ? Colors.white
-                      : Colors.white.withValues(alpha: 0.78),
+                  color: selected ? Colors.white : unselectedIconColor,
                 ),
                 const SizedBox(width: 11),
                 Expanded(
@@ -802,9 +836,7 @@ class _NavButton extends StatelessWidget {
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      color: selected
-                          ? Colors.white
-                          : Colors.white.withValues(alpha: 0.86),
+                      color: selected ? Colors.white : unselectedTextColor,
                       fontWeight: selected ? FontWeight.w800 : FontWeight.w600,
                       fontSize: 14,
                     ),
@@ -920,18 +952,26 @@ class _SidebarAccount extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = AppScope.of(context);
+    final colors = context.streamColors;
+    final lightMode = !context.isDarkMode;
     return Container(
       padding: const EdgeInsets.only(top: 16),
       decoration: BoxDecoration(
         border: Border(
-          top: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+          top: BorderSide(
+            color: lightMode
+                ? colors.border
+                : Colors.white.withValues(alpha: 0.08),
+          ),
         ),
       ),
       child: Row(
         children: [
           CircleAvatar(
-            backgroundColor: Colors.white.withValues(alpha: 0.12),
-            foregroundColor: Colors.white,
+            backgroundColor: lightMode
+                ? colors.primary.withValues(alpha: 0.12)
+                : Colors.white.withValues(alpha: 0.12),
+            foregroundColor: lightMode ? colors.primary : Colors.white,
             child: Text(
               controller.subject.isEmpty
                   ? 'A'
@@ -947,8 +987,8 @@ class _SidebarAccount extends StatelessWidget {
                   controller.subject,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white,
+                  style: TextStyle(
+                    color: lightMode ? colors.textPrimary : Colors.white,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
@@ -957,7 +997,9 @@ class _SidebarAccount extends StatelessWidget {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
-                    color: Colors.white.withValues(alpha: 0.56),
+                    color: lightMode
+                        ? colors.textSecondary
+                        : Colors.white.withValues(alpha: 0.56),
                     fontSize: 12,
                   ),
                 ),
@@ -967,7 +1009,11 @@ class _SidebarAccount extends StatelessWidget {
           IconButton(
             tooltip: '退出',
             onPressed: controller.logout,
-            icon: const Icon(LucideIcons.logOut, color: Colors.white, size: 18),
+            icon: Icon(
+              LucideIcons.logOut,
+              color: lightMode ? colors.textSecondary : Colors.white,
+              size: 18,
+            ),
           ),
         ],
       ),
@@ -987,8 +1033,7 @@ class _CompactTabs extends StatelessWidget {
     return Container(
       height: 54,
       decoration: BoxDecoration(
-        color: colors.surface,
-        border: Border(bottom: BorderSide(color: colors.border)),
+        color: colors.appBackground,
       ),
       child: ListView.separated(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
@@ -1145,22 +1190,9 @@ class _RightInspectorState extends State<_RightInspector> {
                             padding: const EdgeInsets.all(16),
                             children: [
                               if (_nodes.length > 1) ...[
-                                DropdownButtonFormField<String>(
-                                  initialValue: '${selectedNode?['id']}',
-                                  decoration: const InputDecoration(
-                                    labelText: '节点',
-                                    isDense: true,
-                                  ),
-                                  items: [
-                                    for (final node in _nodes)
-                                      DropdownMenuItem(
-                                        value: '${node['id']}',
-                                        child: Text(
-                                          _nodeTitle(node),
-                                          overflow: TextOverflow.ellipsis,
-                                        ),
-                                      ),
-                                  ],
+                                _InspectorNodeMenu(
+                                  nodes: _nodes,
+                                  selectedNode: selectedNode,
                                   onChanged:
                                       widget.controller.selectInspectorNode,
                                 ),
@@ -1202,6 +1234,92 @@ class _RightInspectorState extends State<_RightInspector> {
     return _nodes.firstWhere(
       (node) => '${node['id']}' == selected,
       orElse: () => _nodes.first,
+    );
+  }
+}
+
+class _InspectorNodeMenu extends StatelessWidget {
+  const _InspectorNodeMenu({
+    required this.nodes,
+    required this.selectedNode,
+    required this.onChanged,
+  });
+
+  final List<Map<String, Object?>> nodes;
+  final Map<String, Object?>? selectedNode;
+  final ValueChanged<String?> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.streamColors;
+    final label = selectedNode == null ? '选择节点' : _nodeTitle(selectedNode!);
+    final anchorController = MenuController();
+    return MenuAnchor(
+      controller: anchorController,
+      alignmentOffset: const Offset(0, 6),
+      style: streamMenuStyle(context, minWidth: 278),
+      menuChildren: [
+        for (final node in nodes)
+          StreamMenuOption(
+            width: 278,
+            label: _nodeTitle(node),
+            icon: '${node['id']}' == '${selectedNode?['id']}'
+                ? LucideIcons.check
+                : LucideIcons.server,
+            selected: '${node['id']}' == '${selectedNode?['id']}',
+            onPressed: () {
+              anchorController.close();
+              onChanged('${node['id']}');
+            },
+          ),
+      ],
+      builder: (context, menuController, child) {
+        return SizedBox(
+          height: 42,
+          child: Material(
+            color: Theme.of(context).inputDecorationTheme.fillColor,
+            shape: RoundedRectangleBorder(
+              side: BorderSide(color: colors.border),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () {
+                if (menuController.isOpen) {
+                  menuController.close();
+                } else {
+                  menuController.open();
+                }
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Row(
+                  children: [
+                    Icon(LucideIcons.server,
+                        size: 17, color: colors.textSecondary),
+                    const SizedBox(width: 9),
+                    Expanded(
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: colors.textPrimary,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Icon(LucideIcons.chevronDown,
+                        size: 16, color: colors.textSecondary),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -1640,12 +1758,6 @@ const navItems = [
     icon: LucideIcons.shield,
   ),
   NavItem(
-    label: '调试台',
-    note: 'ZLM、Hook、播放器和诊断工具',
-    section: AppSection.debug,
-    icon: LucideIcons.bug,
-  ),
-  NavItem(
     label: '新建任务',
     note: '创建 StreamServer 任务规格',
     section: AppSection.taskCreate,
@@ -1659,7 +1771,7 @@ final _navGroups = [
   ]),
   NavGroup('任务管理', [
     navItems[1],
-    navItems[10],
+    navItems[9],
   ]),
   NavGroup('资源管理', [
     navItems[3],
@@ -1671,6 +1783,5 @@ final _navGroups = [
   ]),
   NavGroup('系统管理', [
     navItems[8],
-    navItems[9],
   ]),
 ];

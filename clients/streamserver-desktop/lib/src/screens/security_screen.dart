@@ -133,10 +133,14 @@ class _SecurityScreenState extends State<SecurityScreen> {
         '/api/v1/security/machine-allowlist',
         body: {'entries': parsed},
       );
-      if (mounted) showResult(context, '白名单已更新');
+      if (mounted) {
+        showResult(context, '白名单已更新', tone: InlineStatusTone.success);
+      }
       await _loadAllowlist();
     } catch (cause) {
-      if (mounted) showResult(context, cause.toString());
+      if (mounted) {
+        showResult(context, cause.toString(), tone: InlineStatusTone.danger);
+      }
     } finally {
       if (mounted) setState(() => saving = false);
     }
@@ -146,11 +150,11 @@ class _SecurityScreenState extends State<SecurityScreen> {
     final current = currentPasswordController.text;
     final next = newPasswordController.text;
     if (next != repeatPasswordController.text) {
-      showResult(context, '两次新密码不一致');
+      showResult(context, '两次新密码不一致', tone: InlineStatusTone.danger);
       return;
     }
     if (current.isEmpty || next.isEmpty) {
-      showResult(context, '当前密码和新密码不能为空');
+      showResult(context, '当前密码和新密码不能为空', tone: InlineStatusTone.danger);
       return;
     }
     final confirmed = await confirmAction(
@@ -174,9 +178,13 @@ class _SecurityScreenState extends State<SecurityScreen> {
       currentPasswordController.clear();
       newPasswordController.clear();
       repeatPasswordController.clear();
-      if (mounted) showResult(context, '密码已修改');
+      if (mounted) {
+        showResult(context, '密码已修改', tone: InlineStatusTone.success);
+      }
     } catch (cause) {
-      if (mounted) showResult(context, cause.toString());
+      if (mounted) {
+        showResult(context, cause.toString(), tone: InlineStatusTone.danger);
+      }
     }
   }
 
@@ -340,19 +348,7 @@ class _AllowlistMeta extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return RichText(
-      text: TextSpan(
-        style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
-        children: [
-          TextSpan(
-            text: '$label：',
-            style: const TextStyle(
-              color: Color(0xff5b6477),
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-          TextSpan(text: textValue(value)),
-        ],
-      ),
+      text: metadataTextSpan(context, label: label, value: value),
       softWrap: true,
     );
   }

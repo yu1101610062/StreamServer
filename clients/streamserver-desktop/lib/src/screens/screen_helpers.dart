@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -7,6 +8,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
+import '../widgets/app_select_field.dart';
 
 Map<String, Object?> cleanQuery(Map<String, Object?> query) {
   final clean = <String, Object?>{};
@@ -19,14 +21,69 @@ Map<String, Object?> cleanQuery(Map<String, Object?> query) {
   return clean;
 }
 
-void showResult(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      behavior: SnackBarBehavior.floating,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-      content: Text(message),
-    ),
+enum InlineStatusTone { info, success, danger }
+
+OverlayEntry? _activeResultOverlay;
+Timer? _activeResultTimer;
+
+void showResult(
+  BuildContext context,
+  String message, {
+  InlineStatusTone tone = InlineStatusTone.info,
+}) {
+  final overlay = Overlay.maybeOf(context);
+  if (overlay == null) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        content: Text(message),
+      ),
+    );
+    return;
+  }
+
+  _activeResultTimer?.cancel();
+  _activeResultOverlay?.remove();
+  _activeResultOverlay = null;
+
+  late final OverlayEntry entry;
+  entry = OverlayEntry(
+    builder: (overlayContext) {
+      final media = MediaQuery.of(overlayContext);
+      return Positioned(
+        top: media.padding.top + 46,
+        left: 16,
+        right: 16,
+        child: IgnorePointer(
+          child: SafeArea(
+            bottom: false,
+            child: Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 620),
+                child: Material(
+                  color: Colors.transparent,
+                  child: _FloatingStatusMessage(
+                    message: message,
+                    tone: tone,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+    },
   );
+  _activeResultOverlay = entry;
+  overlay.insert(entry);
+  _activeResultTimer = Timer(const Duration(seconds: 3), () {
+    if (_activeResultOverlay == entry) {
+      entry.remove();
+      _activeResultOverlay = null;
+      _activeResultTimer = null;
+    }
+  });
 }
 
 Future<bool> confirmAction(
@@ -77,6 +134,135 @@ bool isPlayableMediaUrl(String url) {
           uri.scheme == 'rtmp');
 }
 
+class InlineStatusMessage extends StatelessWidget {
+  const InlineStatusMessage({
+    required this.message,
+    this.tone = InlineStatusTone.info,
+    super.key,
+  });
+
+  final String message;
+  final InlineStatusTone tone;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.streamColors;
+    final accent = _toneColor(colors, tone);
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: context.isDarkMode ? 0.13 : 0.08),
+        border: Border.all(color: accent.withValues(alpha: 0.34)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(_toneIcon(tone), size: 17, color: accent),
+            const SizedBox(width: 9),
+            Expanded(
+              child: Text(
+                message,
+                style: TextStyle(
+                  color: colors.textPrimary,
+                  fontSize: 13,
+                  height: 1.35,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _FloatingStatusMessage extends StatelessWidget {
+  const _FloatingStatusMessage({
+    required this.message,
+    required this.tone,
+  });
+
+  final String message;
+  final InlineStatusTone tone;
+
+  @override
+  Widget build(BuildContext context) {
+    final colors = context.streamColors;
+    final accent = _toneColor(colors, tone);
+    return TweenAnimationBuilder<double>(
+      duration: const Duration(milliseconds: 160),
+      curve: Curves.easeOutCubic,
+      tween: Tween(begin: 0, end: 1),
+      builder: (context, value, child) {
+        return Opacity(
+          opacity: value,
+          child: Transform.translate(
+            offset: Offset(0, (1 - value) * -8),
+            child: child,
+          ),
+        );
+      },
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: colors.surface,
+          border: Border.all(color: accent.withValues(alpha: 0.36)),
+          borderRadius: BorderRadius.circular(8),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black
+                  .withValues(alpha: context.isDarkMode ? 0.35 : 0.12),
+              blurRadius: 22,
+              offset: const Offset(0, 12),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(_toneIcon(tone), size: 18, color: accent),
+              const SizedBox(width: 10),
+              Flexible(
+                child: Text(
+                  message,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: colors.textPrimary,
+                    fontSize: 13,
+                    height: 1.35,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+Color _toneColor(StreamColors colors, InlineStatusTone tone) {
+  return switch (tone) {
+    InlineStatusTone.info => colors.primary,
+    InlineStatusTone.success => colors.success,
+    InlineStatusTone.danger => colors.danger,
+  };
+}
+
+IconData _toneIcon(InlineStatusTone tone) {
+  return switch (tone) {
+    InlineStatusTone.info => LucideIcons.info,
+    InlineStatusTone.success => LucideIcons.circleCheck,
+    InlineStatusTone.danger => LucideIcons.triangleAlert,
+  };
+}
+
 class FullUrlText extends StatelessWidget {
   const FullUrlText({
     required this.value,
@@ -102,6 +288,27 @@ class FullUrlText extends StatelessWidget {
       ),
     );
   }
+}
+
+TextSpan metadataTextSpan(
+  BuildContext context, {
+  required String label,
+  required Object? value,
+}) {
+  final colors = context.streamColors;
+  return TextSpan(
+    style: TextStyle(color: colors.textPrimary, fontSize: 13),
+    children: [
+      TextSpan(
+        text: '$label：',
+        style: TextStyle(
+          color: colors.textSecondary,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      TextSpan(text: textValue(value)),
+    ],
+  );
 }
 
 class PlayableUrlList extends StatelessWidget {
@@ -456,21 +663,18 @@ class SmallSelect extends StatelessWidget {
         final effectiveWidth = constraints.maxWidth.isFinite
             ? math.min(width, constraints.maxWidth)
             : width;
-        return SizedBox(
+        return AppSelectField<String>(
+          label: label,
           width: effectiveWidth,
-          child: DropdownButtonFormField<String>(
-            initialValue: options.contains(value) ? value : options.first,
-            decoration: InputDecoration(labelText: label),
-            items: options
-                .map((item) => DropdownMenuItem(
-                      value: item,
-                      child: Text(item.isEmpty ? '全部' : item),
-                    ))
-                .toList(),
-            onChanged: (value) {
-              if (value != null) onChanged(value);
-            },
-          ),
+          value: options.contains(value) ? value : options.first,
+          options: [
+            for (final item in options)
+              AppSelectOption(
+                value: item,
+                label: item.isEmpty ? '全部' : item,
+              ),
+          ],
+          onChanged: onChanged,
         );
       },
     );

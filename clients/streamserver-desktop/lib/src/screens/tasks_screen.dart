@@ -4,6 +4,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../core/widgets/stream_data_grid.dart';
 import '../state.dart';
 import '../utils.dart';
+import '../widgets/app_select_field.dart';
 import '../widgets/data_panel.dart';
 import 'screen_helpers.dart';
 
@@ -238,14 +239,67 @@ Future<void> _showTaskContextMenu(
   final selected = await showMenu<String>(
     context: context,
     position: RelativeRect.fromLTRB(size.width / 2, size.height / 2, 24, 24),
-    items: const [
-      PopupMenuItem(value: 'detail', child: Text('打开详情')),
-      PopupMenuItem(value: 'start', child: Text('启动')),
-      PopupMenuItem(value: 'stop', child: Text('停止')),
-      PopupMenuItem(value: 'cancel', child: Text('取消')),
-      PopupMenuItem(value: 'retry', child: Text('重试')),
-      PopupMenuItem(value: 'clone', child: Text('克隆')),
-      PopupMenuItem(value: 'delete', child: Text('删除')),
+    items: [
+      PopupMenuItem<String>(
+        enabled: false,
+        height: 0,
+        padding: EdgeInsets.zero,
+        child: Builder(
+          builder: (menuContext) {
+            void choose(String value) => Navigator.of(menuContext).pop(value);
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                StreamMenuOption(
+                  width: 156,
+                  label: '打开详情',
+                  icon: LucideIcons.eye,
+                  onPressed: () => choose('detail'),
+                ),
+                const StreamMenuDivider(width: 156),
+                StreamMenuOption(
+                  width: 156,
+                  label: '启动',
+                  icon: LucideIcons.play,
+                  onPressed: () => choose('start'),
+                ),
+                StreamMenuOption(
+                  width: 156,
+                  label: '停止',
+                  icon: LucideIcons.square,
+                  onPressed: () => choose('stop'),
+                ),
+                StreamMenuOption(
+                  width: 156,
+                  label: '取消',
+                  icon: LucideIcons.circleX,
+                  onPressed: () => choose('cancel'),
+                ),
+                StreamMenuOption(
+                  width: 156,
+                  label: '重试',
+                  icon: LucideIcons.rotateCw,
+                  onPressed: () => choose('retry'),
+                ),
+                StreamMenuOption(
+                  width: 156,
+                  label: '克隆',
+                  icon: LucideIcons.copy,
+                  onPressed: () => choose('clone'),
+                ),
+                const StreamMenuDivider(width: 156),
+                StreamMenuOption(
+                  width: 156,
+                  label: '删除',
+                  icon: LucideIcons.trash2,
+                  destructive: true,
+                  onPressed: () => choose('delete'),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
     ],
   );
   if (selected == null || !context.mounted) return;
@@ -344,19 +398,7 @@ class _TaskMeta extends StatelessWidget {
     return ConstrainedBox(
       constraints: const BoxConstraints(maxWidth: 260),
       child: RichText(
-        text: TextSpan(
-          style: const TextStyle(color: Color(0xff1d2433), fontSize: 13),
-          children: [
-            TextSpan(
-              text: '$label：',
-              style: const TextStyle(
-                color: Color(0xff5b6477),
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            TextSpan(text: textValue(value)),
-          ],
-        ),
+        text: metadataTextSpan(context, label: label, value: value),
         softWrap: true,
       ),
     );
@@ -459,10 +501,14 @@ class _TaskActions extends StatelessWidget {
   ) async {
     try {
       await controller.mutate(method, path);
-      if (context.mounted) showResult(context, '操作已提交');
+      if (context.mounted) {
+        showResult(context, '操作已提交', tone: InlineStatusTone.success);
+      }
       onDone();
     } catch (cause) {
-      if (context.mounted) showResult(context, cause.toString());
+      if (context.mounted) {
+        showResult(context, cause.toString(), tone: InlineStatusTone.danger);
+      }
     }
   }
 }
@@ -475,6 +521,7 @@ class _TaskActionMenu extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final anchorController = MenuController();
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -483,22 +530,84 @@ class _TaskActionMenu extends StatelessWidget {
           onPressed: () => AppScope.of(context).openTask('${row['id']}'),
           icon: const Icon(LucideIcons.eye, size: 17),
         ),
-        PopupMenuButton<String>(
-          tooltip: '更多操作',
-          onSelected: (value) => run(context, value),
-          itemBuilder: (context) => const [
-            PopupMenuItem(value: 'start', child: Text('启动')),
-            PopupMenuItem(value: 'stop', child: Text('停止')),
-            PopupMenuItem(value: 'cancel', child: Text('取消')),
-            PopupMenuItem(value: 'retry', child: Text('重试')),
-            PopupMenuItem(value: 'clone', child: Text('克隆')),
-            PopupMenuDivider(),
-            PopupMenuItem(value: 'delete', child: Text('删除')),
+        MenuAnchor(
+          controller: anchorController,
+          alignmentOffset: const Offset(-128, 6),
+          style: streamMenuStyle(context, minWidth: 156),
+          menuChildren: [
+            StreamMenuOption(
+              width: 156,
+              label: '启动',
+              icon: LucideIcons.play,
+              onPressed: () {
+                anchorController.close();
+                run(context, 'start');
+              },
+            ),
+            StreamMenuOption(
+              width: 156,
+              label: '停止',
+              icon: LucideIcons.square,
+              onPressed: () {
+                anchorController.close();
+                run(context, 'stop');
+              },
+            ),
+            StreamMenuOption(
+              width: 156,
+              label: '取消',
+              icon: LucideIcons.circleX,
+              onPressed: () {
+                anchorController.close();
+                run(context, 'cancel');
+              },
+            ),
+            StreamMenuOption(
+              width: 156,
+              label: '重试',
+              icon: LucideIcons.rotateCw,
+              onPressed: () {
+                anchorController.close();
+                run(context, 'retry');
+              },
+            ),
+            StreamMenuOption(
+              width: 156,
+              label: '克隆',
+              icon: LucideIcons.copy,
+              onPressed: () {
+                anchorController.close();
+                run(context, 'clone');
+              },
+            ),
+            const StreamMenuDivider(width: 156),
+            StreamMenuOption(
+              width: 156,
+              label: '删除',
+              icon: LucideIcons.trash2,
+              destructive: true,
+              onPressed: () {
+                anchorController.close();
+                run(context, 'delete');
+              },
+            ),
           ],
-          child: const Padding(
-            padding: EdgeInsets.all(8),
-            child: Icon(LucideIcons.ellipsis, size: 18),
-          ),
+          builder: (context, menuController, child) {
+            return Tooltip(
+              message: '更多操作',
+              waitDuration: const Duration(milliseconds: 450),
+              child: IconButton(
+                onPressed: () {
+                  if (menuController.isOpen) {
+                    menuController.close();
+                  } else {
+                    menuController.open();
+                  }
+                },
+                icon: const Icon(LucideIcons.ellipsis, size: 18),
+              ),
+            );
+          },
         ),
       ],
     );
@@ -562,10 +671,14 @@ class _TaskActionMenu extends StatelessWidget {
     }
     try {
       await controller.mutate(method, requestPath);
-      if (context.mounted) showResult(context, '操作已提交');
+      if (context.mounted) {
+        showResult(context, '操作已提交', tone: InlineStatusTone.success);
+      }
       onDone();
     } catch (cause) {
-      if (context.mounted) showResult(context, cause.toString());
+      if (context.mounted) {
+        showResult(context, cause.toString(), tone: InlineStatusTone.danger);
+      }
     }
   }
 }

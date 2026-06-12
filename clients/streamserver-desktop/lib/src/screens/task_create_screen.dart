@@ -6,7 +6,9 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../core/theme/stream_theme.dart';
 import '../state.dart';
 import '../utils.dart';
+import '../widgets/app_select_field.dart';
 import '../widgets/data_panel.dart';
+import 'screen_helpers.dart';
 
 const _multicastInputKinds = {
   'udp_mpegts_multicast',
@@ -17,6 +19,7 @@ const _portInputKinds = {
   'rtp_multicast',
   'gb_rtp',
 };
+const double _taskFormControlHeight = 44;
 
 bool taskInputUsesUrl(String kind) =>
     !_multicastInputKinds.contains(kind) && kind != 'gb_rtp';
@@ -527,13 +530,15 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
     try {
       await action();
       if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('操作完成')));
+        showResult(context, '操作完成', tone: InlineStatusTone.success);
       }
     } catch (error) {
       if (context.mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(error.toString())));
+        showResult(
+          context,
+          error.toString(),
+          tone: InlineStatusTone.danger,
+        );
       }
     }
   }
@@ -655,6 +660,7 @@ class _ScenarioOption extends StatelessWidget {
       onTap: onTap,
       child: Container(
         width: 232,
+        height: 84,
         margin: const EdgeInsets.only(bottom: 10),
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
@@ -700,6 +706,8 @@ class _ScenarioOption extends StatelessWidget {
                   const SizedBox(height: 4),
                   Text(
                     item.description,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       color: colors.textSecondary,
                       fontSize: 12,
@@ -884,17 +892,101 @@ class _FormGrid extends StatelessWidget {
   }
 }
 
-class _TextFieldBox extends StatelessWidget {
+class _TextFieldBox extends StatefulWidget {
   const _TextFieldBox(this.label, this.controller);
 
   final String label;
   final TextEditingController controller;
 
   @override
+  State<_TextFieldBox> createState() => _TextFieldBoxState();
+}
+
+class _TextFieldBoxState extends State<_TextFieldBox> {
+  late final FocusNode _focusNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode = FocusNode()..addListener(_handleFocusChanged);
+  }
+
+  @override
+  void dispose() {
+    _focusNode
+      ..removeListener(_handleFocusChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _handleFocusChanged() => setState(() {});
+
+  @override
   Widget build(BuildContext context) {
-    return TextField(
-      controller: controller,
-      decoration: InputDecoration(labelText: label),
+    final colors = context.streamColors;
+    final fillColor = Theme.of(context).inputDecorationTheme.fillColor!;
+    final focused = _focusNode.hasFocus;
+    return SizedBox(
+      height: _taskFormControlHeight,
+      child: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          Positioned.fill(
+            child: Material(
+              color: fillColor,
+              shape: RoundedRectangleBorder(
+                side: BorderSide(
+                  color: focused ? colors.primary : colors.border,
+                  width: focused ? 1.3 : 1,
+                ),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              clipBehavior: Clip.antiAlias,
+              child: TextField(
+                controller: widget.controller,
+                focusNode: _focusNode,
+                style: TextStyle(
+                  color: colors.textPrimary,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                ),
+                decoration: const InputDecoration(
+                  border: InputBorder.none,
+                  enabledBorder: InputBorder.none,
+                  focusedBorder: InputBorder.none,
+                  disabledBorder: InputBorder.none,
+                  filled: false,
+                  isDense: true,
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 13,
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Positioned(
+            left: 10,
+            top: -7,
+            child: DecoratedBox(
+              decoration: BoxDecoration(color: colors.surface),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(
+                  widget.label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    color: focused ? colors.primary : colors.textSecondary,
+                    fontSize: 12,
+                    height: 1,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -909,16 +1001,19 @@ class _SelectBox extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DropdownButtonFormField<String>(
-      initialValue: options.contains(value) ? value : options.first,
-      decoration: InputDecoration(labelText: label),
-      items: options
-          .map((item) => DropdownMenuItem(
-              value: item, child: Text(item.isEmpty ? '不设置' : item)))
-          .toList(),
-      onChanged: (value) {
-        if (value != null) onChanged(value);
-      },
+    return AppSelectField<String>(
+      label: label,
+      width: double.infinity,
+      height: _taskFormControlHeight,
+      value: options.contains(value) ? value : options.first,
+      options: [
+        for (final item in options)
+          AppSelectOption(
+            value: item,
+            label: item.isEmpty ? '不设置' : item,
+          ),
+      ],
+      onChanged: onChanged,
     );
   }
 }
@@ -933,28 +1028,50 @@ class _SwitchBox extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final colors = context.streamColors;
-    return DecoratedBox(
-      decoration: BoxDecoration(
+    return SizedBox(
+      height: _taskFormControlHeight,
+      child: Material(
         color:
             colors.surfaceAlt.withValues(alpha: context.isDarkMode ? 0.6 : 0.9),
-        border: Border.all(color: colors.border),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-        child: Row(
-          children: [
-            Expanded(
-              child: Text(
-                label,
-                style: TextStyle(
-                  color: colors.textPrimary,
-                  fontWeight: FontWeight.w700,
+        shape: RoundedRectangleBorder(
+          side: BorderSide(color: colors.border),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: () => onChanged(!value),
+          child: Padding(
+            padding: const EdgeInsets.only(left: 12, right: 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      color: colors.textPrimary,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
                 ),
-              ),
+                SizedBox(
+                  width: 46,
+                  height: 30,
+                  child: FittedBox(
+                    fit: BoxFit.contain,
+                    alignment: Alignment.centerRight,
+                    child: Switch(
+                      value: value,
+                      onChanged: onChanged,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ),
+                ),
+              ],
             ),
-            Switch(value: value, onChanged: onChanged),
-          ],
+          ),
         ),
       ),
     );

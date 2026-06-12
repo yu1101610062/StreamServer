@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
 import '../screens/artifacts_screen.dart';
-import '../screens/debug_screen.dart';
 import '../screens/login_screen.dart';
 import '../screens/media_upload_screen.dart';
 import '../screens/nodes_screen.dart';
@@ -102,7 +101,6 @@ Widget screenFor(AppSection section) {
     AppSection.uploads => const MediaUploadScreen(),
     AppSection.nodes => const NodesScreen(),
     AppSection.security => const SecurityScreen(),
-    AppSection.debug => const DebugScreen(),
   };
 }
 
@@ -120,5 +118,4 @@ const _routes = {
   AppSection.uploads: '/uploads',
   AppSection.nodes: '/nodes',
   AppSection.security: '/security',
-  AppSection.debug: '/debug',
 };
