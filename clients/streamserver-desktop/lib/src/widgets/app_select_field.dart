@@ -20,7 +20,7 @@ class AppSelectOption<T> {
 }
 
 class AppSelectField<T> extends StatelessWidget {
-  const AppSelectField({
+  AppSelectField({
     required this.label,
     required this.value,
     required this.options,
@@ -29,7 +29,14 @@ class AppSelectField<T> extends StatelessWidget {
     this.height = 42,
     this.enabled = true,
     super.key,
-  });
+  })  : assert(
+          options.isNotEmpty,
+          'AppSelectField.options must not be empty.',
+        ),
+        assert(
+          options.any((option) => option.value == value),
+          'AppSelectField.value must match one of the provided options.',
+        );
 
   final String label;
   final T value;
