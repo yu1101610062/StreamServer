@@ -137,7 +137,7 @@ class _StreamsScreenState extends State<StreamsScreen> {
                     scrollDirection: Axis.horizontal,
                     child: DataTable(
                       dataRowMinHeight: 56,
-                      dataRowMaxHeight: 132,
+                      dataRowMaxHeight: 260,
                       columns: const [
                         DataColumn(label: Text('协议')),
                         DataColumn(label: Text('应用/流')),
@@ -165,8 +165,8 @@ class _StreamsScreenState extends State<StreamsScreen> {
                             DataCell(Text(textValue(row['viewer_count']))),
                             DataCell(Text('${row['bitrate_kbps'] ?? 0} kbps')),
                             DataCell(Wrap(
-                                spacing: 4,
-                                runSpacing: 4,
+                                spacing: 8,
+                                runSpacing: 8,
                                 children: urls
                                     .map((url) => _PlayButton(url: '$url'))
                                     .toList())),
@@ -253,8 +253,8 @@ class _CompactStreamItem extends StatelessWidget {
         if (urls.isNotEmpty) ...[
           const SizedBox(height: 8),
           Wrap(
-            spacing: 4,
-            runSpacing: 4,
+            spacing: 8,
+            runSpacing: 8,
             children: urls.map((url) => _PlayButton(url: '$url')).toList(),
           ),
         ],
@@ -302,34 +302,7 @@ class _PlayButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 2,
-      crossAxisAlignment: WrapCrossAlignment.center,
-      children: [
-        TextButton.icon(
-          onPressed: () => _open(context),
-          icon: const Icon(Icons.play_arrow),
-          label: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 320),
-            child: Text(
-              url,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ),
-        IconButton(
-          tooltip: '复制地址',
-          onPressed: () => copyText(context, url),
-          icon: const Icon(Icons.copy),
-        ),
-      ],
-    );
-  }
-
-  Future<void> _open(BuildContext context) async {
-    AppScope.of(context).playMedia(url, title: url);
-    showResult(context, '已打开内嵌播放器');
+    return PlayableUrlTile(url: url, title: url, maxWidth: 560);
   }
 }
 

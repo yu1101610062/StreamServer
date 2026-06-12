@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../state.dart';
 import '../utils.dart';
 import '../widgets/data_panel.dart';
+import 'screen_helpers.dart';
 
 class TaskDetailScreen extends StatefulWidget {
   const TaskDetailScreen({super.key});
@@ -310,14 +311,20 @@ class _StreamsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['协议', 'App/Stream', '观众', '播放地址'],
-      rows: rows
-          .map((row) => [
-                row['schema'],
-                '${row['app']}/${row['stream']}',
-                row['viewer_count'],
-                row['play_urls']
-              ])
-          .toList(),
+      rows: rows.map((row) {
+        final urls = (row['play_urls'] as List?)
+                ?.map((url) => '$url')
+                .where((url) => url.trim().isNotEmpty)
+                .toList() ??
+            const <String>[];
+        final title = '${row['app']}/${row['stream']}';
+        return [
+          row['schema'],
+          title,
+          row['viewer_count'],
+          PlayableUrlList(urls: urls, title: title),
+        ];
+      }).toList(),
     );
   }
 }
@@ -331,14 +338,20 @@ class _RecordsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['流', '路径', '大小', 'HTTP'],
-      rows: rows
-          .map((row) => [
-                '${row['app']}/${row['stream']}',
-                row['file_path'],
-                bytesLabel(row['file_size']),
-                row['http_url']
-              ])
-          .toList(),
+      rows: rows.map((row) {
+        final url = '${row['http_url'] ?? ''}';
+        return [
+          '${row['app']}/${row['stream']}',
+          row['file_path'],
+          bytesLabel(row['file_size']),
+          url.isEmpty
+              ? const Text('—')
+              : PlayableUrlTile(
+                  url: url,
+                  title: '录像播放',
+                ),
+        ];
+      }).toList(),
     );
   }
 }
@@ -352,14 +365,20 @@ class _ArtifactsTable extends StatelessWidget {
   Widget build(BuildContext context) {
     return _SimpleTable(
       columns: const ['类型', '文件', '路径', 'HTTP'],
-      rows: rows
-          .map((row) => [
-                row['artifact_kind'],
-                row['file_name'],
-                row['file_path'],
-                row['http_url']
-              ])
-          .toList(),
+      rows: rows.map((row) {
+        final url = '${row['http_url'] ?? ''}';
+        return [
+          row['artifact_kind'],
+          row['file_name'],
+          row['file_path'],
+          url.isEmpty
+              ? const Text('—')
+              : PlayableUrlTile(
+                  url: url,
+                  title: '文件产物播放',
+                ),
+        ];
+      }).toList(),
     );
   }
 }
@@ -386,7 +405,7 @@ class _SimpleTable extends StatelessWidget {
           scrollDirection: Axis.horizontal,
           child: DataTable(
             dataRowMinHeight: 52,
-            dataRowMaxHeight: 180,
+            dataRowMaxHeight: 280,
             columns: columns
                 .map((column) => DataColumn(label: Text(column)))
                 .toList(),
@@ -398,6 +417,9 @@ class _SimpleTable extends StatelessWidget {
                   if (column.contains('状态') ||
                       column.toLowerCase().contains('status')) {
                     return DataCell(StatusBadge(status: value));
+                  }
+                  if (value is Widget) {
+                    return DataCell(value);
                   }
                   return DataCell(WrappedTextCell(
                       value: value, maxWidth: cellWidth, selectable: true));
@@ -478,6 +500,8 @@ class _CompactSimpleCell extends StatelessWidget {
         const SizedBox(height: 3),
         if (isStatus)
           StatusBadge(status: value)
+        else if (value is Widget)
+          value as Widget
         else
           SelectableText(textValue(value),
               style: const TextStyle(fontSize: 13)),

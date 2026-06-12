@@ -3,6 +3,9 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../state.dart';
+import '../utils.dart';
+
 Map<String, Object?> cleanQuery(Map<String, Object?> query) {
   final clean = <String, Object?>{};
   for (final entry in query.entries) {
@@ -52,6 +55,133 @@ Future<void> copyText(BuildContext context, String value) async {
   await Clipboard.setData(ClipboardData(text: value));
   if (context.mounted) {
     showResult(context, '已复制');
+  }
+}
+
+bool isPlayableMediaUrl(String url) {
+  final uri = Uri.tryParse(url.trim());
+  return uri != null &&
+      (uri.scheme == 'http' ||
+          uri.scheme == 'https' ||
+          uri.scheme == 'rtsp' ||
+          uri.scheme == 'rtmp');
+}
+
+class FullUrlText extends StatelessWidget {
+  const FullUrlText({
+    required this.value,
+    this.maxWidth = 720,
+    super.key,
+  });
+
+  final Object? value;
+  final double maxWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: SelectableText(
+        textValue(value),
+        style: const TextStyle(fontSize: 12, height: 1.35),
+      ),
+    );
+  }
+}
+
+class PlayableUrlList extends StatelessWidget {
+  const PlayableUrlList({
+    required this.urls,
+    this.title,
+    this.maxWidth = 640,
+    super.key,
+  });
+
+  final List<String> urls;
+  final String? title;
+  final double maxWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final cleanUrls = urls.where((url) => url.trim().isNotEmpty).toList();
+    if (cleanUrls.isEmpty) {
+      return const Text('—');
+    }
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: cleanUrls
+          .map((url) => PlayableUrlTile(
+                url: url,
+                title: title ?? url,
+                maxWidth: maxWidth,
+              ))
+          .toList(),
+    );
+  }
+}
+
+class PlayableUrlTile extends StatelessWidget {
+  const PlayableUrlTile({
+    required this.url,
+    this.title,
+    this.maxWidth = 640,
+    super.key,
+  });
+
+  final String url;
+  final String? title;
+  final double maxWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = isPlayableMediaUrl(url);
+    return ConstrainedBox(
+      constraints: BoxConstraints(maxWidth: maxWidth),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: const Color(0xfff8fafc),
+          border: Border.all(color: const Color(0xffd7deea)),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SelectableText(
+                url,
+                style: const TextStyle(fontSize: 12, height: 1.35),
+              ),
+              const SizedBox(height: 6),
+              Wrap(
+                spacing: 4,
+                runSpacing: 4,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  TextButton.icon(
+                    onPressed: enabled ? () => _open(context) : null,
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('播放'),
+                  ),
+                  IconButton(
+                    tooltip: '复制地址',
+                    onPressed: () => copyText(context, url),
+                    icon: const Icon(Icons.copy),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _open(BuildContext context) async {
+    AppScope.of(context).playMedia(url, title: title ?? url);
+    showResult(context, '已打开内嵌播放器');
   }
 }
 

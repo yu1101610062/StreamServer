@@ -16,6 +16,9 @@ fi
 
 ./scripts/build_native.sh
 flutter pub get
+if [[ "$TARGET_PLATFORM" == "macos" ]]; then
+  flutter config --no-enable-swift-package-manager >/dev/null
+fi
 flutter build "$TARGET_PLATFORM" --release
 
 mkdir -p dist

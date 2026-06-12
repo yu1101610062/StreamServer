@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/widgets.dart';
 
@@ -62,6 +63,8 @@ class AppController extends ChangeNotifier {
   String? errorMessage;
   bool busy = false;
   bool initialized = false;
+  File? _localStoreFile;
+  Map<String, Object?> _localStore = {};
 
   bool get isAuthenticated => session != null;
   String get subject => (session?['subject'] as String?) ?? 'unknown';
@@ -73,12 +76,18 @@ class AppController extends ChangeNotifier {
     busy = true;
     notifyListeners();
     try {
+      _loadLocalStore();
+      _migrateLegacyLocalStoreIfNeeded();
       serverProfiles = _readServerProfiles();
-      final activeServerId = _readStoreValue('active_server_id');
+      final activeServerId =
+          _readLocalStoreString('active_server_id') ?? _firstServerProfileId();
       server = _firstOrNull(
           serverProfiles.where((profile) => profile.id == activeServerId));
       server ??= _firstOrNull(serverProfiles);
-      refreshToken = _readStoreValue('refresh_token') ?? '';
+
+      if (server != null) {
+        refreshToken = _readStoreValue('refresh_token') ?? '';
+      }
 
       if (server != null && refreshToken.isNotEmpty) {
         try {
@@ -86,9 +95,12 @@ class AppController extends ChangeNotifier {
             'server': server!.toJson(),
             'refresh_token': refreshToken,
           });
+          final previousRefreshToken = refreshToken;
           accessToken = (tokens['access_token'] as String?) ?? '';
           refreshToken = (tokens['refresh_token'] as String?) ?? refreshToken;
-          _writeStoreValue('refresh_token', refreshToken);
+          if (refreshToken != previousRefreshToken) {
+            _writeStoreValue('refresh_token', refreshToken);
+          }
           session = _bridge.call('auth.me', {
             'server': server!.toJson(),
             'access_token': accessToken,
@@ -115,9 +127,9 @@ class AppController extends ChangeNotifier {
     await _run(() async {
       server = ServerProfile(id: baseUrl, name: baseUrl, baseUrl: baseUrl);
       _upsertServerProfile(server!);
-      _writeStoreValue('server_profiles',
-          jsonEncode(serverProfiles.map((item) => item.toJson()).toList()));
-      _writeStoreValue('active_server_id', server!.id);
+      _writeLocalStoreValue('server_profiles',
+          serverProfiles.map((item) => item.toJson()).toList());
+      _writeLocalStoreValue('active_server_id', server!.id);
       final tokens = _bridge.call('auth.login', {
         'server': server!.toJson(),
         'body': {
@@ -140,7 +152,7 @@ class AppController extends ChangeNotifier {
 
   void selectServer(ServerProfile profile) {
     server = profile;
-    _writeStoreValue('active_server_id', profile.id);
+    _writeLocalStoreValue('active_server_id', profile.id);
     notifyListeners();
   }
 
@@ -168,7 +180,9 @@ class AppController extends ChangeNotifier {
       accessToken = nextAccessToken;
     }
     final nextRefreshToken = response['refresh_token'] as String?;
-    if (nextRefreshToken != null && nextRefreshToken.isNotEmpty) {
+    if (nextRefreshToken != null &&
+        nextRefreshToken.isNotEmpty &&
+        nextRefreshToken != refreshToken) {
       refreshToken = nextRefreshToken;
       _writeStoreValue('refresh_token', refreshToken);
     }
@@ -350,10 +364,10 @@ class AppController extends ChangeNotifier {
   }
 
   List<ServerProfile> _readServerProfiles() {
-    final value = _readStoreValue('server_profiles');
-    if (value == null || value.isEmpty) return const [];
+    final value = _localStore['server_profiles'];
+    if (value == null) return const [];
     try {
-      final decoded = jsonDecode(value);
+      final decoded = value is String ? jsonDecode(value) : value;
       if (decoded is List) {
         return decoded
             .whereType<Map>()
@@ -371,6 +385,118 @@ class AppController extends ChangeNotifier {
     final next = serverProfiles.where((item) => item.id != profile.id).toList();
     next.insert(0, profile);
     serverProfiles = next.take(12).toList();
+  }
+
+  void _loadLocalStore() {
+    final file = _localStorePath();
+    _localStoreFile = file;
+    if (!file.existsSync()) {
+      _localStore = {};
+      return;
+    }
+    try {
+      final decoded = jsonDecode(file.readAsStringSync());
+      _localStore = decoded is Map
+          ? decoded.cast<String, Object?>()
+          : <String, Object?>{};
+    } catch (_) {
+      _localStore = {};
+    }
+  }
+
+  void _migrateLegacyLocalStoreIfNeeded() {
+    if (_localStore.containsKey('server_profiles')) return;
+
+    String? legacyProfiles;
+    try {
+      legacyProfiles = _readStoreValue('server_profiles');
+    } catch (_) {
+      return;
+    }
+    if (legacyProfiles == null || legacyProfiles.isEmpty) return;
+
+    try {
+      final decoded = jsonDecode(legacyProfiles);
+      if (decoded is! List) return;
+      final profiles = decoded
+          .whereType<Map>()
+          .map((item) => ServerProfile.fromJson(item.cast<String, Object?>()))
+          .where((item) => item.baseUrl.isNotEmpty)
+          .toList();
+      if (profiles.isEmpty) return;
+
+      _writeLocalStoreValue(
+          'server_profiles', profiles.map((item) => item.toJson()).toList());
+      _writeLocalStoreValue('active_server_id', profiles.first.id);
+    } catch (_) {
+      return;
+    }
+  }
+
+  String? _firstServerProfileId() {
+    try {
+      final value = _localStore['server_profiles'];
+      final decoded = value is String ? jsonDecode(value) : value;
+      if (decoded is! List) return null;
+      for (final item in decoded.whereType<Map>()) {
+        final profile = ServerProfile.fromJson(item.cast<String, Object?>());
+        if (profile.id.isNotEmpty) return profile.id;
+      }
+    } catch (_) {
+      return null;
+    }
+    return null;
+  }
+
+  String? _readLocalStoreString(String key) {
+    final value = _localStore[key];
+    return value is String ? value : null;
+  }
+
+  void _writeLocalStoreValue(String key, Object? value) {
+    _localStore[key] = value;
+    final file = _localStoreFile ?? _localStorePath();
+    _localStoreFile = file;
+    file.parent.createSync(recursive: true);
+    file.writeAsStringSync(
+        const JsonEncoder.withIndent('  ').convert(_localStore));
+  }
+
+  File _localStorePath() {
+    return File('${_appSupportDir().path}${Platform.pathSeparator}state.json');
+  }
+
+  Directory _appSupportDir() {
+    if (Platform.isMacOS) {
+      return Directory(_joinPath([
+        Platform.environment['HOME'],
+        'Library',
+        'Application Support',
+        'StreamServerDesktop',
+      ]));
+    }
+    if (Platform.isWindows) {
+      return Directory(_joinPath([
+        Platform.environment['APPDATA'],
+        'StreamServerDesktop',
+      ]));
+    }
+    final xdgConfig = Platform.environment['XDG_CONFIG_HOME'];
+    if (xdgConfig != null && xdgConfig.isNotEmpty) {
+      return Directory(_joinPath([xdgConfig, 'streamserver-desktop']));
+    }
+    return Directory(_joinPath([
+      Platform.environment['HOME'],
+      '.config',
+      'streamserver-desktop',
+    ]));
+  }
+
+  String _joinPath(List<String?> segments) {
+    return segments
+        .where((segment) => segment != null && segment.isNotEmpty)
+        .cast<String>()
+        .join(Platform.pathSeparator);
   }
 
   String? _readStoreValue(String key) {

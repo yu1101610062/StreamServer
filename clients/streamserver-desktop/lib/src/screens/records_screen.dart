@@ -119,7 +119,7 @@ class _RecordsScreenState extends State<RecordsScreen> {
                         scrollDirection: Axis.horizontal,
                         child: DataTable(
                           dataRowMinHeight: 56,
-                          dataRowMaxHeight: 160,
+                          dataRowMaxHeight: 240,
                           columns: const [
                             DataColumn(label: Text('任务')),
                             DataColumn(label: Text('流')),
@@ -144,10 +144,7 @@ class _RecordsScreenState extends State<RecordsScreen> {
                               DataCell(Text(bytesLabel(row['file_size']))),
                               DataCell(WrappedTextCell(
                                   value: row['created_at'], maxWidth: 220)),
-                              DataCell(WrappedTextCell(
-                                  value: row['http_url'],
-                                  maxWidth: 420,
-                                  selectable: true)),
+                              DataCell(FullUrlText(value: row['http_url'])),
                               DataCell(_MediaActions(url: url)),
                             ]);
                           }).toList(),
@@ -221,7 +218,7 @@ class _CompactRecordItem extends StatelessWidget {
             style: const TextStyle(fontSize: 12)),
         if (url.isNotEmpty) ...[
           const SizedBox(height: 8),
-          SelectableText(url, style: const TextStyle(fontSize: 12)),
+          FullUrlText(value: url, maxWidth: 680),
         ],
         const SizedBox(height: 8),
         _MediaActions(url: url),
