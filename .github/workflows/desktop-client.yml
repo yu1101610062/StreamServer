@@ -58,7 +58,6 @@ jobs:
           sudo apt-get install -y \
             clang \
             cmake \
-            dpkg-dev \
             libgtk-3-dev \
             liblzma-dev \
             libmpv-dev \
@@ -183,59 +182,61 @@ jobs:
         shell: bash
         run: ./scripts/package_offline.sh linux
 
-      - name: Build Linux deb package
+      - name: Build Linux AppImage
         if: runner.os == 'Linux'
         working-directory: clients/streamserver-desktop
         shell: bash
         run: |
+          set -euo pipefail
+
           version="$(awk '/^version:/ { print $2; exit }' pubspec.yaml)"
           safe_version="${version//+/-}"
           stage="$(mktemp -d)"
+          trap 'rm -rf "${stage}" "${appimagetool:-}"' EXIT
+
           release_dir="build/linux/x64/release/bundle"
-          deb="dist/streamserver-desktop-linux-amd64-${safe_version}.deb"
-          installed_size="$(du -sk "${release_dir}" | awk '{ print $1 }')"
+          appdir="${stage}/StreamServerDesktop.AppDir"
+          appimage="dist/streamserver-desktop-linux-x86_64-${safe_version}.AppImage"
+          appimagetool="${stage}/appimagetool-x86_64.AppImage"
+
           mkdir -p \
-            "${stage}/DEBIAN" \
-            "${stage}/opt/streamserver-desktop" \
-            "${stage}/usr/bin" \
-            "${stage}/usr/share/applications" \
-            "${stage}/usr/share/icons/hicolor/256x256/apps"
-          cp -a "${release_dir}/." "${stage}/opt/streamserver-desktop/"
-          cat >"${stage}/DEBIAN/control" <<EOF
-          Package: streamserver-desktop
-          Version: ${version}
-          Section: video
-          Priority: optional
-          Architecture: amd64
-          Maintainer: StreamServer
-          Installed-Size: ${installed_size}
-          Depends: libgtk-3-0, libmpv2, libsecret-1-0
-          Description: StreamServer控制台
-           Desktop client for StreamServer operations and media playback.
-          EOF
-          sed -i 's/^          //' "${stage}/DEBIAN/control"
-          cat >"${stage}/usr/bin/streamserver-desktop" <<'EOF'
-          #!/usr/bin/env sh
-          cd /opt/streamserver-desktop
-          exec ./streamserver_desktop "$@"
-          EOF
-          sed -i 's/^          //' "${stage}/usr/bin/streamserver-desktop"
-          chmod 755 "${stage}/usr/bin/streamserver-desktop"
+            "${appdir}/opt/streamserver-desktop"
+
+          cp -a "${release_dir}/." "${appdir}/opt/streamserver-desktop/"
           cp linux/runner/resources/streamserver-console.png \
-            "${stage}/usr/share/icons/hicolor/256x256/apps/streamserver-console.png"
-          cat >"${stage}/usr/share/applications/streamserver-desktop.desktop" <<'EOF'
+            "${appdir}/streamserver-console.png"
+
+          cat >"${appdir}/AppRun" <<'EOF'
+          #!/usr/bin/env sh
+          set -eu
+
+          here="$(dirname "$(readlink -f "$0")")"
+          cd "${here}/opt/streamserver-desktop"
+          exec "${here}/opt/streamserver-desktop/streamserver_desktop" "$@"
+          EOF
+          sed -i 's/^          //' "${appdir}/AppRun"
+          chmod 755 "${appdir}/AppRun"
+
+          cat >"${appdir}/streamserver-desktop.desktop" <<'EOF'
           [Desktop Entry]
           Type=Application
           Name=StreamServer控制台
           Exec=streamserver-desktop
           Icon=streamserver-console
           Terminal=false
-          Categories=AudioVideo;Network;
+          Categories=AudioVideo;Video;
           EOF
-          sed -i 's/^          //' "${stage}/usr/share/applications/streamserver-desktop.desktop"
-          dpkg-deb --build --root-owner-group "${stage}" "${deb}"
-          sha256sum "${deb}" >> dist/SHA256SUMS
-          rm -rf "${stage}"
+          sed -i 's/^          //' "${appdir}/streamserver-desktop.desktop"
+
+          curl -LfsS \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -o "${appimagetool}"
+          chmod 755 "${appimagetool}"
+
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "${appimagetool}" \
+            "${appdir}" \
+            "${appimage}"
+          sha256sum "${appimage}" >> dist/SHA256SUMS
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
