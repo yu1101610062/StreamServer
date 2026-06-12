@@ -59,8 +59,13 @@ class OverviewScreen extends StatelessWidget {
         final uploadTotal = (uploads['total'] as num?)?.toInt() ?? 0;
         final healthyNodes =
             nodes.where((node) => node['healthy'] == true).length;
-        final runningTasks = _sumStatusTotals(
-            taskStatusTotals, const ['RUNNING', 'STARTING', 'RECOVERING']);
+        final runningTasks = _sumStatusTotals(taskStatusTotals, const [
+          'DISPATCHING',
+          'STARTING',
+          'RUNNING',
+          'RECOVERING',
+          'RECLAIMING',
+        ]);
         final failedTasks =
             _sumStatusTotals(taskStatusTotals, const ['FAILED', 'LOST']);
         final statusEntries =
@@ -1258,7 +1263,8 @@ Future<MapEntry<String, int>> _loadTaskStatusTotal(
     );
     total =
         ((page as Map).cast<String, Object?>()['total'] as num?)?.toInt() ?? 0;
-  } catch (_) {
+  } catch (error) {
+    debugPrint('任务状态统计加载失败 [$status]: $error');
     total = 0;
   }
   return MapEntry(status, total);
