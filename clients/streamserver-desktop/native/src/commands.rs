@@ -183,10 +183,7 @@ async fn dispatch(api: ApiClient, request: NativeRequest) -> Result<Value, Nativ
             media_player::snapshot(session_id, output_path)
         }
         "version" => Ok(json_object([
-            (
-                "name",
-                Value::String("streamserver-desktop".to_string()),
-            ),
+            ("name", Value::String("streamserver-desktop".to_string())),
             (
                 "version",
                 Value::String(env!("CARGO_PKG_VERSION").to_string()),

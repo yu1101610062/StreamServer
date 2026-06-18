@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 
-import type { NodeSummary } from "@/shared/api/types";
+import type { NodeSummary, RuntimeSlotLoad } from "@/shared/api/types";
 import { nodeApi } from "@/shared/api/resources";
 import { formatPercent, formatTime } from "@/shared/utils/format";
 
@@ -82,6 +82,22 @@ function nodeHealthTagType(node: NodeSummary) {
 function nodeHealthLabel(node: NodeSummary) {
   return node.healthy ? "正常" : "异常";
 }
+
+function slotModeLabel(sourceMode: string) {
+  return sourceMode === "live" ? "直播" : sourceMode === "vod" ? "点播" : sourceMode;
+}
+
+function slotLoadText(load: RuntimeSlotLoad) {
+  const maxSlots = load.max_runtime_slots === 0 ? "不限" : String(load.max_runtime_slots);
+  const occupied =
+    load.running_tasks + load.starting_tasks + load.stopping_tasks + load.orphaned_tasks;
+  return `${slotModeLabel(load.source_mode)} ${occupied}/${maxSlots} ${formatPercent((load.slot_usage ?? 0) * 100)}`;
+}
+
+function slotLoadSummary(loads?: RuntimeSlotLoad[] | null) {
+  const values = loads ?? [];
+  return values.length ? values.map(slotLoadText).join(" · ") : "—";
+}
 </script>
 
 <template>
@@ -136,7 +152,7 @@ function nodeHealthLabel(node: NodeSummary) {
             </div>
             <div>
               <span class="subtle">槽位占用</span>
-              <strong>{{ node.slot_usage ?? 0 }}</strong>
+              <strong>{{ slotLoadSummary(node.runtime_slot_loads) }}</strong>
             </div>
             <div>
               <span class="subtle">ZLM / FFmpeg</span>
@@ -186,7 +202,7 @@ function nodeHealthLabel(node: NodeSummary) {
             </template>
           </el-table-column>
           <el-table-column label="运行任务 / 槽位" min-width="150">
-            <template #default="{ row }">{{ row.running_tasks ?? 0 }} / {{ row.slot_usage ?? 0 }}</template>
+            <template #default="{ row }">{{ row.running_tasks ?? 0 }} / {{ slotLoadSummary(row.runtime_slot_loads) }}</template>
           </el-table-column>
           <el-table-column label="ZLM / FFmpeg" min-width="160">
             <template #default="{ row }">
@@ -265,7 +281,9 @@ function nodeHealthLabel(node: NodeSummary) {
                 <template #default="{ row }">{{ formatPercent(row.disk_percent) }}</template>
               </el-table-column>
               <el-table-column prop="running_tasks" label="运行任务" min-width="100" />
-              <el-table-column prop="slot_usage" label="槽位" min-width="100" />
+              <el-table-column label="槽位" min-width="220">
+                <template #default="{ row }">{{ slotLoadSummary(row.runtime_slot_loads) }}</template>
+              </el-table-column>
               <el-table-column label="ZLM / FFmpeg" min-width="160">
                 <template #default="{ row }">{{ row.zlm_alive ? "正常" : "异常" }} / {{ row.ffmpeg_alive ? "正常" : "异常" }}</template>
               </el-table-column>

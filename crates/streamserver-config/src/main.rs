@@ -27,8 +27,9 @@ use crate::port_validation::{
     parse_port_text, validate_port_range_value, validate_port_value,
 };
 use crate::system_ops::{
-    RestartTask, UninstallTask, can_run_root_commands, instance_running, native_unit_candidates,
-    spawn_restart_task, spawn_uninstall_task, validate_instance_dir_for_delete,
+    RestartTask, UninstallTask, can_run_root_commands, instance_running,
+    native_service_unit_candidates, spawn_restart_task, spawn_uninstall_task,
+    validate_instance_dir_for_delete,
 };
 
 const MANAGED_ORDER: &[&str] = &[
@@ -61,7 +62,9 @@ const MANAGED_ORDER: &[&str] = &[
     "NODE_ID",
     "AGENT_NODE_NAME",
     "PUBLIC_HOST",
+    "AGENT_STREAM_ADDR",
     "ZLM_API_HOST",
+    "ZLM_API_BASE",
     "AGENT_HTTP_PORT",
     "ZLM_HTTP_PORT",
     "ZLM_HTTPS_PORT",
@@ -94,7 +97,8 @@ const MANAGED_ORDER: &[&str] = &[
     "AGENT_NETWORK_MODE",
     "AGENT_ACCELERATION_MODE",
     "AGENT_LABELS",
-    "AGENT_MAX_RUNTIME_SLOTS",
+    "AGENT_MAX_LIVE_RUNTIME_SLOTS",
+    "AGENT_MAX_VOD_RUNTIME_SLOTS",
     "AGENT_MP4_RECORD_SEGMENT_SEC",
     "AGENT_HLS_RECORD_SEGMENT_SEC",
     "AGENT_ARTIFACT_CLEANUP_ENABLED",
@@ -368,7 +372,7 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 label: "流媒体服务 API 地址",
                 kind: FieldKind::ReadOnly,
                 scope: FieldScope::Agent,
-                help: "跟随主网卡 IP 自动更新，用于工作节点访问本机流媒体服务接口。",
+                help: "跟随主网卡 IP 自动更新，用于控制面访问该节点流媒体服务接口。",
             },
             FieldDef {
                 key: "AGENT_PRIMARY_INTERFACE_NAME",
@@ -406,11 +410,18 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 help: "固定的 cpu/gpu 算力标签由安装角色决定，不能删除；这里只编辑额外标签，多个值用英文逗号分隔。例如 room-a,edge-1。",
             },
             FieldDef {
-                key: "AGENT_MAX_RUNTIME_SLOTS",
-                label: "最大同时任务数",
+                key: "AGENT_MAX_LIVE_RUNTIME_SLOTS",
+                label: "直播最大并发",
                 kind: FieldKind::Text,
                 scope: FieldScope::Agent,
-                help: "限制这个节点最多同时跑多少个媒体任务。填 0 表示自动估算，现场不确定容量时建议填 0。",
+                help: "限制这个节点最多同时跑多少个直播流任务。填 0 表示不限制。",
+            },
+            FieldDef {
+                key: "AGENT_MAX_VOD_RUNTIME_SLOTS",
+                label: "点播最大并发",
+                kind: FieldKind::Text,
+                scope: FieldScope::Agent,
+                help: "限制这个节点最多同时跑多少个点播流任务。填 0 表示不限制。",
             },
         ],
         Page::Ports => &[
@@ -670,7 +681,7 @@ struct ConfigApp {
     selected: usize,
     editing: Option<String>,
     picker: Option<Picker>,
-    restart_confirm_unit: Option<String>,
+    restart_confirm_units: Option<Vec<String>>,
     restart_task: Option<RestartTask>,
     uninstall_confirm: Option<UninstallConfirm>,
     uninstall_task: Option<UninstallTask>,
@@ -768,7 +779,7 @@ impl ConfigApp {
             selected: 0,
             editing: None,
             picker: None,
-            restart_confirm_unit: None,
+            restart_confirm_units: None,
             restart_task: None,
             uninstall_confirm: None,
             uninstall_task: None,
@@ -1049,7 +1060,7 @@ impl ConfigApp {
             return self.handle_uninstall_confirm_key(key);
         }
 
-        if self.restart_confirm_unit.is_some() {
+        if self.restart_confirm_units.is_some() {
             return self.handle_restart_confirm_key(key);
         }
 
@@ -1141,7 +1152,7 @@ impl ConfigApp {
     fn begin_uninstall_confirm(&mut self) {
         self.editing = None;
         self.picker = None;
-        self.restart_confirm_unit = None;
+        self.restart_confirm_units = None;
         self.uninstall_confirm = Some(UninstallConfirm {
             input: String::new(),
         });
@@ -1253,40 +1264,53 @@ impl ConfigApp {
         if !self.restart_prompt_enabled {
             return false;
         }
-        let Some(unit) = self.restart_unit_name() else {
+        let units = self.restart_units();
+        if units.is_empty() {
             return false;
-        };
-        self.restart_confirm_unit = Some(unit.clone());
-        self.message = format!("退出前是否重启服务 {unit}？Y 重启并退出，N 直接退出，Esc 取消");
+        }
+        let label = units.join(", ");
+        self.restart_confirm_units = Some(units);
+        self.message = format!("退出前是否重启服务 {label}？Y 重启并退出，N 直接退出，Esc 取消");
         true
     }
 
-    fn restart_unit_name(&self) -> Option<String> {
-        native_unit_candidates(&self.values)
+    fn restart_units(&self) -> Vec<String> {
+        native_service_unit_candidates(&self.values)
             .into_iter()
-            .find(|unit| Path::new("/etc/systemd/system").join(unit).exists())
+            .filter(|unit| Path::new("/etc/systemd/system").join(unit).exists())
+            .collect()
+    }
+
+    fn restart_unit_name(&self) -> Option<String> {
+        let units = self.restart_units();
+        if units.is_empty() {
+            None
+        } else {
+            Some(units.join(", "))
+        }
     }
 
     fn handle_restart_confirm_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
         match key.code {
             KeyCode::Esc => {
-                self.restart_confirm_unit = None;
+                self.restart_confirm_units = None;
                 self.message = "已取消退出".to_string();
                 Ok(false)
             }
             KeyCode::Char('n') | KeyCode::Char('N') => Ok(true),
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                let Some(unit) = self.restart_confirm_unit.take() else {
+                let Some(units) = self.restart_confirm_units.take() else {
                     return Ok(true);
                 };
+                let label = units.join(", ");
                 if !can_run_root_commands() {
-                    self.restart_confirm_unit = Some(unit);
+                    self.restart_confirm_units = Some(units);
                     self.message =
                         "重启服务需要 root 或免密 sudo；N 直接退出，Esc 取消".to_string();
                     return Ok(false);
                 }
-                self.restart_task = Some(spawn_restart_task(unit.clone()));
-                self.message = format!("重启中，正在检查节点启动状态请稍候：{unit}");
+                self.restart_task = Some(spawn_restart_task(units));
+                self.message = format!("重启中，正在检查节点启动状态请稍候：{label}");
                 Ok(false)
             }
             _ => Ok(false),
@@ -1300,22 +1324,22 @@ impl ConfigApp {
 
         match task.receiver.try_recv() {
             Ok(Ok(())) => {
-                let unit = task.unit.clone();
+                let label = task.label.clone();
                 self.restart_task = None;
-                self.message = format!("已重启服务 {unit}");
+                self.message = format!("已重启服务 {label}");
                 Ok(true)
             }
             Ok(Err(error)) => {
-                let unit = task.unit.clone();
+                let label = task.label.clone();
                 self.restart_task = None;
-                self.message = format!("重启服务 {unit} 失败：{error}；按 Q 退出");
+                self.message = format!("重启服务 {label} 失败：{error}；按 Q 退出");
                 Ok(false)
             }
             Err(TryRecvError::Empty) => Ok(false),
             Err(TryRecvError::Disconnected) => {
-                let unit = task.unit.clone();
+                let label = task.label.clone();
                 self.restart_task = None;
-                self.message = format!("重启服务 {unit} 失败：后台任务异常结束；按 Q 退出");
+                self.message = format!("重启服务 {label} 失败：后台任务异常结束；按 Q 退出");
                 Ok(false)
             }
         }
@@ -1500,6 +1524,7 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         values.insert("ZLM_API_HOST".to_string(), primary_ip);
         default_if_missing(values, "AGENT_HTTP_PORT", "8081");
         default_zlm_ports(values);
+        sync_agent_endpoint_urls(values);
         default_if_missing(values, "ZLM_WWW_MOUNT_HOST_DIR", &legacy_www_mount_host_dir);
         default_if_missing(
             values,
@@ -1511,7 +1536,8 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         default_if_missing(values, "AGENT_ACCELERATION_MODE", mode);
         default_if_missing(values, "AGENT_LABELS", mode);
         normalize_agent_labels(values);
-        default_if_missing(values, "AGENT_MAX_RUNTIME_SLOTS", "0");
+        default_if_missing(values, "AGENT_MAX_LIVE_RUNTIME_SLOTS", "0");
+        default_if_missing(values, "AGENT_MAX_VOD_RUNTIME_SLOTS", "0");
         default_if_missing(values, "AGENT_MP4_RECORD_SEGMENT_SEC", "7200");
         default_if_missing(values, "AGENT_HLS_RECORD_SEGMENT_SEC", "60");
         default_if_missing(values, "AGENT_ARTIFACT_CLEANUP_ENABLED", "true");
@@ -1585,7 +1611,49 @@ fn sync_primary_interface_followers(values: &mut BTreeMap<String, String>) {
     {
         values.insert("PUBLIC_HOST".to_string(), primary_ip.clone());
         values.insert("ZLM_API_HOST".to_string(), primary_ip);
+        sync_agent_endpoint_urls(values);
     }
+}
+
+fn sync_agent_endpoint_urls(values: &mut BTreeMap<String, String>) {
+    if !values_have_agent(values) {
+        return;
+    }
+
+    let zlm_http_port = values
+        .get("ZLM_HTTP_PORT")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "80".to_string());
+    let public_host = values
+        .get("PUBLIC_HOST")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let zlm_api_host = values
+        .get("ZLM_API_HOST")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| public_host.clone());
+
+    values.insert(
+        "AGENT_STREAM_ADDR".to_string(),
+        http_base_url(&public_host, &zlm_http_port),
+    );
+    values.insert(
+        "ZLM_API_BASE".to_string(),
+        http_base_url(&zlm_api_host, &zlm_http_port),
+    );
+}
+
+fn http_base_url(host: &str, port: &str) -> String {
+    let host = host.trim();
+    let host = if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    format!("http://{}:{}", host, port.trim())
 }
 
 fn normalize_agent_labels(values: &mut BTreeMap<String, String>) {
@@ -1939,7 +2007,8 @@ fn required_text_field(key: &str) -> bool {
             | "ZLM_API_HOST"
             | "ZLM_WWW_MOUNT_HOST_DIR"
             | "ZLM_OUTPUT_MOUNT_HOST_DIR"
-            | "AGENT_MAX_RUNTIME_SLOTS"
+            | "AGENT_MAX_LIVE_RUNTIME_SLOTS"
+            | "AGENT_MAX_VOD_RUNTIME_SLOTS"
             | "AGENT_MP4_RECORD_SEGMENT_SEC"
             | "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT"
             | "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC"
@@ -2016,11 +2085,16 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(value) = values.get("AGENT_MAX_RUNTIME_SLOTS") {
-        value
-            .trim()
-            .parse::<u64>()
-            .with_context(|| "AGENT_MAX_RUNTIME_SLOTS must be zero or a positive integer")?;
+    for key in [
+        "AGENT_MAX_LIVE_RUNTIME_SLOTS",
+        "AGENT_MAX_VOD_RUNTIME_SLOTS",
+    ] {
+        if let Some(value) = values.get(key) {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("{key} must be zero or a positive integer"))?;
+        }
     }
 
     if let Some(value) = values.get("AGENT_MP4_RECORD_SEGMENT_SEC") {
@@ -2244,7 +2318,12 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
     ("NODE_ID", "工作节点唯一 ID，已上线后不要随意修改。"),
     ("AGENT_NODE_NAME", "控制台展示的节点名称。"),
     ("PUBLIC_HOST", "客户端播放地址使用的宿主机 IP 或域名。"),
-    ("ZLM_API_HOST", "工作节点访问本机流媒体服务接口的地址。"),
+    (
+        "AGENT_STREAM_ADDR",
+        "客户端访问该节点流媒体 HTTP 服务的基准地址。",
+    ),
+    ("ZLM_API_HOST", "控制面访问该节点流媒体服务接口的地址。"),
+    ("ZLM_API_BASE", "控制面调用该节点 ZLM API 的完整基准地址。"),
     ("AGENT_HTTP_PORT", "工作节点本地接口端口。"),
     ("ZLM_HTTP_PORT", "流媒体 HTTP 播放和接口端口。"),
     ("ZLM_HTTPS_PORT", "流媒体 HTTPS 端口，0 表示关闭。"),
@@ -2287,8 +2366,12 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
         "节点标签，固定包含算力标签 cpu/gpu，额外标签用英文逗号分隔。",
     ),
     (
-        "AGENT_MAX_RUNTIME_SLOTS",
-        "最大同时任务数，0 表示自动估算。",
+        "AGENT_MAX_LIVE_RUNTIME_SLOTS",
+        "直播流最大并发数，0 表示不限制。",
+    ),
+    (
+        "AGENT_MAX_VOD_RUNTIME_SLOTS",
+        "点播流最大并发数，0 表示不限制。",
     ),
     (
         "ZLM_WWW_MOUNT_HOST_DIR",
@@ -2489,12 +2572,58 @@ mod tests {
             "10.0.0.8".to_string(),
         );
         values.insert("PUBLIC_HOST".to_string(), "old.example".to_string());
+        values.insert(
+            "AGENT_STREAM_ADDR".to_string(),
+            "http://old.example:80".to_string(),
+        );
         values.insert("ZLM_API_HOST".to_string(), "old-api.example".to_string());
+        values.insert(
+            "ZLM_API_BASE".to_string(),
+            "http://old-api.example:80".to_string(),
+        );
+        values.insert("ZLM_HTTP_PORT".to_string(), "18080".to_string());
 
         sync_primary_interface_followers(&mut values);
 
         assert_eq!(values.get("PUBLIC_HOST").unwrap(), "10.0.0.8");
+        assert_eq!(
+            values.get("AGENT_STREAM_ADDR").unwrap(),
+            "http://10.0.0.8:18080"
+        );
         assert_eq!(values.get("ZLM_API_HOST").unwrap(), "10.0.0.8");
+        assert_eq!(values.get("ZLM_API_BASE").unwrap(), "http://10.0.0.8:18080");
+    }
+
+    #[test]
+    fn load_recomputes_agent_stream_and_zlm_api_urls() {
+        let env_path = std::env::temp_dir().join(format!(
+            "streamserver-config-zlm-api-base-test-{}.env",
+            std::process::id()
+        ));
+        fs::write(
+            &env_path,
+            [
+                "INSTALL_ROLE=worker-host-cpu",
+                "AGENT_PRIMARY_INTERFACE_NAME=eno2",
+                "AGENT_PRIMARY_INTERFACE_IP=172.16.1.2",
+                "PUBLIC_HOST=old.example",
+                "AGENT_STREAM_ADDR=http://old.example:80",
+                "ZLM_API_HOST=127.0.0.1",
+                "ZLM_API_BASE=http://127.0.0.1:80",
+                "ZLM_HTTP_PORT=8088",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let app = ConfigApp::load(env_path.clone()).unwrap();
+
+        assert_eq!(app.value("PUBLIC_HOST"), "172.16.1.2");
+        assert_eq!(app.value("AGENT_STREAM_ADDR"), "http://172.16.1.2:8088");
+        assert_eq!(app.value("ZLM_API_HOST"), "172.16.1.2");
+        assert_eq!(app.value("ZLM_API_BASE"), "http://172.16.1.2:8088");
+
+        let _ = fs::remove_file(env_path);
     }
 
     #[test]

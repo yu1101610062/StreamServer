@@ -185,6 +185,7 @@ pub(crate) struct InputMediaProfile {
     pub(crate) audio_extradata_present: bool,
     pub(crate) audio_streams: Vec<InputAudioStream>,
     pub(crate) source_family: InputSourceFamily,
+    pub(crate) duration_sec: Option<u64>,
 }
 
 impl Default for InputMediaProfile {
@@ -202,6 +203,7 @@ impl Default for InputMediaProfile {
             audio_extradata_present: false,
             audio_streams: Vec::new(),
             source_family: InputSourceFamily::Unknown,
+            duration_sec: None,
         }
     }
 }

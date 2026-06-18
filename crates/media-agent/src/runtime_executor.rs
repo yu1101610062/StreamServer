@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     io,
+    process::ExitStatus,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -13,7 +14,7 @@ use std::{
 use chrono::Utc;
 use media_domain::{RuntimeHandle, RuntimeState, TaskType};
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{Value, json};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -39,16 +40,16 @@ use crate::{
     runtime_metadata::{
         attach_zlm_server_id, completion_reason_from_handle, continuous_stream_ingest_from_handle,
         fatal_recording_error_from_handle, mark_source_reconnecting, requires_stream_online,
-        runtime_lease_token, should_emit_recording_gap_started,
+        runtime_lease_token, should_emit_recording_gap_started, source_mode_from_handle,
         sticky_reconnect_stream_ingest_from_handle, stop_reason_from_handle, stream_online,
-        task_runtime_mode_from_handle, task_type_from_handle,
+        task_runtime_mode_from_handle, task_spec_from_handle, task_type_from_handle,
     },
     runtime_monitors::{
         spawn_live_relay_monitor, spawn_rtp_receive_monitor, spawn_startup_probe_monitor,
     },
     runtime_persistence::persist_runtime_state,
-    runtime_plan::TaskRuntimeMode,
-    runtime_process::{ManagedRuntime, RuntimeSlotPermit},
+    runtime_plan::{TaskRuntimeMode, runtime_slot_class_for_request},
+    runtime_process::{ManagedRuntime, RuntimeSlotClass, RuntimeSlotPermit},
     runtime_process_monitors::{
         spawn_adopted_companion_process_monitor, spawn_adopted_runtime_monitor,
     },
@@ -211,10 +212,31 @@ impl ManagedProcessExecutor {
         }
     }
 
+    pub(crate) fn runtime_slot_class_for_manager(
+        &self,
+        request: &StartTaskRequest,
+    ) -> Result<RuntimeSlotClass, ExecutorError> {
+        runtime_slot_class_for_request(request)
+    }
+
     pub(crate) fn acquire_runtime_slot_for_manager(
         &self,
+        slot_class: RuntimeSlotClass,
     ) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
-        self.backend_store.try_acquire_slot()
+        self.backend_store.try_acquire_slot(slot_class)
+    }
+
+    pub(crate) fn acquire_runtime_slot_for_handle(
+        &self,
+        handle: &RuntimeHandle,
+    ) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
+        let source_mode = source_mode_from_handle(handle).ok_or_else(|| {
+            ExecutorError::InvalidRequest(
+                "runtime metadata resolved_spec.input.source_mode is required".to_string(),
+            )
+        })?;
+        self.backend_store
+            .try_acquire_slot(RuntimeSlotClass::from_source_mode(source_mode))
     }
 
     fn current_zlm_server_id(&self) -> Option<String> {
@@ -672,6 +694,21 @@ impl ManagedProcessExecutor {
             ),
         };
 
+        let diagnostics_level = match event_type {
+            "succeeded" => "info",
+            "canceled" => "warn",
+            _ => "error",
+        };
+        pre_terminal_notifications.push(RuntimeNotification::TaskEvent(
+            attempt_diagnostics_notification(
+                &self.events,
+                &exited_handle,
+                &event,
+                event_type,
+                diagnostics_level,
+                &payload,
+            ),
+        ));
         pre_terminal_notifications.push(RuntimeNotification::TaskEvent(RuntimeTaskEvent {
             task_id: exited_handle.task_id,
             attempt_no: exited_handle.attempt_no,
@@ -692,6 +729,81 @@ impl ManagedProcessExecutor {
                 .terminal(),
         )
     }
+}
+
+fn attempt_diagnostics_notification(
+    events: &RuntimeEventSink,
+    handle: &RuntimeHandle,
+    event: &ProcessExitedEvent,
+    terminal_event_type: &str,
+    event_level: &str,
+    terminal_payload: &Value,
+) -> RuntimeTaskEvent {
+    let spec = task_spec_from_handle(handle);
+    let task_type = spec.as_ref().map(|spec| spec.task_type.as_str());
+    let input_kind = spec
+        .as_ref()
+        .and_then(|spec| spec.input.kind.map(|kind| kind.as_str()));
+    let runtime_mode = task_runtime_mode_from_handle(handle).map(task_runtime_mode_as_str);
+    let source_mode = source_mode_from_handle(handle).map(|mode| mode.as_str());
+    let status = event.status.as_ref().ok();
+
+    RuntimeTaskEvent {
+        task_id: handle.task_id,
+        attempt_no: handle.attempt_no,
+        lease_token: runtime_lease_token(handle).unwrap_or_default(),
+        session_epoch: runtime_session_epoch(handle),
+        event_type: "attempt_diagnostics".to_string(),
+        event_level: event_level.to_string(),
+        message: "runtime attempt diagnostics collected".to_string(),
+        payload: json!({
+            "runtime_id": handle.runtime_id,
+            "task_type": task_type,
+            "runtime_mode": runtime_mode,
+            "source_mode": source_mode,
+            "input_kind": input_kind,
+            "pid": handle.pid,
+            "exit_code": status.and_then(ExitStatus::code),
+            "signal": status.and_then(exit_signal),
+            "was_stopped": event.was_stopped,
+            "terminal_event_type": terminal_event_type,
+            "terminal_reason": terminal_reason(terminal_payload),
+            "output_target": event.output_target,
+            "work_dir": event.work_dir,
+            "logs": events.diagnostic_logs(handle.task_id, handle.attempt_no),
+        }),
+    }
+}
+
+fn task_runtime_mode_as_str(mode: TaskRuntimeMode) -> &'static str {
+    match mode {
+        TaskRuntimeMode::ManagedProcess => "managed_process",
+        TaskRuntimeMode::ZlmProxy => "zlm_proxy",
+        TaskRuntimeMode::ZlmRtpServer => "zlm_rtp_server",
+    }
+}
+
+fn terminal_reason(payload: &Value) -> Option<String> {
+    ["reason", "recording_error", "wait_error", "missing_outputs"]
+        .into_iter()
+        .find_map(|key| payload.get(key).filter(|value| !value.is_null()))
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string())
+        })
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &ExitStatus) -> Option<i32> {
+    None
 }
 
 impl ManagedProcessExecutor {
@@ -736,7 +848,8 @@ impl ManagedProcessExecutor {
             },
             |request| async move {
                 let mode = self.prepare_start_mode_for_manager(&request).ok()?;
-                let slot_permit = self.acquire_runtime_slot_for_manager().ok()?;
+                let slot_class = self.runtime_slot_class_for_manager(&request).ok()?;
+                let slot_permit = self.acquire_runtime_slot_for_manager(slot_class).ok()?;
                 self.start_task_for_manager(request, mode, slot_permit)
                     .await
                     .ok()

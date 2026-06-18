@@ -1399,6 +1399,8 @@ class _NodeSummary extends StatelessWidget {
         _OptionalInfoRow(label: '版本', value: node['agent_version']),
         _OptionalInfoRow(label: '标签', value: node['labels']),
         _OptionalInfoRow(label: '网卡', value: node['interfaces']),
+        _OptionalInfoRow(
+            label: '槽位负载', value: _slotLoads(node['runtime_slot_loads'])),
       ],
     );
   }
@@ -1417,6 +1419,8 @@ class _NodeMetricGrid extends StatelessWidget {
       _MetricSpec('内存', _percent(node['mem_percent']), colors.purple),
       _MetricSpec('磁盘', _percent(node['disk_percent']), colors.orange),
       _MetricSpec('运行任务', _plain(node['running_tasks']), colors.success),
+      _MetricSpec(
+          '槽位负载', _slotLoads(node['runtime_slot_loads']), colors.primary),
       _MetricSpec('启动中', _plain(node['starting_tasks']), colors.primary),
       _MetricSpec('停止中', _plain(node['stopping_tasks']), colors.orange),
     ].where((item) => item.value != null).toList();
@@ -1647,6 +1651,11 @@ String? _percent(Object? value) {
 String? _plain(Object? value) {
   if (!_hasValue(value)) return null;
   return _displayValue(value);
+}
+
+String? _slotLoads(Object? value) {
+  final label = runtimeSlotLoadsLabel(value);
+  return label == '—' ? null : label;
 }
 
 bool _hasValue(Object? value) {

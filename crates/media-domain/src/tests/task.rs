@@ -367,6 +367,18 @@ fn validate_allows_stream_ingest_vod_input_looping() {
 }
 
 #[test]
+fn validate_allows_stream_ingest_vod_start_offset() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.input.kind = Some(InputKind::HttpMp4);
+    task.input.source_mode = Some(SourceMode::Vod);
+    task.input.start_offset_sec = Some(600);
+    task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
+
+    task.validate()
+        .expect("validation should allow vod ingest start offset");
+}
+
+#[test]
 fn validate_rejects_loop_enabled_for_live_input() {
     let mut task = sample_task(TaskType::StreamIngest);
     task.input.loop_enabled = Some(true);
@@ -377,6 +389,55 @@ fn validate_rejects_loop_enabled_for_live_input() {
             .issues
             .iter()
             .any(|issue| issue.field == "input.loop_enabled")
+    );
+}
+
+#[test]
+fn validate_rejects_start_offset_for_live_input() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.input.start_offset_sec = Some(600);
+
+    let error = task.validate().expect_err("validation should fail");
+    assert!(
+        error
+            .issues
+            .iter()
+            .any(|issue| issue.field == "input.start_offset_sec")
+    );
+}
+
+#[test]
+fn validate_rejects_start_offset_with_loop_enabled() {
+    let mut task = sample_task(TaskType::StreamIngest);
+    task.input.kind = Some(InputKind::HttpMp4);
+    task.input.source_mode = Some(SourceMode::Vod);
+    task.input.loop_enabled = Some(true);
+    task.input.start_offset_sec = Some(600);
+    task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
+
+    let error = task.validate().expect_err("validation should fail");
+    assert!(
+        error
+            .issues
+            .iter()
+            .any(|issue| issue.field == "input.start_offset_sec")
+    );
+}
+
+#[test]
+fn validate_rejects_start_offset_for_non_stream_ingest() {
+    let mut task = sample_task(TaskType::FileTranscode);
+    task.input.kind = Some(InputKind::HttpMp4);
+    task.input.source_mode = Some(SourceMode::Vod);
+    task.input.start_offset_sec = Some(600);
+    task.input.url = Some("http://vod.example.com/archive.mp4".to_string());
+
+    let error = task.validate().expect_err("validation should fail");
+    assert!(
+        error
+            .issues
+            .iter()
+            .any(|issue| issue.field == "input.start_offset_sec")
     );
 }
 

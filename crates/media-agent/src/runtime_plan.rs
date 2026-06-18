@@ -20,7 +20,7 @@ use crate::{
     ffmpeg_plan::{PublishOutput, append_publish_output_args},
     ffmpeg_probe::{probe_input_media_profile, probe_input_media_profile_with_input_args},
     media_policy::{
-        AudioOutputPolicy, VideoOutputPolicy, ffmpeg_muxer_for_format,
+        AudioOutputPolicy, InputMediaProfile, VideoOutputPolicy, ffmpeg_muxer_for_format,
         logical_output_format_for_format,
     },
     runtime::{
@@ -36,6 +36,7 @@ use crate::{
         ManagedFileOutputKind, allocate_managed_file_output, allocate_managed_output,
         ensure_output_format_enabled, hls_record_segment_sec, managed_file_output_kind_for_task,
     },
+    runtime_process::RuntimeSlotClass,
     runtime_recording::{LiveRelayRecording, build_live_relay_recording},
     runtime_transcode::{
         InternalIngressProtocol, append_live_mpegts_multicast_bridge_args, append_process_args,
@@ -148,6 +149,16 @@ pub(crate) fn parse_task_spec(request: &StartTaskRequest) -> Result<TaskSpec, Ex
     })
 }
 
+pub(crate) fn runtime_slot_class_for_request(
+    request: &StartTaskRequest,
+) -> Result<RuntimeSlotClass, ExecutorError> {
+    let spec = parse_task_spec(request)?;
+    let source_mode = spec.input.source_mode.ok_or_else(|| {
+        ExecutorError::InvalidRequest("resolved_spec.input.source_mode is required".to_string())
+    })?;
+    Ok(RuntimeSlotClass::from_source_mode(source_mode))
+}
+
 pub(crate) fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {
     match spec.task_type {
         TaskType::FileTranscode | TaskType::StreamBridge => TaskRuntimeMode::ManagedProcess,
@@ -177,6 +188,24 @@ fn should_use_managed_process_for_record_only_live_ingest(spec: &TaskSpec) -> bo
         && spec.input.source_mode == Some(SourceMode::Live)
         && spec.record.enabled.unwrap_or(false)
         && !spec.expose.any_playback_enabled()
+}
+
+fn insert_vod_start_offset_input_args(
+    args: &mut Vec<String>,
+    spec: &TaskSpec,
+    profile: &InputMediaProfile,
+) {
+    if spec.input.source_mode == Some(SourceMode::Vod) {
+        if let Some(start_offset_sec) = spec.input.start_offset_sec.filter(|value| *value > 0) {
+            if profile
+                .duration_sec
+                .is_some_and(|duration_sec| u64::from(start_offset_sec) >= duration_sec)
+            {
+                return;
+            }
+            insert_ffmpeg_input_args(args, vec!["-ss".to_string(), start_offset_sec.to_string()]);
+        }
+    }
 }
 
 pub(crate) fn build_file_transcode_plan(
@@ -276,6 +305,7 @@ pub(crate) fn build_stream_ingest_realtime_plan(
         input_url.clone(),
         spec.stream_ingest_requires_realtime_pacing(),
     );
+    insert_vod_start_offset_input_args(&mut args, spec, &profile);
     let stream_ingest_audio_copy_probe_args = resolve_stream_ingest_audio_copy_probe_input_args(
         spec,
         process_output_format,
@@ -388,6 +418,7 @@ pub(crate) fn build_stream_ingest_fast_record_plan(
         input_url.as_str(),
         &probe_input_args,
     );
+    insert_vod_start_offset_input_args(&mut args, spec, &profile);
     let stream_ingest_audio_copy_probe_args = resolve_stream_ingest_audio_copy_probe_input_args(
         spec,
         preferred_output_format,
@@ -991,4 +1022,229 @@ fn preferred_publish_schema(expose: &ExposeSpec) -> String {
 
 fn build_rtp_stream_id(task_id: Uuid, attempt_no: i32) -> String {
     format!("{task_id}-{attempt_no}")
+}
+
+#[cfg(test)]
+mod tests {
+    use media_domain::{
+        CommonSpec, ExposeSpec, InputKind, InputSpec, RecordFormat, RecordSpec, SourceMode,
+        StreamSpec, TaskSpec, TaskType,
+    };
+
+    use super::*;
+
+    fn vod_record_spec(expose: ExposeSpec) -> TaskSpec {
+        TaskSpec {
+            task_type: TaskType::StreamIngest,
+            name: "vod-offset".to_string(),
+            priority: 50,
+            common: CommonSpec {
+                created_by: Some("tester".to_string()),
+                callback_url: None,
+                labels: Vec::new(),
+            },
+            input: InputSpec {
+                kind: Some(InputKind::File),
+                source_mode: Some(SourceMode::Vod),
+                start_offset_sec: Some(600),
+                url: Some("uploads/demo.mp4".to_string()),
+                probe_timeout_ms: Some(1),
+                ..InputSpec::default()
+            },
+            stream: StreamSpec {
+                app: Some("live".to_string()),
+                name: Some("vod-offset".to_string()),
+                vhost: Some("__defaultVhost__".to_string()),
+            },
+            expose,
+            process: Default::default(),
+            publish: Default::default(),
+            record: RecordSpec {
+                enabled: Some(true),
+                format: Some(RecordFormat::Mp4),
+                duration_sec: Some(180),
+                ..RecordSpec::default()
+            },
+            recovery: Default::default(),
+            schedule: Default::default(),
+            resource: Default::default(),
+        }
+    }
+
+    fn agent_settings() -> AgentSettings {
+        AgentSettings {
+            ffprobe_bin: "false".to_string(),
+            ..AgentSettings::default()
+        }
+    }
+
+    fn agent_settings_with_ffprobe(ffprobe_bin: String) -> AgentSettings {
+        AgentSettings {
+            ffprobe_bin,
+            ..AgentSettings::default()
+        }
+    }
+
+    fn mock_ffprobe_with_duration(duration: &str) -> String {
+        let path =
+            std::env::temp_dir().join(format!("streamserver-mock-ffprobe-{}.sh", Uuid::now_v7()));
+        let script = format!(
+            r#"#!/bin/sh
+cat <<'JSON'
+{{"streams":[{{"index":0,"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","extradata_size":1}}],"format":{{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"{duration}"}}}}
+JSON
+"#
+        );
+        std::fs::write(&path, script).expect("mock ffprobe should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&path)
+                .expect("mock ffprobe metadata should exist")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&path, permissions)
+                .expect("mock ffprobe should be executable");
+        }
+        path.to_string_lossy().to_string()
+    }
+
+    fn start_request(spec: &TaskSpec) -> StartTaskRequest {
+        StartTaskRequest {
+            task_id: Uuid::now_v7(),
+            attempt_no: 1,
+            task_type: TaskType::StreamIngest,
+            resolved_spec: serde_json::to_value(spec).expect("spec should serialize"),
+            execution_mode: "managed_process".to_string(),
+            lease_token: "lease".to_string(),
+            trace_context: None,
+            session_epoch: 1,
+        }
+    }
+
+    fn assert_seek_before_input(args: &[String]) {
+        let seek_index = args
+            .iter()
+            .position(|arg| arg == "-ss")
+            .expect("seek arg should be present");
+        let input_index = args
+            .iter()
+            .position(|arg| arg == "-i")
+            .expect("input marker should be present");
+
+        assert!(seek_index < input_index, "{args:?}");
+        assert_eq!(args.get(seek_index + 1).map(String::as_str), Some("600"));
+    }
+
+    fn assert_duration(args: &[String]) {
+        let duration_index = args
+            .iter()
+            .position(|arg| arg == "-t")
+            .expect("duration arg should be present");
+        assert_eq!(
+            args.get(duration_index + 1).map(String::as_str),
+            Some("180")
+        );
+    }
+
+    #[test]
+    fn stream_ingest_realtime_vod_inserts_start_offset_before_input() {
+        let spec = vod_record_spec(ExposeSpec::default()).resolved();
+        let request = start_request(&spec);
+
+        let plan = build_stream_ingest_realtime_plan(
+            &agent_settings(),
+            &request,
+            &spec,
+            RuntimeCapabilityHints::default(),
+        )
+        .expect("realtime vod plan should build");
+
+        assert_seek_before_input(&plan.args);
+        assert!(plan.args.contains(&"-re".to_string()));
+        assert!(!plan.args.contains(&"-t".to_string()));
+    }
+
+    #[test]
+    fn stream_ingest_fast_vod_inserts_start_offset_before_input() {
+        let spec = vod_record_spec(ExposeSpec {
+            enable_rtsp: Some(false),
+            enable_rtmp: Some(false),
+            enable_http_ts: Some(false),
+            enable_http_fmp4: Some(false),
+            enable_hls: Some(false),
+            stop_on_no_reader: None,
+        })
+        .resolved();
+        let request = start_request(&spec);
+
+        let plan = build_stream_ingest_fast_record_plan(&agent_settings(), &request, &spec)
+            .expect("fast vod plan should build");
+
+        assert_seek_before_input(&plan.args);
+        assert_duration(&plan.args);
+        assert!(!plan.args.contains(&"-re".to_string()));
+    }
+
+    #[test]
+    fn zero_start_offset_keeps_existing_vod_args() {
+        let mut spec = vod_record_spec(ExposeSpec::default()).resolved();
+        spec.input.start_offset_sec = Some(0);
+        let request = start_request(&spec);
+
+        let plan = build_stream_ingest_realtime_plan(
+            &agent_settings(),
+            &request,
+            &spec,
+            RuntimeCapabilityHints::default(),
+        )
+        .expect("realtime vod plan should build");
+
+        assert!(!plan.args.contains(&"-ss".to_string()), "{:?}", plan.args);
+    }
+
+    #[test]
+    fn probed_duration_longer_than_start_offset_keeps_seek() {
+        let mut spec = vod_record_spec(ExposeSpec {
+            enable_rtsp: Some(false),
+            enable_rtmp: Some(false),
+            enable_http_ts: Some(false),
+            enable_http_fmp4: Some(false),
+            enable_hls: Some(false),
+            stop_on_no_reader: None,
+        })
+        .resolved();
+        spec.input.probe_timeout_ms = Some(1_000);
+        let request = start_request(&spec);
+        let ffprobe_bin = mock_ffprobe_with_duration("601.0");
+
+        let plan = build_stream_ingest_fast_record_plan(
+            &agent_settings_with_ffprobe(ffprobe_bin),
+            &request,
+            &spec,
+        )
+        .expect("fast vod plan should build");
+
+        assert_seek_before_input(&plan.args);
+        assert_duration(&plan.args);
+    }
+
+    #[test]
+    fn probed_duration_not_longer_than_start_offset_skips_seek() {
+        let mut spec = vod_record_spec(ExposeSpec::default()).resolved();
+        spec.input.probe_timeout_ms = Some(1_000);
+        let request = start_request(&spec);
+        let ffprobe_bin = mock_ffprobe_with_duration("600.0");
+
+        let plan = build_stream_ingest_realtime_plan(
+            &agent_settings_with_ffprobe(ffprobe_bin),
+            &request,
+            &spec,
+            RuntimeCapabilityHints::default(),
+        )
+        .expect("realtime vod plan should build");
+
+        assert!(!plan.args.contains(&"-ss".to_string()), "{:?}", plan.args);
+        assert!(plan.args.contains(&"-re".to_string()));
+    }
 }

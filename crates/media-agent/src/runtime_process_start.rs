@@ -309,6 +309,9 @@ impl RuntimeStartOutcome {
                 runtime_id,
                 handle: handle.clone(),
                 require_stream_online: self.monitor_plan.require_stream_online,
+                work_dir: self.monitor_plan.work_dir.clone(),
+                runtime_log_tail_bytes: self.monitor_plan.settings.runtime_log_tail_bytes,
+                runtime_log_max_file_bytes: self.monitor_plan.settings.runtime_log_max_file_bytes,
                 events: self.monitor_plan.events.clone(),
                 monitor_handle: monitor_handle.clone(),
             },
@@ -532,6 +535,9 @@ pub(crate) struct ProcessStreamReaderContext {
     pub(crate) runtime_id: Uuid,
     pub(crate) handle: RuntimeHandle,
     pub(crate) require_stream_online: bool,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) runtime_log_tail_bytes: usize,
+    pub(crate) runtime_log_max_file_bytes: u64,
     pub(crate) events: RuntimeEventSink,
     pub(crate) monitor_handle: RuntimeMonitorHandle,
 }
@@ -559,6 +565,9 @@ pub(crate) fn spawn_process_stream_readers(
         runtime_id,
         handle,
         require_stream_online,
+        work_dir,
+        runtime_log_tail_bytes,
+        runtime_log_max_file_bytes,
         events,
         monitor_handle,
     } = context;
@@ -566,6 +575,8 @@ pub(crate) fn spawn_process_stream_readers(
     if let Some(stdout) = stdout {
         let progress_handle = handle.clone();
         let monitor_handle = monitor_handle.clone();
+        let events = events.clone();
+        let work_dir = work_dir.clone();
         tokio::spawn(async move {
             read_progress_stream(
                 stdout,
@@ -574,6 +585,10 @@ pub(crate) fn spawn_process_stream_readers(
                 progress_handle.attempt_no,
                 runtime_lease_token(&progress_handle).unwrap_or_default(),
                 require_stream_online,
+                work_dir,
+                runtime_log_max_file_bytes,
+                runtime_log_tail_bytes,
+                events,
                 monitor_handle,
             )
             .await;
@@ -589,6 +604,9 @@ pub(crate) fn spawn_process_stream_readers(
                 runtime_lease_token(&log_handle).unwrap_or_default(),
                 runtime_session_epoch(&log_handle),
                 "stderr".to_string(),
+                work_dir,
+                runtime_log_max_file_bytes,
+                runtime_log_tail_bytes,
                 events,
             )
             .await;
@@ -715,6 +733,9 @@ fn start_prepared_companion_monitors(
     if let Some(stderr) = companion.stderr.take() {
         let events = monitor_plan.events.clone();
         let recording_log_handle = handle.clone();
+        let work_dir = monitor_plan.work_dir.clone();
+        let runtime_log_max_file_bytes = monitor_plan.settings.runtime_log_max_file_bytes;
+        let runtime_log_tail_bytes = monitor_plan.settings.runtime_log_tail_bytes;
         tokio::spawn(async move {
             read_log_stream(
                 stderr,
@@ -723,6 +744,9 @@ fn start_prepared_companion_monitors(
                 runtime_lease_token(&recording_log_handle).unwrap_or_default(),
                 runtime_session_epoch(&recording_log_handle),
                 "recording_stderr".to_string(),
+                work_dir,
+                runtime_log_max_file_bytes,
+                runtime_log_tail_bytes,
                 events,
             )
             .await;

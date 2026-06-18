@@ -26,6 +26,7 @@ struct FfprobeMediaResponse {
 #[derive(Debug, Deserialize)]
 struct FfprobeFormat {
     format_name: Option<String>,
+    duration: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -68,7 +69,7 @@ pub(crate) fn probe_input_media_profile_with_input_args(
     args.extend(extra_input_args.iter().cloned());
     args.extend([
         "-show_entries".to_string(),
-        "stream=index,codec_type,codec_name,pix_fmt,sample_rate,channels,extradata_size:format=format_name"
+        "stream=index,codec_type,codec_name,pix_fmt,sample_rate,channels,extradata_size:format=format_name,duration"
             .to_string(),
         "-of".to_string(),
         "json".to_string(),
@@ -101,6 +102,10 @@ pub(crate) fn probe_input_media_profile_with_input_args(
                 .as_ref()
                 .and_then(|format| format.format_name.as_deref()),
         ),
+        duration_sec: parsed
+            .format
+            .as_ref()
+            .and_then(|format| parse_format_duration_sec(format.duration.as_deref())),
         ..InputMediaProfile::default()
     };
     for (stream_position, stream) in parsed.streams.into_iter().enumerate() {
@@ -159,6 +164,14 @@ pub(crate) fn probe_input_media_profile_with_input_args(
     }
 
     profile
+}
+
+fn parse_format_duration_sec(value: Option<&str>) -> Option<u64> {
+    let duration = value?.trim().parse::<f64>().ok()?;
+    if !duration.is_finite() || duration <= 0.0 {
+        return None;
+    }
+    Some(duration.ceil() as u64)
 }
 
 pub(crate) fn probe_primary_video_codec_family(

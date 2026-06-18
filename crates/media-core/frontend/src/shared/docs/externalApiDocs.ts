@@ -282,6 +282,13 @@ function fieldMeta(path: string): FieldMeta | null {
       },
     },
     {
+      test: (value) => value === "input.start_offset_sec",
+      meta: {
+        description:
+          "点播接入开始偏移，单位秒。仅支持 `stream_ingest + source_mode=vod`，缺省或 0 表示从头读取；V1 不支持与 `input.loop_enabled=true` 同时使用。若运行前探测到点播总时长且偏移不小于总时长，Agent 会忽略该偏移并从头读取；探测不到总时长时仍按请求偏移交给 FFmpeg。网络点播源能否快速跳转取决于源站 Range/HLS 分片和 FFmpeg seek 能力。",
+      },
+    },
+    {
       test: (value) => value === "input.url",
       meta: {
         description: "输入 URL；当 input.kind=file 时，这里填写相对 /data/media/work 的文件路径，前导 / 会被自动忽略；当 input.kind=ftp 时，只支持 ftp://，不支持 ftps://。",
@@ -434,7 +441,10 @@ function fieldMeta(path: string): FieldMeta | null {
     { test: (value) => /zlm_api_list\[\]$/.test(value), meta: { description: "节点支持的 ZLM API 名称列表。" } },
     { test: (value) => /gpu\[\]$/.test(value), meta: { description: "GPU 标识列表。" } },
     { test: (value) => /gpu_devices\[\]/.test(value), meta: { description: "GPU 设备原始能力信息。" } },
-    { test: (value) => /slot_usage$/.test(value), meta: { description: "当前资源槽位占用数。" } },
+    { test: (value) => /runtime_slot_loads\[\]$/.test(value), meta: { description: "按 source_mode 分桶的运行槽位负载数组。" } },
+    { test: (value) => /runtime_slot_loads\[\]\.source_mode$/.test(value), meta: { description: "槽位分桶：live 或 vod。" } },
+    { test: (value) => /runtime_slot_loads\[\]\.max_runtime_slots$/.test(value), meta: { description: "该分桶最大并发数，0 表示不限制。" } },
+    { test: (value) => /runtime_slot_loads\[\]\.slot_usage$/.test(value), meta: { description: "该分桶槽位占用率，范围 0 到 1。" } },
     { test: (value) => /running_tasks$/.test(value), meta: { description: "当前运行任务数。" } },
     { test: (value) => /connected$/.test(value), meta: { description: "控制面连接状态。" } },
     { test: (value) => /cpu_percent$/.test(value), meta: { description: "CPU 使用率，百分比。" } },
@@ -613,8 +623,8 @@ const streamIngestExample = {
   },
 };
 
-const streamIngestLoopExample = {
-  name: "promo-loop-01",
+const streamIngestOffsetExample = {
+  name: "promo-offset-01",
   type: "stream_ingest",
   priority: 50,
   common: {
@@ -623,7 +633,8 @@ const streamIngestLoopExample = {
   input: {
     kind: "http_mp4",
     source_mode: "vod",
-    loop_enabled: true,
+    loop_enabled: false,
+    start_offset_sec: 600,
     url: "http://vod.example.com/promo.mp4",
     probe_timeout_ms: 7000,
   },
@@ -632,7 +643,7 @@ const streamIngestLoopExample = {
   },
   stream: {
     app: "live",
-    name: "promo-loop-01",
+    name: "promo-offset-01",
     vhost: "__defaultVhost__",
   },
   expose: {
@@ -775,12 +786,12 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         Authorization: authHeaderParam().example,
         "Idempotency-Key": "preview-relay-camera-01-20260412",
       },
-      body: streamIngestLoopExample,
+      body: streamIngestOffsetExample,
     },
     responseExample: {
-      requested_spec: streamIngestLoopExample,
+      requested_spec: streamIngestOffsetExample,
       resolved_spec: {
-        ...streamIngestLoopExample,
+        ...streamIngestOffsetExample,
         common: {
           created_by: "alice",
         },
@@ -789,6 +800,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     notes: [
       "这个接口不会创建任务，也不会占用节点资源。",
       "如果要让离线输入持续供流，可在 `stream_ingest + source_mode=vod` 时设置 `input.loop_enabled=true`。",
+      "`input.start_offset_sec` 可让 `stream_ingest + source_mode=vod` 从指定秒数开始读取，但不能和 `input.loop_enabled=true` 同时使用；若运行前已探测到总时长且偏移不小于总时长，会跳过偏移从头读取。",
       "当 `stream_ingest + source_mode=live` 且 expose 全部关闭时，resolved_spec 会自动开启 HTTP-FMP4 兜底；当 `stream_ingest + source_mode=vod + record.enabled=true` 且 expose 全部关闭时，resolved_spec 会走快录语义。",
     ],
   },
@@ -823,6 +835,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
     },
     notes: [
       "`input.loop_enabled=true` 仅支持 `stream_ingest` 的离线输入；若同时配置 `record.duration_sec`，到时任务仍会自动成功结束。",
+      "`input.start_offset_sec` 仅支持点播流接入；网络源是否能快速 seek 取决于 HTTP Range、HLS 分片和源站能力。若运行前已探测到总时长且偏移不小于总时长，会跳过偏移从头读取。",
       "`stream_ingest` 的直播接入不会最终保持零 expose，外部全关时会默认开启 HTTP-FMP4；VOD 录制不会手动指定实时/快录，而是由 expose 自动判定。",
       "`resource.required_labels[]` 会做节点硬过滤；如果当前没有任何匹配标签的在线节点，任务会直接失败。",
     ],
@@ -1823,7 +1836,26 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         ffmpeg_encoders: ["libx264", "aac"],
         ffmpeg_decoders: ["h264", "aac"],
         gpu: [],
-        slot_usage: 0,
+        runtime_slot_loads: [
+          {
+            source_mode: "live",
+            max_runtime_slots: 1,
+            running_tasks: 0,
+            starting_tasks: 0,
+            stopping_tasks: 0,
+            orphaned_tasks: 0,
+            slot_usage: 0,
+          },
+          {
+            source_mode: "vod",
+            max_runtime_slots: 4,
+            running_tasks: 0,
+            starting_tasks: 0,
+            stopping_tasks: 0,
+            orphaned_tasks: 0,
+            slot_usage: 0,
+          },
+        ],
         running_tasks: 0,
         cpu_percent: 7.7,
         mem_percent: 15.9,
@@ -1870,7 +1902,26 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
         upload_disk_available_bytes: 85899345920,
         upload_disk_used_percent: 20.0,
         running_tasks: 0,
-        slot_usage: 0,
+        runtime_slot_loads: [
+          {
+            source_mode: "live",
+            max_runtime_slots: 1,
+            running_tasks: 0,
+            starting_tasks: 0,
+            stopping_tasks: 0,
+            orphaned_tasks: 0,
+            slot_usage: 0,
+          },
+          {
+            source_mode: "vod",
+            max_runtime_slots: 4,
+            running_tasks: 0,
+            starting_tasks: 0,
+            stopping_tasks: 0,
+            orphaned_tasks: 0,
+            slot_usage: 0,
+          },
+        ],
         zlm_alive: true,
         ffmpeg_alive: true,
         gpu_runtime: [],

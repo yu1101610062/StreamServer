@@ -75,6 +75,43 @@ describe("buildDraftPayload", () => {
     });
   });
 
+  it("includes start_offset_sec for stream_ingest vod inputs", () => {
+    const draft = createDefaultDraft();
+    draft.name = "vod-offset";
+    draft.common.created_by = "alice";
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.loop_enabled = false;
+    draft.input.start_offset_sec = "600";
+    draft.input.url = "http://vod.example.com/archive.mp4";
+
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(payload.input).toMatchObject({
+      kind: "http_mp4",
+      source_mode: "vod",
+      start_offset_sec: 600,
+      url: "http://vod.example.com/archive.mp4",
+    });
+  });
+
+  it("omits start_offset_sec when stream_ingest vod loop is enabled", () => {
+    const draft = createDefaultDraft();
+    draft.name = "vod-loop";
+    draft.common.created_by = "alice";
+    draft.input.kind = "http_mp4";
+    draft.input.source_mode = "vod";
+    draft.input.loop_enabled = true;
+    draft.input.start_offset_sec = "600";
+    draft.input.url = "http://vod.example.com/archive.mp4";
+
+    normalizeDraftForTaskType(draft, "stream_ingest");
+    const payload = buildDraftPayload(draft) as Record<string, unknown>;
+
+    expect(draft.input.start_offset_sec).toBe("");
+    expect(payload.input).not.toHaveProperty("start_offset_sec");
+  });
+
   it("defaults ftp input to vod mode", () => {
     expect(defaultSourceModeForInputKind("ftp")).toBe("vod");
   });

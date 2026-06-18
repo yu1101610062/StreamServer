@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import { useQuery } from "@tanstack/vue-query";
 
 import { nodeApi } from "@/shared/api/resources";
-import type { NodeSummary } from "@/shared/api/types";
+import type { NodeSummary, RuntimeSlotLoad } from "@/shared/api/types";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { formatPercent, formatTime } from "@/shared/utils/format";
 
@@ -48,6 +48,22 @@ function nodeHealthTagType(node: NodeSummary) {
 function nodeHealthLabel(node: NodeSummary) {
   return node.healthy ? "正常" : "异常";
 }
+
+function slotModeLabel(sourceMode: string) {
+  return sourceMode === "live" ? "直播" : sourceMode === "vod" ? "点播" : sourceMode;
+}
+
+function slotLoadText(load: RuntimeSlotLoad) {
+  const maxSlots = load.max_runtime_slots === 0 ? "不限" : String(load.max_runtime_slots);
+  const occupied =
+    load.running_tasks + load.starting_tasks + load.stopping_tasks + load.orphaned_tasks;
+  return `${slotModeLabel(load.source_mode)} ${occupied}/${maxSlots} ${formatPercent((load.slot_usage ?? 0) * 100)}`;
+}
+
+function slotLoadSummary(loads?: RuntimeSlotLoad[] | null) {
+  const values = loads ?? [];
+  return values.length ? values.map(slotLoadText).join(" · ") : "—";
+}
 </script>
 
 <template>
@@ -62,7 +78,7 @@ function nodeHealthLabel(node: NodeSummary) {
         </div>
         <div class="subtle">{{ node.hostname }}</div>
         <div class="subtle">CPU {{ formatPercent(node.cpu_percent) }} · 内存 {{ formatPercent(node.mem_percent) }}</div>
-        <div class="subtle">运行任务 {{ node.running_tasks ?? 0 }} · 槽位 {{ node.slot_usage ?? 0 }}</div>
+        <div class="subtle">运行任务 {{ node.running_tasks ?? 0 }} · {{ slotLoadSummary(node.runtime_slot_loads) }}</div>
         <el-button style="margin-top: 14px" @click="openNode(node)">查看详情</el-button>
       </div>
     </div>
@@ -135,7 +151,9 @@ function nodeHealthLabel(node: NodeSummary) {
                 <template #default="{ row }">{{ formatPercent(row.disk_percent) }}</template>
               </el-table-column>
               <el-table-column prop="running_tasks" label="运行任务" min-width="100" />
-              <el-table-column prop="slot_usage" label="槽位" min-width="100" />
+              <el-table-column label="槽位" min-width="220">
+                <template #default="{ row }">{{ slotLoadSummary(row.runtime_slot_loads) }}</template>
+              </el-table-column>
             </el-table>
           </div>
         </div>

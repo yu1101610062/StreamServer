@@ -732,6 +732,26 @@ impl TaskSpec {
                 ));
             }
         }
+        if self.input.start_offset_sec.is_some_and(|value| value > 0) {
+            if self.task_type != TaskType::StreamIngest {
+                issues.push(ValidationIssue::new(
+                    "input.start_offset_sec",
+                    "is only supported for stream_ingest",
+                ));
+            }
+            if self.input.source_mode != Some(SourceMode::Vod) {
+                issues.push(ValidationIssue::new(
+                    "input.start_offset_sec",
+                    "requires source_mode=vod",
+                ));
+            }
+            if self.input.loop_enabled.unwrap_or(false) {
+                issues.push(ValidationIssue::new(
+                    "input.start_offset_sec",
+                    "cannot be combined with input.loop_enabled=true",
+                ));
+            }
+        }
 
         // input.kind 决定后续执行器选择，必须在这里把 URL、文件相对路径、
         // 组播地址和 GB RTP 端口等互斥输入约束一次性收齐。
@@ -1157,6 +1177,8 @@ pub struct InputSpec {
     pub source_mode: Option<SourceMode>,
     #[serde(default)]
     pub loop_enabled: Option<bool>,
+    #[serde(default)]
+    pub start_offset_sec: Option<u32>,
     #[serde(default)]
     pub url: Option<String>,
     #[serde(default)]

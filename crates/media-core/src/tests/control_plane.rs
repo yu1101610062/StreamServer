@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 
 use media_domain::{
     CommonSpec, ExposeSpec, InputSpec, PublishSpec, RecordSpec, RecoverySpec, ResourceSpec,
-    ScheduleSpec, StreamSpec, TaskStatus, TaskType,
+    RuntimeSlotLoad, ScheduleSpec, SourceMode, StreamSpec, TaskStatus, TaskType,
 };
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tokio::{net::TcpStream, sync::mpsc, time::timeout};
@@ -32,6 +32,7 @@ fn sample_spec(kind: InputKind, url: Option<&str>, interface_ip: Option<&str>) -
             kind: Some(kind),
             source_mode: kind.default_source_mode(),
             loop_enabled: None,
+            start_offset_sec: None,
             url: url.map(str::to_string),
             group: None,
             port: None,
@@ -206,6 +207,61 @@ fn sample_registration(node_id: Uuid) -> AgentRegistration {
     }
 }
 
+fn runtime_slot_load_for_usage(
+    source_mode: SourceMode,
+    running_tasks: u32,
+    starting_tasks: u32,
+    stopping_tasks: u32,
+    orphaned_tasks: u32,
+    slot_usage: f64,
+) -> RuntimeSlotLoad {
+    let occupied = running_tasks
+        .saturating_add(starting_tasks)
+        .saturating_add(stopping_tasks)
+        .saturating_add(orphaned_tasks);
+    let max_runtime_slots = if occupied == 0 || slot_usage <= 0.0 {
+        0
+    } else {
+        ((occupied as f64 / slot_usage).ceil() as u32).max(1)
+    };
+    RuntimeSlotLoad {
+        source_mode,
+        max_runtime_slots,
+        running_tasks,
+        starting_tasks,
+        stopping_tasks,
+        orphaned_tasks,
+        slot_usage,
+    }
+}
+
+fn live_slot_load(
+    running_tasks: u32,
+    starting_tasks: u32,
+    stopping_tasks: u32,
+    orphaned_tasks: u32,
+    slot_usage: f64,
+) -> RuntimeSlotLoad {
+    runtime_slot_load_for_usage(
+        SourceMode::Live,
+        running_tasks,
+        starting_tasks,
+        stopping_tasks,
+        orphaned_tasks,
+        slot_usage,
+    )
+}
+
+fn online_live_session_load(running_tasks: u32, slot_usage: f64) -> SessionLoad {
+    SessionLoad {
+        running_tasks,
+        runtime_slot_loads: vec![live_slot_load(running_tasks, 0, 0, 0, slot_usage)],
+        zlm_alive: true,
+        ffmpeg_alive: true,
+        ..SessionLoad::default()
+    }
+}
+
 fn sample_heartbeat(running_tasks: u32, slot_usage: f64) -> HeartbeatSnapshot {
     HeartbeatSnapshot {
         node_time: Utc::now(),
@@ -219,7 +275,7 @@ fn sample_heartbeat(running_tasks: u32, slot_usage: f64) -> HeartbeatSnapshot {
         starting_tasks: 0,
         stopping_tasks: 0,
         orphaned_tasks: 0,
-        slot_usage,
+        runtime_slot_loads: vec![live_slot_load(running_tasks, 0, 0, 0, slot_usage)],
         zlm_alive: true,
         ffmpeg_alive: true,
         artifact_cleanup_blocked: false,
@@ -247,7 +303,13 @@ fn sample_heartbeat_with_states(
         starting_tasks,
         stopping_tasks,
         orphaned_tasks,
-        slot_usage,
+        runtime_slot_loads: vec![live_slot_load(
+            running_tasks,
+            starting_tasks,
+            stopping_tasks,
+            orphaned_tasks,
+            slot_usage,
+        )],
         zlm_alive: true,
         ffmpeg_alive: true,
         artifact_cleanup_blocked: false,
@@ -396,16 +458,15 @@ fn dispatch_reservation_waits_for_active_counts_instead_of_start_events() {
 #[test]
 fn effective_slot_usage_counts_starting_tasks_and_reservations() {
     let load = SessionLoad {
-        slot_usage: 0.5,
         running_tasks: 1,
         starting_tasks: 1,
+        runtime_slot_loads: vec![live_slot_load(1, 1, 0, 0, 0.5)],
         ..SessionLoad::default()
     };
 
-    assert_eq!(estimated_max_slots(&load), Some(4));
-    assert_eq!(effective_occupied_tasks(&load, 0), 2);
-    assert_eq!(effective_slot_usage(&load, 2), 1.0);
-    assert!(session_is_saturated(&load, 2));
+    assert_eq!(effective_occupied_tasks(&load, SourceMode::Live, 0), 2);
+    assert_eq!(effective_slot_usage(&load, SourceMode::Live, 2), 1.0);
+    assert!(session_is_saturated(&load, SourceMode::Live, 2));
 }
 
 #[test]
@@ -429,9 +490,11 @@ fn update_session_load_uses_starting_tasks_to_release_reservations() {
                 reservations: VecDeque::from([
                     DispatchReservation {
                         task_id: Uuid::now_v7(),
+                        source_mode: SourceMode::Live,
                     },
                     DispatchReservation {
                         task_id: Uuid::now_v7(),
+                        source_mode: SourceMode::Live,
                     },
                 ]),
             },
@@ -466,21 +529,15 @@ async fn pick_best_session_skips_saturated_node_without_database() {
             registration: sample_registration(node_id),
             capabilities: SessionCapabilities::default(),
             load: SessionLoad {
-                slot_usage: 1.0,
-                running_tasks: 1,
-                starting_tasks: 0,
-                stopping_tasks: 0,
-                orphaned_tasks: 0,
                 cpu_percent: 0.0,
                 mem_percent: 0.0,
                 disk_percent: 0.0,
                 upload_disk_total_bytes: 100,
                 upload_disk_available_bytes: 80,
                 upload_disk_used_percent: 20.0,
-                zlm_alive: true,
-                ffmpeg_alive: true,
                 artifact_cleanup_blocked: false,
                 gpu_runtime: Vec::new(),
+                ..online_live_session_load(1, 1.0)
             },
             reservations: VecDeque::new(),
         },
@@ -560,11 +617,7 @@ async fn claim_best_session_uses_reservations_to_spread_burst_dispatches() {
                     sender,
                     registration: sample_registration(node_id),
                     capabilities: SessionCapabilities::default(),
-                    load: SessionLoad {
-                        zlm_alive: true,
-                        ffmpeg_alive: true,
-                        ..SessionLoad::default()
-                    },
+                    load: online_live_session_load(0, 0.0),
                     reservations: VecDeque::new(),
                 },
             );
@@ -625,13 +678,7 @@ async fn required_labels_filter_candidates_before_scoring() {
             sender: matching_sender,
             registration: matching_registration,
             capabilities: SessionCapabilities::default(),
-            load: SessionLoad {
-                slot_usage: 0.9,
-                running_tasks: 9,
-                zlm_alive: true,
-                ffmpeg_alive: true,
-                ..SessionLoad::default()
-            },
+            load: online_live_session_load(9, 0.9),
             reservations: VecDeque::new(),
         },
     );
@@ -642,13 +689,7 @@ async fn required_labels_filter_candidates_before_scoring() {
             sender: other_sender,
             registration: other_registration,
             capabilities: SessionCapabilities::default(),
-            load: SessionLoad {
-                slot_usage: 0.1,
-                running_tasks: 1,
-                zlm_alive: true,
-                ffmpeg_alive: true,
-                ..SessionLoad::default()
-            },
+            load: online_live_session_load(1, 0.1),
             reservations: VecDeque::new(),
         },
     );
@@ -684,11 +725,7 @@ async fn required_labels_return_none_when_no_online_node_matches() {
             sender,
             registration,
             capabilities: SessionCapabilities::default(),
-            load: SessionLoad {
-                zlm_alive: true,
-                ffmpeg_alive: true,
-                ..SessionLoad::default()
-            },
+            load: online_live_session_load(0, 0.0),
             reservations: VecDeque::new(),
         },
     );
@@ -723,13 +760,7 @@ async fn required_labels_still_queue_when_matching_node_is_saturated() {
             sender,
             registration,
             capabilities: SessionCapabilities::default(),
-            load: SessionLoad {
-                slot_usage: 1.0,
-                running_tasks: 1,
-                zlm_alive: true,
-                ffmpeg_alive: true,
-                ..SessionLoad::default()
-            },
+            load: online_live_session_load(1, 1.0),
             reservations: VecDeque::new(),
         },
     );
@@ -752,11 +783,7 @@ async fn cpu_only_dispatch_still_prefers_lower_load_gpu_node_as_cpu_candidate() 
     let (gpu_sender, _gpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
     let (cpu_sender, _cpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
 
-    let mut gpu_load = SessionLoad {
-        zlm_alive: true,
-        ffmpeg_alive: true,
-        ..SessionLoad::default()
-    };
+    let mut gpu_load = online_live_session_load(0, 0.0);
     gpu_load.gpu_runtime = sample_gpu_runtime(22.0, 18.0, 5.0);
 
     let mut sessions = service.sessions.lock().await;
@@ -778,11 +805,7 @@ async fn cpu_only_dispatch_still_prefers_lower_load_gpu_node_as_cpu_candidate() 
             sender: cpu_sender,
             registration: sample_registration(cpu_node),
             capabilities: SessionCapabilities::default(),
-            load: SessionLoad {
-                zlm_alive: true,
-                ffmpeg_alive: true,
-                ..SessionLoad::default()
-            },
+            load: online_live_session_load(0, 0.0),
             reservations: VecDeque::new(),
         },
     );
@@ -812,22 +835,10 @@ async fn gpu_nodes_remain_cpu_candidates_when_gpu_is_unavailable() {
     let (gpu_sender, _gpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
     let (cpu_sender, _cpu_receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
 
-    let mut overloaded_gpu_load = SessionLoad {
-        slot_usage: 0.1,
-        running_tasks: 1,
-        zlm_alive: true,
-        ffmpeg_alive: true,
-        ..SessionLoad::default()
-    };
+    let mut overloaded_gpu_load = online_live_session_load(1, 0.1);
     overloaded_gpu_load.gpu_runtime = sample_gpu_runtime(99.0, 99.0, 10.0);
 
-    let cpu_load = SessionLoad {
-        slot_usage: 0.7,
-        running_tasks: 4,
-        zlm_alive: true,
-        ffmpeg_alive: true,
-        ..SessionLoad::default()
-    };
+    let cpu_load = online_live_session_load(4, 0.7);
 
     let mut sessions = service.sessions.lock().await;
     sessions.insert(

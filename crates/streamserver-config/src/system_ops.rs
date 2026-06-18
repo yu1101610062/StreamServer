@@ -13,7 +13,8 @@ use anyhow::{Context, bail};
 use crate::{deploy_mode, native_unit_basename, parse_env_file};
 
 pub(crate) struct RestartTask {
-    pub(crate) unit: String,
+    pub(crate) units: Vec<String>,
+    pub(crate) label: String,
     pub(crate) receiver: Receiver<anyhow::Result<()>>,
 }
 
@@ -21,7 +22,7 @@ impl fmt::Debug for RestartTask {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RestartTask")
-            .field("unit", &self.unit)
+            .field("units", &self.units)
             .finish_non_exhaustive()
     }
 }
@@ -40,14 +41,19 @@ impl fmt::Debug for UninstallTask {
     }
 }
 
-pub(crate) fn spawn_restart_task(unit: String) -> RestartTask {
+pub(crate) fn spawn_restart_task(units: Vec<String>) -> RestartTask {
     let (sender, receiver) = mpsc::channel();
-    let task_unit = unit.clone();
+    let task_units = units.clone();
+    let label = task_units.join(", ");
     thread::spawn(move || {
-        let result = restart_and_wait_instance(&task_unit);
+        let result = restart_and_wait_instance(&task_units);
         let _ = sender.send(result);
     });
-    RestartTask { unit, receiver }
+    RestartTask {
+        units,
+        label,
+        receiver,
+    }
 }
 
 pub(crate) fn spawn_uninstall_task(install_dir: PathBuf) -> UninstallTask {
@@ -97,21 +103,52 @@ pub(crate) fn instance_running(values: &BTreeMap<String, String>) -> bool {
 
 pub(crate) fn native_unit_candidates(values: &BTreeMap<String, String>) -> Vec<String> {
     let mut units = Vec::new();
-    for key in [
-        "SYSTEMD_TARGET",
-        "SYSTEMD_CORE_UNIT",
-        "SYSTEMD_AGENT_UNIT",
-        "SYSTEMD_ZLM_UNIT",
-        "SYSTEMD_POSTGRES_UNIT",
-    ] {
-        if let Some(unit) = values.get(key).filter(|value| !value.trim().is_empty()) {
-            if !units.contains(unit) {
-                units.push(unit.clone());
-            }
+    if let Some(unit) = values
+        .get("SYSTEMD_TARGET")
+        .filter(|value| !value.trim().is_empty())
+    {
+        units.push(unit.clone());
+    }
+    for unit in native_service_unit_candidates(values) {
+        if !units.contains(&unit) {
+            units.push(unit);
         }
     }
     if units.is_empty() {
         units.push(format!("{}.target", native_unit_basename(values)));
+    }
+    units
+}
+
+pub(crate) fn native_service_unit_candidates(values: &BTreeMap<String, String>) -> Vec<String> {
+    let role = values
+        .get("INSTALL_ROLE")
+        .map(|value| value.trim())
+        .unwrap_or_default();
+    let keys: &[&str] = match role {
+        "control-plane" => &["SYSTEMD_POSTGRES_UNIT", "SYSTEMD_CORE_UNIT"],
+        "worker-host-cpu" | "worker-host-gpu" => &["SYSTEMD_ZLM_UNIT", "SYSTEMD_AGENT_UNIT"],
+        "all-in-one-host-cpu" | "all-in-one-host-gpu" => &[
+            "SYSTEMD_POSTGRES_UNIT",
+            "SYSTEMD_CORE_UNIT",
+            "SYSTEMD_ZLM_UNIT",
+            "SYSTEMD_AGENT_UNIT",
+        ],
+        _ => &[
+            "SYSTEMD_POSTGRES_UNIT",
+            "SYSTEMD_CORE_UNIT",
+            "SYSTEMD_ZLM_UNIT",
+            "SYSTEMD_AGENT_UNIT",
+        ],
+    };
+
+    let mut units = Vec::new();
+    for key in keys {
+        if let Some(unit) = values.get(*key).filter(|value| !value.trim().is_empty()) {
+            if !units.contains(unit) {
+                units.push(unit.clone());
+            }
+        }
     }
     units
 }
@@ -150,9 +187,14 @@ fn uninstall_instance(install_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn restart_and_wait_instance(unit: &str) -> anyhow::Result<()> {
-    run_root_command("systemctl", &["restart", unit])?;
-    wait_for_unit_active(unit, Duration::from_secs(90))?;
+fn restart_and_wait_instance(units: &[String]) -> anyhow::Result<()> {
+    if units.is_empty() {
+        bail!("未检测到可重启的 systemd 服务");
+    }
+    for unit in units {
+        run_root_command("systemctl", &["restart", unit])?;
+        wait_for_unit_active(unit, Duration::from_secs(90))?;
+    }
     Ok(())
 }
 
@@ -223,4 +265,59 @@ fn run_command_capture(program: &str, args: &[&str], cwd: Option<&Path>) -> anyh
         "{program} {args} exited with status {}: {detail}",
         output.status
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit_values(role: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("INSTALL_ROLE".to_string(), role.to_string()),
+            (
+                "SYSTEMD_TARGET".to_string(),
+                "ss-example.target".to_string(),
+            ),
+            (
+                "SYSTEMD_POSTGRES_UNIT".to_string(),
+                "ss-example-postgres.service".to_string(),
+            ),
+            (
+                "SYSTEMD_CORE_UNIT".to_string(),
+                "ss-example-core.service".to_string(),
+            ),
+            (
+                "SYSTEMD_ZLM_UNIT".to_string(),
+                "ss-example-zlm.service".to_string(),
+            ),
+            (
+                "SYSTEMD_AGENT_UNIT".to_string(),
+                "ss-example-agent.service".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn worker_restart_candidates_exclude_target_and_core_units() {
+        assert_eq!(
+            native_service_unit_candidates(&unit_values("worker-host-cpu")),
+            vec![
+                "ss-example-zlm.service".to_string(),
+                "ss-example-agent.service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_in_one_restart_candidates_follow_service_dependency_order() {
+        assert_eq!(
+            native_service_unit_candidates(&unit_values("all-in-one-host-cpu")),
+            vec![
+                "ss-example-postgres.service".to_string(),
+                "ss-example-core.service".to_string(),
+                "ss-example-zlm.service".to_string(),
+                "ss-example-agent.service".to_string(),
+            ]
+        );
+    }
 }

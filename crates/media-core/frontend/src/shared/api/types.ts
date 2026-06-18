@@ -208,6 +208,16 @@ export interface GpuRuntimeStats {
   memory_used_mb?: number;
 }
 
+export interface RuntimeSlotLoad {
+  source_mode: "live" | "vod" | string;
+  max_runtime_slots: number;
+  running_tasks: number;
+  starting_tasks: number;
+  stopping_tasks: number;
+  orphaned_tasks: number;
+  slot_usage: number;
+}
+
 export interface NodeSummary {
   id: string;
   node_name: string;
@@ -237,7 +247,7 @@ export interface NodeSummary {
   gpu: string[];
   gpu_devices: Record<string, unknown>[];
   capability_captured_at?: string | null;
-  slot_usage?: number | null;
+  runtime_slot_loads?: RuntimeSlotLoad[] | null;
   running_tasks?: number | null;
   starting_tasks?: number | null;
   stopping_tasks?: number | null;
@@ -262,7 +272,7 @@ export interface NodeHeartbeatSummary {
   upload_disk_available_bytes: number;
   upload_disk_used_percent: number;
   running_tasks: number;
-  slot_usage: number;
+  runtime_slot_loads: RuntimeSlotLoad[];
   zlm_alive: boolean;
   ffmpeg_alive: boolean;
   gpu_runtime: GpuRuntimeStats[];

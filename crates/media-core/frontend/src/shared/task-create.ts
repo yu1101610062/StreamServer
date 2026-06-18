@@ -30,6 +30,7 @@ export interface TaskCreateDraft {
     kind: string;
     source_mode: string;
     loop_enabled: boolean;
+    start_offset_sec: string;
     url: string;
     group: string;
     port: string;
@@ -211,6 +212,7 @@ export function createDefaultDraft(): TaskCreateDraft {
       kind: "rtsp",
       source_mode: "live",
       loop_enabled: false,
+      start_offset_sec: "",
       url: "",
       group: "",
       port: "",
@@ -288,6 +290,7 @@ export function normalizeDraftForTaskType(draft: TaskCreateDraft, taskType: stri
     draft.input.source_mode = fixedSourceMode || draft.input.source_mode || "vod";
     draft.record.enabled = false;
     draft.input.loop_enabled = false;
+    draft.input.start_offset_sec = "";
   } else if (taskType === "stream_bridge") {
     if (draft.input.kind === "gb_rtp" || !draft.input.kind) {
       draft.input.kind = "rtsp";
@@ -297,12 +300,16 @@ export function normalizeDraftForTaskType(draft: TaskCreateDraft, taskType: stri
     draft.input.source_mode = fixedSourceMode || draft.input.source_mode || "live";
     draft.record.enabled = false;
     draft.input.loop_enabled = false;
+    draft.input.start_offset_sec = "";
   } else {
     const fixedSourceMode = defaultSourceModeForInputKind(draft.input.kind);
     draft.publish.kind = "";
     draft.input.source_mode = fixedSourceMode || draft.input.source_mode || "live";
     if (!inputKindSupportsLoop(draft.input.kind, draft.input.source_mode)) {
       draft.input.loop_enabled = false;
+    }
+    if (draft.input.source_mode !== "vod" || draft.input.loop_enabled) {
+      draft.input.start_offset_sec = "";
     }
   }
 }
@@ -472,6 +479,9 @@ export function buildDraftPayload(draft: TaskCreateDraft) {
       "loop_enabled",
       draft.input.loop_enabled,
     );
+    if (draft.input.source_mode === "vod" && !draft.input.loop_enabled) {
+      setIfNumber(payload.input as Record<string, unknown>, "start_offset_sec", draft.input.start_offset_sec);
+    }
   }
   setIfPresent(
     payload.input as Record<string, unknown>,
@@ -562,6 +572,9 @@ export function humanSummary(draft: TaskCreateDraft) {
       ? `直接输出到${publishKindLabel(draft.publish.kind)}`
       : "",
     draft.input.loop_enabled ? "并循环读取离线输入" : "",
+    draft.input.start_offset_sec.trim()
+      ? `从第 ${draft.input.start_offset_sec.trim()} 秒开始读取`
+      : "",
     draft.publish.kind === "file" ? "文件路径由平台自动生成" : "",
     draft.publish.kind === "rtmp_push" && draft.publish.url.trim()
       ? `推送到 ${draft.publish.url.trim()}`

@@ -138,6 +138,14 @@ class _NodesScreenState extends State<NodesScreen> {
                         width: 90,
                       ),
                       StreamGridColumn(
+                        title: '槽位',
+                        field: 'runtime_slot_loads',
+                        width: 240,
+                        renderer: (context, row, value) => gridTextCell(
+                            context, runtimeSlotLoadsLabel(value),
+                            maxWidth: 230),
+                      ),
+                      StreamGridColumn(
                         title: '标签',
                         field: 'labels',
                         width: 260,
@@ -260,6 +268,9 @@ class _CompactNodeItem extends StatelessWidget {
             _NodeMeta(label: 'CPU', value: row['cpu_percent']),
             _NodeMeta(label: '内存', value: row['mem_percent']),
             _NodeMeta(label: '任务', value: row['running_tasks']),
+            _NodeMeta(
+                label: '槽位',
+                value: runtimeSlotLoadsLabel(row['runtime_slot_loads'])),
             _NodeMeta(label: '标签', value: row['labels']),
           ],
         ),

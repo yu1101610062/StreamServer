@@ -1364,11 +1364,11 @@ async fn debug_zlm_snap(
 
 fn apply_live_load(node: &mut repository::NodeSummary, load: Option<NodeLiveLoad>) {
     if let Some(load) = load {
-        node.slot_usage = Some(load.slot_usage);
         node.running_tasks = Some(load.running_tasks);
         node.starting_tasks = Some(load.starting_tasks);
         node.stopping_tasks = Some(load.stopping_tasks);
         node.orphaned_tasks = Some(load.orphaned_tasks);
+        node.runtime_slot_loads = Some(load.runtime_slot_loads);
         node.connected = Some(load.connected);
         node.control_connected = load.connected;
         node.cpu_percent = Some(load.cpu_percent);

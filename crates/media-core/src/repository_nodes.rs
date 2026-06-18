@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot,
+    RuntimeSlotLoad,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -89,7 +90,7 @@ impl TaskRepository {
               starting_tasks,
               stopping_tasks,
               orphaned_tasks,
-              slot_usage,
+              runtime_slot_loads,
               zlm_alive,
               ffmpeg_alive,
               gpu_runtime,
@@ -249,7 +250,7 @@ impl TaskRepository {
               id, node_id, cpu_percent, mem_percent, disk_percent, running_tasks,
               upload_disk_total_bytes, upload_disk_available_bytes, upload_disk_used_percent,
               starting_tasks, stopping_tasks, orphaned_tasks,
-              slot_usage, zlm_alive, ffmpeg_alive, gpu_runtime, node_time, received_at
+              runtime_slot_loads, zlm_alive, ffmpeg_alive, gpu_runtime, node_time, received_at
             ) values (
               $1, $2, $3, $4, $5, $6,
               $7, $8, $9,
@@ -270,7 +271,7 @@ impl TaskRepository {
         .bind(i32::try_from(heartbeat.starting_tasks).unwrap_or(i32::MAX))
         .bind(i32::try_from(heartbeat.stopping_tasks).unwrap_or(i32::MAX))
         .bind(i32::try_from(heartbeat.orphaned_tasks).unwrap_or(i32::MAX))
-        .bind(heartbeat.slot_usage)
+        .bind(serde_json::to_value(&heartbeat.runtime_slot_loads)?)
         .bind(heartbeat.zlm_alive)
         .bind(heartbeat.ffmpeg_alive)
         .bind(serde_json::to_value(&heartbeat.gpu_runtime)?)
@@ -440,8 +441,6 @@ pub struct NodeSummary {
     pub gpu_devices: Vec<GpuDeviceInfo>,
     pub capability_captured_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub slot_usage: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub running_tasks: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub starting_tasks: Option<u32>,
@@ -449,6 +448,8 @@ pub struct NodeSummary {
     pub stopping_tasks: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub orphaned_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_slot_loads: Option<Vec<RuntimeSlotLoad>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -538,11 +539,11 @@ impl NodeSummary {
                 .transpose()?
                 .unwrap_or_default(),
             capability_captured_at: row.try_get("captured_at")?,
-            slot_usage: None,
             running_tasks: None,
             starting_tasks: None,
             stopping_tasks: None,
             orphaned_tasks: None,
+            runtime_slot_loads: None,
             connected: None,
             cpu_percent: None,
             mem_percent: None,
@@ -570,7 +571,7 @@ pub struct NodeHeartbeatSummary {
     pub starting_tasks: u32,
     pub stopping_tasks: u32,
     pub orphaned_tasks: u32,
-    pub slot_usage: f64,
+    pub runtime_slot_loads: Vec<RuntimeSlotLoad>,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
     pub gpu_runtime: Vec<GpuRuntimeStats>,
@@ -602,7 +603,9 @@ impl NodeHeartbeatSummary {
                 .unwrap_or_default(),
             orphaned_tasks: u32::try_from(row.try_get::<i32, _>("orphaned_tasks")?)
                 .unwrap_or_default(),
-            slot_usage: row.try_get("slot_usage")?,
+            runtime_slot_loads: serde_json::from_value(
+                row.try_get::<Value, _>("runtime_slot_loads")?,
+            )?,
             zlm_alive: row.try_get("zlm_alive")?,
             ffmpeg_alive: row.try_get("ffmpeg_alive")?,
             gpu_runtime: row
