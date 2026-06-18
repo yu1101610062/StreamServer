@@ -1434,10 +1434,7 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> anyhow::Res
     }
 
     for (key, value) in values {
-        if managed.contains(key.as_str())
-            || is_legacy_allocation_key(key)
-            || is_hidden_fixed_key(key)
-        {
+        if managed.contains(key.as_str()) || is_removed_env_key(key) || is_hidden_fixed_key(key) {
             continue;
         }
         output.push_str(key);
@@ -1451,7 +1448,7 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> anyhow::Res
 
 fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkInterface]) {
     // native 迁移后保留旧挂载键的输入兼容，但最终配置只写回当前 native 键。
-    values.retain(|key, _| !is_legacy_allocation_key(key));
+    values.retain(|key, _| !is_removed_env_key(key));
     let legacy_www_mount_host_dir = values
         .get("ZLM_WWW_MOUNT_HOST_DIR")
         .or_else(|| values.get("ZLM_WWW_HOST_DIR"))
@@ -1894,6 +1891,10 @@ fn is_legacy_allocation_key(key: &str) -> bool {
             key.strip_prefix("AGENT_ARTIFACT_CLEANUP_PRE"),
             Some("ALLOCATE_PERCENT" | "ALLOCATE_HEADROOM_PERCENT")
         )
+}
+
+fn is_removed_env_key(key: &str) -> bool {
+    key == "AGENT_MAX_RUNTIME_SLOTS" || is_legacy_allocation_key(key)
 }
 
 fn is_hidden_fixed_key(key: &str) -> bool {
@@ -2622,6 +2623,54 @@ mod tests {
         assert_eq!(app.value("AGENT_STREAM_ADDR"), "http://172.16.1.2:8088");
         assert_eq!(app.value("ZLM_API_HOST"), "172.16.1.2");
         assert_eq!(app.value("ZLM_API_BASE"), "http://172.16.1.2:8088");
+
+        let _ = fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn load_drops_removed_agent_runtime_slots_key() {
+        let mut values = BTreeMap::new();
+        values.insert("INSTALL_ROLE".to_string(), "worker-host-cpu".to_string());
+        values.insert("AGENT_MAX_RUNTIME_SLOTS".to_string(), "3".to_string());
+
+        apply_defaults(&mut values, &[]);
+
+        assert!(!values.contains_key("AGENT_MAX_RUNTIME_SLOTS"));
+        assert_eq!(
+            values
+                .get("AGENT_MAX_LIVE_RUNTIME_SLOTS")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            values
+                .get("AGENT_MAX_VOD_RUNTIME_SLOTS")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn write_env_file_drops_removed_agent_runtime_slots_key() {
+        let env_path = std::env::temp_dir().join(format!(
+            "streamserver-config-removed-runtime-slots-test-{}.env",
+            std::process::id()
+        ));
+        let values = BTreeMap::from([
+            ("INSTALL_ROLE".to_string(), "worker-host-cpu".to_string()),
+            ("AGENT_MAX_RUNTIME_SLOTS".to_string(), "3".to_string()),
+            ("AGENT_MAX_LIVE_RUNTIME_SLOTS".to_string(), "4".to_string()),
+            ("AGENT_MAX_VOD_RUNTIME_SLOTS".to_string(), "5".to_string()),
+            ("CUSTOM_KEEP".to_string(), "yes".to_string()),
+        ]);
+
+        write_env_file(&env_path, &values).unwrap();
+        let contents = fs::read_to_string(&env_path).unwrap();
+
+        assert!(!contents.contains("AGENT_MAX_RUNTIME_SLOTS="));
+        assert!(contents.contains("AGENT_MAX_LIVE_RUNTIME_SLOTS=4\n"));
+        assert!(contents.contains("AGENT_MAX_VOD_RUNTIME_SLOTS=5\n"));
+        assert!(contents.contains("CUSTOM_KEEP=yes\n"));
 
         let _ = fs::remove_file(env_path);
     }
