@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{WorkerKind, task::ParseEnumError};
+use crate::{SourceMode, WorkerKind, task::ParseEnumError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +103,17 @@ pub fn normalize_output_mount_relative_prefix(value: &str) -> Result<String, Str
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuntimeSlotLoad {
+    pub source_mode: SourceMode,
+    pub max_runtime_slots: u32,
+    pub running_tasks: u32,
+    pub starting_tasks: u32,
+    pub stopping_tasks: u32,
+    pub orphaned_tasks: u32,
+    pub slot_usage: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatSnapshot {
     pub node_time: DateTime<Utc>,
     pub cpu_percent: f64,
@@ -115,7 +126,7 @@ pub struct HeartbeatSnapshot {
     pub starting_tasks: u32,
     pub stopping_tasks: u32,
     pub orphaned_tasks: u32,
-    pub slot_usage: f64,
+    pub runtime_slot_loads: Vec<RuntimeSlotLoad>,
     pub zlm_alive: bool,
     pub ffmpeg_alive: bool,
     pub artifact_cleanup_blocked: bool,

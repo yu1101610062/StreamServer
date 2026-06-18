@@ -16,13 +16,15 @@ use std::{
 use chrono::{DateTime, Utc};
 use media_domain::{
     AgentRegistration, CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot,
-    InputKind, NetworkMode, TaskSpec, TaskType, normalize_output_mount_relative_prefix,
+    InputKind, NetworkMode, RuntimeSlotLoad, SourceMode, TaskSpec, TaskType,
+    normalize_output_mount_relative_prefix,
 };
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
     GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
-    ProbeCapabilities, ReclaimRuntime, Register as RpcRegister, TaskEvent, TaskLogBatch,
-    TaskProgress, TaskRecordingControl, TaskSnapshot,
+    ProbeCapabilities, ReclaimRuntime, Register as RpcRegister,
+    RuntimeSlotLoad as RpcRuntimeSlotLoad, TaskEvent, TaskLogBatch, TaskProgress,
+    TaskRecordingControl, TaskSnapshot,
     control_plane_server::{ControlPlane, ControlPlaneServer},
 };
 use reqwest::Url;
@@ -78,11 +80,11 @@ struct SessionTarget {
 
 #[derive(Debug, Clone, Default)]
 struct SessionLoad {
-    slot_usage: f64,
     running_tasks: u32,
     starting_tasks: u32,
     stopping_tasks: u32,
     orphaned_tasks: u32,
+    runtime_slot_loads: Vec<RuntimeSlotLoad>,
     cpu_percent: f64,
     mem_percent: f64,
     disk_percent: f64,
@@ -108,16 +110,17 @@ enum ExecutionPreference {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DispatchReservation {
     task_id: Uuid,
+    source_mode: SourceMode,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeLiveLoad {
     pub connected: bool,
-    pub slot_usage: f64,
     pub running_tasks: u32,
     pub starting_tasks: u32,
     pub stopping_tasks: u32,
     pub orphaned_tasks: u32,
+    pub runtime_slot_loads: Vec<RuntimeSlotLoad>,
     pub cpu_percent: f64,
     pub mem_percent: f64,
     pub disk_percent: f64,
@@ -554,7 +557,7 @@ impl ControlPlaneService {
                     starting_tasks = snapshot.starting_tasks,
                     stopping_tasks = snapshot.stopping_tasks,
                     orphaned_tasks = snapshot.orphaned_tasks,
-                    slot_usage = snapshot.slot_usage,
+                    runtime_slot_loads = ?snapshot.runtime_slot_loads,
                     zlm_alive = snapshot.zlm_alive,
                     ffmpeg_alive = snapshot.ffmpeg_alive,
                     "heartbeat updated"
@@ -738,26 +741,26 @@ impl ControlPlaneService {
         let session = sessions
             .get_mut(&node_id)
             .ok_or_else(|| Status::unavailable("control-plane session no longer exists"))?;
-        let previous_active = session.load.running_tasks
-            + session.load.starting_tasks
-            + session.load.stopping_tasks
-            + session.load.orphaned_tasks;
-        let current_active = snapshot.running_tasks
-            + snapshot.starting_tasks
-            + snapshot.stopping_tasks
-            + snapshot.orphaned_tasks;
         // dispatch reservation 是乐观占位；心跳里真实活跃任务数增加后释放对应占位。
-        for _ in 0..current_active.saturating_sub(previous_active) {
-            if session.reservations.pop_front().is_none() {
-                break;
-            }
+        for source_mode in [SourceMode::Live, SourceMode::Vod] {
+            let previous_active = session_slot_load(&session.load, source_mode)
+                .map(slot_load_occupied)
+                .unwrap_or(0);
+            let current_active = runtime_slot_load(&snapshot.runtime_slot_loads, source_mode)
+                .map(slot_load_occupied)
+                .unwrap_or(0);
+            release_dispatch_reservations_for_source_mode(
+                &mut session.reservations,
+                source_mode,
+                current_active.saturating_sub(previous_active),
+            );
         }
         session.load = SessionLoad {
-            slot_usage: normalized_slot_usage(snapshot.slot_usage),
             running_tasks: snapshot.running_tasks,
             starting_tasks: snapshot.starting_tasks,
             stopping_tasks: snapshot.stopping_tasks,
             orphaned_tasks: snapshot.orphaned_tasks,
+            runtime_slot_loads: snapshot.runtime_slot_loads.clone(),
             cpu_percent: snapshot.cpu_percent,
             mem_percent: snapshot.mem_percent,
             disk_percent: snapshot.disk_percent,
@@ -816,20 +819,25 @@ impl ControlPlaneService {
                 ClaimResult::NoConnectedNode
             };
         };
+        let Some(source_mode) = task_source_mode(spec) else {
+            return ClaimResult::NoConnectedNode;
+        };
         let Some(handle) = sessions.get_mut(&target.node_id) else {
             return ClaimResult::NoConnectedNode;
         };
         // 选中节点后立即写入 reservation，降低并发派发时多个任务挤到同一节点的概率。
-        handle
-            .reservations
-            .push_back(DispatchReservation { task_id });
+        handle.reservations.push_back(DispatchReservation {
+            task_id,
+            source_mode,
+        });
         let score = dispatch_score(
             target.node_id,
             &handle.registration,
             &handle.capabilities,
             &handle.load,
             source_affinity_ip,
-            reservation_count(handle),
+            source_mode,
+            reservation_count(handle, source_mode),
             target.using_gpu_path,
         );
         ClaimResult::Selected(SessionTarget {
@@ -860,7 +868,10 @@ impl ControlPlaneService {
         if !node_matches_required_labels(spec, &handle.registration) {
             return ClaimResult::MissingRequiredLabels;
         }
-        let reservations = reservation_count(handle);
+        let Some(source_mode) = task_source_mode(spec) else {
+            return ClaimResult::NoConnectedNode;
+        };
+        let reservations = reservation_count(handle, source_mode);
         if !session_execution_eligible(
             spec,
             preference,
@@ -870,16 +881,18 @@ impl ControlPlaneService {
         ) {
             return ClaimResult::NoConnectedNode;
         }
-        handle
-            .reservations
-            .push_back(DispatchReservation { task_id });
+        handle.reservations.push_back(DispatchReservation {
+            task_id,
+            source_mode,
+        });
         let score = dispatch_score(
             node_id,
             &handle.registration,
             &handle.capabilities,
             &handle.load,
             source_affinity_ip,
-            reservation_count(handle),
+            source_mode,
+            reservation_count(handle, source_mode),
             false,
         );
         ClaimResult::Selected(SessionTarget {
@@ -927,8 +940,8 @@ impl ControlPlaneService {
             has_gpu_devices: !handle.capabilities.gpu_devices.is_empty(),
             using_gpu_path: false,
             gpu_headroom: None,
-            slot_usage: handle.load.slot_usage,
-            occupied_tasks: effective_occupied_tasks(&handle.load, reservation_count(handle)),
+            slot_usage: max_runtime_slot_usage(&handle.load),
+            occupied_tasks: occupied_tasks(&handle.load),
         })
     }
 
@@ -941,11 +954,11 @@ impl ControlPlaneService {
                     *node_id,
                     NodeLiveLoad {
                         connected: true,
-                        slot_usage: handle.load.slot_usage,
                         running_tasks: handle.load.running_tasks,
                         starting_tasks: handle.load.starting_tasks,
                         stopping_tasks: handle.load.stopping_tasks,
                         orphaned_tasks: handle.load.orphaned_tasks,
+                        runtime_slot_loads: handle.load.runtime_slot_loads.clone(),
                         cpu_percent: handle.load.cpu_percent,
                         mem_percent: handle.load.mem_percent,
                         disk_percent: handle.load.disk_percent,
@@ -1073,7 +1086,11 @@ fn heartbeat_from_rpc(heartbeat: RpcHeartbeat) -> Result<HeartbeatSnapshot, Stat
         starting_tasks: heartbeat.starting_tasks,
         stopping_tasks: heartbeat.stopping_tasks,
         orphaned_tasks: heartbeat.orphaned_tasks,
-        slot_usage: heartbeat.slot_usage,
+        runtime_slot_loads: heartbeat
+            .runtime_slot_loads
+            .into_iter()
+            .map(runtime_slot_load_from_rpc)
+            .collect::<Result<Vec<_>, _>>()?,
         zlm_alive: heartbeat.zlm_alive,
         ffmpeg_alive: heartbeat.ffmpeg_alive,
         artifact_cleanup_blocked: heartbeat.artifact_cleanup_blocked,
@@ -1123,6 +1140,27 @@ fn gpu_runtime_from_rpc(runtime: RpcGpuRuntime) -> GpuRuntimeStats {
         encoder_util_percent: runtime.encoder_util_percent,
         decoder_util_percent: runtime.decoder_util_percent,
     }
+}
+
+fn runtime_slot_load_from_rpc(load: RpcRuntimeSlotLoad) -> Result<RuntimeSlotLoad, Status> {
+    let source_mode = match load.source_mode.trim() {
+        "live" => SourceMode::Live,
+        "vod" => SourceMode::Vod,
+        value => {
+            return Err(Status::invalid_argument(format!(
+                "invalid runtime_slot_loads.source_mode: {value}"
+            )));
+        }
+    };
+    Ok(RuntimeSlotLoad {
+        source_mode,
+        max_runtime_slots: load.max_runtime_slots,
+        running_tasks: load.running_tasks,
+        starting_tasks: load.starting_tasks,
+        stopping_tasks: load.stopping_tasks,
+        orphaned_tasks: load.orphaned_tasks,
+        slot_usage: normalized_slot_usage(load.slot_usage),
+    })
 }
 
 fn parse_task_event(event: TaskEvent) -> Result<AgentTaskEventRecord, Status> {
@@ -1274,13 +1312,78 @@ fn parse_url_host_ip_literal(value: &str) -> Option<IpAddr> {
         .and_then(parse_ip_literal)
 }
 
-fn reservation_count(handle: &SessionHandle) -> u32 {
-    u32::try_from(handle.reservations.len()).unwrap_or(u32::MAX)
+fn reservation_count(handle: &SessionHandle, source_mode: SourceMode) -> u32 {
+    u32::try_from(
+        handle
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.source_mode == source_mode)
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 fn task_execution_preference(spec: &TaskSpec) -> ExecutionPreference {
     let _ = spec;
     ExecutionPreference::CpuOnly
+}
+
+fn task_source_mode(spec: &TaskSpec) -> Option<SourceMode> {
+    spec.input.source_mode
+}
+
+fn slot_load_occupied(load: &RuntimeSlotLoad) -> u32 {
+    load.running_tasks
+        .saturating_add(load.starting_tasks)
+        .saturating_add(load.stopping_tasks)
+        .saturating_add(load.orphaned_tasks)
+}
+
+fn runtime_slot_load(
+    loads: &[RuntimeSlotLoad],
+    source_mode: SourceMode,
+) -> Option<&RuntimeSlotLoad> {
+    loads.iter().find(|load| load.source_mode == source_mode)
+}
+
+fn session_slot_load(load: &SessionLoad, source_mode: SourceMode) -> Option<&RuntimeSlotLoad> {
+    runtime_slot_load(&load.runtime_slot_loads, source_mode)
+}
+
+fn effective_occupied_tasks(
+    load: &SessionLoad,
+    source_mode: SourceMode,
+    reserved_dispatches: u32,
+) -> u32 {
+    session_slot_load(load, source_mode)
+        .map(slot_load_occupied)
+        .unwrap_or(0)
+        .saturating_add(reserved_dispatches)
+}
+
+fn effective_slot_usage(
+    load: &SessionLoad,
+    source_mode: SourceMode,
+    reserved_dispatches: u32,
+) -> f64 {
+    let Some(slot_load) = session_slot_load(load, source_mode) else {
+        return 1.0;
+    };
+    if slot_load.max_runtime_slots == 0 {
+        return 0.0;
+    }
+    (effective_occupied_tasks(load, source_mode, reserved_dispatches) as f64
+        / slot_load.max_runtime_slots as f64)
+        .clamp(0.0, 1.0)
+}
+
+fn session_is_saturated(
+    load: &SessionLoad,
+    source_mode: SourceMode,
+    reserved_dispatches: u32,
+) -> bool {
+    let slot_usage = effective_slot_usage(load, source_mode, reserved_dispatches);
+    slot_usage.is_finite() && slot_usage >= 1.0
 }
 
 fn occupied_tasks(load: &SessionLoad) -> u32 {
@@ -1290,43 +1393,28 @@ fn occupied_tasks(load: &SessionLoad) -> u32 {
         .saturating_add(load.orphaned_tasks)
 }
 
-fn effective_occupied_tasks(load: &SessionLoad, reserved_dispatches: u32) -> u32 {
-    occupied_tasks(load).saturating_add(reserved_dispatches)
+fn max_runtime_slot_usage(load: &SessionLoad) -> f64 {
+    load.runtime_slot_loads
+        .iter()
+        .map(|slot_load| normalized_slot_usage(slot_load.slot_usage))
+        .fold(0.0, f64::max)
 }
 
-fn estimated_max_slots(load: &SessionLoad) -> Option<u32> {
-    let slot_usage = normalized_slot_usage(load.slot_usage);
-    let occupied = occupied_tasks(load);
-    if !slot_usage.is_finite() || slot_usage <= 0.0 || occupied == 0 {
-        return None;
+fn release_dispatch_reservations_for_source_mode(
+    reservations: &mut VecDeque<DispatchReservation>,
+    source_mode: SourceMode,
+    mut count: u32,
+) {
+    while count > 0 {
+        let Some(index) = reservations
+            .iter()
+            .position(|reservation| reservation.source_mode == source_mode)
+        else {
+            return;
+        };
+        reservations.remove(index);
+        count -= 1;
     }
-
-    let estimate = (occupied as f64 / slot_usage).ceil();
-    if !estimate.is_finite() || estimate <= 0.0 {
-        return None;
-    }
-
-    Some((estimate as u32).max(occupied))
-}
-
-fn effective_slot_usage(load: &SessionLoad, reserved_dispatches: u32) -> f64 {
-    let base_usage = normalized_slot_usage(load.slot_usage);
-    if reserved_dispatches == 0 || !base_usage.is_finite() || base_usage >= 1.0 {
-        return base_usage;
-    }
-
-    match estimated_max_slots(load) {
-        Some(max_slots) if max_slots > 0 => {
-            (effective_occupied_tasks(load, reserved_dispatches) as f64 / max_slots as f64)
-                .clamp(0.0, 1.0)
-        }
-        _ => base_usage,
-    }
-}
-
-fn session_is_saturated(load: &SessionLoad, reserved_dispatches: u32) -> bool {
-    let slot_usage = effective_slot_usage(load, reserved_dispatches);
-    slot_usage.is_finite() && slot_usage >= 1.0
 }
 
 fn task_requires_zlm(spec: &TaskSpec) -> bool {
@@ -1347,7 +1435,10 @@ fn base_execution_eligible(spec: &TaskSpec, load: &SessionLoad, reserved_dispatc
     if load.artifact_cleanup_blocked {
         return false;
     }
-    if session_is_saturated(load, reserved_dispatches) || !load.ffmpeg_alive {
+    let Some(source_mode) = task_source_mode(spec) else {
+        return false;
+    };
+    if session_is_saturated(load, source_mode, reserved_dispatches) || !load.ffmpeg_alive {
         return false;
     }
     !task_requires_zlm(spec) || load.zlm_alive
@@ -1418,6 +1509,7 @@ fn pick_best_session_target(
     spec: &TaskSpec,
     preference: ExecutionPreference,
 ) -> Option<SessionTarget> {
+    let source_mode = task_source_mode(spec)?;
     let select = |gpu_only: bool| {
         sessions
             .iter()
@@ -1425,7 +1517,7 @@ fn pick_best_session_target(
                 if !node_matches_required_labels(spec, &handle.registration) {
                     return false;
                 }
-                let reservations = reservation_count(handle);
+                let reservations = reservation_count(handle, source_mode);
                 let _ = gpu_only;
                 session_execution_eligible(
                     spec,
@@ -1443,7 +1535,8 @@ fn pick_best_session_target(
                         &left_handle.capabilities,
                         &left_handle.load,
                         source_affinity_ip,
-                        reservation_count(left_handle),
+                        source_mode,
+                        reservation_count(left_handle, source_mode),
                         gpu_only,
                     ),
                     dispatch_score(
@@ -1452,7 +1545,8 @@ fn pick_best_session_target(
                         &right_handle.capabilities,
                         &right_handle.load,
                         source_affinity_ip,
-                        reservation_count(right_handle),
+                        source_mode,
+                        reservation_count(right_handle, source_mode),
                         gpu_only,
                     ),
                 )
@@ -1464,7 +1558,8 @@ fn pick_best_session_target(
                     &handle.capabilities,
                     &handle.load,
                     source_affinity_ip,
-                    reservation_count(handle),
+                    source_mode,
+                    reservation_count(handle, source_mode),
                     gpu_only,
                 );
                 SessionTarget {
@@ -1492,6 +1587,7 @@ fn dispatch_score(
     capabilities: &SessionCapabilities,
     load: &SessionLoad,
     source_affinity_ip: Option<IpAddr>,
+    source_mode: SourceMode,
     reserved_dispatches: u32,
     prefer_gpu_headroom: bool,
 ) -> DispatchScore {
@@ -1501,8 +1597,8 @@ fn dispatch_score(
         gpu_headroom: (prefer_gpu_headroom && !capabilities.gpu_devices.is_empty())
             .then(|| best_gpu_headroom(&load.gpu_runtime))
             .flatten(),
-        slot_usage: effective_slot_usage(load, reserved_dispatches),
-        occupied_tasks: effective_occupied_tasks(load, reserved_dispatches),
+        slot_usage: effective_slot_usage(load, source_mode, reserved_dispatches),
+        occupied_tasks: effective_occupied_tasks(load, source_mode, reserved_dispatches),
         node_id,
     }
 }

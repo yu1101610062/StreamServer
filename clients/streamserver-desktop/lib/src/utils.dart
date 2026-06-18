@@ -56,6 +56,33 @@ String bytesLabel(Object? value) {
   return '${bytes.toStringAsFixed(0)} B';
 }
 
+String runtimeSlotLoadsLabel(Object? value) {
+  if (value is! Iterable) return '—';
+  final labels = <String>[];
+  for (final item in value) {
+    if (item is! Map) continue;
+    final sourceMode = '${item['source_mode'] ?? ''}';
+    final modeLabel = switch (sourceMode) {
+      'live' => '直播',
+      'vod' => '点播',
+      _ => sourceMode.isEmpty ? '未知' : sourceMode,
+    };
+    final maxSlots = item['max_runtime_slots'] is num
+        ? item['max_runtime_slots'] as num
+        : num.tryParse('${item['max_runtime_slots']}') ?? 0;
+    num count(Object? raw) => raw is num ? raw : num.tryParse('$raw') ?? 0;
+    final occupied = count(item['running_tasks']) +
+        count(item['starting_tasks']) +
+        count(item['stopping_tasks']) +
+        count(item['orphaned_tasks']);
+    final usage = count(item['slot_usage']) * 100;
+    final maxLabel = maxSlots == 0 ? '不限' : maxSlots.toStringAsFixed(0);
+    labels.add(
+        '$modeLabel ${occupied.toStringAsFixed(0)}/$maxLabel ${usage.toStringAsFixed(1)}%');
+  }
+  return labels.isEmpty ? '—' : labels.join(' · ');
+}
+
 String pathQuery(Map<String, Object?> query) {
   final params = query.entries
       .where((entry) => entry.value != null && '${entry.value}'.isNotEmpty)

@@ -94,8 +94,10 @@ pub struct AgentSettings {
     pub network_mode: String,
     #[serde(default)]
     pub labels: Vec<String>,
-    #[serde(default = "default_max_runtime_slots")]
-    pub max_runtime_slots: u32,
+    #[serde(default)]
+    pub max_live_runtime_slots: u32,
+    #[serde(default)]
+    pub max_vod_runtime_slots: u32,
     #[serde(default = "default_runtime_manager_start_limit")]
     pub runtime_manager_start_limit: usize,
     #[serde(default = "default_runtime_manager_stop_limit")]
@@ -116,6 +118,12 @@ pub struct AgentSettings {
     pub public_media_base_url: String,
     #[serde(default = "default_acceleration_mode")]
     pub acceleration_mode: String,
+    #[serde(default = "default_runtime_log_tail_bytes")]
+    pub runtime_log_tail_bytes: usize,
+    #[serde(default = "default_runtime_log_max_file_bytes")]
+    pub runtime_log_max_file_bytes: u64,
+    #[serde(default = "default_runtime_log_retention_days")]
+    pub runtime_log_retention_days: u64,
     #[serde(default)]
     pub artifact_cleanup: AgentArtifactCleanupSettings,
 }
@@ -164,7 +172,8 @@ impl Default for AgentSettings {
             multicast_interface_ip: String::new(),
             network_mode: default_network_mode(),
             labels: Vec::new(),
-            max_runtime_slots: default_max_runtime_slots(),
+            max_live_runtime_slots: 0,
+            max_vod_runtime_slots: 0,
             runtime_manager_start_limit: default_runtime_manager_start_limit(),
             runtime_manager_stop_limit: default_runtime_manager_stop_limit(),
             runtime_manager_recording_limit: default_runtime_manager_recording_limit(),
@@ -175,6 +184,9 @@ impl Default for AgentSettings {
             upload_probe_timeout_sec: default_upload_probe_timeout_sec(),
             public_media_base_url: String::new(),
             acceleration_mode: default_acceleration_mode(),
+            runtime_log_tail_bytes: default_runtime_log_tail_bytes(),
+            runtime_log_max_file_bytes: default_runtime_log_max_file_bytes(),
+            runtime_log_retention_days: default_runtime_log_retention_days(),
             artifact_cleanup: AgentArtifactCleanupSettings::default(),
         }
     }
@@ -201,7 +213,10 @@ impl Settings {
             .add_source(config::File::with_name("config/base").required(false))
             .add_source(config::File::with_name(&format!("config/{environment}")).required(false));
 
-        let mut file_settings = builder.build()?.try_deserialize::<FileSettings>()?;
+        let config = builder.build()?;
+        reject_legacy_runtime_slot_config(&config)?;
+        require_runtime_slot_config(&config)?;
+        let mut file_settings = config.try_deserialize::<FileSettings>()?;
         apply_env_overrides(&mut file_settings)?;
 
         let settings = Self {
@@ -307,6 +322,18 @@ impl Settings {
         anyhow::ensure!(
             self.agent.upload_probe_timeout_sec > 0,
             "UPLOAD_PROBE_TIMEOUT_SEC must be greater than 0"
+        );
+        anyhow::ensure!(
+            self.agent.runtime_log_tail_bytes > 0,
+            "AGENT_RUNTIME_LOG_TAIL_BYTES must be greater than 0"
+        );
+        anyhow::ensure!(
+            self.agent.runtime_log_max_file_bytes > 0,
+            "AGENT_RUNTIME_LOG_MAX_FILE_BYTES must be greater than 0"
+        );
+        anyhow::ensure!(
+            self.agent.runtime_log_retention_days > 0,
+            "AGENT_RUNTIME_LOG_RETENTION_DAYS must be greater than 0"
         );
         anyhow::ensure!(
             matches!(self.agent.acceleration_mode.trim(), "cpu" | "gpu"),
@@ -436,8 +463,18 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     if let Some(value) = env("AGENT_LABELS") {
         settings.agent.labels = split_csv(&value);
     }
-    if let Some(value) = env("AGENT_MAX_RUNTIME_SLOTS") {
-        settings.agent.max_runtime_slots = parse_env_or_default(&value, default_max_runtime_slots);
+    if env("AGENT_MAX_RUNTIME_SLOTS").is_some() {
+        anyhow::bail!(
+            "AGENT_MAX_RUNTIME_SLOTS has been removed; use AGENT_MAX_LIVE_RUNTIME_SLOTS and AGENT_MAX_VOD_RUNTIME_SLOTS"
+        );
+    }
+    if let Some(value) = env("AGENT_MAX_LIVE_RUNTIME_SLOTS") {
+        settings.agent.max_live_runtime_slots =
+            parse_required_env("AGENT_MAX_LIVE_RUNTIME_SLOTS", &value)?;
+    }
+    if let Some(value) = env("AGENT_MAX_VOD_RUNTIME_SLOTS") {
+        settings.agent.max_vod_runtime_slots =
+            parse_required_env("AGENT_MAX_VOD_RUNTIME_SLOTS", &value)?;
     }
     if let Some(value) = env("AGENT_RUNTIME_MANAGER_START_LIMIT") {
         settings.agent.runtime_manager_start_limit =
@@ -478,6 +515,21 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     if let Some(value) = env("AGENT_ACCELERATION_MODE") {
         settings.agent.acceleration_mode = value;
     }
+    if let Some(value) = env("AGENT_RUNTIME_LOG_TAIL_BYTES") {
+        settings.agent.runtime_log_tail_bytes = usize::try_from(parse_required_env::<u64>(
+            "AGENT_RUNTIME_LOG_TAIL_BYTES",
+            &value,
+        )?)
+        .unwrap_or(usize::MAX);
+    }
+    if let Some(value) = env("AGENT_RUNTIME_LOG_MAX_FILE_BYTES") {
+        settings.agent.runtime_log_max_file_bytes =
+            parse_required_env("AGENT_RUNTIME_LOG_MAX_FILE_BYTES", &value)?;
+    }
+    if let Some(value) = env("AGENT_RUNTIME_LOG_RETENTION_DAYS") {
+        settings.agent.runtime_log_retention_days =
+            parse_required_env("AGENT_RUNTIME_LOG_RETENTION_DAYS", &value)?;
+    }
     if let Some(value) = env("AGENT_ARTIFACT_CLEANUP_ENABLED") {
         settings.agent.artifact_cleanup.enabled =
             matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
@@ -510,6 +562,40 @@ fn env(name: &str) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+fn config_key_present(config: &config::Config, key: &str) -> bool {
+    config.get::<config::Value>(key).is_ok()
+}
+
+fn reject_legacy_runtime_slot_config(config: &config::Config) -> anyhow::Result<()> {
+    if config_key_present(config, "agent.max_runtime_slots") {
+        anyhow::bail!(
+            "agent.max_runtime_slots has been removed; use agent.max_live_runtime_slots and agent.max_vod_runtime_slots"
+        );
+    }
+    if env("AGENT_MAX_RUNTIME_SLOTS").is_some() {
+        anyhow::bail!(
+            "AGENT_MAX_RUNTIME_SLOTS has been removed; use AGENT_MAX_LIVE_RUNTIME_SLOTS and AGENT_MAX_VOD_RUNTIME_SLOTS"
+        );
+    }
+    Ok(())
+}
+
+fn require_runtime_slot_config(config: &config::Config) -> anyhow::Result<()> {
+    let has_live = config_key_present(config, "agent.max_live_runtime_slots")
+        || env("AGENT_MAX_LIVE_RUNTIME_SLOTS").is_some();
+    let has_vod = config_key_present(config, "agent.max_vod_runtime_slots")
+        || env("AGENT_MAX_VOD_RUNTIME_SLOTS").is_some();
+    anyhow::ensure!(
+        has_live,
+        "agent.max_live_runtime_slots or AGENT_MAX_LIVE_RUNTIME_SLOTS must be provided"
+    );
+    anyhow::ensure!(
+        has_vod,
+        "agent.max_vod_runtime_slots or AGENT_MAX_VOD_RUNTIME_SLOTS must be provided"
+    );
+    Ok(())
 }
 
 fn parse_required_env<T>(name: &str, value: &str) -> anyhow::Result<T>
@@ -599,10 +685,6 @@ fn default_network_mode() -> String {
     "bridge".to_string()
 }
 
-fn default_max_runtime_slots() -> u32 {
-    0
-}
-
 fn default_runtime_manager_start_limit() -> usize {
     8
 }
@@ -650,6 +732,18 @@ fn default_upload_probe_timeout_sec() -> u64 {
 
 fn default_acceleration_mode() -> String {
     "cpu".to_string()
+}
+
+fn default_runtime_log_tail_bytes() -> usize {
+    8 * 1024
+}
+
+fn default_runtime_log_max_file_bytes() -> u64 {
+    128 * 1024 * 1024
+}
+
+fn default_runtime_log_retention_days() -> u64 {
+    7
 }
 
 fn default_allow_enhanced_rtmp_expose() -> bool {

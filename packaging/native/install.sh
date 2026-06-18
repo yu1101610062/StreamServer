@@ -14,6 +14,7 @@ DATABASE_URL_INPUT=""
 SERVICE_USER="${SERVICE_USER:-streamserver}"
 SERVICE_GROUP="${SERVICE_GROUP:-streamserver}"
 UNIT_BASENAME=""
+RESERVED_LOCAL_TCP_PORTS=""
 
 log() {
   printf '[streamserver-native-install] %s\n' "$*"
@@ -148,6 +149,25 @@ prompt_secret() {
   printf '%s' "${answer}"
 }
 
+prompt_password_with_confirmation() {
+  local message="$1"
+  local password
+  local confirm
+  while true; do
+    password="$(prompt_secret "${message}")"
+    [ -n "${password}" ] || {
+      echo "密码不能为空。" >&2
+      continue
+    }
+    confirm="$(prompt_secret "再次输入以确认")"
+    if [ "${password}" = "${confirm}" ]; then
+      printf '%s' "${password}"
+      return 0
+    fi
+    echo "两次输入不一致，请重新输入。" >&2
+  done
+}
+
 ensure_linux_amd64() {
   [ "$(uname -s)" = "Linux" ] || fail "安装脚本只能在 Linux 上运行"
   case "$(uname -m)" in
@@ -278,7 +298,7 @@ default_instance_name() {
 }
 
 collect_basic_inputs() {
-  local default_dir="/opt/streamserver/${INSTALL_ROLE}"
+  local default_dir="/home/streamserver"
   [ -n "${INSTALL_DIR}" ] || INSTALL_DIR="$(prompt_non_empty "安装目录" "${default_dir}")"
   [ -n "${INSTANCE_NAME}" ] || INSTANCE_NAME="$(prompt_non_empty "实例名" "$(default_instance_name "${INSTALL_ROLE}")")"
   INSTANCE_NAME="$(sanitize_instance_name "${INSTANCE_NAME}")"
@@ -288,6 +308,18 @@ collect_basic_inputs() {
     ss-*) UNIT_BASENAME="${INSTANCE_NAME}" ;;
     *) UNIT_BASENAME="ss-${INSTANCE_NAME}" ;;
   esac
+}
+
+confirm_existing_install_target() {
+  if [ -e "${INSTALL_DIR}/.env" ]; then
+    prompt_yes_no "检测到 ${INSTALL_DIR} 中已有 native/Docker 部署配置，将备份并覆盖运行程序，是否继续？" "N" \
+      || fail "用户取消安装"
+    return 0
+  fi
+  if [ -d "${INSTALL_DIR}" ] && find "${INSTALL_DIR}" -mindepth 1 -maxdepth 1 | grep -q .; then
+    prompt_yes_no "目录 ${INSTALL_DIR} 已存在且非空，是否继续写入 StreamServer 文件？" "N" \
+      || fail "用户取消安装"
+  fi
 }
 
 ensure_root_for_install() {
@@ -315,6 +347,69 @@ generate_uuid() {
   fi
 }
 
+normalize_csv_labels() {
+  local raw="${1:-}"
+  local part
+  local trimmed
+  local joined=""
+  local seen=","
+  local parts=()
+  IFS=',' read -r -a parts <<<"${raw}"
+  for part in "${parts[@]}"; do
+    trimmed="$(printf '%s' "${part}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "${trimmed}" ] || continue
+    case "${trimmed}" in
+      *[!A-Za-z0-9_.-]*)
+        fail "节点标签只能包含字母、数字、下划线、点和连字符: ${trimmed}"
+        ;;
+    esac
+    case "${seen}" in
+      *",${trimmed},"*) continue ;;
+    esac
+    seen="${seen}${trimmed},"
+    if [ -n "${joined}" ]; then
+      joined="${joined},${trimmed}"
+    else
+      joined="${trimmed}"
+    fi
+  done
+  printf '%s' "${joined}"
+}
+
+extra_agent_labels_from_existing() {
+  local raw="${1:-}"
+  local part
+  local trimmed
+  local joined=""
+  local parts=()
+  IFS=',' read -r -a parts <<<"${raw}"
+  for part in "${parts[@]}"; do
+    trimmed="$(printf '%s' "${part}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -n "${trimmed}" ] || continue
+    case "${trimmed}" in
+      cpu|gpu) continue ;;
+    esac
+    if [ -n "${joined}" ]; then
+      joined="${joined},${trimmed}"
+    else
+      joined="${trimmed}"
+    fi
+  done
+  normalize_csv_labels "${joined}"
+}
+
+collect_agent_labels() {
+  local default_label="$1"
+  local existing_labels="${2:-${default_label}}"
+  local extra_default
+  local extra_labels
+  printf '当前节点默认会写入算力标签: %s\n' "${default_label}" >&2
+  extra_default="$(extra_agent_labels_from_existing "${existing_labels}")"
+  extra_labels="$(prompt "额外节点标签（英文逗号分隔，可留空）" "${extra_default}")"
+  extra_labels="$(extra_agent_labels_from_existing "${extra_labels}")"
+  normalize_csv_labels "${default_label},${extra_labels}"
+}
+
 detect_default_ip() {
   local ip_value=""
   if command -v hostname >/dev/null 2>&1; then
@@ -324,6 +419,412 @@ detect_default_ip() {
     ip_value="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)"
   fi
   printf '%s' "${ip_value}"
+}
+
+existing_env_value() {
+  local env_file="$1"
+  local key="$2"
+  [ -f "${env_file}" ] || return 1
+  awk -v key="${key}" '
+    BEGIN { found = 0 }
+    $0 ~ /^[[:space:]]*#/ { next }
+    index($0, key "=") == 1 {
+      print substr($0, length(key) + 2)
+      found = 1
+      exit
+    }
+    END { exit found ? 0 : 1 }
+  ' "${env_file}"
+}
+
+env_key_exists() {
+  local env_file="$1"
+  local key="$2"
+  existing_env_value "${env_file}" "${key}" >/dev/null
+}
+
+env_value_or_default() {
+  local env_file="$1"
+  local key="$2"
+  local default_value="$3"
+  local value
+  if value="$(existing_env_value "${env_file}" "${key}")"; then
+    printf '%s' "${value}"
+  else
+    printf '%s' "${default_value}"
+  fi
+}
+
+validate_port_number() {
+  local key="$1"
+  local value="$2"
+  local allow_zero="${3:-false}"
+  case "${value}" in
+    ''|*[!0-9]*)
+      fail "${key} 必须是 0-65535 之间的整数"
+      ;;
+  esac
+  if [ "${allow_zero}" = "true" ] && [ "${value}" = "0" ]; then
+    return 0
+  fi
+  if [ "${value}" -lt 1 ] || [ "${value}" -gt 65535 ]; then
+    fail "${key} 必须是 1-65535 之间的端口"
+  fi
+}
+
+validate_port_range() {
+  local key="$1"
+  local value="$2"
+  local start_port
+  local end_port
+  case "${value}" in
+    *-*) ;;
+    *) fail "${key} 必须使用 start-end 格式" ;;
+  esac
+  start_port="${value%%-*}"
+  end_port="${value#*-}"
+  validate_port_number "${key}" "${start_port}" true
+  validate_port_number "${key}" "${end_port}" true
+  if [ "${start_port}" -gt "${end_port}" ]; then
+    fail "${key} 的起始端口不能大于结束端口"
+  fi
+}
+
+validate_non_negative_integer() {
+  local key="$1"
+  local value="$2"
+  case "${value}" in
+    ''|*[!0-9]*)
+      fail "${key} 必须是大于等于 0 的整数"
+      ;;
+  esac
+}
+
+validate_positive_integer() {
+  local key="$1"
+  local value="$2"
+  case "${value}" in
+    ''|*[!0-9]*)
+      fail "${key} 必须是大于 0 的整数"
+      ;;
+  esac
+  if [ "${value}" -lt 1 ]; then
+    fail "${key} 必须是大于 0 的整数"
+  fi
+}
+
+validate_percent_value() {
+  local key="$1"
+  local value="$2"
+  if ! awk -v value="${value}" 'BEGIN {
+    if (value !~ /^([0-9]+)(\.[0-9]+)?$/) {
+      exit 1
+    }
+    numeric = value + 0
+    if (numeric < 0 || numeric > 100) {
+      exit 1
+    }
+  }'; then
+    fail "${key} 必须是 0-100 之间的数字"
+  fi
+}
+
+validate_upload_extensions() {
+  local raw="$1"
+  local extension
+  local upload_extensions=()
+  [ -n "${raw}" ] || fail "UPLOAD_ALLOWED_EXTENSIONS 不能为空"
+  IFS=',' read -r -a upload_extensions <<<"${raw}"
+  for extension in "${upload_extensions[@]}"; do
+    extension="$(printf '%s' "${extension}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^\\.//')"
+    case "${extension}" in
+      ''|*/*|*\\*|*.*)
+        fail "UPLOAD_ALLOWED_EXTENSIONS 只能包含不带点号的文件扩展名"
+        ;;
+    esac
+  done
+}
+
+prompt_non_negative_integer() {
+  local key="$1"
+  local label="$2"
+  local default_value="$3"
+  local answer
+  while true; do
+    answer="$(prompt_non_empty "${label}" "${default_value}")"
+    if validate_non_negative_integer "${key}" "${answer}"; then
+      printf '%s' "${answer}"
+      return 0
+    fi
+  done
+}
+
+prompt_positive_integer() {
+  local key="$1"
+  local label="$2"
+  local default_value="$3"
+  local answer
+  while true; do
+    answer="$(prompt_non_empty "${label}" "${default_value}")"
+    if validate_positive_integer "${key}" "${answer}"; then
+      printf '%s' "${answer}"
+      return 0
+    fi
+  done
+}
+
+describe_tcp_port_usage() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltnp "sport = :${port}" 2>/dev/null | sed '/^[[:space:]]*$/d' || true
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+  fi
+}
+
+session_reserved_tcp_port_usage() {
+  local port="$1"
+  case " ${RESERVED_LOCAL_TCP_PORTS} " in
+    *" ${port} "*) printf '%s' "当前安装流程已为其他组件预留端口 ${port}" ;;
+  esac
+}
+
+describe_local_tcp_port_conflict() {
+  local port="$1"
+  local skip_host_check="${2:-false}"
+  local usage
+  if [ "${skip_host_check}" != "true" ]; then
+    usage="$(describe_tcp_port_usage "${port}")"
+    if [ -n "${usage}" ]; then
+      printf '%s' "${usage}"
+      return 0
+    fi
+  fi
+  usage="$(session_reserved_tcp_port_usage "${port}")"
+  [ -n "${usage}" ] && printf '%s' "${usage}"
+}
+
+reserve_local_tcp_port() {
+  local port="$1"
+  [ "${port}" = "0" ] && return 0
+  validate_port_number "reserved_tcp_port" "${port}"
+  case " ${RESERVED_LOCAL_TCP_PORTS} " in
+    *" ${port} "*) return 0 ;;
+  esac
+  if [ -n "${RESERVED_LOCAL_TCP_PORTS}" ]; then
+    RESERVED_LOCAL_TCP_PORTS="${RESERVED_LOCAL_TCP_PORTS} ${port}"
+  else
+    RESERVED_LOCAL_TCP_PORTS="${port}"
+  fi
+}
+
+find_next_available_tcp_port() {
+  local start_port="$1"
+  local skip_host_check="${2:-false}"
+  local candidate=$((start_port + 1))
+  while [ "${candidate}" -le 65535 ]; do
+    if [ -z "$(describe_local_tcp_port_conflict "${candidate}" "${skip_host_check}")" ]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+    candidate=$((candidate + 1))
+  done
+  fail "从端口 ${start_port} 开始向后未找到空闲 TCP 端口，请手动清理端口占用后重试"
+}
+
+print_tcp_port_usage_details() {
+  local usage="$1"
+  [ -n "${usage}" ] || return 0
+  echo "占用程序信息:" >&2
+  printf '%s\n' "${usage}" | sed 's/^/  /' >&2
+}
+
+prompt_local_tcp_port() {
+  local env_file="$1"
+  local key="$2"
+  local label="$3"
+  local built_in_default="$4"
+  local allow_zero="${5:-false}"
+  local skip_host_check="false"
+  local default_value
+  local answer
+  local usage
+  [ "${allow_zero}" = "true" ] || validate_port_number "${key}" "${built_in_default}"
+  [ "${allow_zero}" = "true" ] && validate_port_number "${key}" "${built_in_default}" true
+  default_value="$(env_value_or_default "${env_file}" "${key}" "${built_in_default}")"
+  if env_key_exists "${env_file}" "${key}"; then
+    skip_host_check="true"
+  fi
+  while true; do
+    answer="$(prompt_non_empty "${label}" "${default_value}")"
+    validate_port_number "${key}" "${answer}" "${allow_zero}"
+    if [ "${answer}" = "0" ]; then
+      printf '%s' "${answer}"
+      return 0
+    fi
+    usage="$(describe_local_tcp_port_conflict "${answer}" "${skip_host_check}")"
+    if [ -z "${usage}" ]; then
+      reserve_local_tcp_port "${answer}"
+      printf '%s' "${answer}"
+      return 0
+    fi
+    printf '端口 %s 已被占用，不能直接使用。\n' "${answer}" >&2
+    print_tcp_port_usage_details "${usage}"
+    default_value="$(find_next_available_tcp_port "${answer}" "${skip_host_check}")"
+    printf '已临时选中空闲端口 %s 作为当前默认值，请确认或改成其他端口。\n' "${default_value}" >&2
+  done
+}
+
+prompt_remote_port() {
+  local key="$1"
+  local label="$2"
+  local default_value="$3"
+  local allow_zero="${4:-false}"
+  local answer
+  while true; do
+    answer="$(prompt_non_empty "${label}" "${default_value}")"
+    if validate_port_number "${key}" "${answer}" "${allow_zero}"; then
+      printf '%s' "${answer}"
+      return 0
+    fi
+  done
+}
+
+prompt_port_range() {
+  local key="$1"
+  local label="$2"
+  local default_value="$3"
+  local answer
+  while true; do
+    answer="$(prompt_non_empty "${label}" "${default_value}")"
+    if validate_port_range "${key}" "${answer}"; then
+      printf '%s' "${answer}"
+      return 0
+    fi
+  done
+}
+
+discover_ipv4_interfaces() {
+  command -v ip >/dev/null 2>&1 || return 0
+  ip -o -4 addr show up scope global 2>/dev/null \
+    | awk '!seen[$2]++ { split($4, cidr, "/"); print $2 "|" cidr[1] }'
+}
+
+detect_primary_interface_entry() {
+  command -v ip >/dev/null 2>&1 || return 0
+  ip route get 1.1.1.1 2>/dev/null \
+    | awk '{
+        for (i = 1; i <= NF; i++) {
+          if ($i == "dev") dev = $(i + 1)
+          if ($i == "src") src = $(i + 1)
+        }
+      }
+      END {
+        if (dev != "" && src != "") {
+          print dev "|" src
+        }
+      }'
+}
+
+print_interface_options() {
+  local entry
+  local index=1
+  for entry in "$@"; do
+    printf '  %d) %s (%s)\n' "${index}" "${entry%%|*}" "${entry#*|}" >&2
+    index=$((index + 1))
+  done
+}
+
+resolve_interface_choice() {
+  local choice="$1"
+  shift
+  local entries=("$@")
+  local entry
+  local index=1
+  if [[ "${choice}" =~ ^[0-9]+$ ]]; then
+    for entry in "${entries[@]}"; do
+      if [ "${index}" -eq "${choice}" ]; then
+        printf '%s' "${entry}"
+        return 0
+      fi
+      index=$((index + 1))
+    done
+    return 1
+  fi
+  for entry in "${entries[@]}"; do
+    if [ "${entry%%|*}" = "${choice}" ]; then
+      printf '%s' "${entry}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+prompt_interface_selection() {
+  local label="$1"
+  local default_name="$2"
+  local default_ip="$3"
+  shift 3
+  local entries=("$@")
+  local answer
+  local selected
+  if [ "${#entries[@]}" -eq 0 ]; then
+    local name
+    local ip_value
+    name="$(prompt "${label}名称（可留空）" "${default_name}")"
+    ip_value="$(prompt_non_empty "${label} IP" "${default_ip}")"
+    printf '%s|%s' "${name}" "${ip_value}"
+    return 0
+  fi
+  while true; do
+    printf '%s 可用网卡（输入编号或网卡名）:\n' "${label}" >&2
+    print_interface_options "${entries[@]}"
+    answer="$(prompt "${label}" "${default_name}")"
+    if selected="$(resolve_interface_choice "${answer}" "${entries[@]}")"; then
+      printf '%s' "${selected}"
+      return 0
+    fi
+    if [ -n "${default_name}" ] && [ "${answer}" = "${default_name}" ] && [ -n "${default_ip}" ]; then
+      printf '%s|%s' "${default_name}" "${default_ip}"
+      return 0
+    fi
+    printf '无效选择，请输入上面的编号或网卡名。\n' >&2
+  done
+}
+
+configure_host_interfaces() {
+  local env_file="$1"
+  local fallback_ip="$2"
+  local default_entry
+  local default_name
+  local default_ip
+  local primary_entry
+  local multicast_entry
+  local entries=()
+  mapfile -t entries < <(discover_ipv4_interfaces)
+  default_entry="$(detect_primary_interface_entry)"
+  if [ -z "${default_entry}" ] && [ "${#entries[@]}" -gt 0 ]; then
+    default_entry="${entries[0]}"
+  fi
+  default_name="${default_entry%%|*}"
+  default_ip="${default_entry#*|}"
+  [ -n "${default_ip}" ] || default_ip="${fallback_ip}"
+  default_name="$(env_value_or_default "${env_file}" "AGENT_PRIMARY_INTERFACE_NAME" "${default_name}")"
+  default_ip="$(env_value_or_default "${env_file}" "AGENT_PRIMARY_INTERFACE_IP" "${default_ip}")"
+
+  echo "host 工作节点需要分别选择主网卡和组播网卡。" >&2
+  echo "建议：普通流量走主网卡；真实组播收发优先使用独立组播网卡，没有时可与主网卡相同。" >&2
+  primary_entry="$(prompt_interface_selection "主网卡" "${default_name}" "${default_ip}" "${entries[@]}")"
+  AGENT_PRIMARY_INTERFACE_NAME="${primary_entry%%|*}"
+  AGENT_PRIMARY_INTERFACE_IP="${primary_entry#*|}"
+
+  default_name="$(env_value_or_default "${env_file}" "AGENT_MULTICAST_INTERFACE_NAME" "${AGENT_PRIMARY_INTERFACE_NAME}")"
+  default_ip="$(env_value_or_default "${env_file}" "AGENT_MULTICAST_INTERFACE_IP" "${AGENT_PRIMARY_INTERFACE_IP}")"
+  multicast_entry="$(prompt_interface_selection "组播网卡" "${default_name}" "${default_ip}" "${entries[@]}")"
+  AGENT_MULTICAST_INTERFACE_NAME="${multicast_entry%%|*}"
+  AGENT_MULTICAST_INTERFACE_IP="${multicast_entry#*|}"
 }
 
 copy_file_atomically() {
@@ -451,6 +952,15 @@ backup_existing_install() {
   log "已备份现有部署: ${backup_dir}"
 }
 
+create_output_layout_if_local() {
+  local output_root="${INSTALL_DIR}/data/zlm/www/output"
+  if grep -F " ${output_root} " /proc/self/mountinfo >/dev/null 2>&1; then
+    log "检测到 output 目录是挂载点，跳过创建 output/mp4 和 output/hls: ${output_root}"
+    return 0
+  fi
+  mkdir -p "${output_root}/mp4" "${output_root}/hls"
+}
+
 prepare_layout() {
   backup_existing_install
   mkdir -p \
@@ -463,10 +973,9 @@ prepare_layout() {
     "${INSTALL_DIR}/data/media/work" \
     "${INSTALL_DIR}/data/media/logs" \
     "${INSTALL_DIR}/data/postgres-run" \
-    "${INSTALL_DIR}/data/zlm/www/output/mp4" \
-    "${INSTALL_DIR}/data/zlm/www/output/hls" \
     "${INSTALL_DIR}/data/zlm/www/record" \
     "${INSTALL_DIR}/data/zlm/www/snap"
+  create_output_layout_if_local
 }
 
 copy_package_assets() {
@@ -478,6 +987,7 @@ copy_package_assets() {
     role_is_gpu "${INSTALL_ROLE}" && ffmpeg_variant="gpu"
     install_tree "${PACKAGE_ROOT}/runtime/ffmpeg/${ffmpeg_variant}" "${INSTALL_DIR}/runtime/ffmpeg/${ffmpeg_variant}"
     install_tree "${PACKAGE_ROOT}/runtime/zlm" "${INSTALL_DIR}/runtime/zlm"
+    mkdir -p "${INSTALL_DIR}/runtime/zlm/lib/log"
     install_tree "${PACKAGE_ROOT}/templates/common" "${INSTALL_DIR}/zlm"
     [ -f "${INSTALL_DIR}/zlm/zlm.render-config.sh" ] && mv "${INSTALL_DIR}/zlm/zlm.render-config.sh" "${INSTALL_DIR}/zlm/render-config.sh"
     [ -f "${INSTALL_DIR}/zlm/zlm.config.ini.template" ] && mv "${INSTALL_DIR}/zlm/zlm.config.ini.template" "${INSTALL_DIR}/zlm/config.ini.template"
@@ -547,118 +1057,176 @@ write_env_common() {
 }
 
 configure_database() {
-  POSTGRES_DB="${POSTGRES_DB:-streamserver}"
-  POSTGRES_USER="${POSTGRES_USER:-postgres}"
-  POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-$(generate_secret)}"
-  POSTGRES_PORT="${POSTGRES_PORT:-5432}"
+  local existing_env_file="${INSTALL_DIR}/.env"
+  local existing_postgres_password
+  local generated_password
   if ! role_has_core "${INSTALL_ROLE}"; then
     return 0
   fi
   if [ "${DATABASE_MODE}" = "external" ]; then
+    POSTGRES_DB="$(env_value_or_default "${existing_env_file}" "POSTGRES_DB" "streamserver")"
+    POSTGRES_USER="$(env_value_or_default "${existing_env_file}" "POSTGRES_USER" "postgres")"
+    POSTGRES_PASSWORD="$(env_value_or_default "${existing_env_file}" "POSTGRES_PASSWORD" "")"
+    POSTGRES_PORT="$(env_value_or_default "${existing_env_file}" "POSTGRES_PORT" "5432")"
     DATABASE_URL="${DATABASE_URL_INPUT}"
     return 0
   fi
+  generated_password="$(generate_secret)"
   if [ "${BUNDLE_POSTGRES_RUNTIME:-false}" = "true" ] && prompt_yes_no "是否使用包内 PostgreSQL runtime？选择 N 则输入外部 DATABASE_URL" "Y"; then
     DATABASE_MODE="bundled"
+    POSTGRES_DB="$(prompt_non_empty "PostgreSQL 数据库名" "$(env_value_or_default "${existing_env_file}" "POSTGRES_DB" "streamserver")")"
+    POSTGRES_USER="$(prompt_non_empty "PostgreSQL 用户名" "$(env_value_or_default "${existing_env_file}" "POSTGRES_USER" "postgres")")"
+    existing_postgres_password="$(env_value_or_default "${existing_env_file}" "POSTGRES_PASSWORD" "")"
+    POSTGRES_PASSWORD="$(prompt "PostgreSQL 密码（留空沿用现有值或自动生成）" "")"
+    [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${existing_postgres_password}"
+    [ -n "${POSTGRES_PASSWORD}" ] || POSTGRES_PASSWORD="${generated_password}"
+    POSTGRES_PORT="$(prompt_local_tcp_port "${existing_env_file}" "POSTGRES_PORT" "数据库宿主机监听端口" "5432")"
     DATABASE_URL="postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:${POSTGRES_PORT}/${POSTGRES_DB}"
   else
     DATABASE_MODE="external"
     DATABASE_URL="$(prompt_non_empty "外部 DATABASE_URL" "${DATABASE_URL_INPUT}")"
+    POSTGRES_DB="$(env_value_or_default "${existing_env_file}" "POSTGRES_DB" "streamserver")"
+    POSTGRES_USER="$(env_value_or_default "${existing_env_file}" "POSTGRES_USER" "postgres")"
+    POSTGRES_PASSWORD="$(env_value_or_default "${existing_env_file}" "POSTGRES_PASSWORD" "")"
+    POSTGRES_PORT="$(env_value_or_default "${existing_env_file}" "POSTGRES_PORT" "5432")"
   fi
 }
 
 configure_core_values() {
-  CORE_HTTP_PORT="${CORE_HTTP_PORT:-8080}"
-  CORE_GRPC_PORT="${CORE_GRPC_PORT:-50051}"
-  HOOK_SHARED_SECRET="${HOOK_SHARED_SECRET:-$(generate_secret)}"
-  HOOK_SOURCE_ALLOWLIST="${HOOK_SOURCE_ALLOWLIST:-}"
-  STORAGE_ALLOWLIST="${STORAGE_ALLOWLIST:-${INSTALL_DIR}/data/media/work,${INSTALL_DIR}/data/zlm/www}"
-  AUTH_MODE="${AUTH_MODE:-disabled}"
+  local existing_env_file="${INSTALL_DIR}/.env"
+  local existing_hook_secret
+  local generated_secret
+  local auth_default
+  if ! role_has_core "${INSTALL_ROLE}"; then
+    return 0
+  fi
+  CORE_HTTP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "CORE_HTTP_PORT" "控制面板网页和 HTTP API 端口" "8080")"
+  CORE_GRPC_PORT="$(prompt_local_tcp_port "${existing_env_file}" "CORE_GRPC_PORT" "控制面板内部通信端口" "50051")"
+  generated_secret="$(generate_secret)"
+  existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
+  HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空沿用现有值或自动生成）" "")"
+  [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${existing_hook_secret}"
+  [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${generated_secret}"
+  HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")")"
+  STORAGE_ALLOWLIST="$(prompt_non_empty "本地媒体文件访问白名单，逗号分隔" "$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "${INSTALL_DIR}/data/media/work,${INSTALL_DIR}/data/zlm/www")")"
+  AUTH_MODE="$(env_value_or_default "${existing_env_file}" "AUTH_MODE" "disabled")"
   AUTH_ENABLED="false"
   JWT_PUBLIC_KEY=""
   AUTH_JWT_PRIVATE_KEY_PATH=""
   AUTH_JWT_PUBLIC_KEY_PATH=""
-  AUTH_ACCESS_TOKEN_TTL="${AUTH_ACCESS_TOKEN_TTL:-15m}"
-  AUTH_REFRESH_TOKEN_TTL="${AUTH_REFRESH_TOKEN_TTL:-7d}"
+  AUTH_ACCESS_TOKEN_TTL="$(env_value_or_default "${existing_env_file}" "AUTH_ACCESS_TOKEN_TTL" "15m")"
+  AUTH_REFRESH_TOKEN_TTL="$(env_value_or_default "${existing_env_file}" "AUTH_REFRESH_TOKEN_TTL" "7d")"
   ADMIN_USERNAME=""
   ADMIN_PASSWORD=""
-  if role_has_core "${INSTALL_ROLE}" && prompt_yes_no "是否启用本地用户名密码鉴权？" "N"; then
+  auth_default="N"
+  [ "${AUTH_MODE}" = "local_password" ] && auth_default="Y"
+  if prompt_yes_no "是否启用本地用户名密码鉴权？" "${auth_default}"; then
     AUTH_MODE="local_password"
     AUTH_ENABLED="true"
     ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "admin")"
-    ADMIN_PASSWORD="$(prompt_secret "管理员密码")"
-    [ -n "${ADMIN_PASSWORD}" ] || fail "管理员密码不能为空"
+    ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
     openssl genpkey -algorithm Ed25519 -out "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem" >/dev/null 2>&1
     openssl pkey -in "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem" -pubout -out "${INSTALL_DIR}/certs/auth/jwt-ed25519-public.pem" >/dev/null 2>&1
     chmod 600 "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem"
     chmod 644 "${INSTALL_DIR}/certs/auth/jwt-ed25519-public.pem"
     AUTH_JWT_PRIVATE_KEY_PATH="${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem"
     AUTH_JWT_PUBLIC_KEY_PATH="${INSTALL_DIR}/certs/auth/jwt-ed25519-public.pem"
+  else
+    AUTH_MODE="disabled"
+    AUTH_ENABLED="false"
   fi
 }
 
+configure_zlm_port_values() {
+  local existing_env_file="$1"
+  ZLM_HTTP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_HTTP_PORT" "ZLM HTTP 监听端口" "80")"
+  ZLM_HTTPS_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_HTTPS_PORT" "ZLM HTTPS 监听端口（0 表示关闭）" "0" true)"
+  ZLM_RTMP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTMP_PORT" "ZLM RTMP 监听端口" "1935")"
+  ZLM_RTMPS_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTMPS_PORT" "ZLM RTMPS 监听端口（0 表示关闭）" "0" true)"
+  ZLM_RTSP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTSP_PORT" "ZLM RTSP 监听端口" "554")"
+  ZLM_RTSPS_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTSPS_PORT" "ZLM RTSPS 监听端口（0 表示关闭）" "0" true)"
+  ZLM_RTP_PROXY_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTP_PROXY_PORT" "ZLM RTP Proxy 监听端口（0 表示关闭）" "10000" true)"
+  ZLM_RTP_PROXY_PORT_RANGE="$(prompt_port_range "ZLM_RTP_PROXY_PORT_RANGE" "ZLM RTP Proxy 随机端口范围（start-end，0-0 表示关闭）" "$(env_value_or_default "${existing_env_file}" "ZLM_RTP_PROXY_PORT_RANGE" "30000-30500")")"
+  ZLM_RTC_SIGNALING_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTC_SIGNALING_PORT" "ZLM WebRTC signaling 端口（0 表示关闭）" "8000" true)"
+  ZLM_RTC_SIGNALING_SSL_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTC_SIGNALING_SSL_PORT" "ZLM WebRTC signaling SSL 端口（0 表示关闭）" "0" true)"
+  ZLM_RTC_ICE_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTC_ICE_PORT" "ZLM WebRTC ICE UDP 端口（0 表示关闭）" "0" true)"
+  ZLM_RTC_ICE_TCP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTC_ICE_TCP_PORT" "ZLM WebRTC ICE TCP 端口（0 表示关闭）" "0" true)"
+  ZLM_RTC_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTC_PORT" "ZLM WebRTC UDP 端口（0 表示关闭）" "0" true)"
+  ZLM_RTC_TCP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_RTC_TCP_PORT" "ZLM WebRTC TCP 端口（0 表示关闭）" "0" true)"
+  ZLM_RTC_PORT_RANGE="$(prompt_port_range "ZLM_RTC_PORT_RANGE" "ZLM WebRTC 端口范围（start-end，0-0 表示关闭）" "$(env_value_or_default "${existing_env_file}" "ZLM_RTC_PORT_RANGE" "0-0")")"
+  ZLM_SRT_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_SRT_PORT" "ZLM SRT 监听端口（0 表示关闭）" "0" true)"
+  ZLM_SHELL_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_SHELL_PORT" "ZLM Shell 监听端口（0 表示关闭）" "0" true)"
+  ZLM_ONVIF_PORT="$(prompt_local_tcp_port "${existing_env_file}" "ZLM_ONVIF_PORT" "ZLM ONVIF 监听端口（0 表示关闭）" "0" true)"
+}
+
 configure_worker_values() {
+  local existing_env_file="${INSTALL_DIR}/.env"
   local default_ip
+  local existing_hook_secret
+  local base_label="cpu"
   default_ip="$(detect_default_ip)"
   [ -n "${default_ip}" ] || default_ip="127.0.0.1"
-  NODE_ID="${NODE_ID:-$(generate_uuid)}"
-  AGENT_NODE_NAME="${AGENT_NODE_NAME:-$(hostname -s 2>/dev/null || echo streamserver-node)}"
-  PUBLIC_HOST="${PUBLIC_HOST:-${default_ip}}"
-  CORE_HTTP_HOST="${CORE_HTTP_HOST:-${default_ip}}"
-  CORE_GRPC_HOST="${CORE_GRPC_HOST:-${CORE_HTTP_HOST}}"
+  NODE_ID="$(prompt_non_empty "节点 UUID（留空自动生成）" "$(env_value_or_default "${existing_env_file}" "NODE_ID" "$(generate_uuid)")")"
+  AGENT_NODE_NAME="$(prompt_non_empty "节点名称" "$(env_value_or_default "${existing_env_file}" "AGENT_NODE_NAME" "$(hostname -s 2>/dev/null || echo streamserver-node)")")"
+  configure_host_interfaces "${existing_env_file}" "${default_ip}"
+  default_ip="${AGENT_PRIMARY_INTERFACE_IP}"
+  PUBLIC_HOST="$(prompt_non_empty "当前工作节点对外可访问的主机名或 IP" "$(env_value_or_default "${existing_env_file}" "PUBLIC_HOST" "${default_ip}")")"
   if role_has_core "${INSTALL_ROLE}"; then
     CORE_HTTP_HOST="127.0.0.1"
     CORE_GRPC_HOST="127.0.0.1"
+  else
+    CORE_HTTP_HOST="$(prompt_non_empty "control-plane HTTP 地址或域名" "$(env_value_or_default "${existing_env_file}" "CORE_HTTP_HOST" "")")"
+    CORE_HTTP_PORT="$(prompt_remote_port "CORE_HTTP_PORT" "control-plane HTTP 端口" "$(env_value_or_default "${existing_env_file}" "CORE_HTTP_PORT" "8080")")"
+    CORE_GRPC_HOST="$(prompt_non_empty "control-plane gRPC 地址或域名" "$(env_value_or_default "${existing_env_file}" "CORE_GRPC_HOST" "${CORE_HTTP_HOST}")")"
+    CORE_GRPC_PORT="$(prompt_remote_port "CORE_GRPC_PORT" "control-plane gRPC 端口" "$(env_value_or_default "${existing_env_file}" "CORE_GRPC_PORT" "50051")")"
+    existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
+    HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
+    [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${existing_hook_secret}"
+    [ -n "${HOOK_SHARED_SECRET}" ] || fail "worker 角色必须提供与 control-plane 一致的 Hook/API 密钥"
   fi
-  if [ -z "${HOOK_SHARED_SECRET:-}" ]; then
-    HOOK_SHARED_SECRET="$(prompt_non_empty "ZLM Hook/API 密钥（需与 control-plane 一致）" "")"
-  fi
-  AGENT_HTTP_PORT="${AGENT_HTTP_PORT:-8081}"
-  ZLM_HTTP_PORT="${ZLM_HTTP_PORT:-80}"
-  ZLM_HTTPS_PORT="${ZLM_HTTPS_PORT:-0}"
-  ZLM_RTMP_PORT="${ZLM_RTMP_PORT:-1935}"
-  ZLM_RTMPS_PORT="${ZLM_RTMPS_PORT:-0}"
-  ZLM_RTSP_PORT="${ZLM_RTSP_PORT:-554}"
-  ZLM_RTSPS_PORT="${ZLM_RTSPS_PORT:-0}"
-  ZLM_RTP_PROXY_PORT="${ZLM_RTP_PROXY_PORT:-10000}"
-  ZLM_RTP_PROXY_PORT_RANGE="${ZLM_RTP_PROXY_PORT_RANGE:-30000-30500}"
-  ZLM_RTC_SIGNALING_PORT="${ZLM_RTC_SIGNALING_PORT:-8000}"
-  ZLM_RTC_SIGNALING_SSL_PORT="${ZLM_RTC_SIGNALING_SSL_PORT:-0}"
-  ZLM_RTC_ICE_PORT="${ZLM_RTC_ICE_PORT:-0}"
-  ZLM_RTC_ICE_TCP_PORT="${ZLM_RTC_ICE_TCP_PORT:-0}"
-  ZLM_RTC_PORT="${ZLM_RTC_PORT:-0}"
-  ZLM_RTC_TCP_PORT="${ZLM_RTC_TCP_PORT:-0}"
-  ZLM_RTC_PORT_RANGE="${ZLM_RTC_PORT_RANGE:-0-0}"
-  ZLM_SRT_PORT="${ZLM_SRT_PORT:-0}"
-  ZLM_SHELL_PORT="${ZLM_SHELL_PORT:-0}"
-  ZLM_ONVIF_PORT="${ZLM_ONVIF_PORT:-0}"
-  AGENT_PRIMARY_INTERFACE_NAME="${AGENT_PRIMARY_INTERFACE_NAME:-}"
-  AGENT_PRIMARY_INTERFACE_IP="${AGENT_PRIMARY_INTERFACE_IP:-${default_ip}}"
-  AGENT_MULTICAST_INTERFACE_NAME="${AGENT_MULTICAST_INTERFACE_NAME:-${AGENT_PRIMARY_INTERFACE_NAME}}"
-  AGENT_MULTICAST_INTERFACE_IP="${AGENT_MULTICAST_INTERFACE_IP:-${AGENT_PRIMARY_INTERFACE_IP}}"
+  AGENT_HTTP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "AGENT_HTTP_PORT" "工作节点本地接口端口" "8081")"
+  configure_zlm_port_values "${existing_env_file}"
   AGENT_NETWORK_MODE="host"
   AGENT_ACCELERATION_MODE="cpu"
-  AGENT_LABELS="cpu"
   if role_is_gpu "${INSTALL_ROLE}"; then
     AGENT_ACCELERATION_MODE="gpu"
-    AGENT_LABELS="gpu"
+    base_label="gpu"
   fi
-  AGENT_MAX_RUNTIME_SLOTS="${AGENT_MAX_RUNTIME_SLOTS:-0}"
-  AGENT_RUNTIME_MANAGER_START_LIMIT="${AGENT_RUNTIME_MANAGER_START_LIMIT:-8}"
-  AGENT_RUNTIME_MANAGER_STOP_LIMIT="${AGENT_RUNTIME_MANAGER_STOP_LIMIT:-16}"
-  AGENT_RUNTIME_MANAGER_RECORDING_LIMIT="${AGENT_RUNTIME_MANAGER_RECORDING_LIMIT:-12}"
-  AGENT_RUNTIME_MANAGER_ADOPT_LIMIT="${AGENT_RUNTIME_MANAGER_ADOPT_LIMIT:-1}"
-  AGENT_MP4_RECORD_SEGMENT_SEC="${AGENT_MP4_RECORD_SEGMENT_SEC:-7200}"
-  AGENT_HLS_RECORD_SEGMENT_SEC="${AGENT_HLS_RECORD_SEGMENT_SEC:-60}"
-  AGENT_ARTIFACT_CLEANUP_ENABLED="${AGENT_ARTIFACT_CLEANUP_ENABLED:-true}"
-  AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT="${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT:-85}"
-  AGENT_ARTIFACT_CLEANUP_STRATEGY="${AGENT_ARTIFACT_CLEANUP_STRATEGY:-delete_oldest_then_reject}"
-  AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="${AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC:-30}"
-  WORK_ROOT="${INSTALL_DIR}/data/media/work"
-  UPLOAD_MAX_BYTES="${UPLOAD_MAX_BYTES:-10737418240}"
-  UPLOAD_ALLOWED_EXTENSIONS="${UPLOAD_ALLOWED_EXTENSIONS:-mp4,mov,m4v,mkv,webm,ts,m2ts,mts,flv}"
-  UPLOAD_PROBE_TIMEOUT_SEC="${UPLOAD_PROBE_TIMEOUT_SEC:-30}"
-  PUBLIC_MEDIA_BASE_URL="${PUBLIC_MEDIA_BASE_URL:-}"
+  AGENT_LABELS="$(collect_agent_labels "${base_label}" "$(env_value_or_default "${existing_env_file}" "AGENT_LABELS" "${base_label}")")"
+  AGENT_MAX_LIVE_RUNTIME_SLOTS="$(prompt_non_negative_integer "AGENT_MAX_LIVE_RUNTIME_SLOTS" "直播任务并发上限（0 表示不限）" "$(env_value_or_default "${existing_env_file}" "AGENT_MAX_LIVE_RUNTIME_SLOTS" "0")")"
+  AGENT_MAX_VOD_RUNTIME_SLOTS="$(prompt_non_negative_integer "AGENT_MAX_VOD_RUNTIME_SLOTS" "点播任务并发上限（0 表示不限）" "$(env_value_or_default "${existing_env_file}" "AGENT_MAX_VOD_RUNTIME_SLOTS" "0")")"
+  AGENT_RUNTIME_MANAGER_START_LIMIT="$(prompt_positive_integer "AGENT_RUNTIME_MANAGER_START_LIMIT" "运行时启动并发上限" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_MANAGER_START_LIMIT" "8")")"
+  AGENT_RUNTIME_MANAGER_STOP_LIMIT="$(prompt_positive_integer "AGENT_RUNTIME_MANAGER_STOP_LIMIT" "运行时停止并发上限" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_MANAGER_STOP_LIMIT" "16")")"
+  AGENT_RUNTIME_MANAGER_RECORDING_LIMIT="$(prompt_positive_integer "AGENT_RUNTIME_MANAGER_RECORDING_LIMIT" "录制状态巡检并发上限" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_MANAGER_RECORDING_LIMIT" "12")")"
+  AGENT_RUNTIME_MANAGER_ADOPT_LIMIT="$(prompt_positive_integer "AGENT_RUNTIME_MANAGER_ADOPT_LIMIT" "孤儿任务接管并发上限" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_MANAGER_ADOPT_LIMIT" "1")")"
+  AGENT_RUNTIME_LOG_TAIL_BYTES="$(prompt_positive_integer "AGENT_RUNTIME_LOG_TAIL_BYTES" "运行诊断日志 tail 保存字节数" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_LOG_TAIL_BYTES" "8192")")"
+  AGENT_RUNTIME_LOG_MAX_FILE_BYTES="$(prompt_positive_integer "AGENT_RUNTIME_LOG_MAX_FILE_BYTES" "单个运行诊断日志文件最大字节数" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_LOG_MAX_FILE_BYTES" "134217728")")"
+  AGENT_RUNTIME_LOG_RETENTION_DAYS="$(prompt_positive_integer "AGENT_RUNTIME_LOG_RETENTION_DAYS" "运行诊断日志本地保留天数" "$(env_value_or_default "${existing_env_file}" "AGENT_RUNTIME_LOG_RETENTION_DAYS" "7")")"
+  AGENT_MP4_RECORD_SEGMENT_SEC="$(prompt_positive_integer "AGENT_MP4_RECORD_SEGMENT_SEC" "MP4 录制分片时长（秒）" "$(env_value_or_default "${existing_env_file}" "AGENT_MP4_RECORD_SEGMENT_SEC" "7200")")"
+  AGENT_HLS_RECORD_SEGMENT_SEC="$(prompt_non_empty "HLS 录制分片时长（秒，30 或 60）" "$(env_value_or_default "${existing_env_file}" "AGENT_HLS_RECORD_SEGMENT_SEC" "60")")"
+  case "${AGENT_HLS_RECORD_SEGMENT_SEC}" in
+    30|60) ;;
+    *) fail "AGENT_HLS_RECORD_SEGMENT_SEC 必须是 30 或 60" ;;
+  esac
+  if prompt_yes_no "是否启用产物磁盘清理？" "$( [ "$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_ENABLED" "true")" = "true" ] && printf Y || printf N )"; then
+    AGENT_ARTIFACT_CLEANUP_ENABLED="true"
+  else
+    AGENT_ARTIFACT_CLEANUP_ENABLED="false"
+  fi
+  AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT="$(prompt_non_empty "产物磁盘清理阈值百分比" "$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "85")")"
+  validate_percent_value "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT" "${AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT}"
+  AGENT_ARTIFACT_CLEANUP_STRATEGY="$(prompt_non_empty "产物磁盘清理策略（delete_oldest_then_reject/reject_only）" "$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_STRATEGY" "delete_oldest_then_reject")")"
+  case "${AGENT_ARTIFACT_CLEANUP_STRATEGY}" in
+    delete_oldest_then_reject|reject_only) ;;
+    *) fail "AGENT_ARTIFACT_CLEANUP_STRATEGY 必须是 delete_oldest_then_reject/reject_only 之一" ;;
+  esac
+  AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC="$(prompt_positive_integer "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "产物磁盘清理检查间隔（秒）" "$(env_value_or_default "${existing_env_file}" "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC" "30")")"
+  WORK_ROOT="$(prompt_non_empty "工作目录" "$(env_value_or_default "${existing_env_file}" "WORK_ROOT" "${INSTALL_DIR}/data/media/work")")"
+  UPLOAD_MAX_BYTES="$(prompt_positive_integer "UPLOAD_MAX_BYTES" "上传文件最大字节数" "$(env_value_or_default "${existing_env_file}" "UPLOAD_MAX_BYTES" "10737418240")")"
+  UPLOAD_ALLOWED_EXTENSIONS="$(prompt_non_empty "允许上传扩展名（英文逗号分隔，不带点号）" "$(env_value_or_default "${existing_env_file}" "UPLOAD_ALLOWED_EXTENSIONS" "mp4,mov,m4v,mkv,webm,ts,m2ts,mts,flv")")"
+  validate_upload_extensions "${UPLOAD_ALLOWED_EXTENSIONS}"
+  UPLOAD_PROBE_TIMEOUT_SEC="$(prompt_positive_integer "UPLOAD_PROBE_TIMEOUT_SEC" "上传探测超时时间（秒）" "$(env_value_or_default "${existing_env_file}" "UPLOAD_PROBE_TIMEOUT_SEC" "30")")"
+  PUBLIC_MEDIA_BASE_URL="$(prompt "公开媒体访问基准 URL（可留空）" "$(env_value_or_default "${existing_env_file}" "PUBLIC_MEDIA_BASE_URL" "")")"
 }
 
 write_env_file() {
@@ -702,8 +1270,8 @@ write_env_file() {
     write_env_entry "${env_file}" AGENT_HTTP_ADDR "0.0.0.0:${AGENT_HTTP_PORT}"
     write_env_entry "${env_file}" AGENT_HTTP_PORT "${AGENT_HTTP_PORT}"
     write_env_entry "${env_file}" HOOK_SHARED_SECRET "${HOOK_SHARED_SECRET}"
-    write_env_entry "${env_file}" ZLM_API_HOST "127.0.0.1"
-    write_env_entry "${env_file}" ZLM_API_BASE "http://127.0.0.1:${ZLM_HTTP_PORT}"
+    write_env_entry "${env_file}" ZLM_API_HOST "${PUBLIC_HOST}"
+    write_env_entry "${env_file}" ZLM_API_BASE "http://${PUBLIC_HOST}:${ZLM_HTTP_PORT}"
     write_env_entry "${env_file}" ZLM_API_SECRET "${HOOK_SHARED_SECRET:-${ZLM_API_SECRET:-}}"
     write_env_entry "${env_file}" ZLM_API_ALLOW_IP_RANGE "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
     write_env_entry "${env_file}" ZLM_HOOK_SHARED_SECRET "${HOOK_SHARED_SECRET:-${ZLM_API_SECRET:-}}"
@@ -742,11 +1310,15 @@ write_env_file() {
     write_env_entry "${env_file}" AGENT_NETWORK_MODE "${AGENT_NETWORK_MODE}"
     write_env_entry "${env_file}" AGENT_ACCELERATION_MODE "${AGENT_ACCELERATION_MODE}"
     write_env_entry "${env_file}" AGENT_LABELS "${AGENT_LABELS}"
-    write_env_entry "${env_file}" AGENT_MAX_RUNTIME_SLOTS "${AGENT_MAX_RUNTIME_SLOTS}"
+    write_env_entry "${env_file}" AGENT_MAX_LIVE_RUNTIME_SLOTS "${AGENT_MAX_LIVE_RUNTIME_SLOTS}"
+    write_env_entry "${env_file}" AGENT_MAX_VOD_RUNTIME_SLOTS "${AGENT_MAX_VOD_RUNTIME_SLOTS}"
     write_env_entry "${env_file}" AGENT_RUNTIME_MANAGER_START_LIMIT "${AGENT_RUNTIME_MANAGER_START_LIMIT}"
     write_env_entry "${env_file}" AGENT_RUNTIME_MANAGER_STOP_LIMIT "${AGENT_RUNTIME_MANAGER_STOP_LIMIT}"
     write_env_entry "${env_file}" AGENT_RUNTIME_MANAGER_RECORDING_LIMIT "${AGENT_RUNTIME_MANAGER_RECORDING_LIMIT}"
     write_env_entry "${env_file}" AGENT_RUNTIME_MANAGER_ADOPT_LIMIT "${AGENT_RUNTIME_MANAGER_ADOPT_LIMIT}"
+    write_env_entry "${env_file}" AGENT_RUNTIME_LOG_TAIL_BYTES "${AGENT_RUNTIME_LOG_TAIL_BYTES}"
+    write_env_entry "${env_file}" AGENT_RUNTIME_LOG_MAX_FILE_BYTES "${AGENT_RUNTIME_LOG_MAX_FILE_BYTES}"
+    write_env_entry "${env_file}" AGENT_RUNTIME_LOG_RETENTION_DAYS "${AGENT_RUNTIME_LOG_RETENTION_DAYS}"
     write_env_entry "${env_file}" AGENT_MP4_RECORD_SEGMENT_SEC "${AGENT_MP4_RECORD_SEGMENT_SEC}"
     write_env_entry "${env_file}" AGENT_HLS_RECORD_SEGMENT_SEC "${AGENT_HLS_RECORD_SEGMENT_SEC}"
     write_env_entry "${env_file}" AGENT_ARTIFACT_CLEANUP_ENABLED "${AGENT_ARTIFACT_CLEANUP_ENABLED}"
@@ -764,6 +1336,27 @@ write_env_file() {
     write_env_entry "${env_file}" AGENT_ALLOW_ENHANCED_RTMP_EXPOSE true
   fi
   chmod 600 "${env_file}"
+}
+
+load_installed_env() {
+  set -a
+  # shellcheck disable=SC1091
+  . "${INSTALL_DIR}/.env"
+  set +a
+}
+
+run_streamserver_config_tui_if_requested() {
+  local env_file="${INSTALL_DIR}/.env"
+  local config_bin="${INSTALL_DIR}/bin/streamserver-config"
+  [ -x "${config_bin}" ] || return 0
+  if [ -t 0 ] && [ -t 1 ] && prompt_yes_no "是否现在打开高级配置界面？" "N"; then
+    "${config_bin}" --env "${env_file}" --no-restart-prompt
+    load_installed_env
+    if role_has_core "${INSTALL_ROLE}" && [ "${AUTH_MODE:-disabled}" = "local_password" ] && [ -z "${ADMIN_PASSWORD:-}" ]; then
+      ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "${ADMIN_USERNAME:-admin}")"
+      ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
+    fi
+  fi
 }
 
 render_template() {
@@ -851,7 +1444,7 @@ initialize_postgres_if_needed() {
   local data_dir="${INSTALL_DIR}/data/postgres"
   local pwfile="${INSTALL_DIR}/.postgres-pw"
   mkdir -p "${data_dir}"
-  chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}/data" "${INSTALL_DIR}/runtime/postgres"
+  chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${data_dir}" "${INSTALL_DIR}/data/postgres-run" "${INSTALL_DIR}/runtime/postgres"
   if [ ! -f "${data_dir}/PG_VERSION" ]; then
     printf '%s\n' "${POSTGRES_PASSWORD}" >"${pwfile}"
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "${pwfile}"
@@ -967,7 +1560,13 @@ EOF
 }
 
 fix_permissions() {
-  chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}"
+  chown "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}"
+  for item in bin runtime ui zlm docs certs systemd uninstall.sh .env; do
+    [ -e "${INSTALL_DIR}/${item}" ] && chown -R "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}/${item}"
+  done
+  for item in data data/media data/media/work data/media/logs data/postgres data/postgres-run data/zlm data/zlm/www data/zlm/www/record data/zlm/www/snap; do
+    [ -e "${INSTALL_DIR}/${item}" ] && chown "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}/${item}"
+  done
   chmod 755 "${INSTALL_DIR}" "${INSTALL_DIR}/bin"
 }
 
@@ -987,6 +1586,14 @@ start_services_if_requested() {
   log "健康检查: ${INSTALL_DIR}/bin/streamserverctl health"
 }
 
+confirm_start_after_install() {
+  [ "${START_AFTER_INSTALL}" -eq 1 ] || return 0
+  if ! prompt_yes_no "是否立即启动 native 服务？" "Y"; then
+    START_AFTER_INSTALL=0
+    log "已选择暂不启动服务。后续可执行: ${INSTALL_DIR}/bin/streamserverctl start"
+  fi
+}
+
 main() {
   parse_args "$@"
   load_manifest
@@ -1000,6 +1607,7 @@ main() {
   ensure_root_for_install
   select_role
   collect_basic_inputs
+  confirm_existing_install_target
   configure_database
   prepare_layout
   copy_package_assets
@@ -1008,12 +1616,14 @@ main() {
     configure_worker_values
   fi
   write_env_file
+  run_streamserver_config_tui_if_requested
   write_streamserverctl
   install_uninstaller
   ensure_service_user
   initialize_postgres_if_needed
   fix_permissions
   install_systemd_units
+  confirm_start_after_install
   start_services_if_requested
   log "安装完成: ${INSTALL_DIR}"
   log "卸载: ${INSTALL_DIR}/uninstall.sh"

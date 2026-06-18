@@ -636,6 +636,20 @@ impl RuntimeManager {
                 return None;
             }
         };
+        let slot_class = match self
+            .executor
+            .runtime_slot_class_for_manager(&queued.request)
+        {
+            Ok(slot_class) => slot_class,
+            Err(error) => {
+                self.finish_operation(queued.operation_id);
+                send_start_reply(
+                    queued.reply,
+                    RuntimeManagerRequestOutcome::Completed(Err(error)),
+                );
+                return None;
+            }
+        };
 
         let stopping_updates = cleanup_stale_attempt_runtimes(
             StaleAttemptCleanupContext {
@@ -649,7 +663,7 @@ impl RuntimeManager {
             self.apply_state_handle(handle);
         }
 
-        let slot_permit = match self.backend_store.try_acquire_slot() {
+        let slot_permit = match self.backend_store.try_acquire_slot(slot_class) {
             Ok(slot_permit) => slot_permit,
             Err(error) => {
                 self.finish_operation(queued.operation_id);
@@ -1212,7 +1226,17 @@ impl RuntimeManager {
                 RuntimeAdoptionOutcome::Adopted(commit) => {
                     let generation = self.next_runtime_generation();
                     let runtime_id = commit.handle.runtime_id;
+                    let Some(source_mode) =
+                        crate::runtime_metadata::source_mode_from_handle(&commit.handle)
+                    else {
+                        warn!(
+                            runtime_id = %runtime_id,
+                            "adopted runtime is missing resolved_spec.input.source_mode"
+                        );
+                        continue;
+                    };
                     let backend = self.backend_store.adopted_runtime(
+                        crate::runtime_process::RuntimeSlotClass::from_source_mode(source_mode),
                         commit.backend.process,
                         commit.backend.companion_processes.clone(),
                     );
@@ -1432,7 +1456,10 @@ impl RuntimeManager {
                     event.was_stopped,
                     &restart_status,
                 ) {
-                    match self.backend_store.try_acquire_slot() {
+                    match self
+                        .executor
+                        .acquire_runtime_slot_for_handle(&current_handle)
+                    {
                         Ok(slot_permit) => Some(slot_permit),
                         Err(error) => {
                             warn!(

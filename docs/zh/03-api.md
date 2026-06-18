@@ -179,7 +179,7 @@
 - `input.interface_ip` 只用于节点本地收发绑定，不参与源流亲和调度。
 - `stream_bridge` 组播输入/输出若未显式指定 `interface_name/interface_ip`，默认使用工作节点安装时配置的组播网卡。
 - 同网段优先不是强约束；若没有命中节点，则回落到其他在线节点。
-- 同网段优先级之后，再按节点实时负载排序，先比较 `slot_usage`，再比较 `running_tasks`。
+- 同网段优先级之后，再按任务 `input.source_mode` 选择节点对应的 `runtime_slot_loads` 分桶，先比较该分桶 `slot_usage`，再比较任务数。
 - 当前只对字面量 IP 生效；若输入 URL 使用域名，则退化为纯负载调度。
 
 请求体：

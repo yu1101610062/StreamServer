@@ -68,7 +68,7 @@ service ControlPlane {
 - `starting_tasks`
 - `stopping_tasks`
 - `orphaned_tasks`
-- `slot_usage`
+- `runtime_slot_loads[]`：按 `source_mode=live/vod` 分桶上报 `max_runtime_slots`、各状态任务数和 `slot_usage`
 - `zlm_alive`
 - `ffmpeg_alive`
 
@@ -102,7 +102,7 @@ Agent 启动探测或接到探测命令后上报。
 
 ### 4.5 `task_log_batch`
 
-日志按批发送，单批上限 128 行或 32KB。
+日志按批发送，单批上限 64 行或 512KB。Core 只做当前 attempt 归属校验和实时消费，不把完整日志行落库；终态取证以 `attempt_diagnostics` 事件中的摘要、tail 和 Agent 本地日志路径为准。
 
 字段：
 

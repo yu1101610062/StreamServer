@@ -72,7 +72,7 @@ fn restart_panel(app: &ConfigApp) -> Paragraph<'static> {
     let unit = app
         .restart_task
         .as_ref()
-        .map(|task| task.unit.as_str())
+        .map(|task| task.label.as_str())
         .unwrap_or("-");
     Paragraph::new(vec![
         Line::from(""),

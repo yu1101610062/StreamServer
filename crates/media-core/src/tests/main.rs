@@ -7,7 +7,9 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
-use media_domain::{AgentRegistration, HeartbeatSnapshot, NetworkMode};
+use media_domain::{
+    AgentRegistration, HeartbeatSnapshot, NetworkMode, RuntimeSlotLoad, SourceMode,
+};
 use serde_json::json;
 use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
@@ -35,6 +37,23 @@ fn auth_config_from_public_key(enabled: bool, pem: &str) -> anyhow::Result<AuthC
     } else {
         Ok(disabled_auth_config())
     }
+}
+
+fn live_runtime_slot_load(running_tasks: u32, slot_usage: f64) -> Vec<RuntimeSlotLoad> {
+    let max_runtime_slots = if running_tasks == 0 || slot_usage <= 0.0 {
+        0
+    } else {
+        ((running_tasks as f64 / slot_usage).ceil() as u32).max(1)
+    };
+    vec![RuntimeSlotLoad {
+        source_mode: SourceMode::Live,
+        max_runtime_slots,
+        running_tasks,
+        starting_tasks: 0,
+        stopping_tasks: 0,
+        orphaned_tasks: 0,
+        slot_usage,
+    }]
 }
 
 struct TestDatabase {
@@ -192,7 +211,7 @@ fn play_url_test_node(agent_stream_addr: &str) -> repository::NodeSummary {
         gpu: Vec::new(),
         gpu_devices: Vec::new(),
         capability_captured_at: None,
-        slot_usage: None,
+        runtime_slot_loads: None,
         running_tasks: None,
         starting_tasks: None,
         stopping_tasks: None,
@@ -2152,7 +2171,7 @@ async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
                 starting_tasks: 0,
                 stopping_tasks: 0,
                 orphaned_tasks: 0,
-                slot_usage: 0.4,
+                runtime_slot_loads: live_runtime_slot_load(2, 0.4),
                 zlm_alive: true,
                 ffmpeg_alive: true,
                 artifact_cleanup_blocked: false,
@@ -2176,7 +2195,7 @@ async fn list_node_heartbeats_returns_recent_samples() -> anyhow::Result<()> {
                 starting_tasks: 0,
                 stopping_tasks: 0,
                 orphaned_tasks: 0,
-                slot_usage: 0.55,
+                runtime_slot_loads: live_runtime_slot_load(3, 0.55),
                 zlm_alive: true,
                 ffmpeg_alive: false,
                 artifact_cleanup_blocked: false,
@@ -2244,7 +2263,7 @@ async fn node_heartbeat_does_not_refresh_media_last_seen_at() -> anyhow::Result<
                 starting_tasks: 0,
                 stopping_tasks: 0,
                 orphaned_tasks: 0,
-                slot_usage: 0.2,
+                runtime_slot_loads: live_runtime_slot_load(1, 0.2),
                 zlm_alive: true,
                 ffmpeg_alive: true,
                 artifact_cleanup_blocked: false,
@@ -2303,7 +2322,7 @@ async fn node_heartbeat_marks_current_control_session_connected() -> anyhow::Res
                 starting_tasks: 0,
                 stopping_tasks: 0,
                 orphaned_tasks: 0,
-                slot_usage: 0.2,
+                runtime_slot_loads: live_runtime_slot_load(1, 0.2),
                 zlm_alive: true,
                 ffmpeg_alive: true,
                 artifact_cleanup_blocked: false,

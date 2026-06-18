@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use crate::{
     config::AgentSettings,
-    runtime_process::{ManagedRuntime, ProcessIdentity, RuntimeSlotLimiter, RuntimeSlotPermit},
+    runtime_process::{
+        ManagedRuntime, ProcessIdentity, RuntimeSlotClass, RuntimeSlotLimiter, RuntimeSlotPermit,
+    },
     runtime_types::ExecutorError,
 };
 
@@ -24,23 +26,38 @@ pub(crate) struct RuntimeBackendSnapshot {
 #[derive(Clone)]
 pub(crate) struct RuntimeBackendStore {
     inner: Arc<RwLock<HashMap<Uuid, ManagedRuntime>>>,
-    slot_limiter: Arc<RuntimeSlotLimiter>,
+    live_slot_limiter: Arc<RuntimeSlotLimiter>,
+    vod_slot_limiter: Arc<RuntimeSlotLimiter>,
 }
 
 impl RuntimeBackendStore {
     pub(crate) fn new(settings: &AgentSettings) -> Self {
         Self {
             inner: Arc::new(RwLock::new(HashMap::new())),
-            slot_limiter: Arc::new(RuntimeSlotLimiter::new(settings.max_runtime_slots)),
+            live_slot_limiter: Arc::new(RuntimeSlotLimiter::new(settings.max_live_runtime_slots)),
+            vod_slot_limiter: Arc::new(RuntimeSlotLimiter::new(settings.max_vod_runtime_slots)),
         }
     }
 
-    pub(crate) fn try_acquire_slot(&self) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
-        self.slot_limiter.try_acquire()
+    pub(crate) fn try_acquire_slot(
+        &self,
+        slot_class: RuntimeSlotClass,
+    ) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
+        self.slot_limiter(slot_class).try_acquire(slot_class)
     }
 
-    pub(crate) fn attach_existing_slot(&self) -> Arc<RuntimeSlotPermit> {
-        self.slot_limiter.attach_existing()
+    pub(crate) fn attach_existing_slot(
+        &self,
+        slot_class: RuntimeSlotClass,
+    ) -> Arc<RuntimeSlotPermit> {
+        self.slot_limiter(slot_class).attach_existing()
+    }
+
+    fn slot_limiter(&self, slot_class: RuntimeSlotClass) -> &Arc<RuntimeSlotLimiter> {
+        match slot_class {
+            RuntimeSlotClass::Live => &self.live_slot_limiter,
+            RuntimeSlotClass::Vod => &self.vod_slot_limiter,
+        }
     }
 
     pub(crate) fn get(&self, runtime_id: Uuid) -> Option<ManagedRuntime> {
@@ -106,13 +123,14 @@ impl RuntimeBackendStore {
 
     pub(crate) fn adopted_runtime(
         &self,
+        slot_class: RuntimeSlotClass,
         process: Option<ProcessIdentity>,
         companion_processes: Vec<ProcessIdentity>,
     ) -> ManagedRuntime {
         ManagedRuntime {
             process,
             companion_processes,
-            _slot_permit: self.attach_existing_slot(),
+            _slot_permit: self.attach_existing_slot(slot_class),
             stop_requested: Arc::new(AtomicBool::new(false)),
             suppress_companion_events: Arc::new(AtomicBool::new(false)),
         }

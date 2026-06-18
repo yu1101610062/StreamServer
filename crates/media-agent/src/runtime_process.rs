@@ -10,11 +10,35 @@ use std::{
     time::Duration,
 };
 
+use media_domain::SourceMode;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::runtime::ExecutorError;
 use crate::runtime_manager::RuntimeMonitorHandle;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeSlotClass {
+    Live,
+    Vod,
+}
+
+impl RuntimeSlotClass {
+    pub(crate) const fn from_source_mode(source_mode: SourceMode) -> Self {
+        match source_mode {
+            SourceMode::Live => Self::Live,
+            SourceMode::Vod => Self::Vod,
+        }
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Vod => "vod",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProcessIdentity {
@@ -54,7 +78,10 @@ impl RuntimeSlotLimiter {
         }
     }
 
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
+    pub(crate) fn try_acquire(
+        self: &Arc<Self>,
+        slot_class: RuntimeSlotClass,
+    ) -> Result<Arc<RuntimeSlotPermit>, ExecutorError> {
         if self.limit == 0 {
             return Ok(RuntimeSlotPermit::unbounded());
         }
@@ -63,7 +90,8 @@ impl RuntimeSlotLimiter {
         loop {
             if current >= self.limit {
                 return Err(ExecutorError::InvalidRequest(format!(
-                    "max_runtime_slots exhausted: {current}/{}",
+                    "max_{}_runtime_slots exhausted: {current}/{}",
+                    slot_class.as_str(),
                     self.limit
                 )));
             }

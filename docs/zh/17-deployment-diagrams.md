@@ -150,12 +150,12 @@ sequenceDiagram
 
     Agent->>Core: register(node_id, labels, interfaces, capabilities)
     Core->>DB: upsert media_nodes / node_capabilities
-    Agent->>Core: heartbeat(slot_usage, running_tasks, last_seen)
+    Agent->>Core: heartbeat(runtime_slot_loads, running_tasks, last_seen)
 
     Note over Core: 创建网络型任务时
     Core->>DB: 读取在线节点与能力
     Note over Core: 先按源流地址与节点网卡同网段匹配
-    Note over Core: 再按 slot_usage / running_tasks 选轻载节点
+    Note over Core: 再按目标 source_mode 分桶负载选轻载节点
     Core->>Agent: StartTask
     Agent->>Core: accepted / starting / running / progress / logs / snapshot
 ```

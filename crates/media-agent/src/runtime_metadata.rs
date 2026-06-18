@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use chrono::Utc;
-use media_domain::{RecoveryPolicy, RuntimeHandle, TaskSpec, TaskType};
+use media_domain::{RecoveryPolicy, RuntimeHandle, SourceMode, TaskSpec, TaskType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -117,6 +117,18 @@ pub(crate) fn fatal_recording_error_from_handle(handle: &RuntimeHandle) -> Optio
         .get("recording_fatal_error")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+pub(crate) fn task_spec_from_handle(handle: &RuntimeHandle) -> Option<TaskSpec> {
+    handle
+        .metadata
+        .get("resolved_spec")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+pub(crate) fn source_mode_from_handle(handle: &RuntimeHandle) -> Option<SourceMode> {
+    task_spec_from_handle(handle).and_then(|spec| spec.input.source_mode)
 }
 
 pub(crate) fn stream_binding_from_handle(handle: &RuntimeHandle) -> Option<StreamBinding> {

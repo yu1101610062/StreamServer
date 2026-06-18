@@ -5,7 +5,12 @@ import { ElMessage, ElMessageBox } from "element-plus";
 import { CopyDocument, Delete, Refresh, Upload, UploadFilled } from "@element-plus/icons-vue";
 
 import { mediaUploadApi, nodeApi } from "@/shared/api/resources";
-import type { MediaUploadAssetSummary, NodeSummary, UploadMediaResponse } from "@/shared/api/types";
+import type {
+  MediaUploadAssetSummary,
+  NodeSummary,
+  RuntimeSlotLoad,
+  UploadMediaResponse,
+} from "@/shared/api/types";
 import MediaLink from "@/shared/components/MediaLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
 import { copyText } from "@/shared/utils/clipboard";
@@ -107,6 +112,22 @@ function nodeUploadReady(node: NodeSummary) {
 
 function nodeLabels(node: NodeSummary) {
   return node.labels.filter((label) => label.trim());
+}
+
+function slotModeLabel(sourceMode: string) {
+  return sourceMode === "live" ? "直播" : sourceMode === "vod" ? "点播" : sourceMode;
+}
+
+function slotLoadText(load: RuntimeSlotLoad) {
+  const maxSlots = load.max_runtime_slots === 0 ? "不限" : String(load.max_runtime_slots);
+  const occupied =
+    load.running_tasks + load.starting_tasks + load.stopping_tasks + load.orphaned_tasks;
+  return `${slotModeLabel(load.source_mode)} ${occupied}/${maxSlots} ${formatPercent((load.slot_usage ?? 0) * 100)}`;
+}
+
+function slotLoadSummary(loads?: RuntimeSlotLoad[] | null) {
+  const values = loads ?? [];
+  return values.length ? values.map(slotLoadText).join(" · ") : "—";
 }
 
 function uploadParams() {
@@ -344,7 +365,7 @@ async function deleteAsset(asset: MediaUploadAssetSummary) {
               <template #default="{ row }">{{ formatPercent(row.upload_disk_used_percent) }}</template>
             </el-table-column>
             <el-table-column label="槽位" min-width="90">
-              <template #default="{ row }">{{ formatPercent((row.slot_usage ?? 0) * 100) }}</template>
+              <template #default="{ row }">{{ slotLoadSummary(row.runtime_slot_loads) }}</template>
             </el-table-column>
             <el-table-column label="状态" min-width="100">
               <template #default="{ row }">

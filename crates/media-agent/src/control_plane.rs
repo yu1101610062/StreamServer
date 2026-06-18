@@ -14,14 +14,15 @@ use std::{
 
 use anyhow::Context;
 use media_domain::{
-    AgentRegistration, NetworkMode, RecordingControlSpec, RuntimeHandle, TaskType, WorkerKind,
-    normalize_output_mount_relative_prefix,
+    AgentRegistration, NetworkMode, RecordingControlSpec, RuntimeHandle, RuntimeSlotLoad,
+    RuntimeState, SourceMode, TaskType, WorkerKind, normalize_output_mount_relative_prefix,
 };
 use media_rpc::control_plane::{
     AdoptOrphans, AgentEnvelope, CapabilitySnapshot as RpcCapabilitySnapshot, CoreEnvelope,
     GpuDevice as RpcGpuDevice, GpuRuntime as RpcGpuRuntime, Heartbeat as RpcHeartbeat,
-    ProbeCapabilities, Register as RpcRegister, StartTask, StopTask, TaskEvent,
-    TaskRecordingControl, TaskSnapshot, control_plane_client::ControlPlaneClient,
+    ProbeCapabilities, Register as RpcRegister, RuntimeSlotLoad as RpcRuntimeSlotLoad, StartTask,
+    StopTask, TaskEvent, TaskRecordingControl, TaskSnapshot,
+    control_plane_client::ControlPlaneClient,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -36,7 +37,7 @@ use uuid::Uuid;
 use crate::{
     artifact_cleanup::ArtifactCleanupManager,
     capability::{CapabilityProbe, binary_available, probe_gpu_runtime},
-    config::Settings,
+    config::{AgentSettings, Settings},
     heartbeat::HeartbeatSampler,
     runtime::{
         AdoptFilter, AdoptRuntimeFilter, RecordingControlAction, RuntimeEventSink, RuntimeManager,
@@ -46,8 +47,10 @@ use crate::{
         bounded_log_batches, cleanup_persisted_runtime_state, collect_terminal_runtime_replays,
         is_terminal_runtime_event, rejected_runtime_handle, runtime_session_epoch,
     },
+    runtime_events::cleanup_expired_runtime_logs,
     runtime_executor::ManagedProcessExecutor,
     runtime_manager::{RuntimeManagerLimits, RuntimeManagerOptions},
+    runtime_metadata::source_mode_from_handle,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -119,6 +122,13 @@ impl AgentController {
     }
 
     pub async fn run(self) {
+        let removed_logs = cleanup_expired_runtime_logs(
+            &self.settings.agent.work_root,
+            self.settings.agent.runtime_log_retention_days,
+        );
+        if removed_logs > 0 {
+            info!(removed_logs, "expired runtime diagnostic logs cleaned");
+        }
         self.artifact_cleanup.refresh_now().await;
         self.artifact_cleanup.start_background();
         let mut backoff_idx = 0usize;
@@ -187,7 +197,6 @@ impl AgentController {
 
         let mut heartbeat_sampler = HeartbeatSampler::new(
             self.settings.agent.work_root.clone(),
-            self.settings.agent.max_runtime_slots,
             Some(self.artifact_cleanup.clone()),
         );
         let mut heartbeat = interval(HEARTBEAT_INTERVAL);
@@ -254,11 +263,16 @@ impl AgentController {
         let zlm_alive = self.capability_probe.zlm_alive(&self.settings.agent).await;
         let ffmpeg_alive = binary_available(&self.settings.agent.ffmpeg_bin);
         let runtime_counts = self.runtime_read_handle.state_counts();
+        let runtime_slot_loads = build_runtime_slot_loads(
+            &self.settings.agent,
+            &self.runtime_read_handle.active_handles(),
+        );
         let snapshot = sampler.sample(
             runtime_counts.running,
             runtime_counts.starting,
             runtime_counts.stopping,
             runtime_counts.orphaned,
+            runtime_slot_loads,
             zlm_alive,
             ffmpeg_alive,
             probe_gpu_runtime(&self.settings.agent),
@@ -280,7 +294,6 @@ impl AgentController {
                         starting_tasks: snapshot.starting_tasks,
                         stopping_tasks: snapshot.stopping_tasks,
                         orphaned_tasks: snapshot.orphaned_tasks,
-                        slot_usage: snapshot.slot_usage,
                         zlm_alive: snapshot.zlm_alive,
                         ffmpeg_alive: snapshot.ffmpeg_alive,
                         artifact_cleanup_blocked: snapshot.artifact_cleanup_blocked,
@@ -300,6 +313,19 @@ impl AgentController {
                                 decoder_util_percent: runtime.decoder_util_percent,
                             })
                             .collect(),
+                        runtime_slot_loads: snapshot
+                            .runtime_slot_loads
+                            .iter()
+                            .map(|load| RpcRuntimeSlotLoad {
+                                source_mode: load.source_mode.as_str().to_string(),
+                                max_runtime_slots: load.max_runtime_slots,
+                                running_tasks: load.running_tasks,
+                                starting_tasks: load.starting_tasks,
+                                stopping_tasks: load.stopping_tasks,
+                                orphaned_tasks: load.orphaned_tasks,
+                                slot_usage: load.slot_usage,
+                            })
+                            .collect(),
                     }),
                 ),
             },
@@ -308,7 +334,7 @@ impl AgentController {
 
         debug!(
             running_tasks = snapshot.running_tasks,
-            slot_usage = snapshot.slot_usage,
+            runtime_slot_loads = ?snapshot.runtime_slot_loads,
             zlm_alive = snapshot.zlm_alive,
             ffmpeg_alive = snapshot.ffmpeg_alive,
             "heartbeat sent"
@@ -951,6 +977,79 @@ fn log_batch_envelope(batch: RuntimeTaskLogBatch) -> AgentEnvelope {
     }
 }
 
+#[derive(Default)]
+struct SlotLoadCounts {
+    running: u32,
+    starting: u32,
+    stopping: u32,
+    orphaned: u32,
+}
+
+fn build_runtime_slot_loads(
+    settings: &AgentSettings,
+    handles: &[RuntimeHandle],
+) -> Vec<RuntimeSlotLoad> {
+    let mut live = SlotLoadCounts::default();
+    let mut vod = SlotLoadCounts::default();
+
+    for handle in handles {
+        let Some(source_mode) = source_mode_from_handle(handle) else {
+            continue;
+        };
+        let target = match source_mode {
+            SourceMode::Live => &mut live,
+            SourceMode::Vod => &mut vod,
+        };
+        match handle.state {
+            RuntimeState::Pending | RuntimeState::Starting => {
+                target.starting = target.starting.saturating_add(1);
+            }
+            RuntimeState::Running => {
+                target.running = target.running.saturating_add(1);
+            }
+            RuntimeState::Stopping => {
+                target.stopping = target.stopping.saturating_add(1);
+            }
+            RuntimeState::Orphaned => {
+                target.orphaned = target.orphaned.saturating_add(1);
+            }
+            RuntimeState::Exited => {}
+        }
+    }
+
+    vec![
+        runtime_slot_load(SourceMode::Live, settings.max_live_runtime_slots, live),
+        runtime_slot_load(SourceMode::Vod, settings.max_vod_runtime_slots, vod),
+    ]
+}
+
+fn runtime_slot_load(
+    source_mode: SourceMode,
+    max_runtime_slots: u32,
+    counts: SlotLoadCounts,
+) -> RuntimeSlotLoad {
+    let occupied = counts
+        .running
+        .saturating_add(counts.starting)
+        .saturating_add(counts.stopping)
+        .saturating_add(counts.orphaned);
+    let slot_usage = if max_runtime_slots == 0 {
+        0.0
+    } else {
+        (occupied as f64 / max_runtime_slots as f64).clamp(0.0, 1.0)
+    };
+
+    RuntimeSlotLoad {
+        source_mode,
+        max_runtime_slots,
+        running_tasks: counts.running,
+        starting_tasks: counts.starting,
+        stopping_tasks: counts.stopping,
+        orphaned_tasks: counts.orphaned,
+        slot_usage,
+    }
+}
+
 async fn send_runtime_progress(
     sender: &mpsc::Sender<AgentEnvelope>,
     progress: RuntimeTaskProgress,
@@ -1146,7 +1245,7 @@ fn parse_http_addr_port(http_addr: &str) -> anyhow::Result<u16> {
     Ok(port)
 }
 
-fn build_endpoint(settings: &crate::config::AgentSettings) -> anyhow::Result<Endpoint> {
+fn build_endpoint(settings: &AgentSettings) -> anyhow::Result<Endpoint> {
     let mut endpoint = Endpoint::from_shared(settings.core_endpoint.clone())?
         .connect_timeout(Duration::from_secs(5))
         .tcp_keepalive(Some(Duration::from_secs(30)));

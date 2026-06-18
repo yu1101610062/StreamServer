@@ -266,9 +266,8 @@ async fn select_upload_node(
             .upload_disk_available_bytes
             .cmp(&left_load.upload_disk_available_bytes)
             .then_with(|| {
-                left_load
-                    .slot_usage
-                    .partial_cmp(&right_load.slot_usage)
+                node_max_slot_usage(left_load)
+                    .partial_cmp(&node_max_slot_usage(right_load))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| left_load.running_tasks.cmp(&right_load.running_tasks))
@@ -309,6 +308,13 @@ fn upload_node_has_space(load: &NodeLiveLoad, required_bytes: Option<u64>) -> bo
         return true;
     }
     load.upload_disk_available_bytes >= required_bytes
+}
+
+fn node_max_slot_usage(load: &NodeLiveLoad) -> f64 {
+    load.runtime_slot_loads
+        .iter()
+        .map(|slot_load| slot_load.slot_usage.clamp(0.0, 1.0))
+        .fold(0.0, f64::max)
 }
 
 fn node_matches_required_labels(node: &NodeSummary, required_labels: &[String]) -> bool {
@@ -443,7 +449,7 @@ mod tests {
             starting_tasks: 0,
             stopping_tasks: 0,
             orphaned_tasks: 0,
-            slot_usage: 0.0,
+            runtime_slot_loads: Vec::new(),
             cpu_percent: 1.0,
             mem_percent: 1.0,
             disk_percent: 1.0,
@@ -512,7 +518,7 @@ mod tests {
             starting_tasks: 0,
             stopping_tasks: 0,
             orphaned_tasks: 0,
-            slot_usage: 0.0,
+            runtime_slot_loads: Vec::new(),
             cpu_percent: 1.0,
             mem_percent: 1.0,
             disk_percent: 1.0,
@@ -561,7 +567,7 @@ mod tests {
             gpu: Vec::new(),
             gpu_devices: Vec::new(),
             capability_captured_at: None,
-            slot_usage: None,
+            runtime_slot_loads: None,
             running_tasks: None,
             starting_tasks: None,
             stopping_tasks: None,

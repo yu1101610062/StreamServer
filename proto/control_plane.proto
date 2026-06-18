@@ -60,7 +60,7 @@ message Heartbeat {
   double mem_percent = 3;
   double disk_percent = 4;
   uint32 running_tasks = 5;
-  double slot_usage = 6;
+  reserved 6;
   bool zlm_alive = 7;
   bool ffmpeg_alive = 8;
   repeated GpuRuntime gpu_runtime = 9;
@@ -72,6 +72,7 @@ message Heartbeat {
   uint64 upload_disk_total_bytes = 15;
   uint64 upload_disk_available_bytes = 16;
   double upload_disk_used_percent = 17;
+  repeated RuntimeSlotLoad runtime_slot_loads = 18;
 }
 
 message CapabilitySnapshot {
@@ -100,6 +101,16 @@ message GpuRuntime {
   uint64 memory_total_mb = 4;
   double encoder_util_percent = 5;
   double decoder_util_percent = 6;
+}
+
+message RuntimeSlotLoad {
+  string source_mode = 1;
+  uint32 max_runtime_slots = 2;
+  uint32 running_tasks = 3;
+  uint32 starting_tasks = 4;
+  uint32 stopping_tasks = 5;
+  uint32 orphaned_tasks = 6;
+  double slot_usage = 7;
 }
 
 message TaskEvent {

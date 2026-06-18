@@ -36,6 +36,7 @@ use crate::{
         ManagedFileOutputKind, allocate_managed_file_output, allocate_managed_output,
         ensure_output_format_enabled, hls_record_segment_sec, managed_file_output_kind_for_task,
     },
+    runtime_process::RuntimeSlotClass,
     runtime_recording::{LiveRelayRecording, build_live_relay_recording},
     runtime_transcode::{
         InternalIngressProtocol, append_live_mpegts_multicast_bridge_args, append_process_args,
@@ -146,6 +147,16 @@ pub(crate) fn parse_task_spec(request: &StartTaskRequest) -> Result<TaskSpec, Ex
     serde_json::from_value(request.resolved_spec.clone()).map_err(|error| {
         ExecutorError::InvalidRequest(format!("invalid resolved_spec for task execution: {error}"))
     })
+}
+
+pub(crate) fn runtime_slot_class_for_request(
+    request: &StartTaskRequest,
+) -> Result<RuntimeSlotClass, ExecutorError> {
+    let spec = parse_task_spec(request)?;
+    let source_mode = spec.input.source_mode.ok_or_else(|| {
+        ExecutorError::InvalidRequest("resolved_spec.input.source_mode is required".to_string())
+    })?;
+    Ok(RuntimeSlotClass::from_source_mode(source_mode))
 }
 
 pub(crate) fn task_runtime_mode(spec: &TaskSpec) -> TaskRuntimeMode {

@@ -20,8 +20,8 @@ class OverviewScreen extends StatelessWidget {
           _loadOverviewTaskSample(controller),
           _loadTaskStatusTotals(controller),
           controller.api('GET', '/api/v1/streams'),
-          controller.api('GET', '/api/v1/records',
-              query: const {'page_size': 1}),
+          controller
+              .api('GET', '/api/v1/records', query: const {'page_size': 1}),
           controller.api('GET', '/api/v1/file-artifacts',
               query: const {'page_size': 1}),
           controller.api('GET', '/api/v1/nodes'),
@@ -68,8 +68,7 @@ class OverviewScreen extends StatelessWidget {
         ]);
         final failedTasks =
             _sumStatusTotals(taskStatusTotals, const ['FAILED', 'LOST']);
-        final statusEntries =
-            _buildStatusEntries(taskStatusTotals, totalTasks);
+        final statusEntries = _buildStatusEntries(taskStatusTotals, totalTasks);
         return LayoutBuilder(
           builder: (context, constraints) {
             final wide = constraints.maxWidth >= 1180;
@@ -351,6 +350,11 @@ class _OverviewInspector extends StatelessWidget {
                             '运行任务',
                             _formatPlain(node['running_tasks'])!,
                             colors.success),
+                      if (_formatSlotLoads(node['runtime_slot_loads']) != null)
+                        _ResourceTile(
+                            '槽位负载',
+                            _formatSlotLoads(node['runtime_slot_loads'])!,
+                            colors.primary),
                     ],
                   ),
                   const SizedBox(height: 18),
@@ -572,6 +576,11 @@ String? _formatPercent(Object? value) {
 String? _formatPlain(Object? value) {
   if (!_hasInspectorValue(value)) return null;
   return _formatInspectorValue(value);
+}
+
+String? _formatSlotLoads(Object? value) {
+  final label = runtimeSlotLoadsLabel(value);
+  return label == '—' ? null : label;
 }
 
 bool _hasInspectorValue(Object? value) {
