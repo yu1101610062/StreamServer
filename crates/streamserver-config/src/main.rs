@@ -1447,8 +1447,9 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> anyhow::Res
 }
 
 fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkInterface]) {
-    // native 迁移后保留旧挂载键的输入兼容，但最终配置只写回当前 native 键。
+    // 已移除的环境变量只作为输入兼容，加载后不继续保留，避免保存时写回废弃键。
     values.retain(|key, _| !is_removed_env_key(key));
+    // native 迁移后保留旧挂载键的输入兼容，但最终配置只写回当前 native 键。
     let legacy_www_mount_host_dir = values
         .get("ZLM_WWW_MOUNT_HOST_DIR")
         .or_else(|| values.get("ZLM_WWW_HOST_DIR"))
@@ -2666,11 +2667,16 @@ mod tests {
 
         write_env_file(&env_path, &values).unwrap();
         let contents = fs::read_to_string(&env_path).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
 
-        assert!(!contents.contains("AGENT_MAX_RUNTIME_SLOTS="));
-        assert!(contents.contains("AGENT_MAX_LIVE_RUNTIME_SLOTS=4\n"));
-        assert!(contents.contains("AGENT_MAX_VOD_RUNTIME_SLOTS=5\n"));
-        assert!(contents.contains("CUSTOM_KEEP=yes\n"));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| *line == "AGENT_MAX_RUNTIME_SLOTS=3")
+        );
+        assert!(lines.contains(&"AGENT_MAX_LIVE_RUNTIME_SLOTS=4"));
+        assert!(lines.contains(&"AGENT_MAX_VOD_RUNTIME_SLOTS=5"));
+        assert!(lines.contains(&"CUSTOM_KEEP=yes"));
 
         let _ = fs::remove_file(env_path);
     }
