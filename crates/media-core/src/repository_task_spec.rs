@@ -188,6 +188,10 @@ fn input_overlay(spec: &TaskSpec) -> Option<Value> {
             "loop_enabled",
             spec.input.loop_enabled.map(|value| json!(value)),
         ),
+        (
+            "start_offset_sec",
+            spec.input.start_offset_sec.map(|value| json!(value)),
+        ),
         ("url", spec.input.url.as_ref().map(|value| json!(value))),
         ("group", spec.input.group.as_ref().map(|value| json!(value))),
         ("port", spec.input.port.map(|value| json!(value))),

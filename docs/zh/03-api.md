@@ -224,6 +224,7 @@
 - `input.kind=ftp` 时，`input.url` 必须填写 `ftp://` 地址；当前不支持 `ftps://`。
 - `input.source_mode` 用于显式区分 `hls/http_ts` 是实时源还是离线源；`ftp` 固定为 `vod`，其他输入类型按规则自动推断。
 - `input.loop_enabled` 仅支持 `stream_ingest + source_mode=vod`，适用于 `file`、`http_mp4`、`hls(vod)`、`http_ts(vod)`；开启后输入读到 EOF 会从头循环。若同时关闭全部播放协议并启用录制，任务会进入快录分支，此时必须填写 `record.duration_sec` 作为快录终点。
+- `input.start_offset_sec` 表示 `stream_ingest + source_mode=vod` 从点播媒体第 N 秒开始读取；缺省或 `0` 表示从头读取。V1 不支持与 `input.loop_enabled=true` 同时使用。若运行前探测到点播总时长且偏移不小于总时长，Agent 会忽略该偏移并从头读取；探测不到总时长时仍按请求偏移交给 FFmpeg。网络点播源是否能快速跳转取决于源站 Range/HLS 分片和 FFmpeg seek 能力。
 - `stream.*` 表示内部流标识，只对 `stream_ingest` 生效。
 - `expose.*` 只控制内部流在节点 ZLM 上额外暴露哪些播放协议，不会新增一个独立发布目标。对 `stream_ingest + source_mode=live`，如果外部显式关闭全部播放协议，`resolved_spec` 会自动开启 `expose.enable_http_fmp4=true` 作为最小兜底，其他协议保持关闭；直播流接入不会最终处于零 expose 状态。对 `stream_ingest + source_mode=vod + record.enabled=true`，只要任一播放协议开启，任务就保持实时录制；全部关闭则切到快录且不再提供实时播放地址。
 - `publish.kind` 表示任务直接写出的外部目标类型；当前支持 `file`、`udp_mpegts_multicast`、`rtp_multicast`、`rtmp_push`。
@@ -240,11 +241,11 @@
 | `stream_bridge` | `rtsp` `rtmp` `hls` `http_flv` `http_ts` `http_mp4` `ftp(vod)` `file` `udp_mpegts_multicast` `rtp_multicast` | `file` `udp_mpegts_multicast` `rtp_multicast` `rtmp_push` | 不适用 |
 | `file_transcode` | `file` `ftp(vod)` `http_mp4` `hls(vod)` `http_ts(vod)` | `file` | 不适用 |
 
-循环 VOD 输入示例：
+VOD 偏移录制示例：
 
 ```json
 {
-  "name": "promo-loop-01",
+  "name": "promo-offset-01",
   "type": "stream_ingest",
   "common": {
     "created_by": "alice"
@@ -252,12 +253,13 @@
   "input": {
     "kind": "http_mp4",
     "source_mode": "vod",
-    "loop_enabled": true,
+    "loop_enabled": false,
+    "start_offset_sec": 600,
     "url": "http://vod.example.com/promo.mp4"
   },
   "stream": {
     "app": "live",
-    "name": "promo-loop-01"
+    "name": "promo-offset-01"
   },
   "expose": {
     "enable_rtsp": false,

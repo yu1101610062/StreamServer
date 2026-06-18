@@ -64,6 +64,7 @@ void main() {
       inputKind: 'udp_mpegts_multicast',
       sourceMode: 'live',
       loopEnabled: false,
+      startOffset: '',
       url: 'udp://239.0.0.1:5000',
       group: '239.0.0.1',
       port: '5000',
@@ -84,6 +85,7 @@ void main() {
       inputKind: 'gb_rtp',
       sourceMode: 'live',
       loopEnabled: false,
+      startOffset: '',
       url: 'rtp://127.0.0.1:15060',
       group: '239.0.0.1',
       port: '15060',
@@ -103,6 +105,7 @@ void main() {
       inputKind: 'rtsp',
       sourceMode: 'live',
       loopEnabled: false,
+      startOffset: '',
       url: 'rtsp://example/live/stream',
       group: '239.0.0.1',
       port: '5000',
@@ -114,5 +117,39 @@ void main() {
     expect(payload['url'], 'rtsp://example/live/stream');
     expect(payload.containsKey('group'), isFalse);
     expect(payload.containsKey('port'), isFalse);
+  });
+
+  test('task input payload includes vod start offset', () {
+    final payload = buildTaskInputPayload(
+      inputKind: 'http_mp4',
+      sourceMode: 'vod',
+      loopEnabled: false,
+      startOffset: '600',
+      url: 'http://example/video.mp4',
+      group: '',
+      port: '',
+      interfaceName: '',
+      interfaceIp: '',
+      ttl: '',
+    );
+
+    expect(payload['start_offset_sec'], 600);
+  });
+
+  test('task input payload omits vod start offset when looping', () {
+    final payload = buildTaskInputPayload(
+      inputKind: 'http_mp4',
+      sourceMode: 'vod',
+      loopEnabled: true,
+      startOffset: '600',
+      url: 'http://example/video.mp4',
+      group: '',
+      port: '',
+      interfaceName: '',
+      interfaceIp: '',
+      ttl: '',
+    );
+
+    expect(payload.containsKey('start_offset_sec'), isFalse);
   });
 }

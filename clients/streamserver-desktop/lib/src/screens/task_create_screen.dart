@@ -32,6 +32,7 @@ Map<String, Object?> buildTaskInputPayload({
   required String inputKind,
   required String sourceMode,
   required bool loopEnabled,
+  required String startOffset,
   required String url,
   required String group,
   required String port,
@@ -39,10 +40,12 @@ Map<String, Object?> buildTaskInputPayload({
   required String interfaceIp,
   required String ttl,
 }) {
+  final startOffsetSec = int.tryParse(startOffset.trim());
   return cleanTaskPayloadMap({
     'kind': inputKind,
     'source_mode': sourceMode,
     'loop_enabled': loopEnabled,
+    if (sourceMode == 'vod' && !loopEnabled) 'start_offset_sec': startOffsetSec,
     if (taskInputUsesUrl(inputKind)) 'url': url,
     if (taskInputUsesGroup(inputKind)) 'group': group,
     if (taskInputUsesPort(inputKind)) 'port': int.tryParse(port.trim()),
@@ -94,6 +97,7 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
   final interfaceNameController = TextEditingController();
   final interfaceIpController = TextEditingController();
   final ttlController = TextEditingController();
+  final startOffsetController = TextEditingController();
   final durationController = TextEditingController();
   final segmentController = TextEditingController();
   final requiredLabelsController = TextEditingController();
@@ -121,6 +125,15 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
   bool recordAsPlayer = false;
   String? result;
 
+  bool get _showStartOffset =>
+      taskType == 'stream_ingest' && sourceMode == 'vod';
+
+  void _clearStartOffsetIfUnsupported() {
+    if (!_showStartOffset || loopEnabled) {
+      startOffsetController.clear();
+    }
+  }
+
   @override
   void dispose() {
     for (final controller in [
@@ -141,6 +154,7 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
       interfaceNameController,
       interfaceIpController,
       ttlController,
+      startOffsetController,
       durationController,
       segmentController,
       requiredLabelsController,
@@ -229,7 +243,10 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
                             '源模式',
                             sourceMode,
                             const ['live', 'vod'],
-                            (value) => setState(() => sourceMode = value),
+                            (value) => setState(() {
+                              sourceMode = value;
+                              _clearStartOffsetIfUnsupported();
+                            }),
                           ),
                           _SelectBox(
                             '处理模式',
@@ -246,10 +263,19 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
                               inputKind == 'gb_rtp' ? 'GB RTP 监听端口' : '输入端口',
                               inputPortController,
                             ),
+                          if (_showStartOffset)
+                            _TextFieldBox(
+                              '开始偏移秒',
+                              startOffsetController,
+                              enabled: !loopEnabled,
+                            ),
                           _SwitchBox(
                             '循环 VOD',
                             loopEnabled,
-                            (value) => setState(() => loopEnabled = value),
+                            (value) => setState(() {
+                              loopEnabled = value;
+                              _clearStartOffsetIfUnsupported();
+                            }),
                           ),
                         ],
                       ),
@@ -423,6 +449,7 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
         publishFormat = 'mp4';
         recordEnabled = false;
       }
+      _clearStartOffsetIfUnsupported();
     });
   }
 
@@ -449,6 +476,8 @@ class _TaskCreateScreenState extends State<TaskCreateScreen> {
         inputKind: inputKind,
         sourceMode: sourceMode,
         loopEnabled: loopEnabled,
+        startOffset:
+            _showStartOffset && !loopEnabled ? startOffsetController.text : '',
         url: sourceController.text,
         group: inputGroupController.text,
         port: inputPortController.text,
@@ -893,10 +922,11 @@ class _FormGrid extends StatelessWidget {
 }
 
 class _TextFieldBox extends StatefulWidget {
-  const _TextFieldBox(this.label, this.controller);
+  const _TextFieldBox(this.label, this.controller, {this.enabled = true});
 
   final String label;
   final TextEditingController controller;
+  final bool enabled;
 
   @override
   State<_TextFieldBox> createState() => _TextFieldBoxState();
@@ -945,8 +975,11 @@ class _TextFieldBoxState extends State<_TextFieldBox> {
               child: TextField(
                 controller: widget.controller,
                 focusNode: _focusNode,
+                enabled: widget.enabled,
                 style: TextStyle(
-                  color: colors.textPrimary,
+                  color: widget.enabled
+                      ? colors.textPrimary
+                      : colors.textSecondary,
                   fontSize: 13,
                   fontWeight: FontWeight.w700,
                 ),

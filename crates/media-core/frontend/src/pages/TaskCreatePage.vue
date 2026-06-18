@@ -90,6 +90,9 @@ const showInputLoop = computed(
     draft.task_type === "stream_ingest" &&
     inputKindSupportsLoop(draft.input.kind, draft.input.source_mode),
 );
+const showInputStartOffset = computed(
+  () => draft.task_type === "stream_ingest" && draft.input.source_mode === "vod",
+);
 const showPublishSection = computed(() => draft.task_type !== "stream_ingest");
 const showManagedFileOutputHint = computed(
   () => showPublishSection.value && draft.publish.kind === "file",
@@ -215,6 +218,16 @@ watch(
   (enabled) => {
     if (!enabled) {
       draft.input.loop_enabled = false;
+    }
+  },
+  { immediate: true },
+);
+
+watch(
+  [showInputStartOffset, () => draft.input.loop_enabled],
+  ([visible, loopEnabled]) => {
+    if (!visible || loopEnabled) {
+      draft.input.start_offset_sec = "";
     }
   },
   { immediate: true },
@@ -502,6 +515,14 @@ function previewTask() {
           title="FTP 输入仅支持 ftp://"
           :description="ftpInputHint"
         />
+
+        <el-row v-if="showInputStartOffset" :gutter="16">
+          <el-col :md="8" :span="24">
+            <el-form-item label="开始偏移（秒，可选）">
+              <el-input v-model="draft.input.start_offset_sec" :disabled="draft.input.loop_enabled" placeholder="例如 600" />
+            </el-form-item>
+          </el-col>
+        </el-row>
 
         <el-row v-if="showInputLoop" :gutter="16">
           <el-col :md="8" :span="24">

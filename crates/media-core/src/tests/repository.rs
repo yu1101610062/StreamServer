@@ -200,6 +200,39 @@ fn task_spec_overlay_preserves_input_loop_enabled() {
 }
 
 #[test]
+fn task_spec_overlay_preserves_input_start_offset_sec() {
+    let spec = TaskSpec {
+        task_type: TaskType::StreamIngest,
+        name: "offset-check".to_string(),
+        priority: 50,
+        common: media_domain::CommonSpec {
+            created_by: Some("alice".to_string()),
+            callback_url: None,
+            labels: Vec::new(),
+        },
+        input: media_domain::InputSpec {
+            kind: Some(media_domain::InputKind::HttpMp4),
+            source_mode: Some(media_domain::SourceMode::Vod),
+            start_offset_sec: Some(600),
+            url: Some("http://127.0.0.1/test.mp4".to_string()),
+            ..Default::default()
+        },
+        stream: Default::default(),
+        expose: Default::default(),
+        process: Default::default(),
+        publish: Default::default(),
+        record: Default::default(),
+        recovery: Default::default(),
+        schedule: Default::default(),
+        resource: Default::default(),
+    };
+
+    let overlay = task_spec_overlay(&spec);
+
+    assert_eq!(overlay["input"]["start_offset_sec"], json!(600));
+}
+
+#[test]
 fn relative_http_url_from_path_uses_web_root_directly() {
     let url = relative_http_url_from_path(
         "/data/zlm/www/output/mp4/node-192_168_1_10-mp4/task-1/clip.mp4",

@@ -1836,6 +1836,43 @@ async fn preview_task_preserves_record_duration_sec() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn preview_task_preserves_vod_start_offset_sec() -> anyhow::Result<()> {
+    let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
+    let app = build_app(test_app_state(pool));
+    let mut payload = sample_create_task_payload("manual");
+    payload["input"] = json!({
+        "kind": "http_mp4",
+        "source_mode": "vod",
+        "loop_enabled": false,
+        "start_offset_sec": 600,
+        "url": "http://vod.example.com/archive.mp4"
+    });
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/tasks/preview")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&payload)?))?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["requested_spec"]["input"]["start_offset_sec"],
+        json!(600)
+    );
+    assert_eq!(
+        body["resolved_spec"]["input"]["start_offset_sec"],
+        json!(600)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn ui_routes_serve_shell_and_static_assets() -> anyhow::Result<()> {
     let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1/postgres")?;
     let app = build_app(test_app_state(pool));

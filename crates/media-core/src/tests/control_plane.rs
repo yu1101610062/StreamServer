@@ -32,6 +32,7 @@ fn sample_spec(kind: InputKind, url: Option<&str>, interface_ip: Option<&str>) -
             kind: Some(kind),
             source_mode: kind.default_source_mode(),
             loop_enabled: None,
+            start_offset_sec: None,
             url: url.map(str::to_string),
             group: None,
             port: None,
