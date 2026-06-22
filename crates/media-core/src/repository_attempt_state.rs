@@ -485,6 +485,8 @@ impl TaskRepository {
             return Ok(());
         }
 
+        self.delete_stream_bindings_for_task(tx, task_id).await?;
+
         sqlx::query(
             r#"
             update task_attempts

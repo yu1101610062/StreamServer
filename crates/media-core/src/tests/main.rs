@@ -4470,6 +4470,46 @@ async fn list_reclaim_runtimes_includes_dispatching_attempts_with_leases() -> an
     .execute(&db.pool)
     .await?;
 
+    let lost_task_id = Uuid::now_v7();
+    let lost_attempt_id = Uuid::now_v7();
+    sqlx::query(
+        r#"
+        insert into tasks (
+          id, name, type, status, idempotency_key,
+          priority, requested_spec, resolved_spec, created_by, assigned_node_id,
+          current_attempt_no, schedule_start_mode, created_at, updated_at, started_at, finished_at
+        ) values (
+          $1, 'lost-reclaim-stale-runtime', 'stream_ingest'::task_type, 'LOST'::task_status, $2,
+          50, $3, $3, 'tester', null,
+          1, 'immediate', $4, $4, $4, $4
+        )
+        "#,
+    )
+    .bind(lost_task_id)
+    .bind(format!("lost-reclaim-stale-runtime-{lost_task_id}"))
+    .bind(&resolved_spec)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        insert into task_attempts (
+          id, task_id, attempt_no, node_id, worker_kind, status,
+          created_at, lease_token, ended_at
+        ) values (
+          $1, $2, 1, $3, 'hybrid'::worker_kind, 'FAILED'::attempt_status,
+          $4, 'lease-lost-stale-runtime', $4
+        )
+        "#,
+    )
+    .bind(lost_attempt_id)
+    .bind(lost_task_id)
+    .bind(node_id)
+    .bind(now)
+    .execute(&db.pool)
+    .await?;
+
     let reclaim = repository.list_reclaim_runtimes(node_id).await?;
     assert!(reclaim.iter().any(|item| {
         item.task_id == task_id
@@ -4477,6 +4517,10 @@ async fn list_reclaim_runtimes_includes_dispatching_attempts_with_leases() -> an
             && item.lease_token == lease_token
             && item.worker_kind == media_domain::WorkerKind::Hybrid
     }));
+    assert!(
+        reclaim.iter().all(|item| item.task_id != lost_task_id),
+        "LOST tasks must not be advertised for runtime reclaim"
+    );
 
     db.cleanup().await?;
     Ok(())
@@ -6180,6 +6224,79 @@ async fn startup_timeout_snapshot_cleans_stream_bindings() -> anyhow::Result<()>
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(binding_count, 0);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reclaim_timeout_lost_task_cleans_stream_bindings() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let resolved_spec = json!({
+        "type": "stream_ingest",
+        "name": "relay-camera-01",
+        "common": {"created_by": "tester"},
+        "input": {"kind": "rtsp", "source_mode": "live", "url": "rtsp://camera/live"},
+        "stream": {"app": "live", "name": "camera01"},
+        "record": {"enabled": false},
+        "recovery": {"policy": "never"},
+        "schedule": {"start_mode": "immediate"},
+        "resource": {}
+    });
+    let task_id =
+        insert_running_stream_task(&db.pool, node_id, resolved_spec, "live", "camera01").await?;
+    let deadline = Utc::now() - chrono::Duration::seconds(1);
+    sqlx::query(
+        r#"
+        update tasks
+           set status = 'RECLAIMING'::task_status,
+               reclaim_deadline_at = $1,
+               updated_at = $1
+         where id = $2
+        "#,
+    )
+    .bind(deadline)
+    .bind(task_id)
+    .execute(&db.pool)
+    .await?;
+
+    let before_count: i64 =
+        sqlx::query_scalar("select count(*) from stream_bindings where task_id = $1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(before_count, 1);
+
+    let candidate = repository
+        .list_reclaiming_tasks()
+        .await?
+        .into_iter()
+        .find(|candidate| candidate.task_id == task_id)
+        .expect("task should be reclaiming before timeout");
+    assert!(repository.finalize_reclaim_timeout(&candidate).await?);
+
+    let detail = repository.get_task(task_id).await?;
+    assert_eq!(detail.task.status, media_domain::TaskStatus::Lost);
+    assert_eq!(detail.task.assigned_node_id, None);
+
+    let after_count: i64 =
+        sqlx::query_scalar("select count(*) from stream_bindings where task_id = $1")
+            .bind(task_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(after_count, 0);
 
     db.cleanup().await?;
     Ok(())

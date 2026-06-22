@@ -487,8 +487,7 @@ impl TaskRepository {
                 'RUNNING'::task_status,
                 'STOPPING'::task_status,
                 'RECOVERING'::task_status,
-                'RECLAIMING'::task_status,
-                'LOST'::task_status
+                'RECLAIMING'::task_status
               )
               and coalesce(ta.lease_token, '') <> ''
             order by t.updated_at asc, t.id asc
