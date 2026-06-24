@@ -952,9 +952,17 @@ backup_existing_install() {
   log "已备份现有部署: ${backup_dir}"
 }
 
+is_output_root_mountpoint() {
+  local output_root="$1"
+  if grep -F " ${output_root} " /proc/self/mountinfo >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
 create_output_layout_if_local() {
   local output_root="${INSTALL_DIR}/data/zlm/www/output"
-  if grep -F " ${output_root} " /proc/self/mountinfo >/dev/null 2>&1; then
+  if is_output_root_mountpoint "${output_root}"; then
     log "检测到 output 目录是挂载点，跳过创建 output/mp4 和 output/hls: ${output_root}"
     return 0
   fi
@@ -976,6 +984,28 @@ prepare_layout() {
     "${INSTALL_DIR}/data/zlm/www/record" \
     "${INSTALL_DIR}/data/zlm/www/snap"
   create_output_layout_if_local
+}
+
+fix_output_permissions() {
+  local output_root="${INSTALL_DIR}/data/zlm/www/output"
+  if is_output_root_mountpoint "${output_root}"; then
+    log "检测到 output 目录是挂载点，跳过修正 output 权限: ${output_root}"
+    return 0
+  fi
+  mkdir -p "${output_root}/mp4" "${output_root}/hls"
+
+  local item
+  for item in "${output_root}" "${output_root}/mp4" "${output_root}/hls"; do
+    [ -e "${item}" ] || continue
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${item}"
+    chmod 2775 "${item}"
+  done
+
+  for item in "${output_root}"/mp4/node-*-mp4 "${output_root}"/hls/node-*-hls; do
+    [ -d "${item}" ] || continue
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${item}"
+    chmod 2775 "${item}"
+  done
 }
 
 copy_package_assets() {
@@ -1567,6 +1597,7 @@ fix_permissions() {
   for item in data data/media data/media/work data/media/logs data/postgres data/postgres-run data/zlm data/zlm/www data/zlm/www/record data/zlm/www/snap; do
     [ -e "${INSTALL_DIR}/${item}" ] && chown "${SERVICE_USER}:${SERVICE_GROUP}" "${INSTALL_DIR}/${item}"
   done
+  fix_output_permissions
   chmod 755 "${INSTALL_DIR}" "${INSTALL_DIR}/bin"
 }
 
