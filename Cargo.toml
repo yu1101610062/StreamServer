@@ -4,6 +4,7 @@ members = [
     "crates/media-agent",
     "crates/media-core",
     "crates/media-domain",
+    "crates/media-gateway",
     "crates/media-rpc",
     "crates/streamserver-config",
 ]

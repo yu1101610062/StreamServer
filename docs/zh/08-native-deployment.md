@@ -38,7 +38,7 @@ streamserver-native-v0.1.0-linux-amd64-gpu-enabled-20260602.tar.gz
 streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 ```
 
-包内不得包含 `images/*.tar`、`compose.yml`、`streamserver-compose` 或 `tools/docker/`。业务程序 `media-core`、`media-agent`、`streamserver-config` 以 `x86_64-unknown-linux-musl` 二进制交付；FFmpeg、ZLMediaKit、PostgreSQL 以随包 runtime 交付。
+包内不得包含 `images/*.tar`、`compose.yml`、`streamserver-compose` 或 `tools/docker/`。业务程序 `media-core`、`media-agent`、`media-gateway`、`streamserver-config` 以 `x86_64-unknown-linux-musl` 二进制交付；FFmpeg、ZLMediaKit、PostgreSQL 以随包 runtime 交付。
 
 默认 FFmpeg runtime 固定为 `8.1` 系列：CPU 包使用 `jrottenberg/ffmpeg:8.1-ubuntu2404`，GPU 包使用 `jrottenberg/ffmpeg:8.1-nvidia2404`。GPU 节点要求 NVIDIA 驱动满足 FFmpeg/NVIDIA Video Codec SDK 13 系列运行时要求，生产基线按 `570+` 驱动准备；Linux 4.x 内核上的 T4/P4 等老卡优先锁定经过现场验证的 R580/R595 生产分支驱动。
 
@@ -56,7 +56,7 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 
 - `sha256sum -c SHA256SUMS`
 - 包结构确认无 Docker/Compose 运行时资产
-- `media-core`、`media-agent`、`streamserver-config` 的 `file` 和 `ldd` 静态链接检查
+- `media-core`、`media-agent`、`media-gateway`、`streamserver-config` 的 `file` 和 `ldd` 静态链接检查
 - `ffmpeg`、`ffprobe`、`MediaServer`、`default.pem` 的可执行和动态依赖检查
 - 随包 PostgreSQL 模式下 `postgres`、`initdb`、`pg_ctl`、`pg_isready`、`psql` 检查
 - 随包 PostgreSQL 模式下扩展 manifest、`pg_available_extensions` 清单、扩展 `.so` 依赖解析和全量 `CREATE EXTENSION` 检查，确保和构建来源 runtime 的扩展能力一致

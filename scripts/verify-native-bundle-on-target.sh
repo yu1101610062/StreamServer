@@ -554,6 +554,7 @@ check_runtime_binary() {
 section "Business Binaries"
 check_static_binary "media-core" "${ROOT}/binaries/media-core-linux-amd64"
 check_static_binary "media-agent" "${ROOT}/binaries/media-agent-linux-amd64"
+check_static_binary "media-gateway" "${ROOT}/binaries/media-gateway-linux-amd64"
 check_static_binary "streamserver-config" "${ROOT}/binaries/streamserver-config-linux-amd64"
 run_capture "media-core auth help" "${ROOT}/binaries/media-core-linux-amd64" auth --help
 

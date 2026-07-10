@@ -1,12 +1,14 @@
 use super::*;
 use std::net::Ipv4Addr;
 
+use axum::{Json, Router, http::StatusCode};
 use media_domain::{
     CommonSpec, ExposeSpec, InputSpec, PublishSpec, RecordSpec, RecoverySpec, ResourceSpec,
     RuntimeSlotLoad, ScheduleSpec, SourceMode, StreamSpec, TaskStatus, TaskType,
 };
+use serde_json::json;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use tokio::{net::TcpStream, sync::mpsc, time::timeout};
+use tokio::{net::TcpStream, sync::mpsc, task::JoinHandle, time::timeout};
 
 async fn pick_best_session_for_test(
     service: &ControlPlaneService,
@@ -57,6 +59,65 @@ fn sample_spec(kind: InputKind, url: Option<&str>, interface_ip: Option<&str>) -
         schedule: ScheduleSpec::default(),
         resource: ResourceSpec::default(),
     }
+}
+
+#[test]
+fn source_gateway_rewrites_live_http_input_to_relay_url() -> anyhow::Result<()> {
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000111")?;
+    let mut spec = sample_spec(
+        InputKind::HttpFlv,
+        Some("http://customer.example/live.flv"),
+        None,
+    )
+    .resolved();
+
+    let action = crate::source_gateway::plan_gateway_action(&spec, task_id)
+        .expect("live http input should use media relay");
+    crate::source_gateway::apply_gateway_result(
+        &mut spec,
+        action,
+        crate::source_gateway::GatewayActionResult::Relay {
+            relay_url: "http://media:18080/relay/00000000-0000-0000-0000-000000000111?token=t"
+                .to_string(),
+        },
+    )?;
+
+    assert_eq!(spec.input.kind, Some(InputKind::HttpFlv));
+    assert_eq!(spec.input.source_mode, Some(SourceMode::Live));
+    assert_eq!(
+        spec.input.url.as_deref(),
+        Some("http://media:18080/relay/00000000-0000-0000-0000-000000000111?token=t")
+    );
+    Ok(())
+}
+
+#[test]
+fn source_gateway_rewrites_vod_http_input_to_shared_file_path() -> anyhow::Result<()> {
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000222")?;
+    let mut spec = sample_spec(
+        InputKind::HttpMp4,
+        Some("http://customer.example/archive.mp4"),
+        None,
+    )
+    .resolved();
+
+    let action = crate::source_gateway::plan_gateway_action(&spec, task_id)
+        .expect("vod http input should use media prefetch");
+    crate::source_gateway::apply_gateway_result(
+        &mut spec,
+        action,
+        crate::source_gateway::GatewayActionResult::Prefetch {
+            source_url: "imports/00000000-0000-0000-0000-000000000222/source.mp4".to_string(),
+        },
+    )?;
+
+    assert_eq!(spec.input.kind, Some(InputKind::File));
+    assert_eq!(spec.input.source_mode, Some(SourceMode::Vod));
+    assert_eq!(
+        spec.input.url.as_deref(),
+        Some("imports/00000000-0000-0000-0000-000000000222/source.mp4")
+    );
+    Ok(())
 }
 
 struct TestDatabase {
@@ -176,6 +237,69 @@ async fn current_attempt_lease_token(pool: &PgPool, task_id: Uuid) -> anyhow::Re
     .bind(task_id)
     .fetch_one(pool)
     .await?)
+}
+
+async fn resolved_spec_input(pool: &PgPool, task_id: Uuid) -> anyhow::Result<(String, String)> {
+    let row = sqlx::query(
+        "select resolved_spec->'input'->>'kind' as kind, resolved_spec->'input'->>'url' as url from tasks where id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?;
+    Ok((row.try_get("kind")?, row.try_get("url")?))
+}
+
+async fn spawn_source_gateway_stub(
+    relay_status: StatusCode,
+) -> anyhow::Result<(String, Arc<tokio::sync::Mutex<Vec<Value>>>, JoinHandle<()>)> {
+    use axum::{extract::State, routing::delete, routing::post};
+
+    #[derive(Clone)]
+    struct GatewayStubState {
+        calls: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        relay_status: StatusCode,
+    }
+
+    async fn create_relay(
+        State(state): State<GatewayStubState>,
+        Json(payload): Json<Value>,
+    ) -> impl axum::response::IntoResponse {
+        state.calls.lock().await.push(payload.clone());
+        if state.relay_status != StatusCode::OK {
+            return (
+                state.relay_status,
+                Json(json!({"error": "upstream unavailable"})),
+            );
+        }
+        let task_id = payload["task_id"].as_str().unwrap_or("missing");
+        (
+            StatusCode::OK,
+            Json(json!({
+                "relay_url": format!("http://media:18080/relay/{task_id}?token=test")
+            })),
+        )
+    }
+
+    async fn delete_relay() -> impl axum::response::IntoResponse {
+        StatusCode::NO_CONTENT
+    }
+
+    let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/api/relays", post(create_relay))
+        .route("/api/relays/{task_id}", delete(delete_relay))
+        .with_state(GatewayStubState {
+            calls: calls.clone(),
+            relay_status,
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("source gateway stub should run");
+    });
+    Ok((format!("http://{addr}"), calls, handle))
 }
 
 fn sample_immediate_task_spec() -> TaskSpec {
@@ -1135,6 +1259,107 @@ async fn stream_retry_after_disconnect_waits_for_original_node() -> anyhow::Resu
     assert_eq!(resumed.status, TaskStatus::Running);
     assert_eq!(resumed.assigned_node_id, Some(original_node));
     assert_eq!(resumed.current_attempt_no, 1);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_task_rewrites_live_http_source_through_gateway() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let (gateway_base, calls, _gateway) = spawn_source_gateway_stub(StatusCode::OK).await?;
+    let service = ControlPlaneService::with_source_gateway(
+        repository.clone(),
+        crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?,
+    );
+    let mut spec = sample_immediate_task_spec();
+    spec.input.kind = Some(InputKind::HttpFlv);
+    spec.input.source_mode = Some(SourceMode::Live);
+    spec.input.url = Some("http://customer.example/live.flv".to_string());
+    let task = match repository
+        .create_task("source-gateway-live", "source-gateway-live-hash", spec)
+        .await?
+    {
+        crate::repository::CreateTaskResult::Fresh(task)
+        | crate::repository::CreateTaskResult::Replay(task) => task,
+    };
+    let task = repository.ensure_task_queued(task.id).await?;
+    let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000051")?;
+    let (sender, mut receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+    service
+        .bootstrap_session(&sample_registration(node_id), sender)
+        .await?;
+    service
+        .update_session_load(node_id, &sample_heartbeat(0, 0.0))
+        .await?;
+
+    service.dispatch_task(task.id).await?;
+
+    let (_, stored_url) = resolved_spec_input(&db.pool, task.id).await?;
+    assert!(stored_url.starts_with("http://media:18080/relay/"));
+    let dispatched = receiver
+        .recv()
+        .await
+        .expect("agent should receive start task")?;
+    let media_rpc::control_plane::core_envelope::Payload::StartTask(command) = dispatched
+        .payload
+        .expect("start task payload should be sent")
+    else {
+        panic!("expected start task payload");
+    };
+    let sent_spec: TaskSpec = serde_json::from_str(&command.resolved_spec_json)?;
+    assert_eq!(sent_spec.input.url.as_deref(), Some(stored_url.as_str()));
+    assert_eq!(calls.lock().await.len(), 1);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_task_fails_queued_task_when_gateway_relay_creation_fails() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let (gateway_base, _calls, _gateway) =
+        spawn_source_gateway_stub(StatusCode::BAD_GATEWAY).await?;
+    let service = ControlPlaneService::with_source_gateway(
+        repository.clone(),
+        crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?,
+    );
+    let mut spec = sample_immediate_task_spec();
+    spec.input.kind = Some(InputKind::HttpFlv);
+    spec.input.source_mode = Some(SourceMode::Live);
+    spec.input.url = Some("http://customer.example/live.flv".to_string());
+    let task = match repository
+        .create_task(
+            "source-gateway-live-fails",
+            "source-gateway-live-fails-hash",
+            spec,
+        )
+        .await?
+    {
+        crate::repository::CreateTaskResult::Fresh(task)
+        | crate::repository::CreateTaskResult::Replay(task) => task,
+    };
+    let task = repository.ensure_task_queued(task.id).await?;
+    let node_id = Uuid::parse_str("00000000-0000-0000-0000-000000000052")?;
+    let (sender, mut receiver) = mpsc::channel(CONTROL_STREAM_BUFFER);
+    service
+        .bootstrap_session(&sample_registration(node_id), sender)
+        .await?;
+    service
+        .update_session_load(node_id, &sample_heartbeat(0, 0.0))
+        .await?;
+
+    service.dispatch_task(task.id).await?;
+
+    let failed = repository.get_task_summary(task.id).await?;
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert!(receiver.try_recv().is_err());
 
     db.cleanup().await?;
     Ok(())

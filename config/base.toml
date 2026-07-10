@@ -25,6 +25,9 @@ callback_max_backoff_ms = 300000
 callback_settle_delay_ms = 8000
 callback_shared_secret = ""
 storage_allowlist = ["/data/media/work", "/data/zlm/www"]
+source_gateway_base_url = ""
+source_gateway_prefetch_poll_ms = 1000
+source_gateway_prefetch_timeout_ms = 600000
 
 [agent]
 http_addr = "0.0.0.0:8081"

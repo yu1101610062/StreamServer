@@ -43,6 +43,7 @@ use crate::repository::{
     AgentTaskEventRecord, RecordingControlCommand, RepoError, TaskLogBatchRecord,
     TaskProgressRecord, TaskRepository, TaskSnapshotRecord,
 };
+use crate::source_gateway::SourceGatewayClient;
 
 const CONTROL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_STREAM_BUFFER: usize = 32;
@@ -51,6 +52,7 @@ const CONTROL_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub struct ControlPlaneService {
     repository: Arc<TaskRepository>,
+    source_gateway: Option<SourceGatewayClient>,
     sessions: Arc<Mutex<HashMap<Uuid, SessionHandle>>>,
     session_seq: Arc<AtomicU64>,
 }
@@ -153,6 +155,19 @@ impl ControlPlaneService {
     pub fn new(repository: Arc<TaskRepository>) -> Self {
         Self {
             repository,
+            source_gateway: None,
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_seq: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn with_source_gateway(
+        repository: Arc<TaskRepository>,
+        source_gateway: SourceGatewayClient,
+    ) -> Self {
+        Self {
+            repository,
+            source_gateway: Some(source_gateway),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_seq: Arc::new(AtomicU64::new(1)),
         }
@@ -166,8 +181,34 @@ impl ControlPlaneService {
 
     pub async fn dispatch_task(&self, task_id: Uuid) -> Result<(), ControlPlaneError> {
         self.repository.ensure_task_queued(task_id).await?;
-        let resolved_spec =
+        let mut resolved_spec =
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
+        if let Some(source_gateway) = &self.source_gateway {
+            match source_gateway
+                .prepare_task_spec(task_id, &resolved_spec)
+                .await
+            {
+                Ok(Some(rewritten_spec)) => {
+                    self.repository
+                        .update_queued_resolved_spec(task_id, &rewritten_spec)
+                        .await?;
+                    resolved_spec = rewritten_spec;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let reason = error.to_string();
+                    self.repository
+                        .fail_queued_task(task_id, "source_gateway_failed", &reason)
+                        .await?;
+                    warn!(
+                        task_id = %task_id,
+                        error = %reason,
+                        "task failed before dispatch because source gateway preparation failed"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let source_affinity_ip = task_source_affinity_ip(&resolved_spec);
         let uploaded_file_affinity_node = task_uploaded_file_affinity_node(&resolved_spec);
         let execution_preference = task_execution_preference(&resolved_spec);
@@ -291,6 +332,15 @@ impl ControlPlaneService {
         grace_period_sec: u32,
         force_after_sec: u32,
     ) -> Result<(), ControlPlaneError> {
+        if let Some(source_gateway) = &self.source_gateway {
+            if let Err(error) = source_gateway.delete_relay(task_id).await {
+                warn!(
+                    task_id = %task_id,
+                    error = %error,
+                    "failed to delete source gateway relay during stop"
+                );
+            }
+        }
         let Some(command) = self
             .repository
             .build_stop_command(task_id, reason, grace_period_sec, force_after_sec)

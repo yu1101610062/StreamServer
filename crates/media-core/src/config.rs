@@ -95,6 +95,12 @@ pub struct CoreSettings {
     pub callback_shared_secret: String,
     #[serde(default = "default_storage_allowlist")]
     pub storage_allowlist: Vec<String>,
+    #[serde(default)]
+    pub source_gateway_base_url: String,
+    #[serde(default = "default_source_gateway_prefetch_poll_ms")]
+    pub source_gateway_prefetch_poll_ms: u64,
+    #[serde(default = "default_source_gateway_prefetch_timeout_ms")]
+    pub source_gateway_prefetch_timeout_ms: u64,
 }
 
 impl Default for CoreSettings {
@@ -122,6 +128,9 @@ impl Default for CoreSettings {
             callback_settle_delay_ms: default_callback_settle_delay_ms(),
             callback_shared_secret: String::new(),
             storage_allowlist: default_storage_allowlist(),
+            source_gateway_base_url: String::new(),
+            source_gateway_prefetch_poll_ms: default_source_gateway_prefetch_poll_ms(),
+            source_gateway_prefetch_timeout_ms: default_source_gateway_prefetch_timeout_ms(),
         }
     }
 }
@@ -209,6 +218,17 @@ impl Settings {
             self.core.callback_settle_delay_ms > 0,
             "CALLBACK_SETTLE_DELAY_MS must be positive"
         );
+        if !self.core.source_gateway_base_url.trim().is_empty() {
+            anyhow::ensure!(
+                self.core.source_gateway_prefetch_poll_ms > 0,
+                "SOURCE_GATEWAY_PREFETCH_POLL_MS must be positive"
+            );
+            anyhow::ensure!(
+                self.core.source_gateway_prefetch_timeout_ms
+                    >= self.core.source_gateway_prefetch_poll_ms,
+                "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
+            );
+        }
         let tls_fields = [
             self.core.grpc_tls_cert_path.trim(),
             self.core.grpc_tls_key_path.trim(),
@@ -310,6 +330,17 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     if let Some(value) = env("STORAGE_ALLOWLIST") {
         settings.core.storage_allowlist = split_csv(&value);
     }
+    if let Some(value) = env("SOURCE_GATEWAY_BASE_URL") {
+        settings.core.source_gateway_base_url = value;
+    }
+    if let Some(value) = env("SOURCE_GATEWAY_PREFETCH_POLL_MS") {
+        settings.core.source_gateway_prefetch_poll_ms =
+            parse_required_env("SOURCE_GATEWAY_PREFETCH_POLL_MS", &value)?;
+    }
+    if let Some(value) = env("SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS") {
+        settings.core.source_gateway_prefetch_timeout_ms =
+            parse_required_env("SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS", &value)?;
+    }
     if let Some(value) = env("LOG_LEVEL") {
         settings.logging.level = value;
     }
@@ -399,6 +430,14 @@ fn default_callback_max_backoff_ms() -> u64 {
 
 fn default_callback_settle_delay_ms() -> u64 {
     8_000
+}
+
+fn default_source_gateway_prefetch_poll_ms() -> u64 {
+    1_000
+}
+
+fn default_source_gateway_prefetch_timeout_ms() -> u64 {
+    600_000
 }
 
 pub fn parse_duration_spec(value: &str) -> anyhow::Result<Duration> {

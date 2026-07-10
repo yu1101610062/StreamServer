@@ -1010,6 +1010,7 @@ fix_output_permissions() {
 
 copy_package_assets() {
   install_binary MEDIA_CORE_BINARY_PATH media-core
+  install_binary MEDIA_GATEWAY_BINARY_PATH media-gateway
   install_binary STREAMSERVER_CONFIG_BINARY_PATH streamserver-config
   if role_has_worker "${INSTALL_ROLE}"; then
     install_binary MEDIA_AGENT_BINARY_PATH media-agent

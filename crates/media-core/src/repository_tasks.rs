@@ -475,6 +475,35 @@ impl TaskRepository {
         Ok(resolved)
     }
 
+    pub async fn update_queued_resolved_spec(
+        &self,
+        task_id: Uuid,
+        resolved_spec: &TaskSpec,
+    ) -> Result<(), RepoError> {
+        let result = sqlx::query(
+            r#"
+            update tasks
+               set resolved_spec = $2,
+                   updated_at = $3
+             where id = $1
+               and status = 'QUEUED'::task_status
+            "#,
+        )
+        .bind(task_id)
+        .bind(serde_json::to_value(resolved_spec)?)
+        .bind(Utc::now())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(RepoError::TaskNotDispatchable(
+                self.get_task_summary(task_id).await?.status,
+            ))
+        }
+    }
+
     pub(super) async fn fetch_task_summary(&self, task_id: Uuid) -> Result<TaskSummary, RepoError> {
         sqlx::query(
             r#"

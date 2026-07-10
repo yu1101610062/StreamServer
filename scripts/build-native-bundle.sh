@@ -346,6 +346,7 @@ export_business_binaries() {
     --target-triple "${HOST_BINARY_TARGET_TRIPLE}" \
     --package media-core \
     --package media-agent \
+    --package media-gateway \
     --package streamserver-config \
     --output-dir "${output_dir}"
   if [ "${ephemeral_musl_cache}" -eq 1 ]; then
@@ -852,6 +853,7 @@ copy_business_artifacts() {
   mkdir -p "${bundle_root}/binaries" "${bundle_root}/ui/media-core"
   cp "${binaries_dir}/media-core" "${bundle_root}/binaries/media-core-linux-amd64"
   cp "${binaries_dir}/media-agent" "${bundle_root}/binaries/media-agent-linux-amd64"
+  cp "${binaries_dir}/media-gateway" "${bundle_root}/binaries/media-gateway-linux-amd64"
   cp "${binaries_dir}/streamserver-config" "${bundle_root}/binaries/streamserver-config-linux-amd64"
   chmod 755 "${bundle_root}"/binaries/*-linux-amd64
   cp -R "${PREBUILT_UI_DIR}/." "${bundle_root}/ui/media-core/"
@@ -874,6 +876,7 @@ BUNDLE_POSTGRES_RUNTIME=${postgres_runtime}
 DEPLOY_MODE=native
 MEDIA_CORE_BINARY_PATH=binaries/media-core-linux-amd64
 MEDIA_AGENT_BINARY_PATH=binaries/media-agent-linux-amd64
+MEDIA_GATEWAY_BINARY_PATH=binaries/media-gateway-linux-amd64
 STREAMSERVER_CONFIG_BINARY_PATH=binaries/streamserver-config-linux-amd64
 MEDIA_CORE_UI_PATH=ui/media-core
 FFMPEG_CPU_BINARY_PATH=runtime/ffmpeg/cpu/bin/ffmpeg

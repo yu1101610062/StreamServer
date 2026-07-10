@@ -29,11 +29,11 @@ usage() {
 
 说明:
   使用官方 Rust Docker 镜像构建 musl 目标二进制，并保留 Cargo/target 缓存。
-  默认构建 media-core 和 media-agent。
+  默认构建 media-core、media-agent 和 media-gateway。
 
 参数:
   --target-triple TARGET  目标三元组，默认 x86_64-unknown-linux-musl；支持: x86_64-unknown-linux-musl, aarch64-unknown-linux-musl
-  --package NAME          需要构建的 Cargo package，可重复；默认: media-core, media-agent
+  --package NAME          需要构建的 Cargo package，可重复；默认: media-core, media-agent, media-gateway
   --output-dir DIR        输出目录，默认 ./dist/musl-bin；构建完成后会导出同名二进制到该目录
 
 环境变量:
@@ -97,6 +97,7 @@ parse_args() {
   if [ "${#PACKAGES[@]}" -eq 0 ]; then
     append_package "media-core"
     append_package "media-agent"
+    append_package "media-gateway"
   fi
 }
 

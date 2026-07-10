@@ -1506,6 +1506,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "media-gateway"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "media-rpc"
 version = "0.1.0"
 dependencies = [

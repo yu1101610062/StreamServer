@@ -10,6 +10,7 @@ mod error;
 mod repository;
 mod repository_paths;
 mod scheduler;
+mod source_gateway;
 mod telemetry;
 mod ui;
 mod upload;
@@ -132,7 +133,12 @@ async fn main() -> anyhow::Result<()> {
         pool,
         chrono::Duration::milliseconds(settings.core.callback_settle_delay_ms as i64),
     ));
-    let control_plane = ControlPlaneService::new(repository.clone());
+    let source_gateway = source_gateway::SourceGatewayClient::from_settings(&settings.core)?;
+    let control_plane = if let Some(source_gateway) = source_gateway {
+        ControlPlaneService::with_source_gateway(repository.clone(), source_gateway)
+    } else {
+        ControlPlaneService::new(repository.clone())
+    };
     let hook_source_allowlist = parse_hook_source_allowlist(&settings.core.hook_source_allowlist)?;
     let auth = AuthConfig::from_settings(&settings.core)?;
     if auth.supports_local_login() && !repository.has_enabled_admin_user().await? {
