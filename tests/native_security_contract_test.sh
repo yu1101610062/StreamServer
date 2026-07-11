@@ -226,24 +226,90 @@ run_preflight "${TMP_DIR}/relative-worker.env" "${FAKE_CORE}"
 }
 assert_contains "${PREFLIGHT_OUTPUT}" '[OK] worker mTLS'
 
+RANDOM_PASSWORD_ONE="$(generate_one_time_admin_password)"
+RANDOM_PASSWORD_TWO="$(generate_one_time_admin_password)"
+[[ "${RANDOM_PASSWORD_ONE}" =~ ^[0-9a-f]{36}$ ]]
+[[ "${RANDOM_PASSWORD_TWO}" =~ ^[0-9a-f]{36}$ ]]
+[ "${RANDOM_PASSWORD_ONE}" != "${RANDOM_PASSWORD_TWO}" ]
+unset RANDOM_PASSWORD_ONE RANDOM_PASSWORD_TWO
+
 (
   INSTALL_DIR="${TMP_DIR}/fresh-install"
   INSTALL_ROLE="control-plane"
+  INTERACTIVE_INSTALL=1
   mkdir -p "${INSTALL_DIR}/certs/auth"
   prompt() { printf '%s' "${2:-}"; }
   prompt_non_empty() { printf '%s' "$2"; }
   prompt_local_tcp_port() { printf '%s' "$4"; }
-  prompt_password_with_confirmation() { printf '%s' 'contract-test-password'; }
+  prompt_password_with_confirmation() {
+    echo 'fresh install unexpectedly requested a user-selected admin password' >&2
+    return 1
+  }
+  generate_one_time_admin_password() { printf '%s' '0123456789abcdef0123456789abcdef0123'; }
 
   configure_core_values
   [ "${AUTH_MODE}" = "local_password" ]
   [ "${AUTH_ENABLED}" = "true" ]
   [ "${ADMIN_BOOTSTRAP_REQUIRED}" -eq 1 ]
+  [ "${ADMIN_PASSWORD}" = "0123456789abcdef0123456789abcdef0123" ]
   [ "${CORE_HTTP_ADDR}" = "127.0.0.1:8080" ]
   [ "${CORE_GRPC_ADDR}" = "127.0.0.1:50051" ]
   validate_private_public_key_pair \
     "${AUTH_JWT_PRIVATE_KEY_PATH}" "${AUTH_JWT_PUBLIC_KEY_PATH}"
 )
+
+set +e
+NONINTERACTIVE_FRESH_OUTPUT="$(
+  (
+  INSTALL_DIR="${TMP_DIR}/noninteractive-fresh-install"
+  INSTALL_ROLE="control-plane"
+  INTERACTIVE_INSTALL=0
+  mkdir -p "${INSTALL_DIR}/certs/auth"
+  prompt() { printf '%s' "${2:-}"; }
+  prompt_non_empty() { printf '%s' "$2"; }
+  prompt_local_tcp_port() { printf '%s' "$4"; }
+  prompt_password_with_confirmation() {
+    echo 'unexpected-user-password-prompt' >&2
+    printf '%s' 'user-selected-password'
+  }
+  generate_one_time_admin_password() {
+    echo 'unexpected-password-generation' >&2
+    printf '%s' '0123456789abcdef0123456789abcdef0123'
+  }
+  configure_core_values
+  ) 2>&1
+)"
+NONINTERACTIVE_FRESH_STATUS=$?
+set -e
+[ "${NONINTERACTIVE_FRESH_STATUS}" -ne 0 ]
+if printf '%s' "${NONINTERACTIVE_FRESH_OUTPUT}" | grep -Eq 'unexpected-(user-password-prompt|password-generation)|0123456789abcdef'; then
+  echo 'noninteractive fresh install prompted for, generated, or disclosed an admin password' >&2
+  exit 1
+fi
+
+CREDENTIAL_EMIT_COUNT=0
+CREDENTIAL_CAPTURE=""
+emit_initial_admin_credentials() {
+  CREDENTIAL_EMIT_COUNT=$((CREDENTIAL_EMIT_COUNT + 1))
+  CREDENTIAL_CAPTURE="$1:$2"
+}
+INTERACTIVE_INSTALL=1
+ADMIN_BOOTSTRAP_REQUIRED=1
+INITIAL_ADMIN_PASSWORD_READY=1
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=0123456789abcdef0123456789abcdef0123
+show_initial_admin_credentials_if_needed
+[ "${CREDENTIAL_EMIT_COUNT}" -eq 1 ]
+[ "${CREDENTIAL_CAPTURE}" = 'admin:0123456789abcdef0123456789abcdef0123' ]
+[ -z "${ADMIN_PASSWORD}" ]
+[ "${INITIAL_ADMIN_PASSWORD_READY}" -eq 0 ]
+show_initial_admin_credentials_if_needed
+[ "${CREDENTIAL_EMIT_COUNT}" -eq 1 ]
+ADMIN_PASSWORD=0123456789abcdef0123456789abcdef0123
+INITIAL_ADMIN_PASSWORD_READY=0
+show_initial_admin_credentials_if_needed
+[ "${CREDENTIAL_EMIT_COUNT}" -eq 1 ]
+[ -z "${ADMIN_PASSWORD}" ]
 
 UPGRADE_DIR="${TMP_DIR}/upgrade-install"
 mkdir -p "${UPGRADE_DIR}/certs/auth"
@@ -269,6 +335,10 @@ UPGRADE_KEY_HASH="$(sha256sum "${UPGRADE_DIR}/certs/auth/jwt-private.pem" | awk 
   prompt() { printf '%s' "${2:-}"; }
   prompt_non_empty() { printf '%s' "$2"; }
   prompt_local_tcp_port() { printf '%s' "$4"; }
+  generate_one_time_admin_password() {
+    echo 'upgrade unexpectedly generated an administrator password' >&2
+    return 1
+  }
 
   configure_core_values
   [ "${AUTH_MODE}" = "local_password" ]
@@ -366,11 +436,30 @@ grep -Fq 'default_if_missing(values, "AUTH_MODE", "local_password");' "${CONFIG_
 grep -Fq '"${ROOT}/binaries/media-core-linux-amd64" --insecure-dev' "${VERIFY_SCRIPT}"
 grep -Fq 'tests/native_security_contract_test.sh' "${NATIVE_WORKFLOW}"
 grep -Fq 'bash -n packaging/native/install.sh' "${NATIVE_WORKFLOW}"
+grep -Fq 'set +x' "${INSTALLER}"
+grep -Fq '"${username}" "${password}" >/dev/tty' "${INSTALLER}"
+if grep -Eq 'write_env_entry .*ADMIN_(PASSWORD|INITIAL)|log .*ADMIN_PASSWORD' "${INSTALLER}"; then
+  echo 'administrator initial password can flow into .env or installer logs' >&2
+  exit 1
+fi
+grep -Fq 'printf '\''%s'\'' "${ADMIN_PASSWORD}" | "${INSTALL_DIR}/bin/media-core" auth bootstrap-admin' "${INSTALLER}"
 
 tui_line="$(grep -n '^  run_streamserver_config_tui_if_requested$' "${INSTALLER}" | cut -d: -f1)"
 preflight_line="$(grep -n '^  prepare_production_security_state$' "${INSTALLER}" | cut -d: -f1)"
 [ -n "${tui_line}" ] && [ -n "${preflight_line}" ] && [ "${preflight_line}" -gt "${tui_line}" ] || {
   echo 'production security preflight must run after the optional TUI save' >&2
+  exit 1
+}
+complete_line="$(grep -n '^  log "安装完成:' "${INSTALLER}" | cut -d: -f1)"
+credential_line="$(grep -n '^  show_initial_admin_credentials_if_needed$' "${INSTALLER}" | cut -d: -f1)"
+[ -n "${complete_line}" ] && [ -n "${credential_line}" ] && [ "${credential_line}" -gt "${complete_line}" ] || {
+  echo 'initial administrator password must be displayed only after interactive install success' >&2
+  exit 1
+}
+check_only_line="$(grep -n '^  if \[ "${CHECK_ONLY}" -eq 1 \]; then$' "${INSTALLER}" | cut -d: -f1)"
+configure_line="$(grep -n '^  configure_core_values$' "${INSTALLER}" | cut -d: -f1)"
+[ -n "${check_only_line}" ] && [ -n "${configure_line}" ] && [ "${check_only_line}" -lt "${configure_line}" ] || {
+  echo 'check-only must exit before any initial administrator password can be generated' >&2
   exit 1
 }
 

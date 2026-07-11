@@ -108,6 +108,8 @@ enum CliCommand {
     ResetPassword { username: String },
 }
 
+const BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD: bool = true;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let command = parse_cli_command()?.expect("server mode is always explicit after CLI parsing");
@@ -2751,7 +2753,11 @@ async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
                 "an enabled admin user already exists"
             );
             repository
-                .create_bootstrap_admin(&username, &password_hash, false)
+                .create_bootstrap_admin(
+                    &username,
+                    &password_hash,
+                    BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD,
+                )
                 .await?;
             println!("bootstrapped admin user `{username}`");
         }

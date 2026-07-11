@@ -22,6 +22,8 @@ use tokio::{
 use tower::util::ServiceExt;
 
 const TEST_RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDRNk+CElS+M3My1DbTUInl9aeU\nYCLza8Uftij7kPTApECFQcy1em6CZwb+PDHjjtFB2i8Ncfbx+dt2S6CbJHSF0dDB\n+GoiaVaYolB9XoQODqA7LXTy/D4e9jdNJQgDVXlzXsTm4k3v1CnC1As7RfUkgdM/\npsbfsbeai7RULN2NnQIDAQAB\n-----END PUBLIC KEY-----";
+const TEST_ED25519_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMAlSI3/XdPzRT72Rw08g6NnTnJ2eaq1JoJoW5Vlbm/T\n-----END PRIVATE KEY-----";
+const TEST_ED25519_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA5Q5gilpT0f2fcLhC7l30Wou7Ng/gESlFWWx8z6TGJw=\n-----END PUBLIC KEY-----";
 
 fn disabled_auth_config() -> AuthConfig {
     AuthConfig::from_settings(&CoreSettings::default()).expect("disabled auth config")
@@ -220,6 +222,11 @@ fn parse_cli_command_parses_read_only_auth_config_check() {
     ])
     .unwrap_err();
     assert!(error.to_string().contains("does not accept arguments"));
+}
+
+#[test]
+fn bootstrap_admin_cli_requires_password_change() {
+    assert!(BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD);
 }
 
 fn production_security_settings() -> CoreSettings {
@@ -556,6 +563,23 @@ fn test_app_state_with_auth(pool: sqlx::PgPool) -> AppState {
     state.auth =
         auth_config_from_public_key(true, TEST_RSA_PUBLIC_KEY).expect("rsa key should load");
     state
+}
+
+fn test_app_state_with_local_auth(pool: sqlx::PgPool) -> anyhow::Result<AppState> {
+    let key_dir = tempfile::tempdir()?;
+    let private_key_path = key_dir.path().join("jwt-private.pem");
+    let public_key_path = key_dir.path().join("jwt-public.pem");
+    fs::write(&private_key_path, TEST_ED25519_PRIVATE_KEY)?;
+    fs::write(&public_key_path, TEST_ED25519_PUBLIC_KEY)?;
+    let settings = CoreSettings {
+        auth_mode: AuthMode::LocalPassword,
+        auth_jwt_private_key_path: private_key_path.to_string_lossy().to_string(),
+        auth_jwt_public_key_path: public_key_path.to_string_lossy().to_string(),
+        ..CoreSettings::default()
+    };
+    let mut state = test_app_state(pool);
+    state.auth = AuthConfig::from_settings(&settings)?;
+    Ok(state)
 }
 
 async fn upsert_test_node(
@@ -2003,6 +2027,115 @@ async fn current_session_requires_bearer_token_when_auth_is_enabled() -> anyhow:
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let body = json_body(response).await;
     assert_eq!(body["code"], json!("ACCESS_FORBIDDEN"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -> anyhow::Result<()>
+{
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    const USERNAME: &str = "bootstrap-admin";
+    const INITIAL_PASSWORD: &str = "Initial-password-1";
+    const NEXT_PASSWORD: &str = "Changed-password-2";
+
+    let repository = TaskRepository::new(db.pool.clone());
+    repository
+        .create_bootstrap_admin(
+            USERNAME,
+            &hash_password(INITIAL_PASSWORD)?,
+            BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD,
+        )
+        .await?;
+    let app = build_app(test_app_state_with_local_auth(db.pool.clone())?);
+
+    let login_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "username": USERNAME,
+                    "password": INITIAL_PASSWORD,
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(login_response.status(), StatusCode::OK);
+    let login_body = json_body(login_response).await;
+    assert_eq!(login_body["must_change_password"], json!(true));
+    let access_token = login_body["access_token"]
+        .as_str()
+        .expect("login response access token")
+        .to_string();
+    let refresh_token = login_body["refresh_token"]
+        .as_str()
+        .expect("login response refresh token")
+        .to_string();
+
+    let change_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/change-password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "current_password": INITIAL_PASSWORD,
+                    "new_password": NEXT_PASSWORD,
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(change_response.status(), StatusCode::NO_CONTENT);
+
+    let user = repository
+        .find_auth_user_by_username(USERNAME)
+        .await?
+        .expect("bootstrap administrator must exist");
+    assert!(!user.must_change_password);
+    assert!(
+        repository
+            .find_refresh_session(&hash_refresh_token(&refresh_token))
+            .await?
+            .expect("initial refresh session must remain auditable")
+            .revoked_at
+            .is_some()
+    );
+
+    let stale_refresh_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/refresh")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "refresh_token": refresh_token,
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(stale_refresh_response.status(), StatusCode::FORBIDDEN);
+
+    let next_login_response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "username": USERNAME,
+                    "password": NEXT_PASSWORD,
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(next_login_response.status(), StatusCode::OK);
+    let next_login_body = json_body(next_login_response).await;
+    assert_eq!(next_login_body["must_change_password"], json!(false));
+
+    db.cleanup().await?;
     Ok(())
 }
 

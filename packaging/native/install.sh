@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
 
 PACKAGE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 MANIFEST_FILE="${PACKAGE_ROOT}/package-manifest.env"
@@ -17,6 +18,8 @@ SERVICE_USER="${SERVICE_USER:-streamserver}"
 SERVICE_GROUP="${SERVICE_GROUP:-streamserver}"
 UNIT_BASENAME=""
 RESERVED_LOCAL_TCP_PORTS=""
+INTERACTIVE_INSTALL=0
+INITIAL_ADMIN_PASSWORD_READY=0
 
 log() {
   printf '[streamserver-native-install] %s\n' "$*"
@@ -153,34 +156,6 @@ prompt_yes_no() {
       N|n|no|NO) return 1 ;;
       *) echo "请输入 Y 或 N。" >&2 ;;
     esac
-  done
-}
-
-prompt_secret() {
-  local message="$1"
-  local answer
-  printf '%s: ' "${message}" >&2
-  read -r -s answer
-  printf '\n' >&2
-  printf '%s' "${answer}"
-}
-
-prompt_password_with_confirmation() {
-  local message="$1"
-  local password
-  local confirm
-  while true; do
-    password="$(prompt_secret "${message}")"
-    [ -n "${password}" ] || {
-      echo "密码不能为空。" >&2
-      continue
-    }
-    confirm="$(prompt_secret "再次输入以确认")"
-    if [ "${password}" = "${confirm}" ]; then
-      printf '%s' "${password}"
-      return 0
-    fi
-    echo "两次输入不一致，请重新输入。" >&2
   done
 }
 
@@ -353,6 +328,13 @@ ensure_service_user() {
 
 generate_secret() {
   openssl rand -hex 24
+}
+
+generate_one_time_admin_password() {
+  local password
+  password="$(openssl rand -hex 18)" || fail "无法生成一次性管理员初始密码"
+  [[ "${password}" =~ ^[0-9a-f]{36}$ ]] || fail "一次性管理员初始密码生成结果无效"
+  printf '%s' "${password}"
 }
 
 generate_uuid() {
@@ -1458,12 +1440,14 @@ configure_core_values() {
   elif [ -f "${existing_env_file}" ] && [ "${existing_auth_mode}" = "external_jwt" ]; then
     log "保留现有 production 认证模式和公钥: external_jwt"
   else
+    [ "${INTERACTIVE_INSTALL:-0}" -eq 1 ] \
+      || fail "fresh local_password install requires an interactive terminal"
     AUTH_MODE="local_password"
     AUTH_ENABLED="true"
     JWT_PUBLIC_KEY=""
     ADMIN_BOOTSTRAP_REQUIRED=1
     ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "admin")"
-    ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
+    ADMIN_PASSWORD="$(generate_one_time_admin_password)"
     openssl genpkey -algorithm Ed25519 -out "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem" >/dev/null 2>&1
     openssl pkey -in "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem" -pubout -out "${INSTALL_DIR}/certs/auth/jwt-ed25519-public.pem" >/dev/null 2>&1
     chmod 600 "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem"
@@ -1848,6 +1832,27 @@ bootstrap_local_admin_if_needed() {
     set +a
     printf '%s' "${ADMIN_PASSWORD}" | "${INSTALL_DIR}/bin/media-core" auth bootstrap-admin --username "${ADMIN_USERNAME}" --password-stdin
   )
+  INITIAL_ADMIN_PASSWORD_READY=1
+}
+
+emit_initial_admin_credentials() {
+  local username="$1"
+  local password="$2"
+  printf '\n首次登录管理员: %s\n一次性初始密码: %s\n请登录后立即修改；此密码不会保存，也不会再次显示。\n\n' \
+    "${username}" "${password}" >/dev/tty
+}
+
+show_initial_admin_credentials_if_needed() {
+  local emit_status=0
+  if [ "${INTERACTIVE_INSTALL:-0}" -eq 1 ] \
+    && [ "${ADMIN_BOOTSTRAP_REQUIRED:-0}" -eq 1 ] \
+    && [ "${INITIAL_ADMIN_PASSWORD_READY:-0}" -eq 1 ] \
+    && [ -n "${ADMIN_PASSWORD:-}" ]; then
+    emit_initial_admin_credentials "${ADMIN_USERNAME}" "${ADMIN_PASSWORD}" || emit_status=$?
+  fi
+  ADMIN_PASSWORD=""
+  INITIAL_ADMIN_PASSWORD_READY=0
+  [ "${emit_status}" -eq 0 ] || fail "无法向交互终端显示一次性管理员初始密码"
 }
 
 write_streamserverctl() {
@@ -1973,6 +1978,9 @@ confirm_start_after_install() {
 main() {
   local package_core_bin
   parse_args "$@"
+  if [ -t 0 ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    INTERACTIVE_INSTALL=1
+  fi
   if [ "${CHECK_ONLY}" -eq 1 ] && [ "${SECURITY_PREFLIGHT}" -eq 1 ]; then
     fail "--check-only and --security-preflight cannot be used together"
   fi
@@ -2027,6 +2035,7 @@ main() {
   start_services_if_requested
   log "安装完成: ${INSTALL_DIR}"
   log "卸载: ${INSTALL_DIR}/uninstall.sh"
+  show_initial_admin_credentials_if_needed
 }
 
 main "$@"
