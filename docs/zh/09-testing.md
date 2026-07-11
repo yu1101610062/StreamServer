@@ -113,3 +113,53 @@
 - 真实摄像头接入
 - 复杂组播网络联调
 - 浏览器播放兼容性
+
+## 8. 与 Linux CI 一致的本地质量门
+
+服务端发布门禁以 Linux AMD64 为准，由 `.github/workflows/server-ci.yml`
+执行。请从仓库根目录使用 Rust 1.85.0、Node.js 20、PostgreSQL 16 和 18.3 运行
+以下命令。测试数据库账号必须具备创建和删除临时数据库的权限。下面的
+可复制示例会为两个数据库版本分别启动仅供测试的临时容器。
+
+```bash
+set -euo pipefail
+test "$(uname -s)" = "Linux"
+test "$(uname -m)" = "x86_64"
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  libdbus-1-dev pkg-config postgresql-client protobuf-compiler
+rustup toolchain install 1.85.0 \
+  --profile minimal --component rustfmt --component clippy
+rustup default 1.85.0
+python3 tests/ci_workflow_contract_test.py
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cleanup_postgres() {
+  docker rm -f streamserver-ci-postgres >/dev/null 2>&1 || true
+}
+trap cleanup_postgres EXIT
+for POSTGRES_VERSION in 16 18.3; do
+  cleanup_postgres
+  docker run --rm --detach --name streamserver-ci-postgres \
+    --env POSTGRES_PASSWORD=test --publish 5432:5432 "postgres:${POSTGRES_VERSION}"
+  export TEST_DATABASE_URL=postgresql://postgres:test@127.0.0.1:5432/postgres
+  timeout 60 bash -c 'until psql "${TEST_DATABASE_URL}" -c "select 1" >/dev/null 2>&1; do sleep 1; done'
+  cargo test --workspace --all-targets
+  cleanup_postgres
+done
+trap - EXIT
+(
+  cd crates/media-core/frontend
+  npm ci
+  npm run typecheck
+  npm run test
+)
+```
+
+Rust workspace 测试会分别在 PostgreSQL 16 和 18.3 上执行一次。
+这组命令是 Linux AMD64 服务端门禁。只在 Windows 出现的 workspace 失败，
+包括 `media-agent` 编译失败，不应直接判定为服务端回归；必须先在 Linux
+AMD64 上复现。桌面端打包仍由独立的 `desktop-client.yml` 负责。
+
+原生 bundle 构建也保持独立，继续由 `server-native-bundles.yml` 执行，
+不混入快速服务端质量门禁。

@@ -1,0 +1,120 @@
+name: Server CI
+
+on:
+  push:
+    branches:
+      - master
+      - DEV
+  pull_request:
+    branches:
+      - master
+      - DEV
+
+permissions:
+  contents: read
+
+concurrency:
+  group: server-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  TEST_DATABASE_URL: postgresql://postgres:test@127.0.0.1:5432/postgres
+
+jobs:
+  rust:
+    name: Rust workspace (PostgreSQL ${{ matrix.postgres }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres:
+          - "16"
+          - "18.3"
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}
+        env:
+          POSTGRES_DB: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Linux AMD64 runner
+        shell: bash
+        run: |
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev \
+            pkg-config \
+            postgresql-client \
+            protobuf-compiler
+
+      - name: Set up Rust 1.85.0
+        shell: bash
+        run: |
+          rustup toolchain install 1.85.0 \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+          rustup default 1.85.0
+          rustc --version
+
+      - name: Validate CI workflow contract
+        run: python3 tests/ci_workflow_contract_test.py
+
+      - name: Verify PostgreSQL connection
+        shell: bash
+        run: psql "${TEST_DATABASE_URL}" -v ON_ERROR_STOP=1 -c "select 1"
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test full Rust workspace
+        run: cargo test --workspace --all-targets
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: crates/media-core/frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: crates/media-core/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check frontend
+        run: npm run typecheck
+
+      - name: Test frontend
+        run: npm run test
