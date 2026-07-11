@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_database::{config_from_env, finish_setup};
 use std::net::Ipv4Addr;
 
 use axum::{Json, Router, http::StatusCode};
@@ -127,18 +128,17 @@ struct TestDatabase {
 }
 
 impl TestDatabase {
-    async fn new(run_migrations: bool) -> anyhow::Result<Self> {
-        let admin_url = test_admin_database_url();
+    async fn new(admin_url: &str, run_migrations: bool) -> anyhow::Result<Self> {
         let admin_pool = PgPoolOptions::new()
             .max_connections(1)
-            .connect(&admin_url)
+            .connect(admin_url)
             .await?;
         let database_name = format!("streamserver_test_{}", Uuid::now_v7().simple());
         sqlx::query(&format!("create database {database_name}"))
             .execute(&admin_pool)
             .await?;
 
-        let database_url = test_database_url(&admin_url, &database_name)?;
+        let database_url = test_database_url(admin_url, &database_name)?;
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
@@ -155,17 +155,20 @@ impl TestDatabase {
     }
 
     async fn maybe_new(run_migrations: bool) -> anyhow::Result<Option<Self>> {
-        if !database_is_reachable(&test_admin_database_url()).await {
-            eprintln!("skipping database-backed test: database is unreachable");
-            return Ok(None);
+        let config = config_from_env()?;
+        if !database_is_reachable(&config.admin_url).await {
+            return finish_setup(
+                config.required,
+                Err(anyhow::anyhow!(
+                    "database is unreachable at {}",
+                    config.admin_url
+                )),
+            );
         }
-        match Self::new(run_migrations).await {
-            Ok(database) => Ok(Some(database)),
-            Err(error) => {
-                eprintln!("skipping database-backed test: {error}");
-                Ok(None)
-            }
-        }
+        finish_setup(
+            config.required,
+            Self::new(&config.admin_url, run_migrations).await,
+        )
     }
 
     async fn cleanup(self) -> anyhow::Result<()> {
@@ -187,13 +190,6 @@ impl TestDatabase {
         self.admin_pool.close().await;
         Ok(())
     }
-}
-
-fn test_admin_database_url() -> String {
-    std::env::var("TEST_DATABASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "postgresql://postgres:test@127.0.0.1/postgres".to_string())
 }
 
 fn test_database_url(admin_url: &str, database_name: &str) -> anyhow::Result<String> {

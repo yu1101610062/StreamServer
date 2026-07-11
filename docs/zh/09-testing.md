@@ -131,20 +131,22 @@ sudo apt-get install -y --no-install-recommends \
 rustup toolchain install 1.85.0 \
   --profile minimal --component rustfmt --component clippy
 rustup default 1.85.0
+python3 -m pip install --disable-pip-version-check --no-deps -r tests/requirements-ci.txt
 python3 tests/ci_workflow_contract_test.py
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cleanup_postgres() {
   docker rm -f streamserver-ci-postgres >/dev/null 2>&1 || true
 }
 trap cleanup_postgres EXIT
+export REQUIRE_TEST_DATABASE=1
 for POSTGRES_VERSION in 16 18.3; do
   cleanup_postgres
   docker run --rm --detach --name streamserver-ci-postgres \
     --env POSTGRES_PASSWORD=test --publish 5432:5432 "postgres:${POSTGRES_VERSION}"
   export TEST_DATABASE_URL=postgresql://postgres:test@127.0.0.1:5432/postgres
   timeout 60 bash -c 'until psql "${TEST_DATABASE_URL}" -c "select 1" >/dev/null 2>&1; do sleep 1; done'
-  cargo test --workspace --all-targets
+  cargo test --locked --workspace --all-targets
   cleanup_postgres
 done
 trap - EXIT
@@ -157,6 +159,9 @@ trap - EXIT
 ```
 
 Rust workspace 测试会分别在 PostgreSQL 16 和 18.3 上执行一次。
+在这组精确门禁以外，不设置 `REQUIRE_TEST_DATABASE` 时仍保留 PostgreSQL
+不可用便跳过数据库测试的本地开发体验。CI 将其设为 `1`，因此缺少数据库
+配置、创建数据库失败或迁移失败都会使测试失败，不会被当作 skip。
 这组命令是 Linux AMD64 服务端门禁。只在 Windows 出现的 workspace 失败，
 包括 `media-agent` 编译失败，不应直接判定为服务端回归；必须先在 Linux
 AMD64 上复现。桌面端打包仍由独立的 `desktop-client.yml` 负责。

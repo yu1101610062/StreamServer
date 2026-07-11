@@ -2,6 +2,9 @@
 #[path = "tests/main.rs"]
 mod tests;
 
+#[cfg(test)]
+mod test_database;
+
 mod auth;
 mod callback;
 mod config;

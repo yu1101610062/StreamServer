@@ -136,19 +136,15 @@ sudo ./install.sh
 
 ### 快速开始
 
-运行测试：
+快速 smoke 子集（不替代完整 Linux 质量门）：
 
 ```bash
-cargo test --workspace --all-targets
+cargo fmt --all -- --check
+cargo test --locked -p media-domain
 ```
 
-建议质量门禁：
-
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
-```
+PostgreSQL 16/18.3、完整 Rust workspace、Clippy 和前端门禁以
+[完整 Linux 质量门](docs/zh/09-testing.md)为准。
 
 本地运行 Core 需要可访问的 PostgreSQL：
 
@@ -347,11 +343,15 @@ See [Native Deployment](docs/en/08-native-deployment.md).
 
 ### Quick Start
 
+Quick smoke subset (not the complete Linux quality gate):
+
 ```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+cargo fmt --all -- --check
+cargo test --locked -p media-domain
 ```
+
+For the PostgreSQL 16/18.3 matrix, full Rust workspace, Clippy, and frontend
+checks, use the [complete Linux quality gate](docs/en/09-testing.md).
 
 Run Core with PostgreSQL:
 

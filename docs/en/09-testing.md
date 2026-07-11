@@ -18,20 +18,22 @@ sudo apt-get install -y --no-install-recommends \
 rustup toolchain install 1.85.0 \
   --profile minimal --component rustfmt --component clippy
 rustup default 1.85.0
+python3 -m pip install --disable-pip-version-check --no-deps -r tests/requirements-ci.txt
 python3 tests/ci_workflow_contract_test.py
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cleanup_postgres() {
   docker rm -f streamserver-ci-postgres >/dev/null 2>&1 || true
 }
 trap cleanup_postgres EXIT
+export REQUIRE_TEST_DATABASE=1
 for POSTGRES_VERSION in 16 18.3; do
   cleanup_postgres
   docker run --rm --detach --name streamserver-ci-postgres \
     --env POSTGRES_PASSWORD=test --publish 5432:5432 "postgres:${POSTGRES_VERSION}"
   export TEST_DATABASE_URL=postgresql://postgres:test@127.0.0.1:5432/postgres
   timeout 60 bash -c 'until psql "${TEST_DATABASE_URL}" -c "select 1" >/dev/null 2>&1; do sleep 1; done'
-  cargo test --workspace --all-targets
+  cargo test --locked --workspace --all-targets
   cleanup_postgres
 done
 trap - EXIT
@@ -44,6 +46,10 @@ trap - EXIT
 ```
 
 The Rust workspace tests run once against PostgreSQL 16 and once against 18.3.
+Outside this exact gate, leave `REQUIRE_TEST_DATABASE` unset to retain the
+developer-friendly behavior of skipping database-backed tests when PostgreSQL
+is unavailable. The CI gate sets it to `1`, so missing configuration, database
+creation errors, and migration errors fail instead of skipping.
 These are server gates for the Linux AMD64 target. A whole-workspace failure
 seen only on Windows, including a `media-agent` compile failure, is not a server regression.
 Reproduce it on Linux AMD64 before classifying it as one. Desktop packaging

@@ -10,7 +10,7 @@
 | --- | --- |
 | 操作系统 | Linux，优先 Ubuntu 22.04 LTS 或 24.04 LTS |
 | Rust | stable，MSRV `1.85+`，edition `2024` |
-| PostgreSQL | 16 |
+| PostgreSQL | 16 为最低兼容基线；CI 固定覆盖 16 和 18.3；native bundle 默认 18.3 |
 | FFmpeg | 随包 runtime 固定 `8.1` 系列；外部自带 FFmpeg 至少 `6.1+`，必须启用所需协议和编码器 |
 | ZLMediaKit | 随包 runtime 固定版本；不允许现场使用 `latest` |
 
@@ -18,6 +18,7 @@
 
 - 开发环境允许使用次新版，但 CI 和联调环境必须固定版本。
 - 所有第三方 runtime 必须锁定版本和来源。
+- PostgreSQL 16 是最低兼容基线；CI 同时覆盖 16 和 18.3；native bundle 默认携带 18.3。
 - FFmpeg build 来源必须记录到节点能力表中；GPU 节点必须实际通过 `h264_nvenc` 和 `hevc_nvenc` 编码 smoke test。
 
 ## 4. 必备系统资源
