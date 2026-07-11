@@ -3,13 +3,16 @@ level = "info"
 json = false
 
 [core]
-http_addr = "0.0.0.0:8080"
-grpc_addr = "0.0.0.0:50051"
+http_addr = "127.0.0.1:8080"
+http_tls_cert_path = ""
+http_tls_key_path = ""
+grpc_addr = "127.0.0.1:50051"
 grpc_tls_cert_path = ""
 grpc_tls_key_path = ""
 grpc_tls_client_ca_path = ""
 database_url = ""
 auth_mode = "disabled"
+insecure_dev = false
 jwt_public_key = ""
 auth_jwt_private_key_path = ""
 auth_jwt_public_key_path = ""

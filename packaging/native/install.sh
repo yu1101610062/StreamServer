@@ -5,6 +5,8 @@ PACKAGE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 MANIFEST_FILE="${PACKAGE_ROOT}/package-manifest.env"
 
 CHECK_ONLY=0
+SECURITY_PREFLIGHT=0
+UPGRADE=0
 START_AFTER_INSTALL=1
 INSTALL_ROLE=""
 INSTALL_DIR=""
@@ -38,7 +40,8 @@ load_manifest() {
 usage() {
   cat <<EOF
 用法:
-  ./install.sh [--check-only] [--role ROLE] [--install-dir DIR] [--instance-name NAME]
+  ./install.sh [--check-only|--security-preflight] [--upgrade] [--role ROLE]
+               [--install-dir DIR] [--instance-name NAME]
                [--database-url URL] [--no-start]
 
 角色:
@@ -47,6 +50,11 @@ usage() {
   worker-host-gpu
   all-in-one-host-cpu
   all-in-one-host-gpu
+
+安全检查:
+  --check-only              校验安装包；配合 --install-dir 时同时检查现有生产安全配置
+  --security-preflight      只检查 --install-dir 中的 auth/admin、HTTP TLS、gRPC mTLS
+  --upgrade                 升级前用包内新 media-core 对现有数据库和 TLS 配置做只读预检
 
 说明:
   Native 安装器不检查、不安装、不调用 Docker 或 Compose。
@@ -58,6 +66,14 @@ parse_args() {
     case "$1" in
       --check-only)
         CHECK_ONLY=1
+        shift
+        ;;
+      --security-preflight)
+        SECURITY_PREFLIGHT=1
+        shift
+        ;;
+      --upgrade)
+        UPGRADE=1
         shift
         ;;
       --role)
@@ -426,10 +442,36 @@ existing_env_value() {
   local key="$2"
   [ -f "${env_file}" ] || return 1
   awk -v key="${key}" '
-    BEGIN { found = 0 }
+    BEGIN { found = 0; collecting = 0; value = "" }
+    collecting {
+      if (substr($0, length($0), 1) == "\047") {
+        value = value "\n" substr($0, 1, length($0) - 1)
+        print value
+        found = 1
+        exit
+      }
+      value = value "\n" $0
+      next
+    }
     $0 ~ /^[[:space:]]*#/ { next }
-    index($0, key "=") == 1 {
-      print substr($0, length(key) + 2)
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+    }
+    index(line, key "=") == 1 {
+      raw = substr(line, length(key) + 2)
+      if (substr(raw, 1, 1) == "\047") {
+        raw = substr(raw, 2)
+        if (length(raw) > 0 && substr(raw, length(raw), 1) == "\047") {
+          print substr(raw, 1, length(raw) - 1)
+          found = 1
+          exit
+        }
+        value = raw
+        collecting = 1
+        next
+      }
+      print raw
       found = 1
       exit
     }
@@ -453,6 +495,248 @@ env_value_or_default() {
   else
     printf '%s' "${default_value}"
   fi
+}
+
+security_env_value() {
+  local env_file="$1"
+  local key="$2"
+  existing_env_value "${env_file}" "${key}" 2>/dev/null || true
+}
+
+resolve_security_path() {
+  local env_file="$1"
+  local value="$2"
+  local env_dir
+  [ -n "${value}" ] || return 0
+  case "${value}" in
+    /*) printf '%s' "${value}" ;;
+    *)
+      env_dir="$(cd "$(dirname "${env_file}")" && pwd -P)"
+      printf '%s/%s' "${env_dir}" "${value}"
+      ;;
+  esac
+}
+
+is_loopback_socket_addr() {
+  case "$1" in
+    127.*:*|\[::1\]:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_x509_certificate() {
+  local cert_path="$1"
+  [ -r "${cert_path}" ] || return 1
+  openssl x509 -in "${cert_path}" -noout -checkend 0 >/dev/null 2>&1
+}
+
+validate_x509_ca_certificate() {
+  local cert_path="$1"
+  validate_x509_certificate "${cert_path}" || return 1
+  openssl x509 -in "${cert_path}" -noout -text 2>/dev/null | grep -q 'CA:TRUE'
+}
+
+validate_private_key() {
+  local key_path="$1"
+  [ -r "${key_path}" ] || return 1
+  openssl pkey -in "${key_path}" -noout >/dev/null 2>&1
+}
+
+validate_public_key() {
+  local key_path="$1"
+  [ -r "${key_path}" ] || return 1
+  openssl pkey -pubin -in "${key_path}" -noout >/dev/null 2>&1
+}
+
+validate_certificate_key_pair() {
+  local cert_path="$1"
+  local key_path="$2"
+  local cert_fingerprint
+  local key_fingerprint
+  validate_x509_certificate "${cert_path}" || return 1
+  validate_private_key "${key_path}" || return 1
+  cert_fingerprint="$(openssl x509 -in "${cert_path}" -pubkey -noout 2>/dev/null \
+    | openssl pkey -pubin -outform DER 2>/dev/null \
+    | sha256sum | awk '{print $1}')" || return 1
+  key_fingerprint="$(openssl pkey -in "${key_path}" -pubout -outform DER 2>/dev/null \
+    | sha256sum | awk '{print $1}')" || return 1
+  [ -n "${cert_fingerprint}" ] && [ "${cert_fingerprint}" = "${key_fingerprint}" ]
+}
+
+validate_private_public_key_pair() {
+  local private_key_path="$1"
+  local public_key_path="$2"
+  local private_fingerprint
+  local public_fingerprint
+  validate_private_key "${private_key_path}" || return 1
+  validate_public_key "${public_key_path}" || return 1
+  private_fingerprint="$(openssl pkey -in "${private_key_path}" -pubout -outform DER 2>/dev/null \
+    | sha256sum | awk '{print $1}')" || return 1
+  public_fingerprint="$(openssl pkey -pubin -in "${public_key_path}" -outform DER 2>/dev/null \
+    | sha256sum | awk '{print $1}')" || return 1
+  [ -n "${private_fingerprint}" ] && [ "${private_fingerprint}" = "${public_fingerprint}" ]
+}
+
+security_preflight_env() {
+  local env_file="$1"
+  local core_bin="${2:-}"
+  local role auth_mode database_url jwt_private jwt_public jwt_external
+  local http_addr http_cert http_key
+  local grpc_cert grpc_key grpc_client_ca
+  local agent_endpoint agent_cert agent_key agent_ca agent_domain
+  local failures=0
+
+  if [ ! -f "${env_file}" ]; then
+    printf '[MISSING] configuration: %s does not exist\n' "${env_file}" >&2
+    return 1
+  fi
+  role="$(security_env_value "${env_file}" INSTALL_ROLE)"
+  [ -n "${core_bin}" ] || core_bin="$(cd "$(dirname "${env_file}")" && pwd)/bin/media-core"
+  case "${role}" in
+    control-plane|worker-host-cpu|worker-host-gpu|all-in-one-host-cpu|all-in-one-host-gpu) ;;
+    *)
+      printf '[MISSING] configuration: INSTALL_ROLE is missing or unsupported\n' >&2
+      return 1
+      ;;
+  esac
+
+  if role_has_core "${role}"; then
+    auth_mode="$(security_env_value "${env_file}" AUTH_MODE)"
+    database_url="$(security_env_value "${env_file}" DATABASE_URL)"
+    jwt_private="$(security_env_value "${env_file}" AUTH_JWT_PRIVATE_KEY_PATH)"
+    jwt_public="$(security_env_value "${env_file}" AUTH_JWT_PUBLIC_KEY_PATH)"
+    jwt_private="$(resolve_security_path "${env_file}" "${jwt_private}")"
+    jwt_public="$(resolve_security_path "${env_file}" "${jwt_public}")"
+    jwt_external="$(security_env_value "${env_file}" JWT_PUBLIC_KEY)"
+    case "${auth_mode}" in
+      local_password)
+        if [ -z "${database_url}" ]; then
+          printf '[MISSING] auth/admin: DATABASE_URL is not configured\n' >&2
+          failures=$((failures + 1))
+        elif ! validate_private_public_key_pair "${jwt_private}" "${jwt_public}"; then
+          printf '[INVALID] auth/admin: local_password JWT private/public key pair is missing or invalid\n' >&2
+          failures=$((failures + 1))
+        elif [ ! -x "${core_bin}" ]; then
+          printf '[UNKNOWN] auth/admin: media-core admin probe is unavailable\n' >&2
+          failures=$((failures + 1))
+        elif ! env \
+          STREAMSERVER_ENV=production \
+          DATABASE_URL="${database_url}" \
+          AUTH_MODE=local_password \
+          AUTH_JWT_PRIVATE_KEY_PATH="${jwt_private}" \
+          AUTH_JWT_PUBLIC_KEY_PATH="${jwt_public}" \
+          "${core_bin}" auth check-config >/dev/null 2>&1; then
+          printf '[INVALID] auth/admin: local_password JWT configuration is not valid RSA or Ed25519 PEM\n' >&2
+          failures=$((failures + 1))
+        elif env \
+          STREAMSERVER_ENV=production \
+          DATABASE_URL="${database_url}" \
+          AUTH_MODE=local_password \
+          AUTH_JWT_PRIVATE_KEY_PATH="${jwt_private}" \
+          AUTH_JWT_PUBLIC_KEY_PATH="${jwt_public}" \
+          "${core_bin}" auth check-admin >/dev/null 2>&1; then
+          printf '[OK] auth/admin: local_password keys and enabled administrator verified\n'
+        else
+          printf '[MISSING] auth/admin: enabled administrator could not be confirmed\n' >&2
+          failures=$((failures + 1))
+        fi
+        ;;
+      external_jwt)
+        if [ -z "${jwt_external}" ]; then
+          printf '[MISSING] auth/admin: JWT_PUBLIC_KEY is required for external_jwt\n' >&2
+          failures=$((failures + 1))
+        elif [ -z "${database_url}" ]; then
+          printf '[MISSING] auth/admin: DATABASE_URL is not configured\n' >&2
+          failures=$((failures + 1))
+        elif [ ! -x "${core_bin}" ]; then
+          printf '[UNKNOWN] auth/admin: media-core auth configuration probe is unavailable\n' >&2
+          failures=$((failures + 1))
+        elif env \
+          STREAMSERVER_ENV=production \
+          DATABASE_URL="${database_url}" \
+          AUTH_MODE=external_jwt \
+          JWT_PUBLIC_KEY="${jwt_external}" \
+          "${core_bin}" auth check-config >/dev/null 2>&1; then
+          printf '[OK] auth/admin: external_jwt public key verified\n'
+        else
+          printf '[INVALID] auth/admin: external_jwt public key is not a valid RSA or Ed25519 PEM key\n' >&2
+          failures=$((failures + 1))
+        fi
+        ;;
+      *)
+        printf '[MISSING] auth/admin: production AUTH_MODE must be local_password or external_jwt\n' >&2
+        failures=$((failures + 1))
+        ;;
+    esac
+
+    http_addr="$(security_env_value "${env_file}" CORE_HTTP_ADDR)"
+    http_cert="$(security_env_value "${env_file}" CORE_HTTP_TLS_CERT_PATH)"
+    http_key="$(security_env_value "${env_file}" CORE_HTTP_TLS_KEY_PATH)"
+    http_cert="$(resolve_security_path "${env_file}" "${http_cert}")"
+    http_key="$(resolve_security_path "${env_file}" "${http_key}")"
+    if [ -z "${http_cert}" ] && [ -z "${http_key}" ]; then
+      if is_loopback_socket_addr "${http_addr}"; then
+        printf '[OK] HTTP TLS: plaintext listener is restricted to loopback\n'
+      else
+        printf '[MISSING] HTTP TLS: non-loopback CORE_HTTP_ADDR requires certificate and key\n' >&2
+        failures=$((failures + 1))
+      fi
+    elif [ -z "${http_cert}" ] || [ -z "${http_key}" ]; then
+      printf '[MISSING] HTTP TLS: certificate and key must be configured together\n' >&2
+      failures=$((failures + 1))
+    elif validate_certificate_key_pair "${http_cert}" "${http_key}"; then
+      printf '[OK] HTTP TLS: certificate and matching private key verified\n'
+    else
+      printf '[INVALID] HTTP TLS: certificate or matching private key is invalid\n' >&2
+      failures=$((failures + 1))
+    fi
+
+    grpc_cert="$(security_env_value "${env_file}" CORE_GRPC_TLS_CERT_PATH)"
+    grpc_key="$(security_env_value "${env_file}" CORE_GRPC_TLS_KEY_PATH)"
+    grpc_client_ca="$(security_env_value "${env_file}" CORE_GRPC_TLS_CLIENT_CA_PATH)"
+    grpc_cert="$(resolve_security_path "${env_file}" "${grpc_cert}")"
+    grpc_key="$(resolve_security_path "${env_file}" "${grpc_key}")"
+    grpc_client_ca="$(resolve_security_path "${env_file}" "${grpc_client_ca}")"
+    if [ -z "${grpc_cert}" ] || [ -z "${grpc_key}" ] || [ -z "${grpc_client_ca}" ]; then
+      printf '[MISSING] gRPC mTLS: server certificate, key and client CA are all required\n' >&2
+      failures=$((failures + 1))
+    elif validate_certificate_key_pair "${grpc_cert}" "${grpc_key}" \
+      && validate_x509_ca_certificate "${grpc_client_ca}"; then
+      printf '[OK] gRPC mTLS: server identity and client CA verified\n'
+    else
+      printf '[INVALID] gRPC mTLS: server identity or client CA is invalid\n' >&2
+      failures=$((failures + 1))
+    fi
+  fi
+
+  if role_has_worker "${role}"; then
+    agent_endpoint="$(security_env_value "${env_file}" AGENT_CORE_ENDPOINT)"
+    agent_cert="$(security_env_value "${env_file}" AGENT_CERT_PATH)"
+    agent_key="$(security_env_value "${env_file}" AGENT_KEY_PATH)"
+    agent_ca="$(security_env_value "${env_file}" AGENT_CA_PATH)"
+    agent_cert="$(resolve_security_path "${env_file}" "${agent_cert}")"
+    agent_key="$(resolve_security_path "${env_file}" "${agent_key}")"
+    agent_ca="$(resolve_security_path "${env_file}" "${agent_ca}")"
+    agent_domain="$(security_env_value "${env_file}" AGENT_TLS_DOMAIN_NAME)"
+    if [[ "${agent_endpoint}" != https://* ]] \
+      || [ -z "${agent_cert}" ] || [ -z "${agent_key}" ] \
+      || [ -z "${agent_ca}" ] || [ -z "${agent_domain}" ]; then
+      printf '[MISSING] worker mTLS: HTTPS endpoint, client certificate/key, CA and TLS domain are required\n' >&2
+      failures=$((failures + 1))
+    elif validate_certificate_key_pair "${agent_cert}" "${agent_key}" \
+      && validate_x509_ca_certificate "${agent_ca}"; then
+      printf '[OK] worker mTLS: client identity, CA, endpoint and TLS domain verified\n'
+    else
+      printf '[INVALID] worker mTLS: client identity or CA is invalid\n' >&2
+      failures=$((failures + 1))
+    fi
+  fi
+
+  if [ "${failures}" -ne 0 ]; then
+    printf 'security preflight failed with %s issue(s); services will not be started\n' "${failures}" >&2
+    return 1
+  fi
+  printf 'security preflight passed\n'
 }
 
 validate_port_number() {
@@ -945,7 +1229,7 @@ backup_existing_install() {
   [ -e "${INSTALL_DIR}/.env" ] || return 0
   local backup_dir="${INSTALL_DIR}.backup-$(date '+%Y%m%d-%H%M%S')"
   mkdir -p "${backup_dir}"
-  for item in .env bin ui runtime zlm docs systemd uninstall.sh; do
+  for item in .env bin ui runtime zlm docs certs systemd uninstall.sh; do
     [ -e "${INSTALL_DIR}/${item}" ] || continue
     cp -R "${INSTALL_DIR}/${item}" "${backup_dir}/${item}"
   done
@@ -1071,7 +1355,12 @@ write_env_entry() {
   local file="$1"
   local key="$2"
   local value="$3"
-  printf '%s=%s\n' "${key}" "${value}" >>"${file}"
+  if [[ "${value}" == *$'\n'* ]]; then
+    [[ "${value}" != *"'"* ]] || fail "${key} 的跨行值不能包含单引号"
+    printf "%s='%s'\n" "${key}" "${value}" >>"${file}"
+  else
+    printf '%s=%s\n' "${key}" "${value}" >>"${file}"
+  fi
 }
 
 write_env_common() {
@@ -1126,13 +1415,26 @@ configure_database() {
 configure_core_values() {
   local existing_env_file="${INSTALL_DIR}/.env"
   local existing_hook_secret
+  local existing_auth_mode
   local generated_secret
-  local auth_default
   if ! role_has_core "${INSTALL_ROLE}"; then
     return 0
   fi
   CORE_HTTP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "CORE_HTTP_PORT" "控制面板网页和 HTTP API 端口" "8080")"
   CORE_GRPC_PORT="$(prompt_local_tcp_port "${existing_env_file}" "CORE_GRPC_PORT" "控制面板内部通信端口" "50051")"
+  CORE_HTTP_TLS_CERT_PATH="$(prompt "Core HTTP TLS 证书路径（留空时仅允许 loopback 明文）" "$(env_value_or_default "${existing_env_file}" "CORE_HTTP_TLS_CERT_PATH" "")")"
+  CORE_HTTP_TLS_KEY_PATH="$(prompt "Core HTTP TLS 私钥路径" "$(env_value_or_default "${existing_env_file}" "CORE_HTTP_TLS_KEY_PATH" "")")"
+  if [ -n "${CORE_HTTP_TLS_CERT_PATH}" ] && [ -n "${CORE_HTTP_TLS_KEY_PATH}" ]; then
+    CORE_HTTP_ADDR="$(prompt_non_empty "Core HTTP 监听地址" "$(env_value_or_default "${existing_env_file}" "CORE_HTTP_ADDR" "127.0.0.1:${CORE_HTTP_PORT}")")"
+    CORE_HTTP_SCHEME="https"
+  else
+    CORE_HTTP_ADDR="127.0.0.1:${CORE_HTTP_PORT}"
+    CORE_HTTP_SCHEME="http"
+  fi
+  CORE_GRPC_TLS_CERT_PATH="$(prompt "Core gRPC TLS 服务端证书路径（production 必填）" "$(env_value_or_default "${existing_env_file}" "CORE_GRPC_TLS_CERT_PATH" "")")"
+  CORE_GRPC_TLS_KEY_PATH="$(prompt "Core gRPC TLS 服务端私钥路径（production 必填）" "$(env_value_or_default "${existing_env_file}" "CORE_GRPC_TLS_KEY_PATH" "")")"
+  CORE_GRPC_TLS_CLIENT_CA_PATH="$(prompt "Core gRPC 客户端 CA 路径（production 必填）" "$(env_value_or_default "${existing_env_file}" "CORE_GRPC_TLS_CLIENT_CA_PATH" "")")"
+  CORE_GRPC_ADDR="$(prompt_non_empty "Core gRPC 监听地址" "$(env_value_or_default "${existing_env_file}" "CORE_GRPC_ADDR" "127.0.0.1:${CORE_GRPC_PORT}")")"
   generated_secret="$(generate_secret)"
   existing_hook_secret="$(env_value_or_default "${existing_env_file}" "HOOK_SHARED_SECRET" "")"
   HOOK_SHARED_SECRET="$(prompt "ZLM Hook/API 密钥（留空沿用现有值或自动生成）" "")"
@@ -1140,20 +1442,26 @@ configure_core_values() {
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${generated_secret}"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")")"
   STORAGE_ALLOWLIST="$(prompt_non_empty "本地媒体文件访问白名单，逗号分隔" "$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "${INSTALL_DIR}/data/media/work,${INSTALL_DIR}/data/zlm/www")")"
-  AUTH_MODE="$(env_value_or_default "${existing_env_file}" "AUTH_MODE" "disabled")"
-  AUTH_ENABLED="false"
-  JWT_PUBLIC_KEY=""
-  AUTH_JWT_PRIVATE_KEY_PATH=""
-  AUTH_JWT_PUBLIC_KEY_PATH=""
+  existing_auth_mode="$(env_value_or_default "${existing_env_file}" "AUTH_MODE" "local_password")"
+  AUTH_MODE="${existing_auth_mode}"
+  AUTH_ENABLED="true"
+  JWT_PUBLIC_KEY="$(env_value_or_default "${existing_env_file}" "JWT_PUBLIC_KEY" "")"
+  AUTH_JWT_PRIVATE_KEY_PATH="$(env_value_or_default "${existing_env_file}" "AUTH_JWT_PRIVATE_KEY_PATH" "")"
+  AUTH_JWT_PUBLIC_KEY_PATH="$(env_value_or_default "${existing_env_file}" "AUTH_JWT_PUBLIC_KEY_PATH" "")"
   AUTH_ACCESS_TOKEN_TTL="$(env_value_or_default "${existing_env_file}" "AUTH_ACCESS_TOKEN_TTL" "15m")"
   AUTH_REFRESH_TOKEN_TTL="$(env_value_or_default "${existing_env_file}" "AUTH_REFRESH_TOKEN_TTL" "7d")"
   ADMIN_USERNAME=""
   ADMIN_PASSWORD=""
-  auth_default="N"
-  [ "${AUTH_MODE}" = "local_password" ] && auth_default="Y"
-  if prompt_yes_no "是否启用本地用户名密码鉴权？" "${auth_default}"; then
+  ADMIN_BOOTSTRAP_REQUIRED=0
+  if [ -f "${existing_env_file}" ] && [ "${existing_auth_mode}" = "local_password" ]; then
+    log "保留现有 production 认证模式和 JWT 密钥: local_password"
+  elif [ -f "${existing_env_file}" ] && [ "${existing_auth_mode}" = "external_jwt" ]; then
+    log "保留现有 production 认证模式和公钥: external_jwt"
+  else
     AUTH_MODE="local_password"
     AUTH_ENABLED="true"
+    JWT_PUBLIC_KEY=""
+    ADMIN_BOOTSTRAP_REQUIRED=1
     ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "admin")"
     ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
     openssl genpkey -algorithm Ed25519 -out "${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem" >/dev/null 2>&1
@@ -1162,9 +1470,6 @@ configure_core_values() {
     chmod 644 "${INSTALL_DIR}/certs/auth/jwt-ed25519-public.pem"
     AUTH_JWT_PRIVATE_KEY_PATH="${INSTALL_DIR}/certs/auth/jwt-ed25519-private.pem"
     AUTH_JWT_PUBLIC_KEY_PATH="${INSTALL_DIR}/certs/auth/jwt-ed25519-public.pem"
-  else
-    AUTH_MODE="disabled"
-    AUTH_ENABLED="false"
   fi
 }
 
@@ -1217,6 +1522,13 @@ configure_worker_values() {
   fi
   AGENT_HTTP_PORT="$(prompt_local_tcp_port "${existing_env_file}" "AGENT_HTTP_PORT" "工作节点本地接口端口" "8081")"
   configure_zlm_port_values "${existing_env_file}"
+  if ! role_has_core "${INSTALL_ROLE}"; then
+    CORE_HTTP_SCHEME="https"
+  fi
+  AGENT_CERT_PATH="$(prompt "Agent mTLS 客户端证书路径（production 必填）" "$(env_value_or_default "${existing_env_file}" "AGENT_CERT_PATH" "")")"
+  AGENT_KEY_PATH="$(prompt "Agent mTLS 客户端私钥路径（production 必填）" "$(env_value_or_default "${existing_env_file}" "AGENT_KEY_PATH" "")")"
+  AGENT_CA_PATH="$(prompt "Agent 信任的 Core CA 路径（production 必填）" "$(env_value_or_default "${existing_env_file}" "AGENT_CA_PATH" "")")"
+  AGENT_TLS_DOMAIN_NAME="$(prompt_non_empty "Core gRPC TLS 域名" "$(env_value_or_default "${existing_env_file}" "AGENT_TLS_DOMAIN_NAME" "${CORE_GRPC_HOST}")")"
   AGENT_NETWORK_MODE="host"
   AGENT_ACCELERATION_MODE="cpu"
   if role_is_gpu "${INSTALL_ROLE}"; then
@@ -1271,10 +1583,16 @@ write_env_file() {
     write_env_entry "${env_file}" POSTGRES_PASSWORD "${POSTGRES_PASSWORD}"
     write_env_entry "${env_file}" POSTGRES_PORT "${POSTGRES_PORT}"
     write_env_entry "${env_file}" DATABASE_URL "${DATABASE_URL}"
-    write_env_entry "${env_file}" CORE_HTTP_ADDR "0.0.0.0:${CORE_HTTP_PORT}"
+    write_env_entry "${env_file}" CORE_HTTP_ADDR "${CORE_HTTP_ADDR}"
     write_env_entry "${env_file}" CORE_HTTP_PORT "${CORE_HTTP_PORT}"
-    write_env_entry "${env_file}" CORE_GRPC_ADDR "0.0.0.0:${CORE_GRPC_PORT}"
+    write_env_entry "${env_file}" CORE_HTTP_TLS_CERT_PATH "${CORE_HTTP_TLS_CERT_PATH}"
+    write_env_entry "${env_file}" CORE_HTTP_TLS_KEY_PATH "${CORE_HTTP_TLS_KEY_PATH}"
+    write_env_entry "${env_file}" CORE_GRPC_ADDR "${CORE_GRPC_ADDR}"
     write_env_entry "${env_file}" CORE_GRPC_PORT "${CORE_GRPC_PORT}"
+    write_env_entry "${env_file}" CORE_GRPC_TLS_CERT_PATH "${CORE_GRPC_TLS_CERT_PATH}"
+    write_env_entry "${env_file}" CORE_GRPC_TLS_KEY_PATH "${CORE_GRPC_TLS_KEY_PATH}"
+    write_env_entry "${env_file}" CORE_GRPC_TLS_CLIENT_CA_PATH "${CORE_GRPC_TLS_CLIENT_CA_PATH}"
+    write_env_entry "${env_file}" CORE_INSECURE_DEV false
     write_env_entry "${env_file}" STREAMSERVER_UI_DIR "${INSTALL_DIR}/ui"
     write_env_entry "${env_file}" HOOK_SHARED_SECRET "${HOOK_SHARED_SECRET}"
     write_env_entry "${env_file}" HOOK_SOURCE_ALLOWLIST "${HOOK_SOURCE_ALLOWLIST}"
@@ -1295,7 +1613,12 @@ write_env_file() {
     write_env_entry "${env_file}" CORE_HTTP_PORT "${CORE_HTTP_PORT:-8080}"
     write_env_entry "${env_file}" CORE_GRPC_HOST "${CORE_GRPC_HOST}"
     write_env_entry "${env_file}" CORE_GRPC_PORT "${CORE_GRPC_PORT:-50051}"
-    write_env_entry "${env_file}" AGENT_CORE_ENDPOINT "http://${CORE_GRPC_HOST}:${CORE_GRPC_PORT:-50051}"
+    write_env_entry "${env_file}" CORE_HTTP_SCHEME "${CORE_HTTP_SCHEME}"
+    write_env_entry "${env_file}" AGENT_CORE_ENDPOINT "https://${CORE_GRPC_HOST}:${CORE_GRPC_PORT:-50051}"
+    write_env_entry "${env_file}" AGENT_CERT_PATH "${AGENT_CERT_PATH}"
+    write_env_entry "${env_file}" AGENT_KEY_PATH "${AGENT_KEY_PATH}"
+    write_env_entry "${env_file}" AGENT_CA_PATH "${AGENT_CA_PATH}"
+    write_env_entry "${env_file}" AGENT_TLS_DOMAIN_NAME "${AGENT_TLS_DOMAIN_NAME}"
     write_env_entry "${env_file}" PUBLIC_HOST "${PUBLIC_HOST}"
     write_env_entry "${env_file}" AGENT_STREAM_ADDR "http://${PUBLIC_HOST}:${ZLM_HTTP_PORT}"
     write_env_entry "${env_file}" AGENT_HTTP_ADDR "0.0.0.0:${AGENT_HTTP_PORT}"
@@ -1307,7 +1630,7 @@ write_env_file() {
     write_env_entry "${env_file}" ZLM_API_ALLOW_IP_RANGE "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
     write_env_entry "${env_file}" ZLM_HOOK_SHARED_SECRET "${HOOK_SHARED_SECRET:-${ZLM_API_SECRET:-}}"
     write_env_entry "${env_file}" ZLM_SERVER_ID "${NODE_ID}"
-    write_env_entry "${env_file}" ZLM_HOOK_BASE "http://${CORE_HTTP_HOST}:${CORE_HTTP_PORT:-8080}/internal/hooks/zlm/${NODE_ID}"
+    write_env_entry "${env_file}" ZLM_HOOK_BASE "${CORE_HTTP_SCHEME}://${CORE_HTTP_HOST}:${CORE_HTTP_PORT:-8080}/internal/hooks/zlm/${NODE_ID}"
     write_env_entry "${env_file}" ZLM_HTTP_PORT "${ZLM_HTTP_PORT}"
     write_env_entry "${env_file}" ZLM_HTTPS_PORT "${ZLM_HTTPS_PORT}"
     write_env_entry "${env_file}" ZLM_RTMP_PORT "${ZLM_RTMP_PORT}"
@@ -1383,10 +1706,6 @@ run_streamserver_config_tui_if_requested() {
   if [ -t 0 ] && [ -t 1 ] && prompt_yes_no "是否现在打开高级配置界面？" "N"; then
     "${config_bin}" --env "${env_file}" --no-restart-prompt
     load_installed_env
-    if role_has_core "${INSTALL_ROLE}" && [ "${AUTH_MODE:-disabled}" = "local_password" ] && [ -z "${ADMIN_PASSWORD:-}" ]; then
-      ADMIN_USERNAME="$(prompt_non_empty "管理员用户名" "${ADMIN_USERNAME:-admin}")"
-      ADMIN_PASSWORD="$(prompt_password_with_confirmation "管理员密码")"
-    fi
   fi
 }
 
@@ -1520,6 +1839,7 @@ ensure_database_exists() {
 
 bootstrap_local_admin_if_needed() {
   [ "${AUTH_MODE}" = "local_password" ] || return 0
+  [ "${ADMIN_BOOTSTRAP_REQUIRED:-0}" -eq 1 ] || return 0
   log "初始化本地管理员账号: ${ADMIN_USERNAME}"
   (
     set -a
@@ -1559,8 +1879,16 @@ read_units() {
 }
 
 health() {
+  local core_scheme="http"
+  local core_curl_tls=()
+  if [ -n "${CORE_HTTP_TLS_CERT_PATH:-}" ]; then
+    core_scheme="https"
+    # The configured server certificate can be CA-signed; there is no separate HTTP CA setting.
+    # This probe is loopback-only and verifies readiness, while clients still validate normally.
+    core_curl_tls=(-k)
+  fi
   if [ -n "${CORE_HTTP_PORT:-}" ] && systemctl list-unit-files "${SYSTEMD_CORE_UNIT:-missing}" >/dev/null 2>&1; then
-    curl -fsS "http://127.0.0.1:${CORE_HTTP_PORT}/health/ready" >/dev/null && echo "[OK] media-core"
+    curl -fsS "${core_curl_tls[@]}" "${core_scheme}://127.0.0.1:${CORE_HTTP_PORT}/health/ready" >/dev/null && echo "[OK] media-core"
   fi
   if [ -n "${AGENT_HTTP_PORT:-}" ] && systemctl list-unit-files "${SYSTEMD_AGENT_UNIT:-missing}" >/dev/null 2>&1; then
     curl -fsS "http://127.0.0.1:${AGENT_HTTP_PORT}/health/ready" >/dev/null && echo "[OK] media-agent"
@@ -1604,18 +1932,34 @@ fix_permissions() {
 
 start_services_if_requested() {
   [ "${START_AFTER_INSTALL}" -eq 1 ] || return 0
-  if [ "${DATABASE_MODE}" = "bundled" ]; then
-    systemctl start "${UNIT_BASENAME}-postgres.service"
-    wait_for_postgres
-    ensure_database_exists
-    bootstrap_local_admin_if_needed
-  elif [ "${AUTH_MODE:-disabled}" = "local_password" ]; then
-    bootstrap_local_admin_if_needed
-  fi
   systemctl start "${UNIT_BASENAME}.target"
   log "已启动 native 服务。"
   log "状态: ${INSTALL_DIR}/bin/streamserverctl status"
   log "健康检查: ${INSTALL_DIR}/bin/streamserverctl health"
+}
+
+prepare_production_security_state() {
+  if role_has_core "${INSTALL_ROLE}"; then
+    if [ "${DATABASE_MODE}" = "bundled" ]; then
+      systemctl start "${UNIT_BASENAME}-postgres.service"
+      wait_for_postgres
+      ensure_database_exists
+    fi
+    bootstrap_local_admin_if_needed
+  fi
+
+  if ! security_preflight_env "${INSTALL_DIR}/.env"; then
+    if role_has_core "${INSTALL_ROLE}" && [ "${DATABASE_MODE}" = "bundled" ]; then
+      systemctl stop "${UNIT_BASENAME}-postgres.service" >/dev/null 2>&1 || true
+    fi
+    fail "production security preflight failed; no Core/Agent service was started"
+  fi
+
+  if [ "${START_AFTER_INSTALL}" -eq 0 ] \
+    && role_has_core "${INSTALL_ROLE}" \
+    && [ "${DATABASE_MODE}" = "bundled" ]; then
+    systemctl stop "${UNIT_BASENAME}-postgres.service"
+  fi
 }
 
 confirm_start_after_install() {
@@ -1627,14 +1971,37 @@ confirm_start_after_install() {
 }
 
 main() {
+  local package_core_bin
   parse_args "$@"
+  if [ "${CHECK_ONLY}" -eq 1 ] && [ "${SECURITY_PREFLIGHT}" -eq 1 ]; then
+    fail "--check-only and --security-preflight cannot be used together"
+  fi
   load_manifest
   ensure_prerequisites
   verify_package_checksums
   assert_no_docker_assets
+  package_core_bin="${PACKAGE_ROOT}/${MEDIA_CORE_BINARY_PATH}"
+  if [ "${SECURITY_PREFLIGHT}" -eq 1 ]; then
+    [ -n "${INSTALL_DIR}" ] || fail "--security-preflight requires --install-dir"
+    security_preflight_env "${INSTALL_DIR}/.env" "${package_core_bin}" \
+      || fail "installed production security preflight failed"
+    exit 0
+  fi
   if [ "${CHECK_ONLY}" -eq 1 ]; then
+    if [ -n "${INSTALL_DIR}" ]; then
+      security_preflight_env "${INSTALL_DIR}/.env" "${package_core_bin}" \
+        || fail "check-only found production security gaps"
+    fi
     log "check-only 通过。"
     exit 0
+  fi
+  if [ "${UPGRADE}" -eq 1 ]; then
+    [ -n "${INSTALL_DIR}" ] || fail "--upgrade requires --install-dir"
+    [ -f "${INSTALL_DIR}/.env" ] || fail "--upgrade requires an existing native .env"
+    security_preflight_env "${INSTALL_DIR}/.env" "${package_core_bin}" \
+      || fail "upgrade blocked until auth/admin and TLS gaps are migrated"
+    [ -n "${INSTALL_ROLE}" ] || INSTALL_ROLE="$(existing_env_value "${INSTALL_DIR}/.env" INSTALL_ROLE)"
+    [ -n "${INSTANCE_NAME}" ] || INSTANCE_NAME="$(existing_env_value "${INSTALL_DIR}/.env" INSTANCE_NAME)"
   fi
   ensure_root_for_install
   select_role
@@ -1656,6 +2023,7 @@ main() {
   fix_permissions
   install_systemd_units
   confirm_start_after_install
+  prepare_production_security_state
   start_services_if_requested
   log "安装完成: ${INSTALL_DIR}"
   log "卸载: ${INSTALL_DIR}/uninstall.sh"

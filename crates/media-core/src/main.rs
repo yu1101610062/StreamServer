@@ -22,7 +22,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{self, Read},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
 };
@@ -38,6 +38,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
+use axum_server::{Handle as HttpServerHandle, tls_rustls::RustlsConfig};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use control_plane::{ControlPlaneService, NodeLiveLoad};
@@ -99,24 +100,27 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
+    Serve { insecure_dev: bool },
     Help { auth_only: bool },
+    CheckAuthConfig,
+    CheckAdmin,
     BootstrapAdmin { username: String },
     ResetPassword { username: String },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if let Some(command) = parse_cli_command()? {
-        return match command {
-            CliCommand::Help { auth_only } => {
-                print_cli_help(auth_only);
-                Ok(())
-            }
-            other => run_cli_command(other).await,
-        };
-    }
+    let command = parse_cli_command()?.expect("server mode is always explicit after CLI parsing");
+    let insecure_dev = match command {
+        CliCommand::Serve { insecure_dev } => insecure_dev,
+        CliCommand::Help { auth_only } => {
+            print_cli_help(auth_only);
+            return Ok(());
+        }
+        other => return run_cli_command(other).await,
+    };
 
-    let settings = config::Settings::load()?;
+    let settings = config::Settings::load_with_insecure_dev(insecure_dev)?;
     telemetry::init(&settings.logging);
 
     info!(
@@ -166,7 +170,14 @@ async fn main() -> anyhow::Result<()> {
     let app = build_app(state);
 
     let listener = TcpListener::bind(&settings.core.http_addr).await?;
-    info!(listen_addr = %listener.local_addr()?, "media-core http server ready");
+    let http_listen_addr = listener.local_addr()?;
+    let listener = listener.into_std()?;
+    let http_tls_config = load_http_tls_config(&settings.core).await?;
+    info!(
+        listen_addr = %http_listen_addr,
+        tls = http_tls_config.is_some(),
+        "media-core http server ready"
+    );
 
     let grpc_addr = settings.core.grpc_addr.parse()?;
     let control_plane_server = control_plane.clone().into_server();
@@ -198,11 +209,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let http_server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+    let http_server = serve_http(listener, app, http_tls_config, shutdown_rx.clone());
     let mut grpc_builder = Server::builder();
     if let Some(tls_config) = load_grpc_tls_config(&settings.core)? {
         grpc_builder = grpc_builder.tls_config(tls_config)?;
@@ -2570,10 +2577,19 @@ where
 {
     let mut args = args.into_iter();
     let Some(command) = args.next() else {
-        return Ok(None);
+        return Ok(Some(CliCommand::Serve {
+            insecure_dev: false,
+        }));
     };
     if is_help_flag(&command) {
         return Ok(Some(CliCommand::Help { auth_only: false }));
+    }
+    if command == "--insecure-dev" {
+        anyhow::ensure!(
+            args.next().is_none(),
+            "--insecure-dev does not accept a subcommand; use it alone to start the server"
+        );
+        return Ok(Some(CliCommand::Serve { insecure_dev: true }));
     }
     if command != "auth" {
         anyhow::bail!("unsupported command `{command}`");
@@ -2588,6 +2604,20 @@ where
     let remaining_args: Vec<String> = args.collect();
     if remaining_args.len() == 1 && is_help_flag(&remaining_args[0]) {
         return Ok(Some(CliCommand::Help { auth_only: true }));
+    }
+    if subcommand == "check-admin" {
+        anyhow::ensure!(
+            remaining_args.is_empty(),
+            "auth check-admin does not accept arguments"
+        );
+        return Ok(Some(CliCommand::CheckAdmin));
+    }
+    if subcommand == "check-config" {
+        anyhow::ensure!(
+            remaining_args.is_empty(),
+            "auth check-config does not accept arguments"
+        );
+        return Ok(Some(CliCommand::CheckAuthConfig));
     }
 
     let mut args = remaining_args.into_iter();
@@ -2636,26 +2666,35 @@ fn print_cli_help(auth_only: bool) {
 const CLI_HELP_TEXT: &str = "\
 Usage:
   media-core
+  media-core --insecure-dev
   media-core auth bootstrap-admin --username <name> --password-stdin
   media-core auth reset-password --username <name> --password-stdin
+  media-core auth check-config
+  media-core auth check-admin
   media-core [help|-h|--help]
   media-core auth [help|-h|--help]
 
 Description:
   Run without a subcommand to start the media-core server.
+  --insecure-dev permits plaintext development listeners only when both bind to loopback.
 
 Auth commands:
   bootstrap-admin  Create the initial enabled admin user; reads the password from stdin.
-  reset-password   Reset an existing user's password; reads the new password from stdin.";
+  reset-password   Reset an existing user's password; reads the new password from stdin.
+  check-config     Read-only check that validates the configured JWT signing or verification keys.
+  check-admin      Read-only check that succeeds only when an enabled admin exists.";
 
 const AUTH_CLI_HELP_TEXT: &str = "\
 Usage:
   media-core auth bootstrap-admin --username <name> --password-stdin
   media-core auth reset-password --username <name> --password-stdin
+  media-core auth check-config
+  media-core auth check-admin
   media-core auth [help|-h|--help]
 
 Description:
-  Auth commands read the password value from stdin.";
+  bootstrap-admin and reset-password read the password value from stdin.
+  check-config and check-admin never read a password and never run migrations.";
 
 fn read_password_from_stdin() -> anyhow::Result<String> {
     let mut password = String::new();
@@ -2666,20 +2705,45 @@ fn read_password_from_stdin() -> anyhow::Result<String> {
 }
 
 async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
-    let settings = config::Settings::load()?;
+    let settings = config::Settings::load_for_auth_cli()?;
     telemetry::init(&settings.logging);
 
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&settings.core.database_url)
-        .await?;
+    if command == CliCommand::CheckAuthConfig {
+        AuthConfig::from_settings(&settings.core)?;
+        println!("auth configuration is valid");
+        return Ok(());
+    }
+
+    let pool_options = PgPoolOptions::new().max_connections(2);
+    let pool = if command == CliCommand::CheckAdmin {
+        pool_options
+            .connect(&settings.core.database_url)
+            .await
+            .map_err(|_| anyhow::anyhow!("admin check could not connect to the database"))?
+    } else {
+        pool_options.connect(&settings.core.database_url).await?
+    };
+    if command == CliCommand::CheckAdmin {
+        let repository = TaskRepository::new(pool);
+        anyhow::ensure!(
+            repository.has_enabled_admin_user().await?,
+            "no enabled admin user exists"
+        );
+        println!("enabled admin user exists");
+        return Ok(());
+    }
     sqlx::migrate!("../../migrations").run(&pool).await?;
     let repository = TaskRepository::new(pool);
     let password = read_password_from_stdin()?;
     let password_hash = hash_password(&password)?;
 
     match command {
+        CliCommand::Serve { .. } => unreachable!("server commands are handled before DB setup"),
         CliCommand::Help { .. } => unreachable!("help commands are handled before DB setup"),
+        CliCommand::CheckAuthConfig => {
+            unreachable!("auth configuration check is handled before DB setup")
+        }
+        CliCommand::CheckAdmin => unreachable!("admin check is handled before migrations"),
         CliCommand::BootstrapAdmin { username } => {
             let username = normalize_username_value(&username)?;
             anyhow::ensure!(
@@ -2740,6 +2804,60 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
     }
 
     let _ = receiver.changed().await;
+}
+
+async fn load_http_tls_config(
+    settings: &config::CoreSettings,
+) -> anyhow::Result<Option<RustlsConfig>> {
+    if settings.http_tls_cert_path.trim().is_empty() && settings.http_tls_key_path.trim().is_empty()
+    {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        !settings.http_tls_cert_path.trim().is_empty()
+            && !settings.http_tls_key_path.trim().is_empty(),
+        "CORE_HTTP_TLS_CERT_PATH and CORE_HTTP_TLS_KEY_PATH must be set together"
+    );
+
+    RustlsConfig::from_pem_file(&settings.http_tls_cert_path, &settings.http_tls_key_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load Core HTTP TLS certificate {} and key {}",
+                settings.http_tls_cert_path, settings.http_tls_key_path
+            )
+        })
+        .map(Some)
+}
+
+async fn serve_http(
+    listener: StdTcpListener,
+    app: Router,
+    tls_config: Option<RustlsConfig>,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
+    if let Some(tls_config) = tls_config {
+        let handle = HttpServerHandle::new();
+        let shutdown_handle = handle.clone();
+        let shutdown_task = tokio::spawn(async move {
+            wait_for_shutdown(shutdown).await;
+            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
+        });
+        let result = axum_server::from_tcp_rustls(listener, tls_config)?
+            .handle(handle)
+            .serve(service)
+            .await;
+        shutdown_task.abort();
+        result?;
+    } else {
+        listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(listener)?;
+        axum::serve(listener, service)
+            .with_graceful_shutdown(wait_for_shutdown(shutdown))
+            .await?;
+    }
+    Ok(())
 }
 
 fn load_grpc_tls_config(

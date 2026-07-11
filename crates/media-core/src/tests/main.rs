@@ -142,6 +142,24 @@ fn parse_cli_command_accepts_top_level_help() {
 }
 
 #[test]
+fn parse_cli_command_defaults_to_secure_server_mode() {
+    let command = parse_cli_command_from(Vec::<String>::new()).unwrap();
+    assert_eq!(
+        command,
+        Some(CliCommand::Serve {
+            insecure_dev: false,
+        })
+    );
+}
+
+#[test]
+fn parse_cli_command_accepts_explicit_insecure_dev_mode() {
+    let command = parse_cli_command_from(["--insecure-dev".to_string()]).unwrap();
+    assert_eq!(command, Some(CliCommand::Serve { insecure_dev: true }));
+    assert!(CLI_HELP_TEXT.contains("--insecure-dev"));
+}
+
+#[test]
 fn parse_cli_command_accepts_auth_help() {
     let command = parse_cli_command_from(["auth".to_string(), "--help".to_string()]).unwrap();
     assert_eq!(command, Some(CliCommand::Help { auth_only: true }));
@@ -174,6 +192,261 @@ fn parse_cli_command_parses_auth_command() {
             username: "admin".to_string(),
         })
     );
+}
+
+#[test]
+fn parse_cli_command_parses_read_only_admin_check() {
+    let command = parse_cli_command_from(["auth".to_string(), "check-admin".to_string()]).unwrap();
+    assert_eq!(command, Some(CliCommand::CheckAdmin));
+
+    let error = parse_cli_command_from([
+        "auth".to_string(),
+        "check-admin".to_string(),
+        "--password-stdin".to_string(),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("does not accept arguments"));
+}
+
+#[test]
+fn parse_cli_command_parses_read_only_auth_config_check() {
+    let command = parse_cli_command_from(["auth".to_string(), "check-config".to_string()]).unwrap();
+    assert_eq!(command, Some(CliCommand::CheckAuthConfig));
+
+    let error = parse_cli_command_from([
+        "auth".to_string(),
+        "check-config".to_string(),
+        "--password-stdin".to_string(),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("does not accept arguments"));
+}
+
+fn production_security_settings() -> CoreSettings {
+    CoreSettings {
+        http_addr: "0.0.0.0:8080".to_string(),
+        http_tls_cert_path: "http-server.pem".to_string(),
+        http_tls_key_path: "http-server.key".to_string(),
+        grpc_addr: "0.0.0.0:50051".to_string(),
+        grpc_tls_cert_path: "grpc-server.pem".to_string(),
+        grpc_tls_key_path: "grpc-server.key".to_string(),
+        grpc_tls_client_ca_path: "grpc-client-ca.pem".to_string(),
+        auth_mode: AuthMode::LocalPassword,
+        insecure_dev: false,
+        ..CoreSettings::default()
+    }
+}
+
+#[test]
+fn security_policy_covers_production_tls_and_insecure_development_matrix() {
+    struct Case {
+        name: &'static str,
+        environment: &'static str,
+        settings: CoreSettings,
+        expected_error: Option<&'static str>,
+    }
+
+    let mut cases = Vec::new();
+
+    let mut settings = production_security_settings();
+    settings.auth_mode = AuthMode::Disabled;
+    cases.push(Case {
+        name: "production auth disabled",
+        environment: "production",
+        settings,
+        expected_error: Some("production requires AUTH_MODE other than disabled"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.auth_mode = AuthMode::Disabled;
+    cases.push(Case {
+        name: "production environment is normalized",
+        environment: " Production ",
+        settings,
+        expected_error: Some("production requires AUTH_MODE other than disabled"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.http_tls_cert_path.clear();
+    settings.http_tls_key_path.clear();
+    cases.push(Case {
+        name: "production non-loopback without HTTP TLS",
+        environment: "production",
+        settings,
+        expected_error: Some("non-loopback CORE_HTTP_ADDR requires HTTP TLS"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.http_tls_cert_path.clear();
+    settings.http_tls_key_path.clear();
+    cases.push(Case {
+        name: "development plaintext HTTP on non-loopback",
+        environment: "development",
+        settings,
+        expected_error: Some("non-loopback CORE_HTTP_ADDR requires HTTP TLS"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.http_tls_key_path.clear();
+    cases.push(Case {
+        name: "partial HTTP TLS",
+        environment: "production",
+        settings,
+        expected_error: Some(
+            "CORE_HTTP_TLS_CERT_PATH and CORE_HTTP_TLS_KEY_PATH must be set together",
+        ),
+    });
+
+    let mut settings = production_security_settings();
+    settings.grpc_tls_cert_path.clear();
+    settings.grpc_tls_key_path.clear();
+    settings.grpc_tls_client_ca_path.clear();
+    cases.push(Case {
+        name: "production without gRPC mTLS",
+        environment: "production",
+        settings,
+        expected_error: Some("production requires gRPC mTLS"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.grpc_tls_client_ca_path.clear();
+    cases.push(Case {
+        name: "partial gRPC mTLS",
+        environment: "production",
+        settings,
+        expected_error: Some(
+            "CORE_GRPC_TLS_CERT_PATH, CORE_GRPC_TLS_KEY_PATH and CORE_GRPC_TLS_CLIENT_CA_PATH must all be set together",
+        ),
+    });
+
+    let mut settings = production_security_settings();
+    settings.insecure_dev = true;
+    settings.http_addr = "127.0.0.1:8080".to_string();
+    settings.grpc_addr = "127.0.0.1:50051".to_string();
+    cases.push(Case {
+        name: "insecure dev in production",
+        environment: "production",
+        settings,
+        expected_error: Some("--insecure-dev is allowed only in development"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.insecure_dev = true;
+    cases.push(Case {
+        name: "insecure dev on non-loopback",
+        environment: "development",
+        settings,
+        expected_error: Some("--insecure-dev requires loopback HTTP and gRPC addresses"),
+    });
+
+    cases.push(Case {
+        name: "valid production TLS and mTLS",
+        environment: "production",
+        settings: production_security_settings(),
+        expected_error: None,
+    });
+
+    let mut settings = production_security_settings();
+    settings.http_addr = "127.0.0.1:8080".to_string();
+    settings.http_tls_cert_path.clear();
+    settings.http_tls_key_path.clear();
+    cases.push(Case {
+        name: "valid production loopback HTTP with gRPC mTLS",
+        environment: "production",
+        settings,
+        expected_error: None,
+    });
+
+    let mut settings = CoreSettings {
+        http_addr: "127.0.0.1:8080".to_string(),
+        grpc_addr: "127.0.0.1:50051".to_string(),
+        auth_mode: AuthMode::Disabled,
+        insecure_dev: true,
+        ..CoreSettings::default()
+    };
+    settings.http_tls_cert_path.clear();
+    settings.http_tls_key_path.clear();
+    settings.grpc_tls_cert_path.clear();
+    settings.grpc_tls_key_path.clear();
+    settings.grpc_tls_client_ca_path.clear();
+    cases.push(Case {
+        name: "valid development loopback insecure",
+        environment: "development",
+        settings,
+        expected_error: None,
+    });
+
+    let mut settings = cases.last().unwrap().settings.clone();
+    settings.insecure_dev = false;
+    cases.push(Case {
+        name: "development plaintext gRPC without explicit insecure dev",
+        environment: "development",
+        settings,
+        expected_error: Some("development plaintext gRPC requires --insecure-dev"),
+    });
+
+    for case in cases {
+        let result = crate::config::validate_security_policy(case.environment, &case.settings);
+        match case.expected_error {
+            Some(expected) => {
+                let error = result.expect_err(case.name).to_string();
+                assert!(
+                    error.contains(expected),
+                    "{}: expected error containing {expected:?}, got {error:?}",
+                    case.name
+                );
+            }
+            None => result.unwrap_or_else(|error| panic!("{}: {error:#}", case.name)),
+        }
+    }
+}
+
+async fn tls_peer_address(PeerAddress(peer): PeerAddress) -> String {
+    peer.map(|value| value.ip().to_string())
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+#[tokio::test]
+async fn core_http_tls_listener_accepts_https_and_preserves_peer_address() -> anyhow::Result<()> {
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+    let temp_dir = tempfile::tempdir()?;
+    let cert_path = temp_dir.path().join("server.pem");
+    let key_path = temp_dir.path().join("server.key");
+    tokio::fs::write(&cert_path, cert.pem()).await?;
+    tokio::fs::write(&key_path, key_pair.serialize_pem()).await?;
+
+    let settings = CoreSettings {
+        http_tls_cert_path: cert_path.to_string_lossy().into_owned(),
+        http_tls_key_path: key_path.to_string_lossy().into_owned(),
+        ..CoreSettings::default()
+    };
+    let tls = load_http_tls_config(&settings)
+        .await?
+        .expect("HTTP TLS must be configured");
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let listener = listener.into_std()?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = tokio::spawn(serve_http(
+        listener,
+        Router::new().route("/peer", get(tls_peer_address)),
+        Some(tls),
+        shutdown_rx,
+    ));
+
+    let response = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?
+        .get(format!("https://localhost:{}/peer", address.port()))
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().await?, "127.0.0.1");
+
+    shutdown_tx.send(true)?;
+    timeout(std::time::Duration::from_secs(5), server).await???;
+    Ok(())
 }
 
 fn play_url_test_node(agent_stream_addr: &str) -> repository::NodeSummary {

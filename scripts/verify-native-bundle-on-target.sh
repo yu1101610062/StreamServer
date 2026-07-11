@@ -938,7 +938,7 @@ SQL
     STORAGE_ALLOWLIST="${tmp}" \
     STREAMSERVER_UI_DIR="${ROOT}/ui/media-core" \
     LOG_LEVEL=info \
-      "${ROOT}/binaries/media-core-linux-amd64" >"${tmp}/media-core.log" 2>&1 &
+      "${ROOT}/binaries/media-core-linux-amd64" --insecure-dev >"${tmp}/media-core.log" 2>&1 &
     core_pid=$!
     POSTGRES_SMOKE_PIDS="${POSTGRES_SMOKE_PIDS} ${core_pid}"
     core_ready=0

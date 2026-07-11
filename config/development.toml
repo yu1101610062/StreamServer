@@ -2,6 +2,7 @@
 level = "debug"
 
 [core]
+insecure_dev = true
 hook_source_allowlist = ["127.0.0.1"]
 storage_allowlist = ["./data/media/work", "./data/zlm/www"]
 

@@ -160,12 +160,17 @@ const AUTH_MODE_CHOICES: &[ChoiceDef] = &[
     ChoiceDef {
         value: "disabled",
         label: "关闭",
-        help: "接口不启用内建用户名密码鉴权，适合内网受控环境。",
+        help: "仅用于 development loopback 调试；production 启动门禁会拒绝。",
     },
     ChoiceDef {
         value: "local_password",
         label: "用户名密码",
         help: "启用内建账号登录；首次安装建议通过安装器初始化管理员。",
+    },
+    ChoiceDef {
+        value: "external_jwt",
+        label: "外部 JWT",
+        help: "保留外部 JWT 公钥鉴权；production 保存时不得降级为 disabled。",
     },
 ];
 
@@ -831,11 +836,7 @@ impl ConfigApp {
 
         if key == "AUTH_MODE" {
             // UI 暴露的是鉴权模式；底层服务仍需要兼容 AUTH_ENABLED 这个布尔开关。
-            let enabled = if value == "local_password" {
-                "true"
-            } else {
-                "false"
-            };
+            let enabled = if value != "disabled" { "true" } else { "false" };
             self.values.insert(key.to_string(), value);
             self.values
                 .insert("AUTH_ENABLED".to_string(), enabled.to_string());
@@ -1379,8 +1380,13 @@ pub(crate) fn parse_env_file(path: &Path) -> anyhow::Result<BTreeMap<String, Str
     let contents =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
     let mut values = BTreeMap::new();
-    // 这里只支持安装器生成的简单 KEY=VALUE，不尝试实现完整 shell 语法。
-    for line in contents.lines() {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let mut line_index = 0;
+    // 支持安装器生成的 KEY=VALUE，以及 systemd EnvironmentFile 可接受的跨行单引号值。
+    // 这不是完整的 shell 语法解析器；跨行形式用于保存 external_jwt 的 PEM 公钥。
+    while line_index < lines.len() {
+        let line = lines[line_index];
+        line_index += 1;
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
@@ -1388,7 +1394,34 @@ pub(crate) fn parse_env_file(path: &Path) -> anyhow::Result<BTreeMap<String, Str
         let Some((key, value)) = trimmed.split_once('=') else {
             continue;
         };
-        values.insert(key.trim().to_string(), unquote_env_value(value.trim()));
+        let value = value.trim();
+        let parsed_value =
+            if value.starts_with('\'') && (value.len() == 1 || !value.ends_with('\'')) {
+                let mut parsed = value[1..].to_string();
+                let mut closed = false;
+                while line_index < lines.len() {
+                    let continuation = lines[line_index];
+                    line_index += 1;
+                    parsed.push('\n');
+                    if let Some(final_line) = continuation.strip_suffix('\'') {
+                        parsed.push_str(final_line);
+                        closed = true;
+                        break;
+                    }
+                    parsed.push_str(continuation);
+                }
+                if !closed {
+                    bail!(
+                        "unterminated single-quoted value for {} in {}",
+                        key.trim(),
+                        path.display()
+                    );
+                }
+                parsed
+            } else {
+                unquote_env_value(value)
+            };
+        values.insert(key.trim().to_string(), parsed_value);
     }
     Ok(values)
 }
@@ -1426,10 +1459,7 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> anyhow::Res
                 output.push_str(comment);
                 output.push('\n');
             }
-            output.push_str(key);
-            output.push('=');
-            output.push_str(value);
-            output.push('\n');
+            push_env_entry(&mut output, key, value)?;
         }
     }
 
@@ -1437,13 +1467,27 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> anyhow::Res
         if managed.contains(key.as_str()) || is_removed_env_key(key) || is_hidden_fixed_key(key) {
             continue;
         }
-        output.push_str(key);
-        output.push('=');
-        output.push_str(value);
-        output.push('\n');
+        push_env_entry(&mut output, key, value)?;
     }
 
     fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn push_env_entry(output: &mut String, key: &str, value: &str) -> anyhow::Result<()> {
+    output.push_str(key);
+    output.push('=');
+    if value.contains('\n') {
+        if value.contains('\'') {
+            bail!("{key} contains a single quote and cannot be written as a multiline value");
+        }
+        output.push('\'');
+        output.push_str(value);
+        output.push('\'');
+    } else {
+        output.push_str(value);
+    }
+    output.push('\n');
+    Ok(())
 }
 
 fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkInterface]) {
@@ -1489,8 +1533,8 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
             "STORAGE_ALLOWLIST",
             "/data/media/work,/data/zlm/www",
         );
-        default_if_missing(values, "AUTH_MODE", "disabled");
-        default_if_missing(values, "AUTH_ENABLED", "false");
+        default_if_missing(values, "AUTH_MODE", "local_password");
+        default_if_missing(values, "AUTH_ENABLED", "true");
         default_if_missing(values, "JWT_PUBLIC_KEY", "");
         default_if_missing(values, "AUTH_JWT_PRIVATE_KEY_PATH", "");
         default_if_missing(values, "AUTH_JWT_PUBLIC_KEY_PATH", "");
@@ -2314,7 +2358,7 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
     ("CORE_GRPC_PORT", "控制面板内部通信端口。"),
     (
         "AUTH_MODE",
-        "控制台鉴权模式，可选 disabled/local_password。",
+        "控制台鉴权模式，可选 disabled/local_password/external_jwt。",
     ),
     ("AUTH_ENABLED", "是否启用鉴权。"),
     ("NODE_ID", "工作节点唯一 ID，已上线后不要随意修改。"),
@@ -2678,6 +2722,34 @@ mod tests {
         assert!(lines.contains(&"AGENT_MAX_VOD_RUNTIME_SLOTS=5"));
         assert!(lines.contains(&"CUSTOM_KEEP=yes"));
 
+        let _ = fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn external_jwt_survives_tui_load_and_save() {
+        const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAA5Q5gilpT0f2fcLhC7l30Wou7Ng/gESlFWWx8z6TGJw=\n-----END PUBLIC KEY-----";
+        let env_path = std::env::temp_dir().join(format!(
+            "streamserver-config-external-jwt-test-{}.env",
+            std::process::id()
+        ));
+        let contents = format!(
+            "INSTALL_ROLE=control-plane\nINSTANCE_NAME=ss-external-jwt-test\nAUTH_MODE=external_jwt\nAUTH_ENABLED=true\nJWT_PUBLIC_KEY='{PUBLIC_KEY}'\n"
+        );
+        fs::write(&env_path, contents).unwrap();
+
+        let mut app = ConfigApp::load(env_path.clone()).unwrap();
+        assert_eq!(app.value("AUTH_MODE"), "external_jwt");
+        assert_eq!(app.value("JWT_PUBLIC_KEY"), PUBLIC_KEY);
+        app.save().expect("external_jwt must remain saveable");
+
+        let saved = fs::read_to_string(&env_path).unwrap();
+        assert!(saved.lines().any(|line| line == "AUTH_MODE=external_jwt"));
+        assert!(saved.lines().any(|line| line == "AUTH_ENABLED=true"));
+        assert!(saved.contains(&format!("JWT_PUBLIC_KEY='{PUBLIC_KEY}'")));
+        assert_eq!(
+            parse_env_file(&env_path).unwrap()["JWT_PUBLIC_KEY"],
+            PUBLIC_KEY
+        );
         let _ = fs::remove_file(env_path);
     }
 

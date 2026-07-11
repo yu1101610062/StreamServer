@@ -276,7 +276,7 @@ flowchart LR
     end
 
     User -->|"HTTPS + JWT"| Core
-    Agent -->|"gRPC\n明文或 mTLS"| Core
+    Agent -->|"gRPC\nproduction mTLS"| Core
     ZLM -->|"HTTP Hook\nshared secret + allowlist"| Core
     Core -->|"SQL 内网访问"| DB
 ```
@@ -284,14 +284,13 @@ flowchart LR
 当前实现口径：
 
 - 外部业务访问只打到 `media-core`。
-- `media-core <-> media-agent` 默认可明文跑通，也支持 mTLS。
+- `media-core <-> media-agent` 在 production 必须使用 mTLS；仅 development + loopback + `--insecure-dev` 可使用明文。
 - `media-core <-> ZLM` 通过 Hook shared secret 和源地址白名单约束。
 - PostgreSQL 不对业务侧开放。
 
 证书与密钥准备规则：
 
-- 若 `media-agent` 连接 `http://` 的 `core_endpoint`，可以不准备 mTLS 证书。
-- 若启用 `https://` gRPC，则必须手工准备：
+- production 的 Agent 必须连接 `https://` gRPC endpoint，并手工准备：
   - Core 服务端证书
   - Core 服务端私钥
   - 客户端 CA
@@ -304,7 +303,7 @@ flowchart LR
 | 通道 | 发起方 | 目标 | 默认端口 | 说明 |
 | --- | --- | --- | --- | --- |
 | 北向 HTTP API | 业务系统 / 管理台 | `media-core` | `8080` | 开发默认 |
-| 北向 HTTPS API | 业务系统 / 管理台 | `media-core` | `8443` | 生产建议 |
+| 北向 HTTPS API | 业务系统 / 管理台 | `media-core` | `8443` | production 非 loopback 监听必需 |
 | ControlPlane gRPC | `media-agent` | `media-core` | `50051` | 注册、心跳、任务下发 |
 | PostgreSQL | `media-core` | `postgres` | `5432` | 状态与审计真相库 |
 | ZLM API | `media-agent` | 节点本地 ZLM | 由配置决定 | 本地节点内调用 |
@@ -326,8 +325,8 @@ flowchart LR
 
 ### 10.2 推荐的首版上线路径
 
-1. 先用明文 gRPC 跑通内网环境。
-2. 再补内部 CA 和 mTLS。
+1. 可在 development 的 loopback 地址上用 `media-core --insecure-dev` 做本机验证。
+2. 切换 production 前准备 Core HTTP TLS（若需非 loopback）和完整 gRPC mTLS 证书链，并完成管理员迁移。
 3. 再根据是否需要组播，决定节点网络模式使用 `bridge`、`host` 还是 `macvlan`。
 
 ### 10.3 不建议的形态

@@ -50,7 +50,13 @@
 ### 7.1 `media-core`
 
 - `CORE_HTTP_ADDR`
+- `CORE_HTTP_TLS_CERT_PATH`
+- `CORE_HTTP_TLS_KEY_PATH`
 - `CORE_GRPC_ADDR`
+- `CORE_GRPC_TLS_CERT_PATH`
+- `CORE_GRPC_TLS_KEY_PATH`
+- `CORE_GRPC_TLS_CLIENT_CA_PATH`
+- `CORE_INSECURE_DEV`
 - `DATABASE_URL`
 - `AUTH_MODE`
 - `JWT_PUBLIC_KEY`
@@ -74,6 +80,8 @@
 - `UPLOAD_ALLOWED_EXTENSIONS`
 - `UPLOAD_PROBE_TIMEOUT_SEC`
 - `PUBLIC_MEDIA_BASE_URL`
+
+`STREAMSERVER_ENV=production` 时，`AUTH_MODE=disabled` 会被拒绝；gRPC 必须配置完整的服务端证书、私钥和客户端 CA。Core HTTP 未配置证书时只能监听 loopback，监听非 loopback 必须同时配置 HTTP 证书和私钥。仅本地开发可使用 `media-core --insecure-dev`，且 HTTP/gRPC 必须同时监听 loopback。
 
 手动上传文件由 Agent 写入 `WORK_ROOT/uploads/<node_id>/YYYY/MM/DD/`；Core 代理上传请求并维护上传产物台账，后续 `input.kind=file` 任务按路径内的 `<node_id>` 做节点亲和调度。Agent 注册时会上报 `agent_http_base_url`，Core 使用该地址转发上传请求，不需要额外配置上传地址模板。Agent 心跳会上报 `WORK_ROOT` 所在磁盘的总量、剩余空间和使用率，Core 自动选择上传节点时优先选择上传盘剩余空间更大的节点。上传后的 `ffprobe` 时长探测使用较大的探测窗口；探测失败或超时时上传仍成功，`durationSec` 返回默认值 `0`。
 

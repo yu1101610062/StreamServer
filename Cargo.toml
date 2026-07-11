@@ -20,6 +20,7 @@ version = "0.1.0"
 anyhow = "1.0.98"
 argon2 = "0.5.3"
 axum = { version = "0.8.4", features = ["macros", "multipart"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 config = { version = "0.15.18", default-features = false, features = ["toml"] }

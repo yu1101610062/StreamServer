@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{net::SocketAddr, str::FromStr};
 
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,10 @@ impl Default for LoggingSettings {
 pub struct CoreSettings {
     #[serde(default = "default_core_http_addr")]
     pub http_addr: String,
+    #[serde(default = "default_http_tls_cert_path")]
+    pub http_tls_cert_path: String,
+    #[serde(default = "default_http_tls_key_path")]
+    pub http_tls_key_path: String,
     #[serde(default = "default_core_grpc_addr")]
     pub grpc_addr: String,
     #[serde(default = "default_grpc_tls_cert_path")]
@@ -65,6 +69,8 @@ pub struct CoreSettings {
     pub database_url: String,
     #[serde(default)]
     pub auth_mode: AuthMode,
+    #[serde(default)]
+    pub insecure_dev: bool,
     #[serde(default)]
     pub jwt_public_key: String,
     #[serde(default)]
@@ -107,12 +113,15 @@ impl Default for CoreSettings {
     fn default() -> Self {
         Self {
             http_addr: default_core_http_addr(),
+            http_tls_cert_path: default_http_tls_cert_path(),
+            http_tls_key_path: default_http_tls_key_path(),
             grpc_addr: default_core_grpc_addr(),
             grpc_tls_cert_path: default_grpc_tls_cert_path(),
             grpc_tls_key_path: default_grpc_tls_key_path(),
             grpc_tls_client_ca_path: default_grpc_tls_client_ca_path(),
             database_url: String::new(),
             auth_mode: AuthMode::Disabled,
+            insecure_dev: false,
             jwt_public_key: String::new(),
             auth_jwt_private_key_path: String::new(),
             auth_jwt_public_key_path: String::new(),
@@ -136,17 +145,29 @@ impl Default for CoreSettings {
 }
 
 impl Settings {
-    pub fn load() -> anyhow::Result<Self> {
+    pub fn load_with_insecure_dev(insecure_dev: bool) -> anyhow::Result<Self> {
+        Self::load_internal(insecure_dev, true)
+    }
+
+    pub fn load_for_auth_cli() -> anyhow::Result<Self> {
+        Self::load_internal(false, false)
+    }
+
+    fn load_internal(insecure_dev: bool, validate_listener_security: bool) -> anyhow::Result<Self> {
         let environment = match std::env::var("STREAMSERVER_ENV") {
             Ok(value) => value,
             Err(_) => "development".into(),
         };
+        let environment = environment.trim().to_string();
         let builder = config::Config::builder()
             .add_source(config::File::with_name("config/base").required(false))
             .add_source(config::File::with_name(&format!("config/{environment}")).required(false));
 
         let mut file_settings = builder.build()?.try_deserialize::<FileSettings>()?;
         apply_env_overrides(&mut file_settings)?;
+        if insecure_dev {
+            file_settings.core.insecure_dev = true;
+        }
 
         let settings = Self {
             environment,
@@ -154,11 +175,11 @@ impl Settings {
             core: file_settings.core,
         };
 
-        settings.validate()?;
+        settings.validate(validate_listener_security)?;
         Ok(settings)
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    fn validate(&self, validate_listener_security: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             !self.core.http_addr.trim().is_empty(),
             "core.http_addr must not be empty"
@@ -167,6 +188,9 @@ impl Settings {
             !self.core.grpc_addr.trim().is_empty(),
             "core.grpc_addr must not be empty"
         );
+        if validate_listener_security {
+            validate_security_policy(&self.environment, &self.core)?;
+        }
         anyhow::ensure!(
             !self.core.database_url.trim().is_empty(),
             "DATABASE_URL must be configured"
@@ -229,20 +253,88 @@ impl Settings {
                 "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
             );
         }
-        let tls_fields = [
-            self.core.grpc_tls_cert_path.trim(),
-            self.core.grpc_tls_key_path.trim(),
-            self.core.grpc_tls_client_ca_path.trim(),
-        ];
-        if tls_fields.iter().any(|value| !value.is_empty()) {
-            anyhow::ensure!(
-                tls_fields.iter().all(|value| !value.is_empty()),
-                "CORE_GRPC_TLS_CERT_PATH, CORE_GRPC_TLS_KEY_PATH and CORE_GRPC_TLS_CLIENT_CA_PATH must all be set together"
-            );
-        }
-
         Ok(())
     }
+}
+
+pub(crate) fn validate_security_policy(
+    environment: &str,
+    core: &CoreSettings,
+) -> anyhow::Result<()> {
+    let http_addr = parse_bind_addr("CORE_HTTP_ADDR", &core.http_addr)?;
+    let grpc_addr = parse_bind_addr("CORE_GRPC_ADDR", &core.grpc_addr)?;
+    let environment = environment.trim();
+    let is_production = environment.eq_ignore_ascii_case("production");
+    let is_development = environment.eq_ignore_ascii_case("development");
+
+    let http_tls_fields = [
+        core.http_tls_cert_path.trim(),
+        core.http_tls_key_path.trim(),
+    ];
+    let http_tls_configured = http_tls_fields.iter().all(|value| !value.is_empty());
+    anyhow::ensure!(
+        http_tls_fields.iter().all(|value| value.is_empty()) || http_tls_configured,
+        "CORE_HTTP_TLS_CERT_PATH and CORE_HTTP_TLS_KEY_PATH must be set together"
+    );
+
+    let grpc_tls_fields = [
+        core.grpc_tls_cert_path.trim(),
+        core.grpc_tls_key_path.trim(),
+        core.grpc_tls_client_ca_path.trim(),
+    ];
+    let grpc_mtls_configured = grpc_tls_fields.iter().all(|value| !value.is_empty());
+    anyhow::ensure!(
+        grpc_tls_fields.iter().all(|value| value.is_empty()) || grpc_mtls_configured,
+        "CORE_GRPC_TLS_CERT_PATH, CORE_GRPC_TLS_KEY_PATH and CORE_GRPC_TLS_CLIENT_CA_PATH must all be set together"
+    );
+
+    if is_production {
+        anyhow::ensure!(
+            core.auth_mode != AuthMode::Disabled,
+            "production requires AUTH_MODE other than disabled; configure local_password or external_jwt"
+        );
+    }
+
+    if core.insecure_dev {
+        anyhow::ensure!(
+            is_development,
+            "--insecure-dev is allowed only in development; remove it or set STREAMSERVER_ENV=development"
+        );
+        anyhow::ensure!(
+            http_addr.ip().is_loopback() && grpc_addr.ip().is_loopback(),
+            "--insecure-dev requires loopback HTTP and gRPC addresses"
+        );
+    }
+
+    anyhow::ensure!(
+        http_tls_configured || http_addr.ip().is_loopback(),
+        "non-loopback CORE_HTTP_ADDR requires HTTP TLS; configure CORE_HTTP_TLS_CERT_PATH and CORE_HTTP_TLS_KEY_PATH"
+    );
+
+    if is_production {
+        anyhow::ensure!(
+            grpc_mtls_configured,
+            "production requires gRPC mTLS; configure CORE_GRPC_TLS_CERT_PATH, CORE_GRPC_TLS_KEY_PATH and CORE_GRPC_TLS_CLIENT_CA_PATH"
+        );
+    } else if !grpc_mtls_configured {
+        anyhow::ensure!(
+            grpc_addr.ip().is_loopback(),
+            "non-loopback CORE_GRPC_ADDR requires gRPC mTLS"
+        );
+        anyhow::ensure!(
+            is_development && core.insecure_dev,
+            "development plaintext gRPC requires --insecure-dev and a loopback CORE_GRPC_ADDR"
+        );
+    }
+
+    Ok(())
+}
+
+fn parse_bind_addr(name: &str, value: &str) -> anyhow::Result<SocketAddr> {
+    value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|error| anyhow::anyhow!("{name} must be an IP socket address: {error}"))
 }
 
 fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
@@ -250,6 +342,12 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     // 继续集中在 validate() 中处理，避免覆盖阶段提前耦合业务规则。
     if let Some(value) = env("CORE_HTTP_ADDR") {
         settings.core.http_addr = value;
+    }
+    if let Some(value) = env("CORE_HTTP_TLS_CERT_PATH") {
+        settings.core.http_tls_cert_path = value;
+    }
+    if let Some(value) = env("CORE_HTTP_TLS_KEY_PATH") {
+        settings.core.http_tls_key_path = value;
     }
     if let Some(value) = env("CORE_GRPC_ADDR") {
         settings.core.grpc_addr = value;
@@ -279,6 +377,9 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
         } else {
             AuthMode::Disabled
         };
+    }
+    if let Some(value) = env("CORE_INSECURE_DEV") {
+        settings.core.insecure_dev = parse_bool_env("CORE_INSECURE_DEV", &value)?;
     }
     if let Some(value) = env("JWT_PUBLIC_KEY") {
         settings.core.jwt_public_key = value;
@@ -367,6 +468,14 @@ where
     T::from_str(value).map_err(|_| anyhow::anyhow!("{name} must be an integer"))
 }
 
+fn parse_bool_env(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => anyhow::bail!("{name} must be true or false"),
+    }
+}
+
 fn split_csv(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -381,11 +490,19 @@ fn default_log_level() -> String {
 }
 
 fn default_core_http_addr() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:8080".to_string()
+}
+
+fn default_http_tls_cert_path() -> String {
+    String::new()
+}
+
+fn default_http_tls_key_path() -> String {
+    String::new()
 }
 
 fn default_core_grpc_addr() -> String {
-    "0.0.0.0:50051".to_string()
+    "127.0.0.1:50051".to_string()
 }
 
 fn default_grpc_tls_cert_path() -> String {

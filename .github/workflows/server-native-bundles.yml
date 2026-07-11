@@ -28,6 +28,8 @@ on:
       - "scripts/build-frontend-ui.mjs"
       - "scripts/build-musl-binaries.sh"
       - "scripts/build-native-bundle.sh"
+      - "scripts/verify-native-bundle-on-target.sh"
+      - "tests/native_security_contract_test.sh"
   pull_request:
     branches:
       - DEV
@@ -41,6 +43,8 @@ on:
       - "scripts/build-frontend-ui.mjs"
       - "scripts/build-musl-binaries.sh"
       - "scripts/build-native-bundle.sh"
+      - "scripts/verify-native-bundle-on-target.sh"
+      - "tests/native_security_contract_test.sh"
 
 permissions:
   contents: write
@@ -100,6 +104,13 @@ jobs:
           echo "== Disk after cleanup =="
           df -h
           docker system df || true
+
+      - name: Validate native installer security contracts
+        if: steps.select.outputs.selected == 'true'
+        shell: bash
+        run: |
+          bash -n packaging/native/install.sh
+          bash tests/native_security_contract_test.sh
 
       - name: Set up Node.js
         if: steps.select.outputs.selected == 'true'
