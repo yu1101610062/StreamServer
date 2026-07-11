@@ -69,6 +69,9 @@ FRONTEND_USES_STEPS = {
     "Checkout": "actions/checkout@v4",
     "Set up Node.js 20": "actions/setup-node@v4",
 }
+CONTROL_KEYS = {"if", "continue-on-error"}
+RUST_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "strategy", "services", "steps"}
+FRONTEND_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "defaults", "steps"}
 
 
 def normalized_script(value: object) -> str:
@@ -105,6 +108,20 @@ def steps_by_name(job: dict, job_name: str, errors: list[str]) -> dict[str, dict
     return indexed
 
 
+def validate_allowed_keys(
+    value: dict,
+    path: str,
+    allowed_keys: set[str],
+    errors: list[str],
+) -> None:
+    for control_key in CONTROL_KEYS:
+        if control_key in value:
+            errors.append(f"{path} must not set {control_key}")
+    unexpected_keys = set(value) - allowed_keys - CONTROL_KEYS
+    if unexpected_keys:
+        errors.append(f"{path} has unexpected keys {sorted(unexpected_keys)!r}")
+
+
 def validate_steps(
     job: dict,
     job_name: str,
@@ -123,8 +140,12 @@ def validate_steps(
 
     for name, expected_run in expected_runs.items():
         step = indexed.get(name, {})
-        if set(step) - {"name", "run", "shell"}:
-            errors.append(f"jobs.{job_name} step {name!r} has unexpected keys")
+        validate_allowed_keys(
+            step,
+            f"jobs.{job_name} step {name!r}",
+            {"name", "run", "shell"},
+            errors,
+        )
         if normalized_script(step.get("run", "")) != normalized_script(expected_run):
             errors.append(
                 f"jobs.{job_name} step {name!r} must directly run {expected_run!r}"
@@ -132,6 +153,15 @@ def validate_steps(
 
     for name, expected_uses_value in expected_uses.items():
         step = indexed.get(name, {})
+        allowed_keys = {"name", "uses"}
+        if name == "Set up Node.js 20":
+            allowed_keys.add("with")
+        validate_allowed_keys(
+            step,
+            f"jobs.{job_name} step {name!r}",
+            allowed_keys,
+            errors,
+        )
         if step.get("uses") != expected_uses_value:
             errors.append(
                 f"jobs.{job_name} step {name!r} must use {expected_uses_value!r}"
@@ -177,6 +207,8 @@ def workflow_contract_errors(workflow_text: str) -> list[str]:
         errors.append("workflow.jobs must contain only rust and frontend")
     rust = mapping_value(jobs, "rust", "workflow.jobs", errors)
     frontend = mapping_value(jobs, "frontend", "workflow.jobs", errors)
+    validate_allowed_keys(rust, "jobs.rust", RUST_JOB_KEYS, errors)
+    validate_allowed_keys(frontend, "jobs.frontend", FRONTEND_JOB_KEYS, errors)
 
     if rust.get("runs-on") != "ubuntu-24.04":
         errors.append("jobs.rust.runs-on must be ubuntu-24.04")
@@ -312,6 +344,52 @@ class ServerCiWorkflowContractTest(unittest.TestCase):
             workflow += f"\n      - name: Misplaced gate\n        run: {command}\n"
 
         self.assert_workflow_is_rejected(workflow)
+
+    def test_disabled_required_job_or_step_does_not_satisfy_the_contract(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        disabled_job = workflow.replace(
+            "  rust:\n",
+            "  rust:\n    if: ${{ false }}\n",
+            1,
+        )
+        self.assert_workflow_is_rejected(disabled_job)
+
+        disabled_step = workflow.replace(
+            "      - name: Validate CI workflow contract\n",
+            "      - name: Validate CI workflow contract\n        if: ${{ false }}\n",
+            1,
+        )
+        self.assert_workflow_is_rejected(disabled_step)
+
+        disabled_uses_step = workflow.replace(
+            "      - name: Checkout\n        uses: actions/checkout@v4\n",
+            "      - name: Checkout\n        if: ${{ false }}\n        uses: actions/checkout@v4\n",
+            1,
+        )
+        self.assert_workflow_is_rejected(disabled_uses_step)
+
+    def test_non_blocking_required_job_or_step_does_not_satisfy_the_contract(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        non_blocking_job = workflow.replace(
+            "  rust:\n",
+            "  rust:\n    continue-on-error: true\n",
+            1,
+        )
+        self.assert_workflow_is_rejected(non_blocking_job)
+
+        non_blocking_step = workflow.replace(
+            "      - name: Validate CI workflow contract\n",
+            "      - name: Validate CI workflow contract\n        continue-on-error: true\n",
+            1,
+        )
+        self.assert_workflow_is_rejected(non_blocking_step)
+
+        non_blocking_uses_step = workflow.replace(
+            "      - name: Checkout\n        uses: actions/checkout@v4\n",
+            "      - name: Checkout\n        continue-on-error: true\n        uses: actions/checkout@v4\n",
+            1,
+        )
+        self.assert_workflow_is_rejected(non_blocking_uses_step)
 
 
 if __name__ == "__main__":
