@@ -7,6 +7,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "server-ci.yml"
+DESKTOP_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "desktop-client.yml"
 REQUIREMENTS_PATH = REPO_ROOT / "tests" / "requirements-ci.txt"
 ENGLISH_TESTING_DOC = REPO_ROOT / "docs" / "en" / "09-testing.md"
 BRANCH_WORKFLOW_DOC = REPO_ROOT / "docs" / "zh" / "11-development-workflow.md"
@@ -392,6 +393,21 @@ class ServerCiWorkflowContractTest(unittest.TestCase):
             1,
         )
         self.assert_workflow_is_rejected(non_blocking_uses_step)
+
+
+class DesktopWorkflowContractTest(unittest.TestCase):
+    def test_desktop_workflow_listens_to_master_and_dev(self) -> None:
+        workflow = yaml.load(
+            DESKTOP_WORKFLOW_PATH.read_text(encoding="utf-8"),
+            Loader=yaml.BaseLoader,
+        )
+        self.assertIsInstance(workflow, dict)
+        triggers = workflow.get("on", {})
+        self.assertIsInstance(triggers, dict)
+        for event in ("push", "pull_request"):
+            event_config = triggers.get(event, {})
+            self.assertIsInstance(event_config, dict)
+            self.assertEqual(set(event_config.get("branches", [])), {"master", "DEV"})
 
 
 if __name__ == "__main__":

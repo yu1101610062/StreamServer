@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
+      - master
       - DEV
     tags:
       - "v*"
@@ -14,6 +15,7 @@ on:
       - "clients/streamserver-desktop/**"
   pull_request:
     branches:
+      - master
       - DEV
     paths:
       - ".github/workflows/desktop-client.yml"
