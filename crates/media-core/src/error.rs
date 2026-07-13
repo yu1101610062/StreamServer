@@ -16,7 +16,11 @@ pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
+    Unauthorized(String),
+    #[error("{0}")]
     Forbidden(String),
+    #[error("{0}")]
+    Conflict(String),
     #[error("{0}")]
     NotFound(String),
     #[error(transparent)]
@@ -56,9 +60,23 @@ impl AppError {
                 Value::Null,
             )
                 .into(),
+            Self::Unauthorized(message) => (
+                StatusCode::UNAUTHORIZED,
+                "AUTH_UNAUTHORIZED",
+                message,
+                Value::Null,
+            )
+                .into(),
             Self::Forbidden(message) => (
                 StatusCode::FORBIDDEN,
                 "ACCESS_FORBIDDEN",
+                message,
+                Value::Null,
+            )
+                .into(),
+            Self::Conflict(message) => (
+                StatusCode::CONFLICT,
+                "CONFLICT_REQUEST",
                 message,
                 Value::Null,
             )

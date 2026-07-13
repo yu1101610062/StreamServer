@@ -1,4 +1,25 @@
+use std::sync::{Arc, OnceLock};
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
 const DEFAULT_TEST_DATABASE_URL: &str = "postgresql://postgres:test@127.0.0.1/postgres";
+const MAX_CONCURRENT_TEST_DATABASES: usize = 3;
+
+static TEST_DATABASE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+async fn acquire_slot(slots: Arc<Semaphore>) -> anyhow::Result<OwnedSemaphorePermit> {
+    slots
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("test database concurrency limiter closed unexpectedly"))
+}
+
+pub(crate) async fn acquire_test_database_slot() -> anyhow::Result<OwnedSemaphorePermit> {
+    let slots = TEST_DATABASE_SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TEST_DATABASES)))
+        .clone();
+    acquire_slot(slots).await
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TestDatabaseConfig {
@@ -56,7 +77,36 @@ pub(crate) fn finish_setup<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{config_from_values, finish_setup};
+    use std::sync::Arc;
+
+    use tokio::{sync::Semaphore, time::timeout};
+
+    use super::{MAX_CONCURRENT_TEST_DATABASES, acquire_slot, config_from_values, finish_setup};
+
+    #[tokio::test]
+    async fn database_test_slots_bound_concurrent_database_lifetimes() -> anyhow::Result<()> {
+        let slots = Arc::new(Semaphore::new(MAX_CONCURRENT_TEST_DATABASES));
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT_TEST_DATABASES {
+            held.push(acquire_slot(slots.clone()).await?);
+        }
+
+        assert!(
+            timeout(
+                std::time::Duration::from_millis(25),
+                acquire_slot(slots.clone())
+            )
+            .await
+            .is_err(),
+            "a fourth database lifetime must wait for capacity"
+        );
+
+        held.pop();
+        let _released = timeout(std::time::Duration::from_secs(1), acquire_slot(slots))
+            .await
+            .expect("a released database slot must unblock the waiter")?;
+        Ok(())
+    }
 
     #[test]
     fn required_mode_rejects_a_missing_database_url() {

@@ -15,39 +15,53 @@ on:
           - control-plane-minimal
   push:
     branches:
+      - master
       - DEV
     tags:
       - "v*"
     paths:
       - ".github/workflows/server-native-bundles.yml"
+      - ".gitattributes"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "config/**"
       - "crates/**"
+      - "docs/zh/08-native-deployment.md"
+      - "migrations/**"
       - "packaging/native/**"
       - "packaging/docker/**"
+      - "proto/**"
       - "scripts/build-frontend-ui.mjs"
       - "scripts/build-musl-binaries.sh"
       - "scripts/build-native-bundle.sh"
       - "scripts/verify-native-bundle-on-target.sh"
       - "tests/native_security_contract_test.sh"
+      - "tests/native_verifier_*_contract_test.sh"
   pull_request:
     branches:
+      - master
       - DEV
     paths:
       - ".github/workflows/server-native-bundles.yml"
+      - ".gitattributes"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "config/**"
       - "crates/**"
+      - "docs/zh/08-native-deployment.md"
+      - "migrations/**"
       - "packaging/native/**"
       - "packaging/docker/**"
+      - "proto/**"
       - "scripts/build-frontend-ui.mjs"
       - "scripts/build-musl-binaries.sh"
       - "scripts/build-native-bundle.sh"
       - "scripts/verify-native-bundle-on-target.sh"
       - "tests/native_security_contract_test.sh"
+      - "tests/native_verifier_*_contract_test.sh"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: server-native-bundles-${{ github.ref }}
@@ -109,8 +123,24 @@ jobs:
         if: steps.select.outputs.selected == 'true'
         shell: bash
         run: |
-          bash -n packaging/native/install.sh
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 \
+            .github/workflows/server-native-bundles.yml
+          bash -n \
+            packaging/native/install.sh \
+            scripts/verify-native-bundle-on-target.sh \
+            tests/native_security_contract_test.sh \
+            tests/native_verifier_locale_contract_test.sh \
+            tests/native_verifier_process_contract_test.sh \
+            tests/native_verifier_strict_contract_test.sh
+          shellcheck -S warning \
+            scripts/verify-native-bundle-on-target.sh \
+            tests/native_verifier_locale_contract_test.sh \
+            tests/native_verifier_process_contract_test.sh \
+            tests/native_verifier_strict_contract_test.sh
           bash tests/native_security_contract_test.sh
+          bash tests/native_verifier_locale_contract_test.sh
+          bash tests/native_verifier_process_contract_test.sh
+          bash tests/native_verifier_strict_contract_test.sh
 
       - name: Set up Node.js
         if: steps.select.outputs.selected == 'true'
@@ -130,6 +160,28 @@ jobs:
             --no-runtime-cache \
             --prune-images-after-extract \
             --output-dir "${OUTPUT_DIR}"
+
+      - name: Execute built archive through target verifier
+        if: steps.select.outputs.selected == 'true'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          bundles=("${OUTPUT_DIR}"/*.tar.gz)
+          if [[ "${#bundles[@]}" -ne 1 ]]; then
+            printf 'expected exactly one native archive, found %s\n' "${#bundles[@]}" >&2
+            exit 1
+          fi
+          verifier_args=(
+            --local
+            --bundle "${bundles[0]}"
+            --output-dir "dist/native-verification/${NATIVE_VARIANT}"
+          )
+          if [[ "${NATIVE_VARIANT}" == gpu-enabled ]]; then
+            # Hosted runners validate GPU archive shape/load/versions/encoders;
+            # actual NVENC execution remains a required GPU-host target gate.
+            verifier_args+=(--gpu-hardware skip)
+          fi
+          scripts/verify-native-bundle-on-target.sh "${verifier_args[@]}"
 
       - name: Print disk usage
         if: always() && steps.select.outputs.selected == 'true'
@@ -197,8 +249,22 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  release:
+    name: Publish signed tag assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: streamserver-native-*
+          path: dist/release-assets
+          merge-multiple: true
+
       - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/v') && steps.select.outputs.selected == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

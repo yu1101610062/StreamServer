@@ -5,6 +5,8 @@ mod tests;
 #[cfg(test)]
 mod test_database;
 
+mod agent_identity;
+mod agent_management;
 mod auth;
 mod callback;
 mod config;
@@ -21,27 +23,42 @@ mod upload;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     net::{IpAddr, SocketAddr, TcpListener as StdTcpListener},
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
 };
 
+use agent_identity::{
+    AgentCertificateAuthority, AgentEnrollmentAdmissionError, AgentEnrollmentPublicConfig,
+    AgentIdentityService, AgentIdentityServiceError, CreatedAgentEnrollment,
+    VerifiedAgentEnrollmentToken,
+};
+use agent_management::{
+    AgentCapabilitySigner, AgentManagementClient, AgentManagementService,
+    AgentManagementTlsMaterial, RoutedAgentManagementService, TracingAgentManagementAuditSink,
+};
 use anyhow::Context;
 use auth::{
-    ApiPermission, AuthConfig, generate_refresh_token, hash_password, hash_refresh_token,
-    maybe_extract_bearer_token, verify_password,
+    ApiPermission, AuthConfig, extract_bearer_token, generate_refresh_token, hash_password,
+    hash_refresh_token, maybe_extract_bearer_token, verify_password,
 };
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Extension, FromRequestParts, Path, Query, Request, State,
+    },
     http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use axum_server::{Handle as HttpServerHandle, tls_rustls::RustlsConfig};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use control_plane::{ControlPlaneService, NodeLiveLoad};
+use control_plane::{
+    ControlPlaneService, NodeLiveLoad, ZlmDebugCallError, ZlmDebugCommand, ZlmDebugResult,
+};
 use error::AppError;
 use media_domain::RecordingControlSpec;
 use repository::{
@@ -60,6 +77,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
+use x509_parser::prelude::FromDer;
 
 use media_domain::{TaskOperation, TaskSpec};
 
@@ -70,11 +88,109 @@ pub(crate) struct AppState {
     started_at: DateTime<Utc>,
     environment: String,
     auth: AuthConfig,
-    http_client: Client,
+    agent_identity: Option<AgentIdentityService>,
+    agent_management: Option<Arc<dyn AgentManagementService>>,
     hook_shared_secret: String,
     hook_source_allowlist: Vec<IpAddr>,
     zlm_auto_close_on_no_reader_enabled: bool,
     storage_allowlist: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ZlmHookBusinessContext {
+    repository: Arc<TaskRepository>,
+    zlm_auto_close_on_no_reader_enabled: bool,
+    storage_allowlist: Vec<String>,
+}
+
+impl ZlmHookBusinessContext {
+    fn new(
+        repository: Arc<TaskRepository>,
+        zlm_auto_close_on_no_reader_enabled: bool,
+        storage_allowlist: Vec<String>,
+    ) -> Self {
+        Self {
+            repository,
+            zlm_auto_close_on_no_reader_enabled,
+            storage_allowlist,
+        }
+    }
+
+    fn from_app_state(state: &AppState) -> Self {
+        Self::new(
+            state.repository.clone(),
+            state.zlm_auto_close_on_no_reader_enabled,
+            state.storage_allowlist.clone(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CoreZlmHookHandler {
+    context: ZlmHookBusinessContext,
+}
+
+impl CoreZlmHookHandler {
+    fn new(
+        repository: Arc<TaskRepository>,
+        zlm_auto_close_on_no_reader_enabled: bool,
+        storage_allowlist: Vec<String>,
+    ) -> Self {
+        Self {
+            context: ZlmHookBusinessContext::new(
+                repository,
+                zlm_auto_close_on_no_reader_enabled,
+                storage_allowlist,
+            ),
+        }
+    }
+}
+
+impl control_plane::ZlmHookHandler for CoreZlmHookHandler {
+    fn handle(
+        &self,
+        request: control_plane::AuthenticatedZlmHook,
+    ) -> control_plane::ZlmHookFuture<'_> {
+        Box::pin(async move {
+            match process_authenticated_zlm_hook(
+                &self.context,
+                request.node_id,
+                request.node_id.to_string(),
+                request.hook_name,
+                request.body,
+            )
+            .await
+            {
+                Ok((status, Json(body))) => control_plane::ZlmHookHandlerResponse {
+                    http_status: status.as_u16(),
+                    body,
+                },
+                Err(error) => map_zlm_hook_handler_error(error),
+            }
+        })
+    }
+}
+
+fn map_zlm_hook_handler_error(error: AppError) -> control_plane::ZlmHookHandlerResponse {
+    let (http_status, message) = match error {
+        AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+        AppError::Validation(message) => (StatusCode::BAD_REQUEST, message.to_string()),
+        AppError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
+        AppError::Forbidden(message) => (StatusCode::FORBIDDEN, message),
+        AppError::Conflict(message) => (StatusCode::CONFLICT, message),
+        AppError::NotFound(message) => (StatusCode::NOT_FOUND, message),
+        AppError::ControlPlane(_) | AppError::Repository(_) | AppError::Internal(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ZLM hook processing failed".to_string(),
+        ),
+    };
+    control_plane::ZlmHookHandlerResponse {
+        http_status: http_status.as_u16(),
+        body: json!({
+            "code": -1,
+            "msg": message,
+        }),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -100,12 +216,33 @@ where
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliCommand {
-    Serve { insecure_dev: bool },
-    Help { auth_only: bool },
+    Serve {
+        insecure_dev: bool,
+    },
+    Help {
+        auth_only: bool,
+    },
+    AgentHelp,
+    AgentCreateEnrollment {
+        node_id: Uuid,
+    },
     CheckAuthConfig,
     CheckAdmin,
-    BootstrapAdmin { username: String },
-    ResetPassword { username: String },
+    BootstrapStatus {
+        username: String,
+        handoff_id: String,
+    },
+    RecoverBootstrapAdmin {
+        username: String,
+        handoff_id: String,
+        expected_version: String,
+    },
+    BootstrapAdmin {
+        username: String,
+    },
+    ResetPassword {
+        username: String,
+    },
 }
 
 const BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD: bool = true;
@@ -119,6 +256,13 @@ async fn main() -> anyhow::Result<()> {
             print_cli_help(auth_only);
             return Ok(());
         }
+        CliCommand::AgentHelp => {
+            print_agent_cli_help();
+            return Ok(());
+        }
+        CliCommand::AgentCreateEnrollment { node_id } => {
+            return run_agent_create_enrollment(node_id).await;
+        }
         other => return run_cli_command(other).await,
     };
 
@@ -131,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
         grpc_addr = %settings.core.grpc_addr,
         "starting media-core"
     );
+    let agent_enrollment_material = load_agent_certificate_authority(&settings.core, Utc::now())?;
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -142,12 +287,53 @@ async fn main() -> anyhow::Result<()> {
         pool,
         chrono::Duration::milliseconds(settings.core.callback_settle_delay_ms as i64),
     ));
+    let core_instance_id = agent_enrollment_material
+        .as_ref()
+        .map(|(_, _, core_instance_id)| *core_instance_id)
+        .or_else(|| Uuid::parse_str(settings.core.core_instance_id.trim()).ok())
+        .filter(|value| !value.is_nil())
+        .unwrap_or_else(Uuid::now_v7);
+    let agent_management_client = agent_enrollment_material
+        .as_ref()
+        .map(|(_, public_config, _)| {
+            load_agent_management_client(&settings.core, public_config.capability_jwt_kid.as_str())
+        })
+        .transpose()?;
+    let agent_identity = agent_enrollment_material.map(|(authority, public_config, _)| {
+        AgentIdentityService::new(repository.clone(), authority, public_config)
+    });
     let source_gateway = source_gateway::SourceGatewayClient::from_settings(&settings.core)?;
     let control_plane = if let Some(source_gateway) = source_gateway {
-        ControlPlaneService::with_source_gateway(repository.clone(), source_gateway)
+        ControlPlaneService::with_source_gateway_and_core_instance_id(
+            repository.clone(),
+            source_gateway,
+            core_instance_id,
+        )
     } else {
-        ControlPlaneService::new(repository.clone())
+        ControlPlaneService::new_with_core_instance_id(repository.clone(), core_instance_id)
     };
+    let control_plane = control_plane.with_zlm_hook_handler(Arc::new(CoreZlmHookHandler::new(
+        repository.clone(),
+        settings.core.zlm_auto_close_on_no_reader_enabled,
+        settings.core.storage_allowlist.clone(),
+    )));
+    let control_plane = match (&agent_identity, &agent_management_client) {
+        (Some(agent_identity), Some(agent_management_client)) => control_plane
+            .with_agent_identity_and_readiness(
+                agent_identity.clone(),
+                agent_management_client.clone(),
+            ),
+        (None, None) => control_plane,
+        _ => anyhow::bail!(
+            "Agent identity and authenticated management client must be configured together"
+        ),
+    };
+    let agent_management = agent_management_client.map(|client| {
+        Arc::new(RoutedAgentManagementService::new(
+            client,
+            Arc::new(control_plane.clone()),
+        )) as Arc<dyn AgentManagementService>
+    });
     let hook_source_allowlist = parse_hook_source_allowlist(&settings.core.hook_source_allowlist)?;
     let auth = AuthConfig::from_settings(&settings.core)?;
     if auth.supports_local_login() && !repository.has_enabled_admin_user().await? {
@@ -155,14 +341,14 @@ async fn main() -> anyhow::Result<()> {
             "local_password auth mode requires at least one enabled admin user; run `media-core auth bootstrap-admin --username <name> --password-stdin` first"
         );
     }
-
     let state = AppState {
         repository: repository.clone(),
         control_plane: control_plane.clone(),
         started_at: Utc::now(),
         environment: settings.environment.clone(),
         auth,
-        http_client: Client::new(),
+        agent_identity,
+        agent_management,
         hook_shared_secret: settings.core.hook_shared_secret.clone(),
         hook_source_allowlist,
         zlm_auto_close_on_no_reader_enabled: settings.core.zlm_auto_close_on_no_reader_enabled,
@@ -231,6 +417,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 pub(crate) fn build_app(state: AppState) -> Router {
+    let enrollment_route = post(enroll_agent)
+        .layer(DefaultBodyLimit::max(40 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admit_agent_enrollment,
+        ));
     let api_router = Router::new()
         .route("/me", get(ui::current_session))
         .route("/auth/login", post(auth_login))
@@ -241,6 +433,8 @@ pub(crate) fn build_app(state: AppState) -> Router {
             "/security/machine-allowlist",
             get(list_machine_allowlist).put(update_machine_allowlist),
         )
+        .route("/admin/agent-enrollments", post(create_agent_enrollment))
+        .route("/agent-enroll", enrollment_route)
         .route("/tasks/preview", post(ui::preview_task))
         .route(
             "/uploads/media",
@@ -284,18 +478,115 @@ pub(crate) fn build_app(state: AppState) -> Router {
         .route("/debug/zlm/close-stream", post(debug_zlm_close_stream))
         .route("/debug/zlm/snap", get(debug_zlm_snap));
 
-    Router::new()
+    let app = Router::new()
         .route("/health/live", get(live_health))
-        .route("/health/ready", get(ready_health))
-        .route("/internal/hooks/zlm/{server_id}", post(receive_zlm_hook))
-        .route(
-            "/internal/hooks/zlm/{server_id}/{hook_name}",
-            post(receive_named_zlm_hook),
-        )
-        .nest("/api/v1", api_router)
+        .route("/health/ready", get(ready_health));
+    let app = if state.environment == "development" {
+        app.route("/internal/hooks/zlm/{server_id}", post(receive_zlm_hook))
+            .route(
+                "/internal/hooks/zlm/{server_id}/{hook_name}",
+                post(receive_named_zlm_hook),
+            )
+    } else {
+        app
+    };
+    app.nest("/api/v1", api_router)
         .merge(ui::router())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                tracing::debug_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                )
+            }),
+        )
         .with_state(state)
+}
+
+async fn admit_agent_enrollment(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let service = match configured_agent_identity_service(&state) {
+        Ok(service) => service,
+        Err(error) => return error.into_response(),
+    };
+    let Some(peer_ip) = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0.ip())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": "AGENT_ENROLLMENT_PEER_UNAVAILABLE",
+                "message": "agent enrollment peer identity is unavailable",
+                "request_id": Uuid::now_v7().to_string(),
+            })),
+        )
+            .into_response();
+    };
+    let permit = match service.try_admit_http(peer_ip) {
+        Ok(permit) => permit,
+        Err(AgentEnrollmentAdmissionError::Busy) => {
+            return enrollment_admission_limited_response(std::time::Duration::from_secs(1));
+        }
+        Err(AgentEnrollmentAdmissionError::RateLimited { retry_after }) => {
+            return enrollment_admission_limited_response(retry_after);
+        }
+    };
+    let token = match extract_bearer_token(request.headers()) {
+        Ok(token) => token,
+        Err(_) => {
+            return AppError::Unauthorized("invalid or expired agent enrollment".to_string())
+                .into_response();
+        }
+    };
+    let verified = match service.verify_enrollment_token(token, Utc::now()) {
+        Ok(verified) => verified,
+        Err(_) => {
+            return AppError::Unauthorized("invalid or expired agent enrollment".to_string())
+                .into_response();
+        }
+    };
+    request.headers_mut().remove(header::AUTHORIZATION);
+    request.extensions_mut().insert(verified);
+    let response =
+        tokio::time::timeout(std::time::Duration::from_secs(10), next.run(request)).await;
+    drop(permit);
+    match response {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "code": "AGENT_ENROLLMENT_TIMEOUT",
+                "message": "agent enrollment did not complete within its deadline",
+                "request_id": Uuid::now_v7().to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn enrollment_admission_limited_response(retry_after: std::time::Duration) -> Response {
+    let retry_after_seconds = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "code": "AGENT_ENROLLMENT_RATE_LIMITED",
+            "message": "agent enrollment admission is temporarily limited",
+            "request_id": Uuid::now_v7().to_string(),
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        header::HeaderValue::from_str(&retry_after_seconds.to_string())
+            .expect("Retry-After seconds are always a valid header value"),
+    );
+    response
 }
 
 async fn live_health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -322,11 +613,11 @@ pub(crate) async fn authorize_business_request(
     permission: ApiPermission,
 ) -> Result<auth::AuthenticatedPrincipal, AppError> {
     if !state.auth.enabled() {
-        return state.auth.authorize(headers, permission);
+        return authorize_api_request(state, headers, permission).await;
     }
 
     match maybe_extract_bearer_token(headers)? {
-        Some(_) => state.auth.authorize(headers, permission),
+        Some(_) => authorize_api_request(state, headers, permission).await,
         None => {
             let peer_ip = peer.map(|addr| addr.ip()).ok_or_else(|| {
                 AppError::Forbidden(
@@ -346,6 +637,48 @@ pub(crate) async fn authorize_business_request(
     }
 }
 
+pub(crate) async fn authenticated_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<auth::AuthenticatedPrincipal, AppError> {
+    let principal = state.auth.verify_session_claims(headers)?;
+    if !state.auth.supports_local_login() {
+        return Ok(principal);
+    }
+    if !principal.is_user() {
+        return Err(AppError::Forbidden(
+            "local access token does not identify a user".to_string(),
+        ));
+    }
+    let credential_version = principal.credential_version().ok_or_else(|| {
+        AppError::Forbidden("local access token is missing credential state".to_string())
+    })?;
+    let current = state
+        .repository
+        .local_access_token_is_current(
+            principal.subject(),
+            credential_version,
+            principal.must_change_password(),
+        )
+        .await?;
+    if !current {
+        return Err(AppError::Forbidden(
+            "local access token is no longer current".to_string(),
+        ));
+    }
+    Ok(principal)
+}
+
+async fn authorize_api_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    permission: ApiPermission,
+) -> Result<auth::AuthenticatedPrincipal, AppError> {
+    let principal = authenticated_session(state, headers).await?;
+    principal.require_permission(permission)?;
+    Ok(principal)
+}
+
 fn require_local_password_login(state: &AppState) -> Result<(), AppError> {
     if state.auth.supports_local_login() {
         Ok(())
@@ -362,7 +695,15 @@ fn user_agent_from_headers(headers: &HeaderMap) -> Option<String> {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string)
+        .map(|value| truncate_utf8_for_storage(value, 256))
+}
+
+fn truncate_utf8_for_storage(value: &str, max_bytes: usize) -> String {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 fn normalize_username_value(username: &str) -> anyhow::Result<String> {
@@ -551,22 +892,43 @@ async fn auth_login(
     let now = Utc::now();
     let refresh_token = generate_refresh_token();
     let refresh_expires_at = now + state.auth.refresh_token_ttl();
+    let login_session_created = state
+        .repository
+        .insert_login_refresh_session(
+            NewRefreshSession {
+                id: Uuid::now_v7(),
+                user_id: user.id,
+                token_hash: hash_refresh_token(&refresh_token),
+                expires_at: refresh_expires_at,
+                created_at: now,
+                client_ip: remote_ip,
+                user_agent: user_agent.clone(),
+            },
+            &user.password_hash,
+        )
+        .await?;
+    if !login_session_created {
+        record_security_event(
+            &state,
+            "login_failed",
+            &username,
+            Some(&username),
+            remote_ip,
+            user_agent.as_deref(),
+            json!({ "reason": "password_changed_during_login" }),
+        )
+        .await?;
+        return Err(invalid_credentials_error());
+    }
     let issued = state
         .auth
-        .issue_access_token(&user.username, auth::ApiRole::Admin)
+        .issue_access_token(
+            &user.username,
+            auth::ApiRole::Admin,
+            user.credential_version,
+            user.must_change_password,
+        )
         .map_err(|error| AppError::Internal(format!("failed to issue access token: {error}")))?;
-    state
-        .repository
-        .insert_refresh_session(NewRefreshSession {
-            id: Uuid::now_v7(),
-            user_id: user.id,
-            token_hash: hash_refresh_token(&refresh_token),
-            expires_at: refresh_expires_at,
-            created_at: now,
-            client_ip: remote_ip,
-            user_agent: user_agent.clone(),
-        })
-        .await?;
     state.repository.touch_auth_user_login(user.id, now).await?;
     record_security_event(
         &state,
@@ -617,14 +979,12 @@ async fn auth_refresh(
 
     let next_refresh_token = generate_refresh_token();
     let next_refresh_expires_at = now + state.auth.refresh_token_ttl();
-    let issued = state
-        .auth
-        .issue_access_token(&session.user.username, auth::ApiRole::Admin)
-        .map_err(|error| AppError::Internal(format!("failed to issue access token: {error}")))?;
-    state
+    let refresh_rotated = state
         .repository
         .rotate_refresh_session(
             session.id,
+            session.user.id,
+            &session.user.password_hash,
             &hash_refresh_token(&next_refresh_token),
             next_refresh_expires_at,
             now,
@@ -632,6 +992,18 @@ async fn auth_refresh(
             user_agent.as_deref(),
         )
         .await?;
+    if !refresh_rotated {
+        return Err(AppError::Forbidden("invalid refresh token".to_string()));
+    }
+    let issued = state
+        .auth
+        .issue_access_token(
+            &session.user.username,
+            auth::ApiRole::Admin,
+            session.user.credential_version,
+            session.user.must_change_password,
+        )
+        .map_err(|error| AppError::Internal(format!("failed to issue access token: {error}")))?;
     record_security_event(
         &state,
         "refresh_succeeded",
@@ -696,7 +1068,7 @@ async fn auth_change_password(
     Json(request): Json<AuthChangePasswordRequest>,
 ) -> Result<StatusCode, AppError> {
     require_local_password_login(&state)?;
-    let principal = state.auth.session(&headers)?;
+    let principal = authenticated_session(&state, &headers).await?;
     if principal.is_machine() {
         return Err(AppError::Forbidden(
             "machine allowlisted callers cannot change passwords".to_string(),
@@ -724,18 +1096,24 @@ async fn auth_change_password(
     }
     let next_password_hash = hash_password(&request.new_password)
         .map_err(|error| AppError::BadRequest(error.to_string()))?;
-    state
+    let password_changed = state
         .repository
-        .reset_user_password(
+        .change_user_password(
             &username,
+            &user.password_hash,
+            user.bootstrap_handoff_id,
+            user.bootstrap_handoff_version,
             &next_password_hash,
-            false,
             &username,
-            "password_changed",
             remote_ip,
             user_agent.as_deref(),
         )
         .await?;
+    if !password_changed {
+        return Err(AppError::Forbidden(
+            "password changed concurrently; retry with the current password".to_string(),
+        ));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -743,9 +1121,7 @@ async fn list_machine_allowlist(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MachineAllowlistResponse>, AppError> {
-    let _principal = state
-        .auth
-        .authorize(&headers, ApiPermission::SecurityWrite)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::SecurityWrite).await?;
     let entries = state.repository.list_machine_allowlist().await?;
     Ok(Json(MachineAllowlistResponse { entries }))
 }
@@ -755,9 +1131,7 @@ async fn update_machine_allowlist(
     headers: HeaderMap,
     Json(request): Json<UpdateMachineAllowlistRequest>,
 ) -> Result<Json<MachineAllowlistResponse>, AppError> {
-    let principal = state
-        .auth
-        .authorize(&headers, ApiPermission::SecurityWrite)?;
+    let principal = authorize_api_request(&state, &headers, ApiPermission::SecurityWrite).await?;
     let entries = normalize_machine_allowlist_entries(request.entries)?;
     state.repository.replace_machine_allowlist(&entries).await?;
     record_security_event(
@@ -772,6 +1146,146 @@ async fn update_machine_allowlist(
     .await?;
     let updated = state.repository.list_machine_allowlist().await?;
     Ok(Json(MachineAllowlistResponse { entries: updated }))
+}
+
+async fn create_agent_enrollment(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    headers: HeaderMap,
+    Json(request): Json<CreateAgentEnrollmentRequest>,
+) -> Result<
+    (
+        StatusCode,
+        [(header::HeaderName, header::HeaderValue); 2],
+        Json<CreateAgentEnrollmentResponse>,
+    ),
+    AppError,
+> {
+    let principal = authorize_api_request(&state, &headers, ApiPermission::SecurityWrite).await?;
+    if request.node_id.is_nil() {
+        return Err(AppError::BadRequest(
+            "node_id must be a non-nil UUID".to_string(),
+        ));
+    }
+    let service = configured_agent_identity_service(&state)?;
+    let created = service
+        .create_enrollment(
+            request.node_id,
+            principal.subject(),
+            peer.map(|address| address.ip()),
+            user_agent_from_headers(&headers),
+            Utc::now(),
+        )
+        .await
+        .map_err(map_agent_identity_service_error)?;
+    Ok((
+        StatusCode::CREATED,
+        [
+            (
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-store"),
+            ),
+            (header::PRAGMA, header::HeaderValue::from_static("no-cache")),
+        ],
+        Json(CreateAgentEnrollmentResponse {
+            enrollment_id: created.enrollment_id,
+            node_id: created.node_id,
+            token: created.token.to_string(),
+            expires_at: created.expires_at,
+        }),
+    ))
+}
+
+async fn enroll_agent(
+    State(state): State<AppState>,
+    PeerAddress(peer): PeerAddress,
+    Extension(verified): Extension<VerifiedAgentEnrollmentToken>,
+    headers: HeaderMap,
+    Json(request): Json<EnrollAgentRequest>,
+) -> Result<Json<EnrollAgentResponse>, AppError> {
+    if request.node_id.is_nil() {
+        return Err(AppError::BadRequest(
+            "node_id must be a non-nil UUID".to_string(),
+        ));
+    }
+    let csr_pem = request.csr_pem.trim();
+    if csr_pem.is_empty() || csr_pem.len() > 16 * 1024 {
+        return Err(AppError::BadRequest(
+            "csr_pem must contain a PEM certificate signing request within 16 KiB".to_string(),
+        ));
+    }
+    let management_csr_pem = request.management_csr_pem.trim();
+    if management_csr_pem.is_empty() || management_csr_pem.len() > 16 * 1024 {
+        return Err(AppError::BadRequest(
+            "management_csr_pem must contain a PEM certificate signing request within 16 KiB"
+                .to_string(),
+        ));
+    }
+    let service = configured_agent_identity_service(&state)?;
+    let completed = service
+        .enroll_verified(
+            &verified,
+            request.node_id,
+            csr_pem,
+            management_csr_pem,
+            peer.map(|address| address.ip()),
+            user_agent_from_headers(&headers),
+            Utc::now(),
+        )
+        .await
+        .map_err(map_agent_identity_service_error)?;
+    Ok(Json(EnrollAgentResponse {
+        node_id: completed.node_id,
+        certificate_pem: completed.certificate_pem,
+        ca_certificate_pem: completed.ca_certificate_pem,
+        agent_client_issuer_ca_pem: completed.agent_client_issuer_ca_pem,
+        control_plane_server_ca_pem: completed.control_plane_server_ca_pem,
+        management_client_ca_pem: completed.management_client_ca_pem,
+        fingerprint_sha256: completed.fingerprint_sha256,
+        serial_number: completed.serial_number,
+        not_before: completed.not_before,
+        not_after: completed.not_after,
+        management_certificate_pem: completed.management_certificate_pem,
+        management_fingerprint_sha256: completed.management_fingerprint_sha256,
+        management_serial_number: completed.management_serial_number,
+        management_not_before: completed.management_not_before,
+        management_not_after: completed.management_not_after,
+        capability_jwt_public_key_pem: completed.capability_jwt_public_key_pem,
+        capability_jwt_kid: completed.capability_jwt_kid,
+    }))
+}
+
+fn configured_agent_identity_service(state: &AppState) -> Result<&AgentIdentityService, AppError> {
+    state.agent_identity.as_ref().ok_or_else(|| {
+        AppError::Conflict("Agent enrollment is not configured on this Core".to_string())
+    })
+}
+
+fn map_agent_identity_service_error(error: AgentIdentityServiceError) -> AppError {
+    match error {
+        AgentIdentityServiceError::IdentityAlreadyActive => {
+            AppError::Conflict("agent identity is already active".to_string())
+        }
+        AgentIdentityServiceError::IdentityRevoked => {
+            AppError::Conflict("agent identity is revoked".to_string())
+        }
+        AgentIdentityServiceError::InvalidEnrollment => {
+            AppError::Unauthorized("invalid or expired agent enrollment".to_string())
+        }
+        AgentIdentityServiceError::InvalidCsr => {
+            AppError::BadRequest("agent CSR is invalid".to_string())
+        }
+        AgentIdentityServiceError::CertificateSigning => {
+            AppError::Internal("agent certificate signing failed".to_string())
+        }
+        AgentIdentityServiceError::InvalidRotation => {
+            AppError::Conflict("agent certificate rotation is not authorized".to_string())
+        }
+        AgentIdentityServiceError::RotationExpired => AppError::Conflict(
+            "agent certificate rotation bundle expired before activation".to_string(),
+        ),
+        AgentIdentityServiceError::Repository(error) => AppError::Repository(error),
+    }
 }
 
 async fn create_task(
@@ -1015,8 +1529,7 @@ async fn stop_task_recording(
     let _principal =
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let reason = body
-        .map(|Json(payload)| payload.reason)
-        .flatten()
+        .and_then(|Json(payload)| payload.reason)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "user_requested".to_string());
@@ -1162,7 +1675,7 @@ async fn list_nodes(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<repository::NodeSummary>>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::NodeRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::NodeRead).await?;
     let mut nodes = state.repository.list_nodes().await?;
     let live_loads = state.control_plane.current_node_loads().await;
     for node in &mut nodes {
@@ -1177,7 +1690,7 @@ async fn list_node_heartbeats(
     Path(node_id): Path<Uuid>,
     Query(query): Query<NodeHeartbeatQuery>,
 ) -> Result<Json<Vec<repository::NodeHeartbeatSummary>>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::NodeRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::NodeRead).await?;
     Ok(Json(
         state
             .repository
@@ -1191,7 +1704,7 @@ async fn list_debug_hooks(
     headers: HeaderMap,
     Query(query): Query<HookEventListFilter>,
 ) -> Result<Json<Vec<repository::HookEventSummary>>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(state.repository.list_hook_events(query).await?))
 }
 
@@ -1200,13 +1713,17 @@ async fn debug_zlm_media(
     headers: HeaderMap,
     Query(query): Query<ZlmMediaQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
+        call_zlm_json(
             &state,
             query.node_id,
-            "/index/api/getMediaList",
-            debug_media_query_params(&query),
+            ZlmDebugCommand::ListMedia {
+                schema: normalized_zlm_filter(query.schema),
+                vhost: normalized_zlm_filter(query.vhost),
+                app: normalized_zlm_filter(query.app),
+                stream: normalized_zlm_filter(query.stream),
+            },
         )
         .await?,
     ))
@@ -1217,15 +1734,9 @@ async fn debug_zlm_sessions(
     headers: HeaderMap,
     Query(query): Query<NodeScopedQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
-            &state,
-            query.node_id,
-            "/index/api/getAllSession",
-            Vec::new(),
-        )
-        .await?,
+        call_zlm_json(&state, query.node_id, ZlmDebugCommand::ListSessions).await?,
     ))
 }
 
@@ -1234,15 +1745,9 @@ async fn debug_zlm_players(
     headers: HeaderMap,
     Query(query): Query<NodeScopedQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
-            &state,
-            query.node_id,
-            "/index/api/getMediaPlayerList",
-            Vec::new(),
-        )
-        .await?,
+        call_zlm_json(&state, query.node_id, ZlmDebugCommand::ListPlayers).await?,
     ))
 }
 
@@ -1251,9 +1756,9 @@ async fn debug_zlm_statistic(
     headers: HeaderMap,
     Query(query): Query<NodeScopedQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(&state, query.node_id, "/index/api/getStatistic", Vec::new()).await?,
+        call_zlm_json(&state, query.node_id, ZlmDebugCommand::GetStatistic).await?,
     ))
 }
 
@@ -1262,15 +1767,9 @@ async fn debug_zlm_threads_load(
     headers: HeaderMap,
     Query(query): Query<NodeScopedQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
-            &state,
-            query.node_id,
-            "/index/api/getThreadsLoad",
-            Vec::new(),
-        )
-        .await?,
+        call_zlm_json(&state, query.node_id, ZlmDebugCommand::GetThreadsLoad).await?,
     ))
 }
 
@@ -1279,15 +1778,9 @@ async fn debug_zlm_work_threads_load(
     headers: HeaderMap,
     Query(query): Query<NodeScopedQuery>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
-            &state,
-            query.node_id,
-            "/index/api/getWorkThreadsLoad",
-            Vec::new(),
-        )
-        .await?,
+        call_zlm_json(&state, query.node_id, ZlmDebugCommand::GetWorkThreadsLoad).await?,
     ))
 }
 
@@ -1296,13 +1789,14 @@ async fn debug_zlm_kick_session(
     headers: HeaderMap,
     Json(request): Json<DebugKickSessionRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
+        call_zlm_json(
             &state,
             request.node_id,
-            "/index/api/kick_session",
-            vec![("id".to_string(), request.session_id)],
+            ZlmDebugCommand::KickSession {
+                session_id: request.session_id,
+            },
         )
         .await?,
     ))
@@ -1313,21 +1807,17 @@ async fn debug_zlm_kick_sessions(
     headers: HeaderMap,
     Json(request): Json<DebugKickSessionsRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
-    let mut params = Vec::new();
-    if let Some(local_port) = request.local_port {
-        params.push(("local_port".to_string(), local_port.to_string()));
-    }
-    if let Some(peer_ip) = request
-        .peer_ip
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        params.push(("peer_ip".to_string(), peer_ip.to_string()));
-    }
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(&state, request.node_id, "/index/api/kick_sessions", params).await?,
+        call_zlm_json(
+            &state,
+            request.node_id,
+            ZlmDebugCommand::KickSessions {
+                local_port: request.local_port,
+                peer_ip: normalized_zlm_filter(request.peer_ip),
+            },
+        )
+        .await?,
     ))
 }
 
@@ -1336,19 +1826,18 @@ async fn debug_zlm_close_stream(
     headers: HeaderMap,
     Json(request): Json<DebugCloseStreamRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
     Ok(Json(
-        call_zlm_api(
+        call_zlm_json(
             &state,
             request.node_id,
-            "/index/api/close_streams",
-            vec![
-                ("schema".to_string(), request.schema),
-                ("vhost".to_string(), request.vhost),
-                ("app".to_string(), request.app),
-                ("stream".to_string(), request.stream),
-                ("force".to_string(), request.force.to_string()),
-            ],
+            ZlmDebugCommand::CloseStream {
+                schema: request.schema,
+                vhost: request.vhost,
+                app: request.app,
+                stream: request.stream,
+                force: request.force,
+            },
         )
         .await?,
     ))
@@ -1359,18 +1848,27 @@ async fn debug_zlm_snap(
     headers: HeaderMap,
     Query(query): Query<DebugSnapQuery>,
 ) -> Result<Json<DebugSnapResponse>, AppError> {
-    let _principal = state.auth.authorize(&headers, ApiPermission::DebugRead)?;
-    let (content_type, body) = call_zlm_binary_api(
-        &state,
-        query.node_id,
-        "/index/api/getSnap",
-        vec![
-            ("url".to_string(), query.url),
-            ("timeout_sec".to_string(), query.timeout_sec.to_string()),
-            ("expire_sec".to_string(), query.expire_sec.to_string()),
-        ],
-    )
-    .await?;
+    let _principal = authorize_api_request(&state, &headers, ApiPermission::DebugRead).await?;
+    let (content_type, body) = match state
+        .control_plane
+        .zlm_debug(
+            query.node_id,
+            ZlmDebugCommand::Snapshot {
+                source_url: query.url,
+                timeout_sec: query.timeout_sec,
+                expire_sec: query.expire_sec,
+            },
+        )
+        .await
+        .map_err(map_zlm_debug_error)?
+    {
+        ZlmDebugResult::Snapshot { content_type, data } => (content_type, data),
+        ZlmDebugResult::Json(_) => {
+            return Err(AppError::Internal(
+                "Agent returned JSON for a ZLM snapshot request".to_string(),
+            ));
+        }
+    };
     Ok(Json(DebugSnapResponse {
         content_type: content_type.clone(),
         data_url: format!(
@@ -1587,7 +2085,17 @@ async fn load_zlm_media_index(
     state: &AppState,
     node_id: Uuid,
 ) -> Result<HashMap<(String, String, String), StreamRuntimeInfo>, AppError> {
-    let body = call_zlm_api(state, node_id, "/index/api/getMediaList", Vec::new()).await?;
+    let body = call_zlm_json(
+        state,
+        node_id,
+        ZlmDebugCommand::ListMedia {
+            schema: None,
+            vhost: None,
+            app: None,
+            stream: None,
+        },
+    )
+    .await?;
     Ok(build_stream_runtime_index(&body))
 }
 
@@ -1694,133 +2202,54 @@ fn value_to_f64(value: Option<&Value>) -> Option<f64> {
     value.and_then(|value| value.as_f64().or_else(|| value.as_u64().map(|v| v as f64)))
 }
 
-fn debug_media_query_params(query: &ZlmMediaQuery) -> Vec<(String, String)> {
-    let mut params = Vec::new();
-    if let Some(schema) = query
-        .schema
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        params.push(("schema".to_string(), schema.trim().to_string()));
-    }
-    if let Some(vhost) = query
-        .vhost
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        params.push(("vhost".to_string(), vhost.trim().to_string()));
-    }
-    if let Some(app) = query
-        .app
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        params.push(("app".to_string(), app.trim().to_string()));
-    }
-    if let Some(stream) = query
-        .stream
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        params.push(("stream".to_string(), stream.trim().to_string()));
-    }
-    params
+fn normalized_zlm_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
-async fn call_zlm_api(
+async fn call_zlm_json(
     state: &AppState,
     node_id: Uuid,
-    path: &str,
-    params: Vec<(String, String)>,
+    command: ZlmDebugCommand,
 ) -> Result<Value, AppError> {
-    let target = state.repository.get_node_debug_target(node_id).await?;
-    let mut url = build_zlm_debug_url(&target, path)?;
+    match state
+        .control_plane
+        .zlm_debug(node_id, command)
+        .await
+        .map_err(map_zlm_debug_error)?
     {
-        let mut query = url.query_pairs_mut();
-        for (key, value) in &params {
-            query.append_pair(key, value);
-        }
+        ZlmDebugResult::Json(body) => ensure_zlm_debug_success("Agent ZLM debug", body),
+        ZlmDebugResult::Snapshot { .. } => Err(AppError::Internal(
+            "Agent returned a snapshot for a JSON ZLM debug request".to_string(),
+        )),
     }
-
-    let response = state
-        .http_client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| AppError::Internal(format!("failed to call ZLM API: {error}")))?
-        .error_for_status()
-        .map_err(|error| AppError::Internal(format!("ZLM API returned error: {error}")))?;
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|error| AppError::Internal(format!("failed to decode ZLM API body: {error}")))?;
-
-    ensure_zlm_debug_success(path, body)
 }
 
-async fn call_zlm_binary_api(
-    state: &AppState,
-    node_id: Uuid,
-    path: &str,
-    params: Vec<(String, String)>,
-) -> Result<(String, Vec<u8>), AppError> {
-    let target = state.repository.get_node_debug_target(node_id).await?;
-    let mut url = build_zlm_debug_url(&target, path)?;
-    {
-        let mut query = url.query_pairs_mut();
-        for (key, value) in &params {
-            query.append_pair(key, value);
+fn map_zlm_debug_error(error: ZlmDebugCallError) -> AppError {
+    match error {
+        ZlmDebugCallError::InvalidRequest => {
+            AppError::BadRequest("invalid ZLM debug request".to_string())
+        }
+        ZlmDebugCallError::Disconnected => {
+            AppError::Conflict("the selected Agent is not connected".to_string())
+        }
+        ZlmDebugCallError::Busy => {
+            AppError::Conflict("too many ZLM debug requests are pending".to_string())
+        }
+        ZlmDebugCallError::DeadlineExceeded => {
+            AppError::Internal("ZLM debug request timed out".to_string())
+        }
+        ZlmDebugCallError::ProtocolViolation => {
+            AppError::Internal("Agent returned an invalid ZLM debug response".to_string())
+        }
+        ZlmDebugCallError::ResponseTooLarge => {
+            AppError::Internal("Agent ZLM debug response exceeded the size limit".to_string())
+        }
+        ZlmDebugCallError::Remote { code, message } => {
+            AppError::Internal(format!("Agent ZLM debug failed: {code}: {message}"))
         }
     }
-
-    let response = state
-        .http_client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| AppError::Internal(format!("failed to call ZLM API: {error}")))?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("image/jpeg")
-        .to_string();
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| AppError::Internal(format!("failed to decode ZLM binary body: {error}")))?
-        .to_vec();
-
-    if content_type.contains("application/json") {
-        let value: Value = serde_json::from_slice(&body).map_err(|error| {
-            AppError::Internal(format!("failed to decode unexpected JSON body: {error}"))
-        })?;
-        let _ = ensure_zlm_debug_success(path, value)?;
-        return Err(AppError::Internal(format!(
-            "{path} returned JSON instead of a binary image payload"
-        )));
-    }
-
-    if !status.is_success() {
-        return Err(AppError::Internal(format!(
-            "{path} returned HTTP status {status}"
-        )));
-    }
-
-    Ok((content_type, body))
-}
-
-fn build_zlm_debug_url(target: &repository::NodeDebugTarget, path: &str) -> Result<Url, AppError> {
-    let mut url = Url::parse(target.zlm_api_base.trim())
-        .map_err(|error| AppError::Internal(format!("invalid node zlm_api_base: {error}")))?
-        .join(path)
-        .map_err(|error| AppError::Internal(format!("invalid ZLM API path join: {error}")))?;
-    if !target.zlm_api_secret.trim().is_empty() {
-        url.query_pairs_mut()
-            .append_pair("secret", target.zlm_api_secret.trim());
-    }
-    Ok(url)
 }
 
 fn ensure_zlm_debug_success(path: &str, body: Value) -> Result<Value, AppError> {
@@ -1922,6 +2351,23 @@ async fn process_zlm_hook(
         )));
     };
 
+    process_authenticated_zlm_hook(
+        &ZlmHookBusinessContext::from_app_state(&state),
+        node_id,
+        server_id,
+        hook_name,
+        payload,
+    )
+    .await
+}
+
+async fn process_authenticated_zlm_hook(
+    state: &ZlmHookBusinessContext,
+    node_id: Uuid,
+    server_id: String,
+    hook_name: String,
+    payload: serde_json::Value,
+) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let hook_name = hook_name.trim().to_string();
     if hook_name.is_empty() {
         return Err(AppError::BadRequest(
@@ -2593,6 +3039,57 @@ where
         );
         return Ok(Some(CliCommand::Serve { insecure_dev: true }));
     }
+    if command == "agent" {
+        let Some(subcommand) = args.next() else {
+            anyhow::bail!("missing agent subcommand");
+        };
+        if is_help_flag(&subcommand) {
+            anyhow::ensure!(
+                args.next().is_none(),
+                "agent help does not accept additional arguments"
+            );
+            return Ok(Some(CliCommand::AgentHelp));
+        }
+        let remaining_args: Vec<String> = args.collect();
+        if remaining_args.len() == 1 && is_help_flag(&remaining_args[0]) {
+            return Ok(Some(CliCommand::AgentHelp));
+        }
+        anyhow::ensure!(
+            subcommand == "create-enrollment",
+            "unsupported agent subcommand `{subcommand}`"
+        );
+        let mut args = remaining_args.into_iter();
+        let mut node_id = None;
+        let mut token_stdout = false;
+        while let Some(argument) = args.next() {
+            match argument.as_str() {
+                "--node-id" => {
+                    anyhow::ensure!(node_id.is_none(), "--node-id may be specified only once");
+                    node_id = Some(
+                        args.next()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --node-id"))?,
+                    );
+                }
+                "--token-stdout" => {
+                    anyhow::ensure!(!token_stdout, "--token-stdout may be specified only once");
+                    token_stdout = true;
+                }
+                other => anyhow::bail!("unsupported agent argument `{other}`"),
+            }
+        }
+        anyhow::ensure!(
+            token_stdout,
+            "--token-stdout is required because the one-time token is sensitive"
+        );
+        let node_id = node_id.ok_or_else(|| anyhow::anyhow!("--node-id is required"))?;
+        let parsed = Uuid::parse_str(&node_id)
+            .map_err(|_| anyhow::anyhow!("--node-id must be a canonical non-nil UUID"))?;
+        anyhow::ensure!(
+            !parsed.is_nil() && parsed.to_string() == node_id,
+            "--node-id must be a canonical non-nil UUID"
+        );
+        return Ok(Some(CliCommand::AgentCreateEnrollment { node_id: parsed }));
+    }
     if command != "auth" {
         anyhow::bail!("unsupported command `{command}`");
     }
@@ -2621,9 +3118,23 @@ where
         );
         return Ok(Some(CliCommand::CheckAuthConfig));
     }
+    if subcommand == "bootstrap-status" {
+        anyhow::ensure!(
+            remaining_args.len() == 4
+                && remaining_args[0] == "--username"
+                && remaining_args[2] == "--handoff-id",
+            "auth bootstrap-status requires --username <name> --handoff-id <uuid> and never accepts password input"
+        );
+        return Ok(Some(CliCommand::BootstrapStatus {
+            username: remaining_args[1].clone(),
+            handoff_id: remaining_args[3].clone(),
+        }));
+    }
 
     let mut args = remaining_args.into_iter();
     let mut username = None;
+    let mut handoff_id = None;
+    let mut expected_version = None;
     let mut expects_password_stdin = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -2632,6 +3143,18 @@ where
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("missing value for --username"))?;
                 username = Some(value);
+            }
+            "--handoff-id" => {
+                handoff_id = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for --handoff-id"))?,
+                );
+            }
+            "--expected-version" => {
+                expected_version = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for --expected-version"))?,
+                );
             }
             "--password-stdin" => expects_password_stdin = true,
             other => anyhow::bail!("unsupported auth argument `{other}`"),
@@ -2645,8 +3168,26 @@ where
     );
 
     let command = match subcommand.as_str() {
-        "bootstrap-admin" => CliCommand::BootstrapAdmin { username },
-        "reset-password" => CliCommand::ResetPassword { username },
+        "bootstrap-admin" => {
+            anyhow::ensure!(
+                handoff_id.is_none() && expected_version.is_none(),
+                "bootstrap-admin does not accept handoff arguments"
+            );
+            CliCommand::BootstrapAdmin { username }
+        }
+        "recover-bootstrap-admin" => CliCommand::RecoverBootstrapAdmin {
+            username,
+            handoff_id: handoff_id.ok_or_else(|| anyhow::anyhow!("--handoff-id is required"))?,
+            expected_version: expected_version
+                .ok_or_else(|| anyhow::anyhow!("--expected-version is required"))?,
+        },
+        "reset-password" => {
+            anyhow::ensure!(
+                handoff_id.is_none() && expected_version.is_none(),
+                "reset-password does not accept handoff arguments"
+            );
+            CliCommand::ResetPassword { username }
+        }
         other => anyhow::bail!("unsupported auth subcommand `{other}`"),
     };
     Ok(Some(command))
@@ -2665,16 +3206,24 @@ fn print_cli_help(auth_only: bool) {
     println!("{help}");
 }
 
+fn print_agent_cli_help() {
+    println!("{AGENT_CLI_HELP_TEXT}");
+}
+
 const CLI_HELP_TEXT: &str = "\
 Usage:
   media-core
   media-core --insecure-dev
   media-core auth bootstrap-admin --username <name> --password-stdin
+  media-core auth recover-bootstrap-admin --username <name> --handoff-id <uuid> --expected-version <n> --password-stdin
   media-core auth reset-password --username <name> --password-stdin
   media-core auth check-config
   media-core auth check-admin
+  media-core auth bootstrap-status --username <name> --handoff-id <uuid>
+  media-core agent create-enrollment --node-id <canonical-uuid> --token-stdout
   media-core [help|-h|--help]
   media-core auth [help|-h|--help]
+  media-core agent [help|-h|--help]
 
 Description:
   Run without a subcommand to start the media-core server.
@@ -2682,21 +3231,40 @@ Description:
 
 Auth commands:
   bootstrap-admin  Create the initial enabled admin user; reads the password from stdin.
+  recover-bootstrap-admin  Atomically create or recover only a pending bootstrap administrator.
   reset-password   Reset an existing user's password; reads the new password from stdin.
-  check-config     Read-only check that validates the configured JWT signing or verification keys.
-  check-admin      Read-only check that succeeds only when an enabled admin exists.";
+  check-config     Read-only check for listener policy, JWT keys, and the Agent signing CA.
+  check-admin      Read-only check that succeeds only when an enabled admin exists.
+
+Agent commands:
+  create-enrollment  Create a 10-minute one-time enrollment token for an exact node identity.";
 
 const AUTH_CLI_HELP_TEXT: &str = "\
 Usage:
   media-core auth bootstrap-admin --username <name> --password-stdin
+  media-core auth recover-bootstrap-admin --username <name> --handoff-id <uuid> --expected-version <n> --password-stdin
   media-core auth reset-password --username <name> --password-stdin
   media-core auth check-config
   media-core auth check-admin
+  media-core auth bootstrap-status --username <name> --handoff-id <uuid>
   media-core auth [help|-h|--help]
 
 Description:
   bootstrap-admin and reset-password read the password value from stdin.
-  check-config and check-admin never read a password and never run migrations.";
+  check-config, check-admin, and bootstrap-status never read a password or run migrations.";
+
+const AGENT_CLI_HELP_TEXT: &str = "\
+Usage:
+  media-core agent create-enrollment --node-id <canonical-uuid> --token-stdout
+  media-core agent [help|-h|--help]
+
+Description:
+  Loads the normal Core security configuration and Agent PKI, runs pending database
+  migrations, and creates a node-bound 10-minute one-time enrollment token.
+
+Sensitive output:
+  --token-stdout is mandatory. The token is written as the only stdout line.
+  stdout is sensitive: capture it only into protected ephemeral storage and never log it.";
 
 fn read_password_from_stdin() -> anyhow::Result<String> {
     let mut password = String::new();
@@ -2706,22 +3274,74 @@ fn read_password_from_stdin() -> anyhow::Result<String> {
     Ok(password)
 }
 
+fn write_agent_enrollment_token(
+    writer: &mut impl Write,
+    enrollment: &CreatedAgentEnrollment,
+) -> io::Result<()> {
+    writer.write_all(enrollment.token.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+async fn create_agent_enrollment_for_cli(
+    settings: &config::CoreSettings,
+    node_id: Uuid,
+    now: DateTime<Utc>,
+) -> anyhow::Result<CreatedAgentEnrollment> {
+    let (authority, public_config, _) = load_agent_certificate_authority(settings, now)?
+        .ok_or_else(|| anyhow::anyhow!("Agent enrollment PKI is not configured"))?;
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&settings.database_url)
+        .await?;
+    sqlx::migrate!("../../migrations").run(&pool).await?;
+    let repository = Arc::new(TaskRepository::new(pool));
+    AgentIdentityService::new(repository, authority, public_config)
+        .create_enrollment(
+            node_id,
+            "local-agent-enrollment-cli",
+            None,
+            Some("media-core agent create-enrollment".to_string()),
+            now,
+        )
+        .await
+        .map_err(Into::into)
+}
+
+async fn run_agent_create_enrollment(node_id: Uuid) -> anyhow::Result<()> {
+    // Use the normal server loader so production listener/auth/PKI policy is
+    // validated. Deliberately do not initialize telemetry: the installer must
+    // be able to treat stdout as exactly one sensitive token line.
+    let settings = config::Settings::load_with_insecure_dev(false)?;
+    let enrollment = create_agent_enrollment_for_cli(&settings.core, node_id, Utc::now()).await?;
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_agent_enrollment_token(&mut stdout, &enrollment)?;
+    Ok(())
+}
+
 async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
     let settings = config::Settings::load_for_auth_cli()?;
     telemetry::init(&settings.logging);
 
     if command == CliCommand::CheckAuthConfig {
+        config::validate_security_policy(&settings.environment, &settings.core, false)?;
         AuthConfig::from_settings(&settings.core)?;
-        println!("auth configuration is valid");
+        let _authority = load_agent_certificate_authority(&settings.core, Utc::now())?;
+        println!("authentication and Agent CA configuration is valid");
         return Ok(());
     }
 
     let pool_options = PgPoolOptions::new().max_connections(2);
-    let pool = if command == CliCommand::CheckAdmin {
+    let read_only_database_probe = matches!(
+        command,
+        CliCommand::CheckAdmin | CliCommand::BootstrapStatus { .. }
+    );
+    let pool = if read_only_database_probe {
         pool_options
             .connect(&settings.core.database_url)
             .await
-            .map_err(|_| anyhow::anyhow!("admin check could not connect to the database"))?
+            .map_err(|_| anyhow::anyhow!("auth check could not connect to the database"))?
     } else {
         pool_options.connect(&settings.core.database_url).await?
     };
@@ -2734,6 +3354,24 @@ async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
         println!("enabled admin user exists");
         return Ok(());
     }
+    if let CliCommand::BootstrapStatus {
+        username,
+        handoff_id,
+    } = &command
+    {
+        let username = normalize_username_value(username)?;
+        let handoff_id = Uuid::parse_str(handoff_id)
+            .map_err(|_| anyhow::anyhow!("--handoff-id must be a UUID"))?;
+        let repository = TaskRepository::new(pool);
+        println!(
+            "{}",
+            repository
+                .bootstrap_admin_password_state(&username, handoff_id)
+                .await?
+                .as_cli_value()
+        );
+        return Ok(());
+    }
     sqlx::migrate!("../../migrations").run(&pool).await?;
     let repository = TaskRepository::new(pool);
     let password = read_password_from_stdin()?;
@@ -2742,10 +3380,49 @@ async fn run_cli_command(command: CliCommand) -> anyhow::Result<()> {
     match command {
         CliCommand::Serve { .. } => unreachable!("server commands are handled before DB setup"),
         CliCommand::Help { .. } => unreachable!("help commands are handled before DB setup"),
+        CliCommand::AgentHelp | CliCommand::AgentCreateEnrollment { .. } => {
+            unreachable!("Agent CLI commands are handled before auth DB setup")
+        }
         CliCommand::CheckAuthConfig => {
             unreachable!("auth configuration check is handled before DB setup")
         }
         CliCommand::CheckAdmin => unreachable!("admin check is handled before migrations"),
+        CliCommand::BootstrapStatus { .. } => {
+            unreachable!("bootstrap status is handled before migrations")
+        }
+        CliCommand::RecoverBootstrapAdmin {
+            username,
+            handoff_id,
+            expected_version,
+        } => {
+            let username = normalize_username_value(&username)?;
+            let handoff_id = Uuid::parse_str(&handoff_id)
+                .map_err(|_| anyhow::anyhow!("--handoff-id must be a UUID"))?;
+            let expected_version = expected_version.parse::<i64>().map_err(|_| {
+                anyhow::anyhow!("--expected-version must be a non-negative integer")
+            })?;
+            anyhow::ensure!(
+                expected_version >= 0,
+                "--expected-version must be a non-negative integer"
+            );
+            let outcome = repository
+                .reconcile_bootstrap_admin_password(
+                    &username,
+                    handoff_id,
+                    expected_version,
+                    &password_hash,
+                )
+                .await?;
+            anyhow::ensure!(
+                matches!(
+                    outcome,
+                    repository::BootstrapAdminReconcileOutcome::Created
+                        | repository::BootstrapAdminReconcileOutcome::Recovered
+                ),
+                "bootstrap administrator is already complete or conflicts with the pending handoff"
+            );
+            println!("reconciled pending bootstrap administrator `{username}`");
+        }
         CliCommand::BootstrapAdmin { username } => {
             let username = normalize_username_value(&username)?;
             anyhow::ensure!(
@@ -2810,6 +3487,548 @@ async fn wait_for_shutdown(mut receiver: watch::Receiver<bool>) {
     }
 
     let _ = receiver.changed().await;
+}
+
+fn load_agent_management_client(
+    settings: &config::CoreSettings,
+    capability_kid: &str,
+) -> anyhow::Result<Arc<AgentManagementClient>> {
+    let client_certificate_path = settings.agent_management_client_cert_path.trim();
+    let client_private_key_path = settings.agent_management_client_key_path.trim();
+    let agent_issuer_ca_path = settings.agent_ca_cert_path.trim();
+    let capability_private_key_path = settings.agent_capability_jwt_private_key_path.trim();
+    anyhow::ensure!(
+        !client_certificate_path.is_empty()
+            && !client_private_key_path.is_empty()
+            && !agent_issuer_ca_path.is_empty()
+            && !capability_private_key_path.is_empty(),
+        "authenticated Agent management requires its mTLS and capability key material"
+    );
+
+    let client_certificate_pem =
+        fs::read_to_string(client_certificate_path).with_context(|| {
+            format!("failed to read Agent management client certificate {client_certificate_path}")
+        })?;
+    let client_private_key_pem =
+        zeroize::Zeroizing::new(fs::read_to_string(client_private_key_path).with_context(
+            || format!("failed to read Agent management client key {client_private_key_path}"),
+        )?);
+    let agent_issuer_ca_pem = fs::read_to_string(agent_issuer_ca_path)
+        .with_context(|| format!("failed to read Agent signing CA {agent_issuer_ca_path}"))?;
+    let capability_private_key_pem = zeroize::Zeroizing::new(
+        fs::read_to_string(capability_private_key_path).with_context(|| {
+            format!("failed to read Agent capability key {capability_private_key_path}")
+        })?,
+    );
+    let signer = AgentCapabilitySigner::new(
+        capability_private_key_pem.as_str(),
+        capability_kid,
+        settings.agent_capability_ttl_sec,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to configure Agent capability signer ({})",
+            error.safe_code()
+        )
+    })?;
+    let tls = AgentManagementTlsMaterial::from_pem(
+        &client_certificate_pem,
+        client_private_key_pem.as_str(),
+        &agent_issuer_ca_pem,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to configure Agent management mTLS ({})",
+            error.safe_code()
+        )
+    })?;
+    let client = AgentManagementClient::new(signer, tls, Arc::new(TracingAgentManagementAuditSink))
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to configure Agent management client ({})",
+                error.safe_code()
+            )
+        })?;
+    Ok(Arc::new(client))
+}
+
+fn load_agent_certificate_authority(
+    settings: &config::CoreSettings,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<(AgentCertificateAuthority, AgentEnrollmentPublicConfig, Uuid)>> {
+    let certificate_path = settings.agent_ca_cert_path.trim();
+    let private_key_path = settings.agent_ca_key_path.trim();
+    anyhow::ensure!(
+        certificate_path.is_empty() == private_key_path.is_empty(),
+        "CORE_AGENT_CA_CERT_PATH and CORE_AGENT_CA_KEY_PATH must be set together"
+    );
+    if certificate_path.is_empty() {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        !settings.grpc_tls_client_ca_path.trim().is_empty(),
+        "Agent enrollment requires CORE_GRPC_TLS_CLIENT_CA_PATH"
+    );
+    let authority = AgentCertificateAuthority::from_paths(
+        FsPath::new(certificate_path),
+        FsPath::new(private_key_path),
+        now,
+    )?;
+    authority
+        .ensure_present_in_client_ca_bundle(FsPath::new(settings.grpc_tls_client_ca_path.trim()))?;
+    let control_plane_server_ca_pem = load_and_validate_control_plane_server_ca(settings, now)?;
+    let (core_instance_id, management_client_ca_pem) =
+        load_and_validate_management_client_identity(
+            settings,
+            now,
+            authority.certificate_pem(),
+            &control_plane_server_ca_pem,
+        )?;
+    let (capability_jwt_public_key_pem, capability_jwt_kid) =
+        load_and_validate_agent_capability_key_pair(settings)?;
+    validate_dedicated_agent_security_keys(settings, &capability_jwt_public_key_pem)?;
+    Ok(Some((
+        authority,
+        AgentEnrollmentPublicConfig {
+            control_plane_server_ca_pem,
+            management_client_ca_pem,
+            capability_jwt_public_key_pem,
+            capability_jwt_kid,
+        },
+        core_instance_id,
+    )))
+}
+
+fn load_and_validate_control_plane_server_ca(
+    settings: &config::CoreSettings,
+    now: DateTime<Utc>,
+) -> anyhow::Result<String> {
+    let ca_path = settings.grpc_tls_server_ca_path.trim();
+    anyhow::ensure!(
+        !ca_path.is_empty(),
+        "Agent enrollment requires CORE_GRPC_TLS_SERVER_CA_PATH"
+    );
+    let ca_pem = fs::read_to_string(ca_path)
+        .with_context(|| format!("failed to read gRPC server CA {ca_path}"))?;
+    let ca_der = decode_exact_certificate_pem(&ca_pem, "gRPC server CA")?;
+    let (_, ca) = x509_parser::certificate::X509Certificate::from_der(&ca_der)
+        .map_err(|_| anyhow::anyhow!("gRPC server CA is not valid X.509"))?;
+    let validation_time = x509_parser::time::ASN1Time::from_timestamp(now.timestamp())
+        .map_err(|_| anyhow::anyhow!("gRPC server CA validation time is invalid"))?;
+    anyhow::ensure!(
+        ca.validity().is_valid_at(validation_time),
+        "gRPC server CA is not currently valid"
+    );
+    let basic_constraints = ca
+        .basic_constraints()
+        .map_err(|_| anyhow::anyhow!("gRPC server CA BasicConstraints is malformed"))?
+        .ok_or_else(|| anyhow::anyhow!("gRPC server CA requires BasicConstraints CA:TRUE"))?;
+    anyhow::ensure!(
+        basic_constraints.value.ca,
+        "gRPC server CA requires BasicConstraints CA:TRUE"
+    );
+    let key_usage = ca
+        .key_usage()
+        .map_err(|_| anyhow::anyhow!("gRPC server CA key usage is malformed"))?
+        .ok_or_else(|| anyhow::anyhow!("gRPC server CA requires keyCertSign key usage"))?;
+    anyhow::ensure!(
+        key_usage.value.key_cert_sign(),
+        "gRPC server CA requires keyCertSign key usage"
+    );
+    anyhow::ensure!(
+        ca.subject() == ca.issuer(),
+        "gRPC server CA must be a single self-signed root certificate"
+    );
+    ca.verify_signature(None)
+        .map_err(|_| anyhow::anyhow!("gRPC server CA self-signature is invalid"))?;
+
+    let server_certificate_pem = fs::read_to_string(settings.grpc_tls_cert_path.trim())
+        .with_context(|| {
+            format!(
+                "failed to read gRPC server certificate {}",
+                settings.grpc_tls_cert_path
+            )
+        })?;
+    let server_der =
+        decode_exact_certificate_pem(&server_certificate_pem, "gRPC server certificate")?;
+    let (_, server) = x509_parser::certificate::X509Certificate::from_der(&server_der)
+        .map_err(|_| anyhow::anyhow!("gRPC server certificate is not valid X.509"))?;
+    anyhow::ensure!(
+        server.validity().is_valid_at(validation_time),
+        "gRPC server certificate is not currently valid"
+    );
+    anyhow::ensure!(
+        server.validity().not_before >= ca.validity().not_before
+            && server.validity().not_after <= ca.validity().not_after,
+        "gRPC server certificate validity must be contained by its CA"
+    );
+    anyhow::ensure!(
+        server.issuer() == ca.subject(),
+        "gRPC server certificate is not directly issued by CORE_GRPC_TLS_SERVER_CA_PATH"
+    );
+    server
+        .verify_signature(Some(ca.public_key()))
+        .map_err(|_| anyhow::anyhow!("gRPC server certificate signature does not match its CA"))?;
+    let basic_constraints = server
+        .basic_constraints()
+        .map_err(|_| anyhow::anyhow!("gRPC server certificate BasicConstraints is malformed"))?;
+    anyhow::ensure!(
+        basic_constraints.is_none_or(|extension| !extension.value.ca),
+        "gRPC server certificate must not be a CA"
+    );
+    let extended = server
+        .extended_key_usage()
+        .map_err(|_| anyhow::anyhow!("gRPC server certificate EKU is malformed"))?
+        .ok_or_else(|| anyhow::anyhow!("gRPC server certificate requires serverAuth EKU"))?;
+    anyhow::ensure!(
+        extended.value.server_auth && !extended.value.client_auth && !extended.value.any,
+        "gRPC server certificate requires serverAuth-only EKU"
+    );
+    validate_private_key_matches_certificate(
+        settings.grpc_tls_key_path.trim(),
+        server.public_key().raw,
+        "gRPC server",
+    )?;
+    Ok(ca_pem)
+}
+
+fn load_and_validate_management_client_identity(
+    settings: &config::CoreSettings,
+    now: DateTime<Utc>,
+    agent_issuer_ca_pem: &str,
+    control_plane_server_ca_pem: &str,
+) -> anyhow::Result<(Uuid, String)> {
+    let instance_text = settings.core_instance_id.trim();
+    let core_instance_id = Uuid::parse_str(instance_text)
+        .map_err(|_| anyhow::anyhow!("CORE_INSTANCE_ID must be a non-nil canonical UUID"))?;
+    anyhow::ensure!(
+        !core_instance_id.is_nil() && core_instance_id.to_string() == instance_text,
+        "CORE_INSTANCE_ID must be a non-nil canonical UUID"
+    );
+
+    let ca_path = settings.agent_management_ca_path.trim();
+    let ca_pem = fs::read_to_string(ca_path)
+        .with_context(|| format!("failed to read Agent management client CA {ca_path}"))?;
+    let ca_der = decode_exact_certificate_pem(&ca_pem, "Agent management client CA")?;
+    let agent_issuer_der = decode_exact_certificate_pem(agent_issuer_ca_pem, "Agent signing CA")?;
+    let server_ca_der =
+        decode_exact_certificate_pem(control_plane_server_ca_pem, "gRPC server CA")?;
+    anyhow::ensure!(
+        ca_der != agent_issuer_der && ca_der != server_ca_der && agent_issuer_der != server_ca_der,
+        "Agent signing, gRPC server, and management client trust roots must be distinct"
+    );
+    let (_, ca) = x509_parser::certificate::X509Certificate::from_der(&ca_der)
+        .map_err(|_| anyhow::anyhow!("Agent management client CA is not valid X.509"))?;
+    let (_, agent_issuer_ca) =
+        x509_parser::certificate::X509Certificate::from_der(&agent_issuer_der)
+            .map_err(|_| anyhow::anyhow!("Agent signing CA is not valid X.509"))?;
+    let (_, control_plane_server_ca) =
+        x509_parser::certificate::X509Certificate::from_der(&server_ca_der)
+            .map_err(|_| anyhow::anyhow!("gRPC server CA is not valid X.509"))?;
+    anyhow::ensure!(
+        ca.public_key().raw != agent_issuer_ca.public_key().raw
+            && ca.public_key().raw != control_plane_server_ca.public_key().raw
+            && agent_issuer_ca.public_key().raw != control_plane_server_ca.public_key().raw,
+        "Agent signing, gRPC server, and management client trust roots must use distinct keys"
+    );
+    let validation_time = x509_parser::time::ASN1Time::from_timestamp(now.timestamp())
+        .map_err(|_| anyhow::anyhow!("Agent management client CA validation time is invalid"))?;
+    anyhow::ensure!(
+        ca.validity().is_valid_at(validation_time),
+        "Agent management client CA is not currently valid"
+    );
+    let basic_constraints = ca
+        .basic_constraints()
+        .map_err(|_| anyhow::anyhow!("Agent management client CA BasicConstraints is malformed"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Agent management client CA requires BasicConstraints CA:TRUE")
+        })?;
+    anyhow::ensure!(
+        basic_constraints.value.ca,
+        "Agent management client CA requires BasicConstraints CA:TRUE"
+    );
+    let key_usage = ca
+        .key_usage()
+        .map_err(|_| anyhow::anyhow!("Agent management client CA key usage is malformed"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Agent management client CA requires keyCertSign key usage")
+        })?;
+    anyhow::ensure!(
+        key_usage.value.key_cert_sign(),
+        "Agent management client CA requires keyCertSign key usage"
+    );
+    anyhow::ensure!(
+        ca.subject() == ca.issuer(),
+        "Agent management client CA must be a single self-signed root certificate"
+    );
+    ca.verify_signature(None)
+        .map_err(|_| anyhow::anyhow!("Agent management client CA self-signature is invalid"))?;
+
+    let certificate_path = settings.agent_management_client_cert_path.trim();
+    let certificate_pem = fs::read_to_string(certificate_path).with_context(|| {
+        format!("failed to read Agent management client certificate {certificate_path}")
+    })?;
+    let certificate_der =
+        decode_exact_certificate_pem(&certificate_pem, "Agent management client certificate")?;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&certificate_der)
+        .map_err(|_| anyhow::anyhow!("Agent management client certificate is not valid X.509"))?;
+    anyhow::ensure!(
+        certificate.validity().is_valid_at(validation_time),
+        "Agent management client certificate is not currently valid"
+    );
+    anyhow::ensure!(
+        certificate.validity().not_before >= ca.validity().not_before
+            && certificate.validity().not_after <= ca.validity().not_after,
+        "Agent management client certificate validity must be contained by its CA"
+    );
+    anyhow::ensure!(
+        certificate.issuer() == ca.subject(),
+        "Agent management client certificate is not directly issued by CORE_AGENT_MANAGEMENT_CA_PATH"
+    );
+    certificate
+        .verify_signature(Some(ca.public_key()))
+        .map_err(|_| anyhow::anyhow!("Agent management client certificate signature is invalid"))?;
+    let basic_constraints = certificate.basic_constraints().map_err(|_| {
+        anyhow::anyhow!("Agent management client certificate BasicConstraints is malformed")
+    })?;
+    anyhow::ensure!(
+        basic_constraints.is_none_or(|extension| !extension.value.ca),
+        "Agent management client certificate must not be a CA"
+    );
+    let san = certificate
+        .subject_alternative_name()
+        .map_err(|_| anyhow::anyhow!("Agent management client certificate SAN is malformed"))?
+        .ok_or_else(|| anyhow::anyhow!("Agent management client certificate requires URI SAN"))?;
+    let expected_uri = format!("spiffe://streamserver/core/{core_instance_id}");
+    anyhow::ensure!(
+        matches!(
+            san.value.general_names.as_slice(),
+            [x509_parser::extensions::GeneralName::URI(uri)] if *uri == expected_uri
+        ),
+        "Agent management client certificate URI SAN must match CORE_INSTANCE_ID"
+    );
+    let key_usage = certificate
+        .key_usage()
+        .map_err(|_| anyhow::anyhow!("Agent management client key usage is malformed"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Agent management client certificate requires digitalSignature")
+        })?;
+    anyhow::ensure!(
+        key_usage.value.flags == 1 && key_usage.value.digital_signature(),
+        "Agent management client certificate requires digitalSignature-only key usage"
+    );
+    let extended = certificate
+        .extended_key_usage()
+        .map_err(|_| anyhow::anyhow!("Agent management client certificate EKU is malformed"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("Agent management client certificate requires clientAuth EKU")
+        })?;
+    anyhow::ensure!(
+        extended.value.client_auth
+            && !extended.value.server_auth
+            && !extended.value.any
+            && !extended.value.code_signing
+            && !extended.value.email_protection
+            && !extended.value.time_stamping
+            && !extended.value.ocsp_signing
+            && extended.value.other.is_empty(),
+        "Agent management client certificate requires clientAuth-only EKU"
+    );
+    validate_private_key_matches_certificate(
+        settings.agent_management_client_key_path.trim(),
+        certificate.public_key().raw,
+        "Agent management client",
+    )?;
+    Ok((core_instance_id, ca_pem))
+}
+
+fn validate_private_key_matches_certificate(
+    private_key_path: &str,
+    certificate_public_key_der: &[u8],
+    description: &str,
+) -> anyhow::Result<()> {
+    use rcgen::KeyPair;
+    use zeroize::Zeroize as _;
+
+    let mut private_key_pem = fs::read_to_string(private_key_path)
+        .with_context(|| format!("failed to read {description} private key {private_key_path}"))?;
+    let mut private_key = match KeyPair::from_pem(&private_key_pem) {
+        Ok(key) => key,
+        Err(_) => {
+            private_key_pem.zeroize();
+            anyhow::bail!("{description} private key is invalid")
+        }
+    };
+    private_key_pem.zeroize();
+    let matches = private_key.public_key_der() == certificate_public_key_der;
+    private_key.zeroize();
+    anyhow::ensure!(
+        matches,
+        "{description} certificate and private key do not match"
+    );
+    Ok(())
+}
+
+fn decode_exact_certificate_pem(value: &str, description: &str) -> anyhow::Result<Vec<u8>> {
+    let (remaining, pem) = x509_parser::pem::parse_x509_pem(value.as_bytes())
+        .map_err(|_| anyhow::anyhow!("{description} is not valid PEM"))?;
+    anyhow::ensure!(
+        remaining.iter().all(u8::is_ascii_whitespace),
+        "{description} must contain exactly one PEM certificate"
+    );
+    anyhow::ensure!(
+        pem.label == "CERTIFICATE",
+        "{description} PEM is not a certificate"
+    );
+    Ok(pem.contents)
+}
+
+fn load_and_validate_agent_capability_key_pair(
+    settings: &config::CoreSettings,
+) -> anyhow::Result<(String, String)> {
+    use rcgen::KeyPair;
+    use zeroize::Zeroize as _;
+
+    let public_path = settings.agent_capability_jwt_public_key_path.trim();
+    let private_path = settings.agent_capability_jwt_private_key_path.trim();
+    anyhow::ensure!(
+        !public_path.is_empty() && !private_path.is_empty(),
+        "Agent enrollment requires CORE_AGENT_CAPABILITY_JWT_PRIVATE_KEY_PATH and CORE_AGENT_CAPABILITY_JWT_PUBLIC_KEY_PATH"
+    );
+    let public_pem = fs::read_to_string(public_path)
+        .with_context(|| format!("failed to read Agent capability public key {public_path}"))?;
+    let (remaining, public_block) = x509_parser::pem::parse_x509_pem(public_pem.as_bytes())
+        .map_err(|_| anyhow::anyhow!("Agent capability public key is not valid PEM"))?;
+    anyhow::ensure!(
+        remaining.iter().all(u8::is_ascii_whitespace) && public_block.label == "PUBLIC KEY",
+        "Agent capability public key must be exactly one PUBLIC KEY PEM"
+    );
+    let (spki_remaining, spki) =
+        x509_parser::x509::SubjectPublicKeyInfo::from_der(&public_block.contents)
+            .map_err(|_| anyhow::anyhow!("Agent capability public key is not valid SPKI DER"))?;
+    anyhow::ensure!(
+        spki_remaining.is_empty()
+            && spki.algorithm.algorithm.to_id_string() == "1.3.101.112"
+            && spki.algorithm.parameters.is_none(),
+        "Agent capability key must use Ed25519"
+    );
+
+    let mut private_pem = fs::read_to_string(private_path)
+        .with_context(|| format!("failed to read Agent capability private key {private_path}"))?;
+    let mut private_key = match KeyPair::from_pem(&private_pem) {
+        Ok(key) => key,
+        Err(_) => {
+            private_pem.zeroize();
+            anyhow::bail!("Agent capability private key is invalid")
+        }
+    };
+    private_pem.zeroize();
+    let matches = private_key.public_key_der() == public_block.contents;
+    private_key.zeroize();
+    anyhow::ensure!(
+        matches,
+        "Agent capability public and private keys do not match"
+    );
+    let kid = bytes_to_lower_hex(&Sha256::digest(&public_block.contents));
+    Ok((public_pem, kid))
+}
+
+fn validate_dedicated_agent_security_keys(
+    settings: &config::CoreSettings,
+    capability_public_key_pem: &str,
+) -> anyhow::Result<()> {
+    let capability_key =
+        decode_exact_public_key_pem(capability_public_key_pem, "Agent capability public key")?;
+    let agent_ca_key = certificate_public_key_der_from_path(
+        settings.agent_ca_cert_path.trim(),
+        "Agent signing CA",
+    )?;
+    let grpc_server_key = certificate_public_key_der_from_path(
+        settings.grpc_tls_cert_path.trim(),
+        "gRPC server certificate",
+    )?;
+    let grpc_server_ca_key = certificate_public_key_der_from_path(
+        settings.grpc_tls_server_ca_path.trim(),
+        "gRPC server CA",
+    )?;
+    let management_client_key = certificate_public_key_der_from_path(
+        settings.agent_management_client_cert_path.trim(),
+        "Agent management client certificate",
+    )?;
+    let management_client_ca_key = certificate_public_key_der_from_path(
+        settings.agent_management_ca_path.trim(),
+        "Agent management client CA",
+    )?;
+    let keys = [
+        ("Agent capability", capability_key.as_slice()),
+        ("Agent signing CA", agent_ca_key.as_slice()),
+        ("gRPC server", grpc_server_key.as_slice()),
+        ("gRPC server CA", grpc_server_ca_key.as_slice()),
+        ("Agent management client", management_client_key.as_slice()),
+        (
+            "Agent management client CA",
+            management_client_ca_key.as_slice(),
+        ),
+    ];
+    for left in 0..keys.len() {
+        for right in (left + 1)..keys.len() {
+            anyhow::ensure!(
+                keys[left].1 != keys[right].1,
+                "{} and {} keys must be dedicated and must not be reused",
+                keys[left].0,
+                keys[right].0
+            );
+        }
+    }
+
+    if settings.auth_mode == config::AuthMode::LocalPassword {
+        let auth_path = settings.auth_jwt_public_key_path.trim();
+        if !auth_path.is_empty() {
+            let auth_pem = fs::read_to_string(auth_path)
+                .with_context(|| format!("failed to read local auth public key {auth_path}"))?;
+            let auth_key = decode_exact_public_key_pem(&auth_pem, "local auth public key")?;
+            anyhow::ensure!(
+                capability_key != auth_key,
+                "Agent capability key must not reuse the local auth signing key"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn certificate_public_key_der_from_path(path: &str, description: &str) -> anyhow::Result<Vec<u8>> {
+    let pem =
+        fs::read_to_string(path).with_context(|| format!("failed to read {description} {path}"))?;
+    let der = decode_exact_certificate_pem(&pem, description)?;
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
+        .map_err(|_| anyhow::anyhow!("{description} is not valid X.509"))?;
+    Ok(certificate.public_key().raw.to_vec())
+}
+
+fn decode_exact_public_key_pem(value: &str, description: &str) -> anyhow::Result<Vec<u8>> {
+    let (remaining, pem) = x509_parser::pem::parse_x509_pem(value.as_bytes())
+        .map_err(|_| anyhow::anyhow!("{description} is not valid PEM"))?;
+    anyhow::ensure!(
+        remaining.iter().all(u8::is_ascii_whitespace) && pem.label == "PUBLIC KEY",
+        "{description} must be exactly one PUBLIC KEY PEM"
+    );
+    let (der_remaining, _) = x509_parser::x509::SubjectPublicKeyInfo::from_der(&pem.contents)
+        .map_err(|_| anyhow::anyhow!("{description} is not valid SPKI DER"))?;
+    anyhow::ensure!(
+        der_remaining.is_empty(),
+        "{description} contains trailing SPKI DER data"
+    );
+    Ok(pem.contents)
+}
+
+fn bytes_to_lower_hex(value: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(value.len() * 2);
+    for byte in value {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
 }
 
 async fn load_http_tls_config(
@@ -3120,6 +4339,53 @@ struct UpdateMachineAllowlistRequest {
 #[derive(Debug, Serialize)]
 struct MachineAllowlistResponse {
     entries: Vec<MachineAllowlistEntry>,
+}
+
+#[derive(Deserialize)]
+struct CreateAgentEnrollmentRequest {
+    node_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct CreateAgentEnrollmentResponse {
+    enrollment_id: Uuid,
+    node_id: Uuid,
+    token: String,
+    expires_at: DateTime<Utc>,
+}
+
+impl Drop for CreateAgentEnrollmentResponse {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.token);
+    }
+}
+
+#[derive(Deserialize)]
+struct EnrollAgentRequest {
+    node_id: Uuid,
+    csr_pem: String,
+    management_csr_pem: String,
+}
+
+#[derive(Serialize)]
+struct EnrollAgentResponse {
+    node_id: Uuid,
+    certificate_pem: String,
+    ca_certificate_pem: String,
+    agent_client_issuer_ca_pem: String,
+    control_plane_server_ca_pem: String,
+    management_client_ca_pem: String,
+    fingerprint_sha256: String,
+    serial_number: String,
+    not_before: DateTime<Utc>,
+    not_after: DateTime<Utc>,
+    management_certificate_pem: String,
+    management_fingerprint_sha256: String,
+    management_serial_number: String,
+    management_not_before: DateTime<Utc>,
+    management_not_after: DateTime<Utc>,
+    capability_jwt_public_key_pem: String,
+    capability_jwt_kid: String,
 }
 
 const fn default_snap_timeout_sec() -> u32 {

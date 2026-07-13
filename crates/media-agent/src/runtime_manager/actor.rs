@@ -826,8 +826,7 @@ impl RuntimeManager {
 
         if self
             .pending_recording_by_runtime
-            .get(&entry.handle.runtime_id)
-            .is_some()
+            .contains_key(&entry.handle.runtime_id)
         {
             self.finish_operation(queued.operation_id);
             send_recording_reply(
@@ -1772,10 +1771,10 @@ fn send_adopt_reply(
 fn clone_recording_result(
     result: &Result<RuntimeHandle, crate::runtime_types::ExecutorError>,
 ) -> Result<RuntimeHandle, crate::runtime_types::ExecutorError> {
-    result
-        .as_ref()
-        .map(Clone::clone)
-        .map_err(clone_executor_error)
+    match result {
+        Ok(handle) => Ok(handle.clone()),
+        Err(error) => Err(clone_executor_error(error)),
+    }
 }
 
 fn clone_executor_error(

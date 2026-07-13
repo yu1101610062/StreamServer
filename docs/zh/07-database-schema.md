@@ -301,6 +301,8 @@ create table operation_requests (
 
 保存原始 Hook 负载，便于幂等和审计。
 
+`server_id` 由 Core 使用已认证 mTLS control session 绑定的 `node_id` 规范化产生，绝不直接读取 Hook payload 中的 `server_id`、`mediaServerId` 或其他拼写。
+
 ```sql
 create table hook_events (
   id uuid primary key,

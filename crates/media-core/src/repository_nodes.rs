@@ -1,16 +1,17 @@
 //! 节点仓储：维护 Agent 节点注册、心跳、能力快照、调试目标和节点标识解析。
 
 use chrono::{DateTime, Utc};
+#[cfg(test)]
+use media_domain::AgentRegistration;
 use media_domain::{
-    AgentRegistration, CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot,
-    RuntimeSlotLoad,
+    CapabilitySnapshot, GpuDeviceInfo, GpuRuntimeStats, HeartbeatSnapshot, RuntimeSlotLoad,
 };
 use serde::Serialize;
 use serde_json::Value;
 use sqlx::{Row, postgres::PgRow};
 use uuid::Uuid;
 
-use super::{RepoError, TaskRepository, validation_error};
+use super::{AgentSessionWriteOutcome, RepoError, TaskRepository, validation_error};
 
 impl TaskRepository {
     pub async fn resolve_node_id_by_server_id(
@@ -35,9 +36,9 @@ impl TaskRepository {
               n.node_name,
               n.hostname,
               n.labels,
-              n.zlm_api_base,
+              ''::text as zlm_api_base,
               n.agent_stream_addr,
-              n.agent_http_base_url,
+              ''::text as agent_http_base_url,
               n.zlm_rtmp_port,
               n.zlm_rtsp_port,
               n.network_mode,
@@ -76,7 +77,7 @@ impl TaskRepository {
         limit: u32,
     ) -> Result<Vec<NodeHeartbeatSummary>, RepoError> {
         let limit = limit.clamp(1, 200);
-        Ok(sqlx::query(
+        sqlx::query(
             r#"
             select
               node_id,
@@ -108,35 +109,30 @@ impl TaskRepository {
         .await?
         .into_iter()
         .map(|row| NodeHeartbeatSummary::from_row(&row))
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
     }
 
-    pub async fn get_node_debug_target(&self, node_id: Uuid) -> Result<NodeDebugTarget, RepoError> {
-        sqlx::query(
-            r#"
-            select id, zlm_api_base, zlm_api_secret
-              from media_nodes
-             where id = $1
-            "#,
-        )
-        .bind(node_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(RepoError::NodeNotFound(node_id))
-        .and_then(|row| {
-            Ok(NodeDebugTarget {
-                zlm_api_base: row.try_get("zlm_api_base")?,
-                zlm_api_secret: row.try_get("zlm_api_secret")?,
-            })
-        })
-    }
-
+    #[cfg(test)]
     pub async fn upsert_node_registration(
         &self,
         registration: &AgentRegistration,
         seen_at: DateTime<Utc>,
     ) -> Result<(), RepoError> {
         let mut tx = self.pool.begin().await?;
+        // Legacy repository tests create nodes without exercising the R1
+        // enrollment flow. Mirror the migration state for such nodes so the
+        // production FK remains strict without weakening it for tests.
+        sqlx::query(
+            r#"
+            insert into agent_identities (node_id, status, created_at, updated_at)
+            values ($1, 'pending_enrollment', $2, $2)
+            on conflict (node_id) do nothing
+            "#,
+        )
+        .bind(registration.node_id)
+        .bind(seen_at)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             r#"
             insert into media_nodes (
@@ -176,10 +172,10 @@ impl TaskRepository {
         .bind(&registration.node_name)
         .bind(&registration.hostname)
         .bind(serde_json::to_value(&registration.labels)?)
-        .bind(&registration.zlm_api_base)
-        .bind(&registration.zlm_api_secret)
+        .bind("")
+        .bind("")
         .bind(&registration.agent_stream_addr)
-        .bind(&registration.agent_http_base_url)
+        .bind("")
         .bind(i32::from(registration.zlm_rtmp_port))
         .bind(i32::from(registration.zlm_rtsp_port))
         .bind(&registration.output_mount_relative_prefix_mp4)
@@ -216,12 +212,44 @@ impl TaskRepository {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn record_node_heartbeat(
         &self,
         node_id: Uuid,
         heartbeat: &HeartbeatSnapshot,
     ) -> Result<(), RepoError> {
+        self.record_node_heartbeat_inner(node_id, None, heartbeat)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn record_node_heartbeat_for_session(
+        &self,
+        node_id: Uuid,
+        session_id: Uuid,
+        heartbeat: &HeartbeatSnapshot,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        self.record_node_heartbeat_inner(node_id, Some(session_id), heartbeat)
+            .await
+    }
+
+    async fn record_node_heartbeat_inner(
+        &self,
+        node_id: Uuid,
+        session_id: Option<Uuid>,
+        heartbeat: &HeartbeatSnapshot,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
         let mut tx = self.pool.begin().await?;
+        let received_at = Utc::now();
+        if let Some(session_id) = session_id {
+            if !self
+                .renew_current_agent_control_session(&mut tx, node_id, session_id, received_at)
+                .await?
+            {
+                tx.commit().await?;
+                return Ok(AgentSessionWriteOutcome::FencedSession);
+            }
+        }
         let result = sqlx::query(
             r#"
             update media_nodes
@@ -234,7 +262,7 @@ impl TaskRepository {
             "#,
         )
         .bind(heartbeat.node_time)
-        .bind(Utc::now())
+        .bind(received_at)
         .bind(node_id)
         .bind(heartbeat.artifact_cleanup_blocked)
         .execute(&mut *tx)
@@ -276,15 +304,16 @@ impl TaskRepository {
         .bind(heartbeat.ffmpeg_alive)
         .bind(serde_json::to_value(&heartbeat.gpu_runtime)?)
         .bind(heartbeat.node_time)
-        .bind(Utc::now())
+        .bind(received_at)
         .execute(&mut *tx)
         .await?;
 
         tx.commit().await?;
 
-        Ok(())
+        Ok(AgentSessionWriteOutcome::Applied)
     }
 
+    #[cfg(test)]
     pub async fn update_node_health(
         &self,
         node_id: Uuid,
@@ -363,11 +392,32 @@ impl TaskRepository {
         Ok(())
     }
 
-    pub async fn upsert_node_capabilities(
+    pub async fn upsert_node_capabilities_for_session(
         &self,
         node_id: Uuid,
+        session_id: Uuid,
         snapshot: &CapabilitySnapshot,
-    ) -> Result<(), RepoError> {
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        self.upsert_node_capabilities_inner(node_id, Some(session_id), snapshot)
+            .await
+    }
+
+    async fn upsert_node_capabilities_inner(
+        &self,
+        node_id: Uuid,
+        session_id: Option<Uuid>,
+        snapshot: &CapabilitySnapshot,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(session_id) = session_id {
+            if !self
+                .lock_current_agent_control_session(&mut tx, node_id, session_id, Utc::now())
+                .await?
+            {
+                tx.commit().await?;
+                return Ok(AgentSessionWriteOutcome::FencedSession);
+            }
+        }
         let result = sqlx::query(
             r#"
             insert into node_capabilities (
@@ -399,14 +449,15 @@ impl TaskRepository {
         .bind(serde_json::to_value(&snapshot.gpu)?)
         .bind(serde_json::to_value(&snapshot.gpu_devices)?)
         .bind(snapshot.captured_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(RepoError::NodeNotFound(node_id));
         }
 
-        Ok(())
+        tx.commit().await?;
+        Ok(AgentSessionWriteOutcome::Applied)
     }
 }
 
@@ -617,10 +668,4 @@ impl NodeHeartbeatSummary {
             received_at: row.try_get("received_at")?,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct NodeDebugTarget {
-    pub zlm_api_base: String,
-    pub zlm_api_secret: String,
 }

@@ -1,10 +1,12 @@
 use super::*;
+#[cfg(unix)]
+use crate::config::Settings;
 use crate::config::{AuthMode, CoreSettings};
-use crate::test_database::{config_from_env, finish_setup};
+use crate::test_database::{acquire_test_database_slot, config_from_env, finish_setup};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    http::{Request, StatusCode, header},
+    http::{HeaderMap, Request, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
@@ -20,6 +22,9 @@ use tokio::{
     time::timeout,
 };
 use tower::util::ServiceExt;
+
+#[cfg(unix)]
+static CORE_CONFIG_ENVIRONMENT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const TEST_RSA_PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDRNk+CElS+M3My1DbTUInl9aeU\nYCLza8Uftij7kPTApECFQcy1em6CZwb+PDHjjtFB2i8Ncfbx+dt2S6CbJHSF0dDB\n+GoiaVaYolB9XoQODqA7LXTy/D4e9jdNJQgDVXlzXsTm4k3v1CnC1As7RfUkgdM/\npsbfsbeai7RULN2NnQIDAQAB\n-----END PUBLIC KEY-----";
 const TEST_ED25519_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIMAlSI3/XdPzRT72Rw08g6NnTnJ2eaq1JoJoW5Vlbm/T\n-----END PRIVATE KEY-----";
@@ -42,6 +47,52 @@ fn auth_config_from_public_key(enabled: bool, pem: &str) -> anyhow::Result<AuthC
     }
 }
 
+#[test]
+fn persisted_user_agent_is_capped() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_str(&"x".repeat(2_048)).unwrap(),
+    );
+    let persisted = user_agent_from_headers(&headers).expect("user agent");
+    assert_eq!(persisted.len(), 256);
+    let unicode = truncate_utf8_for_storage(&"界".repeat(100), 256);
+    assert!(unicode.len() <= 256);
+    assert!(unicode.is_char_boundary(unicode.len()));
+}
+
+#[test]
+fn http_handlers_cannot_bypass_database_validated_authentication() {
+    let main_source = include_str!("../main.rs");
+    let route_modules = [
+        main_source,
+        include_str!("../ui.rs"),
+        include_str!("../upload.rs"),
+    ];
+
+    assert_eq!(
+        main_source.matches(".auth.verify_session_claims(").count(),
+        1,
+        "only authenticated_session may call the claim verifier directly"
+    );
+    assert_eq!(
+        route_modules
+            .iter()
+            .map(|source| source.matches(".auth.verify_session_claims(").count())
+            .sum::<usize>(),
+        1,
+        "route modules must not introduce another direct claim-verifier call"
+    );
+    for source in route_modules {
+        assert!(
+            !source.contains(".auth.authorize(")
+                && !source.contains(".auth.session(")
+                && source.matches(".auth.verify_session_claims(").count() <= 1,
+            "HTTP handlers must use authenticated_session/authorize_api_request"
+        );
+    }
+}
+
 fn live_runtime_slot_load(running_tasks: u32, slot_usage: f64) -> Vec<RuntimeSlotLoad> {
     let max_runtime_slots = if running_tasks == 0 || slot_usage <= 0.0 {
         0
@@ -60,6 +111,7 @@ fn live_runtime_slot_load(running_tasks: u32, slot_usage: f64) -> Vec<RuntimeSlo
 }
 
 struct TestDatabase {
+    _slot: tokio::sync::OwnedSemaphorePermit,
     admin_pool: sqlx::PgPool,
     pool: sqlx::PgPool,
     database_name: String,
@@ -67,6 +119,7 @@ struct TestDatabase {
 
 impl TestDatabase {
     async fn new(admin_url: &str, run_migrations: bool) -> anyhow::Result<Self> {
+        let slot = acquire_test_database_slot().await?;
         let admin_pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(admin_url)
@@ -86,6 +139,7 @@ impl TestDatabase {
         }
 
         Ok(Self {
+            _slot: slot,
             admin_pool,
             pool,
             database_name,
@@ -179,6 +233,153 @@ fn parse_cli_command_accepts_auth_subcommand_help() {
 }
 
 #[test]
+fn parse_cli_command_accepts_agent_enrollment_help_and_warns_about_sensitive_stdout() {
+    for args in [
+        vec!["agent".to_string(), "--help".to_string()],
+        vec![
+            "agent".to_string(),
+            "create-enrollment".to_string(),
+            "--help".to_string(),
+        ],
+    ] {
+        assert_eq!(
+            parse_cli_command_from(args).unwrap(),
+            Some(CliCommand::AgentHelp)
+        );
+    }
+    assert!(CLI_HELP_TEXT.contains("agent create-enrollment"));
+    assert!(AGENT_CLI_HELP_TEXT.contains("only stdout line"));
+    assert!(AGENT_CLI_HELP_TEXT.contains("sensitive"));
+}
+
+#[test]
+fn parse_cli_command_requires_an_exact_node_and_explicit_token_stdout() {
+    let node_id = Uuid::parse_str("0190d8d4-31d2-7b23-b27e-8b9b28a2ed11").unwrap();
+    assert_eq!(
+        parse_cli_command_from([
+            "agent".to_string(),
+            "create-enrollment".to_string(),
+            "--node-id".to_string(),
+            node_id.to_string(),
+            "--token-stdout".to_string(),
+        ])
+        .unwrap(),
+        Some(CliCommand::AgentCreateEnrollment { node_id })
+    );
+
+    for (name, args) in [
+        (
+            "missing token stdout opt-in",
+            vec![
+                "agent",
+                "create-enrollment",
+                "--node-id",
+                "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11",
+            ],
+        ),
+        (
+            "noncanonical uppercase UUID",
+            vec![
+                "agent",
+                "create-enrollment",
+                "--node-id",
+                "0190D8D4-31D2-7B23-B27E-8B9B28A2ED11",
+                "--token-stdout",
+            ],
+        ),
+        (
+            "nil UUID",
+            vec![
+                "agent",
+                "create-enrollment",
+                "--node-id",
+                "00000000-0000-0000-0000-000000000000",
+                "--token-stdout",
+            ],
+        ),
+        (
+            "extra argument",
+            vec![
+                "agent",
+                "create-enrollment",
+                "--node-id",
+                "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11",
+                "--token-stdout",
+                "extra",
+            ],
+        ),
+        (
+            "duplicate token option",
+            vec![
+                "agent",
+                "create-enrollment",
+                "--node-id",
+                "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11",
+                "--token-stdout",
+                "--token-stdout",
+            ],
+        ),
+    ] {
+        let error = parse_cli_command_from(args.into_iter().map(str::to_string)).expect_err(name);
+        assert!(!error.to_string().is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn agent_enrollment_cli_writes_only_the_sensitive_token_line_and_redacts_debug() {
+    let enrollment = agent_identity::CreatedAgentEnrollment {
+        enrollment_id: Uuid::now_v7(),
+        node_id: Uuid::now_v7(),
+        token: zeroize::Zeroizing::new("one-time-sensitive-token".to_string()),
+        expires_at: Utc::now() + chrono::Duration::minutes(10),
+    };
+    let mut output = Vec::new();
+    write_agent_enrollment_token(&mut output, &enrollment).unwrap();
+    assert_eq!(output, b"one-time-sensitive-token\n");
+    let debug = format!("{enrollment:?}");
+    assert!(!debug.contains("one-time-sensitive-token"));
+    assert!(debug.contains("[REDACTED]"));
+}
+
+#[tokio::test]
+async fn agent_enrollment_cli_loads_pki_runs_migrations_and_persists_only_a_token_hash()
+-> anyhow::Result<()> {
+    use sha2::Digest as _;
+
+    let Some(db) = require_test_database(false).await? else {
+        return Ok(());
+    };
+    let config = config_from_env()?;
+    let directory = tempfile::tempdir()?;
+    let now = Utc::now();
+    let mut settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    settings.database_url = test_database_url(&config.admin_url, &db.database_name)?;
+    let node_id = Uuid::now_v7();
+
+    let enrollment = create_agent_enrollment_for_cli(&settings, node_id, now).await?;
+    assert_eq!(enrollment.node_id, node_id);
+    let persisted_hash: Vec<u8> =
+        sqlx::query_scalar("select token_hash from agent_enrollment_tokens where node_id = $1")
+            .bind(node_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        persisted_hash,
+        sha2::Sha256::digest(enrollment.token.as_bytes()).as_slice()
+    );
+    let persisted_token: bool = sqlx::query_scalar(
+        "select exists (select 1 from security_audit_events where payload::text like '%' || $1 || '%')",
+    )
+    .bind(enrollment.token.as_str())
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(!persisted_token);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[test]
 fn parse_cli_command_parses_auth_command() {
     let command = parse_cli_command_from([
         "auth".to_string(),
@@ -225,8 +426,59 @@ fn parse_cli_command_parses_read_only_auth_config_check() {
 }
 
 #[test]
+fn parse_cli_command_parses_bootstrap_status_probe() {
+    let command = parse_cli_command_from([
+        "auth".to_string(),
+        "bootstrap-status".to_string(),
+        "--username".to_string(),
+        "admin".to_string(),
+        "--handoff-id".to_string(),
+        "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(
+        command,
+        Some(CliCommand::BootstrapStatus {
+            username: "admin".to_string(),
+            handoff_id: "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11".to_string(),
+        })
+    );
+
+    let error = parse_cli_command_from([
+        "auth".to_string(),
+        "bootstrap-status".to_string(),
+        "--username".to_string(),
+        "admin".to_string(),
+        "--password-stdin".to_string(),
+    ])
+    .unwrap_err();
+    assert!(error.to_string().contains("requires"));
+
+    let recover = parse_cli_command_from([
+        "auth".to_string(),
+        "recover-bootstrap-admin".to_string(),
+        "--username".to_string(),
+        "admin".to_string(),
+        "--handoff-id".to_string(),
+        "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11".to_string(),
+        "--expected-version".to_string(),
+        "7".to_string(),
+        "--password-stdin".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(
+        recover,
+        Some(CliCommand::RecoverBootstrapAdmin {
+            username: "admin".to_string(),
+            handoff_id: "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11".to_string(),
+            expected_version: "7".to_string(),
+        })
+    );
+}
+
+#[test]
 fn bootstrap_admin_cli_requires_password_change() {
-    assert!(BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD);
+    assert!(std::hint::black_box(BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD));
 }
 
 fn production_security_settings() -> CoreSettings {
@@ -238,10 +490,260 @@ fn production_security_settings() -> CoreSettings {
         grpc_tls_cert_path: "grpc-server.pem".to_string(),
         grpc_tls_key_path: "grpc-server.key".to_string(),
         grpc_tls_client_ca_path: "grpc-client-ca.pem".to_string(),
+        grpc_tls_server_ca_path: "grpc-server-ca.pem".to_string(),
+        agent_ca_cert_path: "agent-ca.pem".to_string(),
+        agent_ca_key_path: "agent-ca.key".to_string(),
+        agent_capability_jwt_private_key_path: "agent-capability-private.pem".to_string(),
+        agent_capability_jwt_public_key_path: "agent-capability-public.pem".to_string(),
+        agent_capability_ttl_sec: 60,
+        core_instance_id: "0190d8d4-31d2-7b23-b27e-8b9b28a2ed11".to_string(),
+        agent_management_client_cert_path: "management-client.pem".to_string(),
+        agent_management_client_key_path: "management-client-key.pem".to_string(),
+        agent_management_ca_path: "management-client-ca.pem".to_string(),
         auth_mode: AuthMode::LocalPassword,
-        insecure_dev: false,
         ..CoreSettings::default()
     }
+}
+
+fn write_test_agent_enrollment_materials(
+    directory: &FsPath,
+    now: DateTime<Utc>,
+) -> anyhow::Result<CoreSettings> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
+        IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519, SanType,
+    };
+
+    fn root_params(now: DateTime<Utc>, name: &str) -> CertificateParams {
+        let mut params = CertificateParams::default();
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params.not_before = time::OffsetDateTime::from_unix_timestamp(
+            (now - chrono::Duration::days(1)).timestamp(),
+        )
+        .unwrap();
+        params.not_after = time::OffsetDateTime::from_unix_timestamp(
+            (now + chrono::Duration::days(365)).timestamp(),
+        )
+        .unwrap();
+        params
+    }
+
+    let agent_ca_key = KeyPair::generate()?;
+    let agent_ca = root_params(now, "Agent Root").self_signed(&agent_ca_key)?;
+    let server_ca_key = KeyPair::generate()?;
+    let server_ca = root_params(now, "Core Server Root").self_signed(&server_ca_key)?;
+    let server_key = KeyPair::generate()?;
+    let mut server_params = CertificateParams::default();
+    server_params.distinguished_name = DistinguishedName::new();
+    server_params
+        .distinguished_name
+        .push(DnType::CommonName, "Core gRPC");
+    server_params.subject_alt_names = vec![SanType::DnsName(
+        "core.streamserver.internal".try_into().unwrap(),
+    )];
+    server_params.is_ca = IsCa::NoCa;
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    server_params.not_before = time::OffsetDateTime::from_unix_timestamp(
+        (now - chrono::Duration::minutes(5)).timestamp(),
+    )?;
+    server_params.not_after =
+        time::OffsetDateTime::from_unix_timestamp((now + chrono::Duration::days(90)).timestamp())?;
+    let server = server_params.signed_by(&server_key, &server_ca, &server_ca_key)?;
+    let core_instance_id = Uuid::parse_str("0190d8d4-31d2-7b23-b27e-8b9b28a2ed11")?;
+    let management_ca_key = KeyPair::generate()?;
+    let management_ca =
+        root_params(now, "Core Management Client Root").self_signed(&management_ca_key)?;
+    let management_client_key = KeyPair::generate_for(&PKCS_ED25519)?;
+    let mut management_client_params = CertificateParams::default();
+    management_client_params.distinguished_name = DistinguishedName::new();
+    management_client_params
+        .distinguished_name
+        .push(DnType::CommonName, "StreamServer Core Management Client");
+    management_client_params.subject_alt_names = vec![SanType::URI(
+        format!("spiffe://streamserver/core/{core_instance_id}")
+            .try_into()
+            .unwrap(),
+    )];
+    management_client_params.is_ca = IsCa::NoCa;
+    management_client_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    management_client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    management_client_params.not_before = time::OffsetDateTime::from_unix_timestamp(
+        (now - chrono::Duration::minutes(5)).timestamp(),
+    )?;
+    management_client_params.not_after =
+        time::OffsetDateTime::from_unix_timestamp((now + chrono::Duration::days(90)).timestamp())?;
+    let management_client = management_client_params.signed_by(
+        &management_client_key,
+        &management_ca,
+        &management_ca_key,
+    )?;
+
+    let agent_ca_path = directory.join("agent-ca.pem");
+    let agent_ca_key_path = directory.join("agent-ca-key.pem");
+    let client_ca_path = directory.join("client-ca.pem");
+    let server_ca_path = directory.join("server-ca.pem");
+    let server_path = directory.join("server.pem");
+    let server_key_path = directory.join("server-key.pem");
+    let capability_private_path = directory.join("capability-private.pem");
+    let capability_public_path = directory.join("capability-public.pem");
+    let management_client_path = directory.join("management-client.pem");
+    let management_client_key_path = directory.join("management-client-key.pem");
+    let management_ca_path = directory.join("management-client-ca.pem");
+    fs::write(&agent_ca_path, agent_ca.pem())?;
+    fs::write(&agent_ca_key_path, agent_ca_key.serialize_pem())?;
+    fs::write(&client_ca_path, agent_ca.pem())?;
+    fs::write(&server_ca_path, server_ca.pem())?;
+    fs::write(&server_path, server.pem())?;
+    fs::write(&server_key_path, server_key.serialize_pem())?;
+    fs::write(&capability_private_path, TEST_ED25519_PRIVATE_KEY)?;
+    fs::write(&capability_public_path, TEST_ED25519_PUBLIC_KEY)?;
+    fs::write(&management_client_path, management_client.pem())?;
+    fs::write(
+        &management_client_key_path,
+        management_client_key.serialize_pem(),
+    )?;
+    fs::write(&management_ca_path, management_ca.pem())?;
+
+    Ok(CoreSettings {
+        grpc_tls_cert_path: server_path.to_string_lossy().to_string(),
+        grpc_tls_key_path: server_key_path.to_string_lossy().to_string(),
+        grpc_tls_client_ca_path: client_ca_path.to_string_lossy().to_string(),
+        grpc_tls_server_ca_path: server_ca_path.to_string_lossy().to_string(),
+        agent_ca_cert_path: agent_ca_path.to_string_lossy().to_string(),
+        agent_ca_key_path: agent_ca_key_path.to_string_lossy().to_string(),
+        agent_capability_jwt_private_key_path: capability_private_path
+            .to_string_lossy()
+            .to_string(),
+        agent_capability_jwt_public_key_path: capability_public_path.to_string_lossy().to_string(),
+        core_instance_id: core_instance_id.to_string(),
+        agent_management_client_cert_path: management_client_path.to_string_lossy().to_string(),
+        agent_management_client_key_path: management_client_key_path.to_string_lossy().to_string(),
+        agent_management_ca_path: management_ca_path.to_string_lossy().to_string(),
+        ..CoreSettings::default()
+    })
+}
+
+#[test]
+fn agent_enrollment_startup_loads_distinct_server_ca_and_capability_metadata() -> anyhow::Result<()>
+{
+    let now = Utc::now();
+    let directory = tempfile::tempdir()?;
+    let mut settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    let agent_ca_pem = fs::read_to_string(&settings.agent_ca_cert_path)?;
+    let expected_server_ca = fs::read_to_string(&settings.grpc_tls_server_ca_path)?;
+    let expected_management_ca = fs::read_to_string(&settings.agent_management_ca_path)?;
+
+    let (_, public_config, loaded_core_instance_id) =
+        load_agent_certificate_authority(&settings, now)?
+            .expect("Agent enrollment material must be configured");
+    assert_eq!(
+        loaded_core_instance_id.to_string(),
+        settings.core_instance_id
+    );
+
+    assert_eq!(
+        public_config.control_plane_server_ca_pem,
+        expected_server_ca
+    );
+    assert_ne!(public_config.control_plane_server_ca_pem, agent_ca_pem);
+    assert_eq!(
+        public_config.management_client_ca_pem,
+        expected_management_ca
+    );
+    assert_ne!(public_config.management_client_ca_pem, agent_ca_pem);
+    assert_ne!(
+        public_config.management_client_ca_pem,
+        public_config.control_plane_server_ca_pem
+    );
+    assert_eq!(
+        public_config.capability_jwt_public_key_pem,
+        TEST_ED25519_PUBLIC_KEY
+    );
+    let (_, public_block) =
+        x509_parser::pem::parse_x509_pem(TEST_ED25519_PUBLIC_KEY.as_bytes()).unwrap();
+    assert_eq!(
+        public_config.capability_jwt_kid,
+        bytes_to_lower_hex(&Sha256::digest(public_block.contents))
+    );
+    settings.agent_capability_ttl_sec = 10;
+    let management_client =
+        load_agent_management_client(&settings, public_config.capability_jwt_kid.as_str())?;
+    let management_private = fs::read_to_string(&settings.agent_management_client_key_path)?;
+    let debug = format!("{management_client:?}");
+    assert!(!debug.contains(TEST_ED25519_PRIVATE_KEY));
+    assert!(!debug.contains(&management_private));
+    assert!(debug.contains("[REDACTED]"));
+    assert!(debug.contains("ttl_seconds: 10"));
+    Ok(())
+}
+
+#[test]
+fn agent_enrollment_startup_rejects_wrong_server_ca_and_capability_pair() -> anyhow::Result<()> {
+    use rcgen::{
+        BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose, PKCS_ED25519,
+    };
+
+    let now = Utc::now();
+    let directory = tempfile::tempdir()?;
+    let settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    let other_ca_key = KeyPair::generate()?;
+    let mut other_ca_params = CertificateParams::default();
+    other_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    other_ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    other_ca_params.not_before =
+        time::OffsetDateTime::from_unix_timestamp((now - chrono::Duration::days(1)).timestamp())?;
+    other_ca_params.not_after =
+        time::OffsetDateTime::from_unix_timestamp((now + chrono::Duration::days(365)).timestamp())?;
+    let other_ca = other_ca_params.self_signed(&other_ca_key)?;
+    fs::write(&settings.grpc_tls_server_ca_path, other_ca.pem())?;
+    let error = load_agent_certificate_authority(&settings, now)
+        .expect_err("unrelated server CA must fail");
+    assert!(error.to_string().contains("not directly issued"));
+
+    let settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    let different_capability_key = KeyPair::generate_for(&PKCS_ED25519)?;
+    fs::write(
+        &settings.agent_capability_jwt_public_key_path,
+        different_capability_key.public_key_pem(),
+    )?;
+    let error = load_agent_certificate_authority(&settings, now)
+        .expect_err("mismatched capability key pair must fail");
+    assert!(error.to_string().contains("do not match"));
+
+    let mut settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    let instance = Uuid::parse_str(&settings.core_instance_id)?;
+    settings.core_instance_id = Uuid::from_u128(instance.as_u128() ^ 1).to_string();
+    let error = load_agent_certificate_authority(&settings, now)
+        .expect_err("management client SAN must match CORE_INSTANCE_ID");
+    assert!(error.to_string().contains("CORE_INSTANCE_ID"));
+
+    let settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    let management_private = fs::read_to_string(&settings.agent_management_client_key_path)?;
+    let management_key = KeyPair::from_pem(&management_private)?;
+    fs::write(
+        &settings.agent_capability_jwt_private_key_path,
+        management_private,
+    )?;
+    fs::write(
+        &settings.agent_capability_jwt_public_key_path,
+        management_key.public_key_pem(),
+    )?;
+    let error = load_agent_certificate_authority(&settings, now)
+        .expect_err("capability key must not reuse management client key");
+    assert!(error.to_string().contains("dedicated"));
+
+    let mut settings = write_test_agent_enrollment_materials(directory.path(), now)?;
+    settings.auth_mode = AuthMode::LocalPassword;
+    settings.auth_jwt_private_key_path = settings.agent_capability_jwt_private_key_path.clone();
+    settings.auth_jwt_public_key_path = settings.agent_capability_jwt_public_key_path.clone();
+    let error = load_agent_certificate_authority(&settings, now)
+        .expect_err("capability key must not reuse local auth signing key");
+    assert!(error.to_string().contains("local auth"));
+    Ok(())
 }
 
 #[test]
@@ -272,6 +774,15 @@ fn security_policy_covers_production_tls_and_insecure_development_matrix() {
         settings,
         expected_error: Some("production requires AUTH_MODE other than disabled"),
     });
+
+    for environment in ["prod", "staging", "production-typo"] {
+        cases.push(Case {
+            name: "unknown environment fails closed",
+            environment,
+            settings: production_security_settings(),
+            expected_error: Some("STREAMSERVER_ENV must be development or production"),
+        });
+    }
 
     let mut settings = production_security_settings();
     settings.http_tls_cert_path.clear();
@@ -327,24 +838,90 @@ fn security_policy_covers_production_tls_and_insecure_development_matrix() {
     });
 
     let mut settings = production_security_settings();
-    settings.insecure_dev = true;
-    settings.http_addr = "127.0.0.1:8080".to_string();
-    settings.grpc_addr = "127.0.0.1:50051".to_string();
+    settings.agent_ca_key_path.clear();
     cases.push(Case {
-        name: "insecure dev in production",
+        name: "partial Agent signing CA",
         environment: "production",
         settings,
-        expected_error: Some("--insecure-dev is allowed only in development"),
+        expected_error: Some(
+            "CORE_AGENT_CA_CERT_PATH and CORE_AGENT_CA_KEY_PATH must be set together",
+        ),
     });
 
     let mut settings = production_security_settings();
-    settings.insecure_dev = true;
+    settings.grpc_tls_server_ca_path.clear();
     cases.push(Case {
-        name: "insecure dev on non-loopback",
-        environment: "development",
+        name: "Agent enrollment without explicit Core server CA",
+        environment: "production",
         settings,
-        expected_error: Some("--insecure-dev requires loopback HTTP and gRPC addresses"),
+        expected_error: Some("Agent enrollment requires CORE_GRPC_TLS_SERVER_CA_PATH"),
     });
+
+    let mut settings = production_security_settings();
+    settings.agent_capability_jwt_public_key_path.clear();
+    cases.push(Case {
+        name: "partial Agent capability signer",
+        environment: "production",
+        settings,
+        expected_error: Some(
+            "CORE_AGENT_CAPABILITY_JWT_PRIVATE_KEY_PATH and CORE_AGENT_CAPABILITY_JWT_PUBLIC_KEY_PATH must be set together",
+        ),
+    });
+
+    let mut settings = production_security_settings();
+    settings.agent_management_ca_path.clear();
+    cases.push(Case {
+        name: "partial Agent management client identity",
+        environment: "production",
+        settings,
+        expected_error: Some(
+            "CORE_AGENT_MANAGEMENT_CLIENT_CERT_PATH, CORE_AGENT_MANAGEMENT_CLIENT_KEY_PATH and CORE_AGENT_MANAGEMENT_CA_PATH must all be set together",
+        ),
+    });
+
+    let mut settings = production_security_settings();
+    settings.core_instance_id = Uuid::nil().to_string();
+    cases.push(Case {
+        name: "nil Core instance identity",
+        environment: "production",
+        settings,
+        expected_error: Some("CORE_INSTANCE_ID must be a non-nil canonical UUID"),
+    });
+
+    for ttl in [9, 121] {
+        let mut settings = production_security_settings();
+        settings.agent_capability_ttl_sec = ttl;
+        cases.push(Case {
+            name: "Agent capability TTL outside policy",
+            environment: "production",
+            settings,
+            expected_error: Some("CORE_AGENT_CAPABILITY_TTL_SEC must be between 10 and 120"),
+        });
+    }
+
+    let mut settings = production_security_settings();
+    settings.agent_ca_cert_path.clear();
+    settings.agent_ca_key_path.clear();
+    cases.push(Case {
+        name: "production without Agent signing CA",
+        environment: "production",
+        settings,
+        expected_error: Some("production requires the Agent signing CA"),
+    });
+
+    let mut settings = production_security_settings();
+    settings.http_addr = "127.0.0.1:8080".to_string();
+    settings.grpc_addr = "127.0.0.1:50051".to_string();
+    let error = crate::config::validate_security_policy("production", &settings, true)
+        .expect_err("insecure dev in production")
+        .to_string();
+    assert!(error.contains("--insecure-dev is allowed only in development"));
+
+    let settings = production_security_settings();
+    let error = crate::config::validate_security_policy("development", &settings, true)
+        .expect_err("insecure dev on non-loopback")
+        .to_string();
+    assert!(error.contains("--insecure-dev requires loopback HTTP and gRPC addresses"));
 
     cases.push(Case {
         name: "valid production TLS and mTLS",
@@ -368,7 +945,6 @@ fn security_policy_covers_production_tls_and_insecure_development_matrix() {
         http_addr: "127.0.0.1:8080".to_string(),
         grpc_addr: "127.0.0.1:50051".to_string(),
         auth_mode: AuthMode::Disabled,
-        insecure_dev: true,
         ..CoreSettings::default()
     };
     settings.http_tls_cert_path.clear();
@@ -376,15 +952,9 @@ fn security_policy_covers_production_tls_and_insecure_development_matrix() {
     settings.grpc_tls_cert_path.clear();
     settings.grpc_tls_key_path.clear();
     settings.grpc_tls_client_ca_path.clear();
-    cases.push(Case {
-        name: "valid development loopback insecure",
-        environment: "development",
-        settings,
-        expected_error: None,
-    });
+    crate::config::validate_security_policy("development", &settings, true)
+        .expect("valid development loopback insecure");
 
-    let mut settings = cases.last().unwrap().settings.clone();
-    settings.insecure_dev = false;
     cases.push(Case {
         name: "development plaintext gRPC without explicit insecure dev",
         environment: "development",
@@ -393,7 +963,8 @@ fn security_policy_covers_production_tls_and_insecure_development_matrix() {
     });
 
     for case in cases {
-        let result = crate::config::validate_security_policy(case.environment, &case.settings);
+        let result =
+            crate::config::validate_security_policy(case.environment, &case.settings, false);
         match case.expected_error {
             Some(expected) => {
                 let error = result.expect_err(case.name).to_string();
@@ -406,6 +977,81 @@ fn security_policy_covers_production_tls_and_insecure_development_matrix() {
             None => result.unwrap_or_else(|error| panic!("{}: {error:#}", case.name)),
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_unicode_streamserver_environment_fails_closed() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let _guard = CORE_CONFIG_ENVIRONMENT_LOCK.lock().unwrap();
+    let previous = std::env::var_os("STREAMSERVER_ENV");
+    unsafe {
+        std::env::set_var("STREAMSERVER_ENV", OsString::from_vec(vec![0xff]));
+    }
+    let error = Settings::load_with_insecure_dev(false)
+        .expect_err("non-Unicode STREAMSERVER_ENV must not default to development");
+    match previous {
+        Some(value) => unsafe { std::env::set_var("STREAMSERVER_ENV", value) },
+        None => unsafe { std::env::remove_var("STREAMSERVER_ENV") },
+    }
+    assert!(error.to_string().contains("valid Unicode"));
+}
+
+#[test]
+fn insecure_dev_config_key_is_rejected() -> anyhow::Result<()> {
+    let result = ::config::Config::builder()
+        .add_source(::config::File::from_str(
+            "insecure_dev = true",
+            ::config::FileFormat::Toml,
+        ))
+        .build()?
+        .try_deserialize::<CoreSettings>();
+
+    let error = result.expect_err("core.insecure_dev must not replace the CLI flag");
+    assert!(error.to_string().contains("insecure_dev"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn insecure_dev_environment_override_is_rejected() {
+    let _guard = CORE_CONFIG_ENVIRONMENT_LOCK.lock().unwrap();
+    let previous_environment = std::env::var_os("STREAMSERVER_ENV");
+    let previous_database_url = std::env::var_os("DATABASE_URL");
+    let previous_insecure_dev = std::env::var_os("CORE_INSECURE_DEV");
+    unsafe {
+        std::env::set_var("STREAMSERVER_ENV", "development");
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgresql://unused:unused@127.0.0.1:1/unused",
+        );
+        std::env::set_var("CORE_INSECURE_DEV", "true");
+    }
+
+    let result = Settings::load_with_insecure_dev(false);
+
+    unsafe {
+        match previous_environment {
+            Some(value) => std::env::set_var("STREAMSERVER_ENV", value),
+            None => std::env::remove_var("STREAMSERVER_ENV"),
+        }
+        match previous_database_url {
+            Some(value) => std::env::set_var("DATABASE_URL", value),
+            None => std::env::remove_var("DATABASE_URL"),
+        }
+        match previous_insecure_dev {
+            Some(value) => std::env::set_var("CORE_INSECURE_DEV", value),
+            None => std::env::remove_var("CORE_INSECURE_DEV"),
+        }
+    }
+
+    let error = result.expect_err("CORE_INSECURE_DEV must not replace the CLI flag");
+    assert!(
+        error
+            .to_string()
+            .contains("CORE_INSECURE_DEV is unsupported")
+    );
 }
 
 async fn tls_peer_address(PeerAddress(peer): PeerAddress) -> String {
@@ -550,7 +1196,8 @@ fn test_app_state(pool: sqlx::PgPool) -> AppState {
         started_at: Utc::now(),
         environment: "test".to_string(),
         auth: disabled_auth_config(),
-        http_client: Client::new(),
+        agent_identity: None,
+        agent_management: None,
         hook_shared_secret: String::new(),
         hook_source_allowlist: Vec::new(),
         zlm_auto_close_on_no_reader_enabled: false,
@@ -580,6 +1227,23 @@ fn test_app_state_with_local_auth(pool: sqlx::PgPool) -> anyhow::Result<AppState
     let mut state = test_app_state(pool);
     state.auth = AuthConfig::from_settings(&settings)?;
     Ok(state)
+}
+
+async fn authenticated_get_status(
+    app: &Router,
+    uri: &str,
+    access_token: &str,
+) -> anyhow::Result<StatusCode> {
+    Ok(app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+                .body(Body::empty())?,
+        )
+        .await?
+        .status())
 }
 
 async fn upsert_test_node(
@@ -632,6 +1296,93 @@ async fn upsert_test_node_with_ports(
             Utc::now(),
         )
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn authenticated_zlm_hook_handler_uses_session_node_id_as_server_id_and_real_business_logic()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let node_id = Uuid::now_v7();
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+    let handler = CoreZlmHookHandler::new(repository, false, Vec::new());
+
+    let response = control_plane::ZlmHookHandler::handle(
+        &handler,
+        control_plane::AuthenticatedZlmHook {
+            node_id,
+            hook_name: "on_server_started".to_string(),
+            body: json!({}),
+        },
+    )
+    .await;
+    assert_eq!(response.http_status, 200);
+    assert_eq!(response.body["code"], json!(0));
+
+    let row = sqlx::query(
+        "select server_id, payload from hook_events where hook_name = 'on_server_started'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(row.try_get::<String, _>("server_id")?, node_id.to_string());
+    assert_eq!(row.try_get::<Value, _>("payload")?, json!({}));
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_removes_direct_zlm_hook_routes_while_development_keeps_compatibility()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let node_id = Uuid::now_v7();
+    let server_id = format!("zlm-{node_id}");
+    upsert_test_node(
+        &repository,
+        node_id,
+        "http://127.0.0.1:65535",
+        "http://stream.example",
+    )
+    .await?;
+
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/internal/hooks/zlm/{server_id}/on_server_started"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .extension(ConnectInfo(
+                "127.0.0.1:19350"
+                    .parse::<SocketAddr>()
+                    .expect("loopback hook peer"),
+            ))
+            .body(Body::from("{}"))
+            .expect("hook request")
+    };
+
+    let mut production = test_app_state(db.pool.clone());
+    production.environment = "production".to_string();
+    let production_response = build_app(production).oneshot(request()).await?;
+    assert_eq!(production_response.status(), StatusCode::NOT_FOUND);
+
+    let mut development = test_app_state(db.pool.clone());
+    development.environment = "development".to_string();
+    let development_response = build_app(development).oneshot(request()).await?;
+    assert_eq!(development_response.status(), StatusCode::OK);
+    assert_eq!(json_body(development_response).await["code"], json!(0));
+
+    db.cleanup().await?;
     Ok(())
 }
 
@@ -2031,6 +2782,154 @@ async fn current_session_requires_bearer_token_when_auth_is_enabled() -> anyhow:
 }
 
 #[tokio::test]
+async fn external_jwt_ignores_local_claims_without_database_lookup() -> anyhow::Result<()> {
+    #[derive(serde::Serialize)]
+    struct ExternalClaims<'a> {
+        sub: &'a str,
+        role: auth::ApiRole,
+        #[serde(rename = "urn:streamserver:credential_version")]
+        credential_version: i64,
+        #[serde(rename = "urn:streamserver:must_change_password")]
+        must_change_password: bool,
+        jti: &'a str,
+        iat: i64,
+        nbf: i64,
+        exp: i64,
+    }
+
+    let now = Utc::now().timestamp();
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA),
+        &ExternalClaims {
+            sub: "external-admin",
+            role: auth::ApiRole::Admin,
+            credential_version: 999,
+            must_change_password: true,
+            jti: "external-local-claim-collision",
+            iat: now,
+            nbf: now,
+            exp: now + 300,
+        },
+        &jsonwebtoken::EncodingKey::from_ed_pem(TEST_ED25519_PRIVATE_KEY.as_bytes())?,
+    )?;
+    let pool = PgPoolOptions::new().connect_lazy("postgresql://postgres@127.0.0.1:1/postgres")?;
+    let mut state = test_app_state(pool);
+    state.auth = auth_config_from_public_key(true, TEST_ED25519_PUBLIC_KEY)?;
+    let response = build_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/me")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["must_change_password"], json!(false));
+    assert_eq!(body["permissions"][0], json!("task_read"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn bootstrap_status_reports_missing_for_a_truly_empty_database() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(false).await? else {
+        return Ok(());
+    };
+    let repository = TaskRepository::new(db.pool.clone());
+    let probe = repository
+        .bootstrap_admin_password_state("fresh-admin", Uuid::now_v7())
+        .await?;
+    assert_eq!(
+        probe.state,
+        repository::BootstrapAdminPasswordState::Missing
+    );
+    assert_eq!(probe.expected_version, Some(0));
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn bootstrap_status_handles_legacy_schema_and_fails_closed_on_partial_schema()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(false).await? else {
+        return Ok(());
+    };
+    sqlx::query(
+        r#"
+        create table auth_users (
+          username text primary key,
+          role text not null,
+          enabled boolean not null
+        )
+        "#,
+    )
+    .execute(&db.pool)
+    .await?;
+    let repository = TaskRepository::new(db.pool.clone());
+    let handoff_id = Uuid::now_v7();
+    let empty_legacy = repository
+        .bootstrap_admin_password_state("legacy-admin", handoff_id)
+        .await?;
+    assert_eq!(
+        empty_legacy.state,
+        repository::BootstrapAdminPasswordState::Missing
+    );
+    sqlx::query("insert into auth_users (username, role, enabled) values ($1, 'viewer', false)")
+        .bind("legacy-admin")
+        .execute(&db.pool)
+        .await?;
+    let occupied_target = repository
+        .bootstrap_admin_password_state("legacy-admin", handoff_id)
+        .await?;
+    assert_eq!(
+        occupied_target.state,
+        repository::BootstrapAdminPasswordState::Conflict
+    );
+    sqlx::query("delete from auth_users")
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(
+        "insert into auth_users (username, role, enabled) values ('other-admin', 'admin', true)",
+    )
+    .execute(&db.pool)
+    .await?;
+    let occupied_admin = repository
+        .bootstrap_admin_password_state("legacy-admin", handoff_id)
+        .await?;
+    assert_eq!(
+        occupied_admin.state,
+        repository::BootstrapAdminPasswordState::Conflict
+    );
+
+    sqlx::query("alter table auth_users add column bootstrap_handoff_id uuid")
+        .execute(&db.pool)
+        .await?;
+    assert!(
+        repository
+            .bootstrap_admin_password_state("legacy-admin", handoff_id)
+            .await
+            .is_err(),
+        "partially applied handoff schema must fail closed"
+    );
+    sqlx::query("drop table auth_users")
+        .execute(&db.pool)
+        .await?;
+    sqlx::query("create table auth_users (username text primary key)")
+        .execute(&db.pool)
+        .await?;
+    assert!(
+        repository
+            .bootstrap_admin_password_state("legacy-admin", handoff_id)
+            .await
+            .is_err(),
+        "unexpected legacy schemas must propagate their database error"
+    );
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -> anyhow::Result<()>
 {
     let Some(db) = require_test_database(true).await? else {
@@ -2038,17 +2937,219 @@ async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -
     };
     const USERNAME: &str = "bootstrap-admin";
     const INITIAL_PASSWORD: &str = "Initial-password-1";
+    const RECOVERED_PASSWORD_A: &str = "Recovered-password-A2";
+    const RECOVERED_PASSWORD_B: &str = "Recovered-password-B2";
+    const BARRIER_RECOVERY_PASSWORD: &str = "Barrier-recovery-3";
     const NEXT_PASSWORD: &str = "Changed-password-2";
+    const RACING_RECOVERY_PASSWORD: &str = "Must-not-overwrite-3";
+    const CONFLICT_USERNAME: &str = "unrelated-admin";
 
     let repository = TaskRepository::new(db.pool.clone());
-    repository
-        .create_bootstrap_admin(
-            USERNAME,
-            &hash_password(INITIAL_PASSWORD)?,
-            BOOTSTRAP_ADMIN_MUST_CHANGE_PASSWORD,
+    let handoff_id = Uuid::now_v7();
+    let missing_probe = repository
+        .bootstrap_admin_password_state(USERNAME, handoff_id)
+        .await?;
+    assert_eq!(
+        missing_probe.state,
+        repository::BootstrapAdminPasswordState::Missing
+    );
+    assert_eq!(missing_probe.expected_version, Some(0));
+    assert_eq!(
+        repository
+            .reconcile_bootstrap_admin_password(
+                USERNAME,
+                handoff_id,
+                0,
+                &hash_password(INITIAL_PASSWORD)?,
+            )
+            .await?,
+        repository::BootstrapAdminReconcileOutcome::Created
+    );
+    let pending_probe = repository
+        .bootstrap_admin_password_state(USERNAME, handoff_id)
+        .await?;
+    assert_eq!(
+        pending_probe.state,
+        repository::BootstrapAdminPasswordState::PendingPasswordChange
+    );
+    assert_eq!(pending_probe.expected_version, Some(1));
+    let user_before_recovery = repository
+        .find_auth_user_by_username(USERNAME)
+        .await?
+        .expect("created handoff administrator");
+    assert_eq!(user_before_recovery.credential_version, 1);
+
+    let repository_a = repository.clone();
+    let repository_b = repository.clone();
+    let hash_a = hash_password(RECOVERED_PASSWORD_A)?;
+    let hash_b = hash_password(RECOVERED_PASSWORD_B)?;
+    let (outcome_a, outcome_b) = tokio::join!(
+        repository_a.reconcile_bootstrap_admin_password(USERNAME, handoff_id, 1, &hash_a),
+        repository_b.reconcile_bootstrap_admin_password(USERNAME, handoff_id, 1, &hash_b),
+    );
+    let outcome_a = outcome_a?;
+    let outcome_b = outcome_b?;
+    assert!(matches!(
+        (outcome_a, outcome_b),
+        (
+            repository::BootstrapAdminReconcileOutcome::Recovered,
+            repository::BootstrapAdminReconcileOutcome::Stale
+        ) | (
+            repository::BootstrapAdminReconcileOutcome::Stale,
+            repository::BootstrapAdminReconcileOutcome::Recovered
+        )
+    ));
+    let recovered_password = if outcome_a == repository::BootstrapAdminReconcileOutcome::Recovered {
+        RECOVERED_PASSWORD_A
+    } else {
+        RECOVERED_PASSWORD_B
+    };
+    let app = build_app(test_app_state_with_local_auth(db.pool.clone())?);
+    let pre_barrier_login = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "username": USERNAME,
+                    "password": recovered_password,
+                }))?))?,
         )
         .await?;
-    let app = build_app(test_app_state_with_local_auth(db.pool.clone())?);
+    assert_eq!(pre_barrier_login.status(), StatusCode::OK);
+    let pre_barrier_login = json_body(pre_barrier_login).await;
+    let pre_barrier_access = pre_barrier_login["access_token"]
+        .as_str()
+        .expect("pre-recovery access token")
+        .to_string();
+    let pre_barrier_refresh = pre_barrier_login["refresh_token"]
+        .as_str()
+        .expect("pre-recovery refresh token")
+        .to_string();
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/me", &pre_barrier_access).await?,
+        StatusCode::OK,
+        "a current must-change token may inspect its own session"
+    );
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/tasks", &pre_barrier_access).await?,
+        StatusCode::FORBIDDEN,
+        "a must-change token may not call business APIs"
+    );
+    let pending_logout = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/auth/logout")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&json!({
+                    "refresh_token": pre_barrier_refresh,
+                }))?))?,
+        )
+        .await?;
+    assert_eq!(
+        pending_logout.status(),
+        StatusCode::NO_CONTENT,
+        "must-change users must remain able to log out"
+    );
+
+    let stale_login_inserted = repository
+        .insert_login_refresh_session(
+            repository::NewRefreshSession {
+                id: Uuid::now_v7(),
+                user_id: user_before_recovery.id,
+                token_hash: hash_refresh_token("stale-login-after-recovery"),
+                expires_at: Utc::now() + chrono::Duration::minutes(5),
+                created_at: Utc::now(),
+                client_ip: None,
+                user_agent: Some("stale-login-race".to_string()),
+            },
+            &user_before_recovery.password_hash,
+        )
+        .await?;
+    assert!(!stale_login_inserted);
+
+    let pending_probe = repository
+        .bootstrap_admin_password_state(USERNAME, handoff_id)
+        .await?;
+    assert_eq!(pending_probe.expected_version, Some(2));
+    let current_user = repository
+        .find_auth_user_by_username(USERNAME)
+        .await?
+        .expect("recovered handoff administrator");
+    assert_eq!(current_user.credential_version, 2);
+    let barrier_session_id = Uuid::now_v7();
+    let barrier_session_hash = hash_refresh_token("login-linearization-barrier");
+    let mut login_tx = db.pool.begin().await?;
+    sqlx::query_scalar::<_, Uuid>(
+        "select id from auth_users where id = $1 and password_hash = $2 for share",
+    )
+    .bind(current_user.id)
+    .bind(&current_user.password_hash)
+    .fetch_one(&mut *login_tx)
+    .await?;
+    sqlx::query(
+        r#"
+        insert into auth_refresh_sessions (
+          id, user_id, token_hash, expires_at, revoked_at, created_at,
+          updated_at, last_used_at, client_ip, user_agent
+        ) values ($1, $2, $3, $4, null, $5, $5, null, null, 'barrier')
+        "#,
+    )
+    .bind(barrier_session_id)
+    .bind(current_user.id)
+    .bind(&barrier_session_hash)
+    .bind(Utc::now() + chrono::Duration::minutes(5))
+    .bind(Utc::now())
+    .execute(&mut *login_tx)
+    .await?;
+    let barrier_repository = repository.clone();
+    let barrier_hash = hash_password(BARRIER_RECOVERY_PASSWORD)?;
+    let recovery_task = tokio::spawn(async move {
+        barrier_repository
+            .reconcile_bootstrap_admin_password(USERNAME, handoff_id, 2, &barrier_hash)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !recovery_task.is_finished(),
+        "recovery must wait for the login transaction's user row lock"
+    );
+    login_tx.commit().await?;
+    let interleaved_login_access = test_app_state_with_local_auth(db.pool.clone())?
+        .auth
+        .issue_access_token(
+            USERNAME,
+            auth::ApiRole::Admin,
+            current_user.credential_version,
+            current_user.must_change_password,
+        )?
+        .token;
+    assert_eq!(
+        recovery_task.await??,
+        repository::BootstrapAdminReconcileOutcome::Recovered
+    );
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/me", &pre_barrier_access).await?,
+        StatusCode::FORBIDDEN,
+        "bootstrap recovery must invalidate access tokens issued for the prior credential version"
+    );
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/me", &interleaved_login_access).await?,
+        StatusCode::FORBIDDEN,
+        "a token signed after the login transaction commits must still be stale if recovery wins before authorization"
+    );
+    assert!(
+        repository
+            .find_refresh_session(&barrier_session_hash)
+            .await?
+            .expect("barrier session remains auditable")
+            .revoked_at
+            .is_some()
+    );
 
     let login_response = app
         .clone()
@@ -2059,7 +3160,7 @@ async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_vec(&json!({
                     "username": USERNAME,
-                    "password": INITIAL_PASSWORD,
+                    "password": BARRIER_RECOVERY_PASSWORD,
                 }))?))?,
         )
         .await?;
@@ -2084,18 +3185,84 @@ async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
                 .body(Body::from(serde_json::to_vec(&json!({
-                    "current_password": INITIAL_PASSWORD,
+                    "current_password": BARRIER_RECOVERY_PASSWORD,
                     "new_password": NEXT_PASSWORD,
                 }))?))?,
         )
         .await?;
     assert_eq!(change_response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/me", &access_token).await?,
+        StatusCode::FORBIDDEN,
+        "changing the password must invalidate the access token used for the change"
+    );
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/tasks", &access_token).await?,
+        StatusCode::FORBIDDEN
+    );
 
     let user = repository
         .find_auth_user_by_username(USERNAME)
         .await?
         .expect("bootstrap administrator must exist");
     assert!(!user.must_change_password);
+    assert_eq!(user.credential_version, 4);
+    let complete_probe = repository
+        .bootstrap_admin_password_state(USERNAME, handoff_id)
+        .await?;
+    assert_eq!(
+        complete_probe.state,
+        repository::BootstrapAdminPasswordState::Complete
+    );
+    assert_eq!(complete_probe.expected_version, None);
+    assert_eq!(
+        repository
+            .reconcile_bootstrap_admin_password(
+                USERNAME,
+                handoff_id,
+                user.bootstrap_handoff_version,
+                &hash_password(RACING_RECOVERY_PASSWORD)?,
+            )
+            .await?,
+        repository::BootstrapAdminReconcileOutcome::AlreadyComplete
+    );
+    let completed_user = repository
+        .find_auth_user_by_username(USERNAME)
+        .await?
+        .expect("completed administrator must remain present");
+    assert!(verify_password(
+        &completed_user.password_hash,
+        NEXT_PASSWORD
+    )?);
+    assert!(!verify_password(
+        &completed_user.password_hash,
+        RACING_RECOVERY_PASSWORD
+    )?);
+    let unrelated_handoff_id = Uuid::now_v7();
+    let conflict_probe = repository
+        .bootstrap_admin_password_state(CONFLICT_USERNAME, unrelated_handoff_id)
+        .await?;
+    assert_eq!(
+        conflict_probe.state,
+        repository::BootstrapAdminPasswordState::Conflict
+    );
+    assert_eq!(
+        repository
+            .reconcile_bootstrap_admin_password(
+                CONFLICT_USERNAME,
+                unrelated_handoff_id,
+                0,
+                &hash_password(RACING_RECOVERY_PASSWORD)?,
+            )
+            .await?,
+        repository::BootstrapAdminReconcileOutcome::Conflict
+    );
+    assert!(
+        repository
+            .find_auth_user_by_username(CONFLICT_USERNAME)
+            .await?
+            .is_none()
+    );
     assert!(
         repository
             .find_refresh_session(&hash_refresh_token(&refresh_token))
@@ -2120,6 +3287,7 @@ async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -
     assert_eq!(stale_refresh_response.status(), StatusCode::FORBIDDEN);
 
     let next_login_response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2134,6 +3302,155 @@ async fn bootstrap_login_requires_change_and_password_change_revokes_refresh() -
     assert_eq!(next_login_response.status(), StatusCode::OK);
     let next_login_body = json_body(next_login_response).await;
     assert_eq!(next_login_body["must_change_password"], json!(false));
+    let next_access_token = next_login_body["access_token"]
+        .as_str()
+        .expect("post-change access token")
+        .to_string();
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/tasks", &next_access_token).await?,
+        StatusCode::OK,
+        "a current post-change token may call business APIs"
+    );
+
+    const RESET_PASSWORD: &str = "Reset-password-4";
+    repository
+        .reset_user_password(
+            USERNAME,
+            &hash_password(RESET_PASSWORD)?,
+            true,
+            "test-cli",
+            "password_reset",
+            None,
+            Some("credential-version-test"),
+        )
+        .await?;
+    assert_eq!(
+        repository
+            .find_auth_user_by_username(USERNAME)
+            .await?
+            .expect("reset administrator")
+            .credential_version,
+        5
+    );
+    assert_eq!(
+        authenticated_get_status(&app, "/api/v1/me", &next_access_token).await?,
+        StatusCode::FORBIDDEN,
+        "a password reset must invalidate already-issued access tokens"
+    );
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn change_password_and_bootstrap_recovery_are_linearized() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    const USERNAME: &str = "handoff-change-race";
+    const INITIAL_PASSWORD: &str = "Handoff-initial-1";
+    const CHANGED_PASSWORD: &str = "User-selected-2";
+    const RECOVERED_PASSWORD: &str = "Installer-recovered-3";
+
+    let repository = TaskRepository::new(db.pool.clone());
+    let handoff_id = Uuid::now_v7();
+    assert_eq!(
+        repository
+            .reconcile_bootstrap_admin_password(
+                USERNAME,
+                handoff_id,
+                0,
+                &hash_password(INITIAL_PASSWORD)?,
+            )
+            .await?,
+        repository::BootstrapAdminReconcileOutcome::Created
+    );
+    let user = repository
+        .find_auth_user_by_username(USERNAME)
+        .await?
+        .expect("race user");
+    let session_token_hash = hash_refresh_token("handoff-change-race-session");
+    assert!(
+        repository
+            .insert_login_refresh_session(
+                repository::NewRefreshSession {
+                    id: Uuid::now_v7(),
+                    user_id: user.id,
+                    token_hash: session_token_hash.clone(),
+                    expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    created_at: Utc::now(),
+                    client_ip: None,
+                    user_agent: Some("handoff-change-race".to_string()),
+                },
+                &user.password_hash,
+            )
+            .await?
+    );
+
+    let change_repository = repository.clone();
+    let recovery_repository = repository.clone();
+    let changed_hash = hash_password(CHANGED_PASSWORD)?;
+    let recovered_hash = hash_password(RECOVERED_PASSWORD)?;
+    let expected_hash = user.password_hash.clone();
+    let (change_outcome, recovery_outcome) = tokio::join!(
+        change_repository.change_user_password(
+            USERNAME,
+            &expected_hash,
+            Some(handoff_id),
+            1,
+            &changed_hash,
+            USERNAME,
+            None,
+            Some("race-test"),
+        ),
+        recovery_repository.reconcile_bootstrap_admin_password(
+            USERNAME,
+            handoff_id,
+            1,
+            &recovered_hash,
+        ),
+    );
+    let change_outcome = change_outcome?;
+    let recovery_outcome = recovery_outcome?;
+    let final_user = repository
+        .find_auth_user_by_username(USERNAME)
+        .await?
+        .expect("linearized race user");
+    let final_probe = repository
+        .bootstrap_admin_password_state(USERNAME, handoff_id)
+        .await?;
+    match (change_outcome, recovery_outcome) {
+        (true, repository::BootstrapAdminReconcileOutcome::AlreadyComplete) => {
+            assert!(verify_password(
+                &final_user.password_hash,
+                CHANGED_PASSWORD
+            )?);
+            assert_eq!(
+                final_probe.state,
+                repository::BootstrapAdminPasswordState::Complete
+            );
+        }
+        (false, repository::BootstrapAdminReconcileOutcome::Recovered) => {
+            assert!(verify_password(
+                &final_user.password_hash,
+                RECOVERED_PASSWORD
+            )?);
+            assert_eq!(
+                final_probe.state,
+                repository::BootstrapAdminPasswordState::PendingPasswordChange
+            );
+            assert_eq!(final_probe.expected_version, Some(2));
+        }
+        outcomes => panic!("password change/recovery race was not linearized: {outcomes:?}"),
+    }
+    assert!(
+        repository
+            .find_refresh_session(&session_token_hash)
+            .await?
+            .expect("race session remains auditable")
+            .revoked_at
+            .is_some()
+    );
 
     db.cleanup().await?;
     Ok(())
@@ -2900,7 +4217,7 @@ async fn publish_lookup_requires_binding_when_node_has_multiple_media_servers() 
 }
 
 #[tokio::test]
-async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::Result<()> {
+async fn list_streams_does_not_use_self_reported_zlm_control_address() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -2940,32 +4257,9 @@ async fn list_streams_enriches_viewer_count_and_play_urls_from_zlm() -> anyhow::
     let body = json_body(response).await;
     let items = body.as_array().expect("streams should be a list");
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["viewer_count"], json!(3));
-    assert_eq!(items[0]["has_viewer"], json!(true));
-    assert!(items[0]["bitrate_kbps"].as_f64().unwrap_or_default() >= 32.0);
-    let play_urls = items[0]["play_urls"]
-        .as_array()
-        .expect("play_urls should be a list");
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "rtsp://stream.example:554/live/camera01")
-    );
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "rtmp://stream.example:1935/live/camera01")
-    );
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "http://stream.example/live/camera01.live.flv")
-    );
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "http://stream.example/live/camera01/hls.m3u8")
-    );
+    assert!(items[0].get("viewer_count").is_none());
+    assert!(items[0].get("bitrate_kbps").is_none());
+    assert_ne!(items[0]["has_viewer"], json!(true));
 
     zlm_handle.abort();
     db.cleanup().await?;
@@ -3033,7 +4327,7 @@ async fn list_streams_orders_by_stream_or_task_created_at_desc() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn list_streams_uses_current_node_stream_ports() -> anyhow::Result<()> {
+async fn list_streams_does_not_probe_self_reported_zlm_for_play_schemas() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -3081,29 +4375,8 @@ async fn list_streams_uses_current_node_stream_ports() -> anyhow::Result<()> {
     let body = json_body(response).await;
     let items = body.as_array().expect("streams should be a list");
     assert_eq!(items.len(), 1);
-    let play_urls = items[0]["play_urls"]
-        .as_array()
-        .expect("play_urls should be a list");
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "rtsp://stream.example:9554/live/camera01")
-    );
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "rtmp://stream.example:2935/live/camera01")
-    );
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "http://stream.example:18080/live/camera01.live.flv")
-    );
-    assert!(
-        play_urls
-            .iter()
-            .any(|value| value == "http://stream.example:18080/live/camera01/hls.m3u8")
-    );
+    assert!(items[0].get("viewer_count").is_none());
+    assert!(items[0].get("bitrate_kbps").is_none());
 
     zlm_handle.abort();
     db.cleanup().await?;
@@ -3451,13 +4724,12 @@ async fn callback_dispatcher_waits_for_record_artifact_before_first_terminal_cal
             .iter()
             .any(|value| value == "rtsp://stream.example:554/live/camera01")
     );
-    assert_eq!(
+    assert!(
         delivered_calls[0]
             .0
             .get("X-StreamServer-Signature")
             .and_then(|value| value.to_str().ok())
-            .is_some(),
-        true
+            .is_some()
     );
     assert_eq!(
         delivered_calls[0].1["records"][0]["http_url"],
@@ -5907,7 +7179,8 @@ async fn list_file_artifacts_returns_stream_ingest_fast_record_outputs() -> anyh
 }
 
 #[tokio::test]
-async fn list_streams_omits_stale_entries_when_runtime_lookup_succeeds() -> anyhow::Result<()> {
+async fn list_streams_keeps_database_entries_without_authenticated_runtime_lookup()
+-> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -5942,8 +7215,12 @@ async fn list_streams_omits_stale_entries_when_runtime_lookup_succeeds() -> anyh
     assert_eq!(response.status(), StatusCode::OK);
     let body = json_body(response).await;
     let items = body.as_array().expect("streams should be a list");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0]["stream"], json!("camera01"));
+    assert_eq!(items.len(), 2);
+    let streams = items
+        .iter()
+        .map(|item| item["stream"].as_str().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(streams, BTreeSet::from(["camera01", "camera02"]));
 
     zlm_handle.abort();
     db.cleanup().await?;
@@ -6201,7 +7478,7 @@ async fn debug_hooks_route_filters_by_node() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn debug_zlm_snap_returns_data_url() -> anyhow::Result<()> {
+async fn debug_zlm_snap_rejects_legacy_self_reported_control_address() -> anyhow::Result<()> {
     let Some(db) = require_test_database(true).await? else {
         return Ok(());
     };
@@ -6222,19 +7499,32 @@ async fn debug_zlm_snap_returns_data_url() -> anyhow::Result<()> {
                 .body(Body::empty())?,
         )
         .await?;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert_eq!(body["content_type"], json!("image/jpeg"));
-    assert!(
-        body["data_url"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("data:image/jpeg;base64,")
-    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
 
     zlm_handle.abort();
     db.cleanup().await?;
     Ok(())
+}
+
+#[test]
+fn core_zlm_debug_has_no_direct_url_secret_or_repository_target_path() {
+    let main_source = include_str!("../main.rs");
+    let repository_source = include_str!("../repository_nodes.rs");
+    for forbidden in [
+        "fn build_zlm_debug_url",
+        "async fn call_zlm_binary_api",
+        ".get_node_debug_target(",
+        "zlm_api_secret.trim()",
+    ] {
+        assert!(
+            !main_source.contains(forbidden),
+            "Core ZLM debug path must not contain {forbidden}"
+        );
+    }
+    assert!(
+        !repository_source.contains("pub async fn get_node_debug_target"),
+        "legacy self-reported ZLM target lookup must be deleted"
+    );
 }
 
 #[tokio::test]

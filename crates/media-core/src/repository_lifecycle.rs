@@ -1,7 +1,5 @@
 //! 任务生命周期仓储：处理启动、停止、取消、重试、克隆和重新入队等用户操作。
 
-use std::str::FromStr;
-
 use chrono::Utc;
 use media_domain::{AttemptStatus, EventSource, StartMode, TaskOperation, TaskSpec, TaskStatus};
 use serde::{Deserialize, Serialize};
@@ -10,9 +8,6 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::{AttemptSummary, RepoError, TaskRepository, TaskSummary, task_summary_transcode_mode};
-
-const DISPATCH_RECLAIM_GRACE_SECS: i64 = 10;
-const RUNTIME_RECLAIM_GRACE_SECS: i64 = 60;
 
 impl TaskRepository {
     pub async fn transition_task(
@@ -229,83 +224,6 @@ impl TaskRepository {
         .await?;
 
         Ok(row.and_then(|row| row.try_get::<Option<Uuid>, _>("node_id").ok().flatten()))
-    }
-
-    pub async fn mark_tasks_reclaiming_for_disconnected_node(
-        &self,
-        node_id: Uuid,
-    ) -> Result<(), RepoError> {
-        let rows = sqlx::query(
-            r#"
-            select id, status::text as status, current_attempt_no
-             from tasks
-             where assigned_node_id = $1
-               and current_attempt_no > 0
-               and status in ('DISPATCHING', 'STARTING', 'RUNNING', 'STOPPING', 'RECOVERING')
-             order by updated_at asc
-            "#,
-        )
-        .bind(node_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        for row in rows {
-            let task_id: Uuid = row.try_get("id")?;
-            let attempt_no: i32 = row.try_get("current_attempt_no")?;
-            let status = TaskStatus::from_str(&row.try_get::<String, _>("status")?)?;
-            let now = Utc::now();
-            let reclaim_deadline_at = now
-                + if status == TaskStatus::Dispatching {
-                    chrono::Duration::seconds(DISPATCH_RECLAIM_GRACE_SECS)
-                } else {
-                    chrono::Duration::seconds(RUNTIME_RECLAIM_GRACE_SECS)
-                };
-            let mut tx = self.pool.begin().await?;
-            let updated = sqlx::query(
-                r#"
-                update tasks
-                   set status = 'RECLAIMING'::task_status,
-                       reclaim_deadline_at = $1,
-                       updated_at = $2,
-                       finished_at = null
-                 where id = $3
-                   and current_attempt_no = $4
-                   and status = $5::task_status
-                "#,
-            )
-            .bind(reclaim_deadline_at)
-            .bind(now)
-            .bind(task_id)
-            .bind(attempt_no)
-            .bind(status.as_str())
-            .execute(&mut *tx)
-            .await?;
-            if updated.rows_affected() == 0 {
-                tx.commit().await?;
-                continue;
-            }
-
-            self.insert_event(
-                &mut tx,
-                task_id,
-                None,
-                Some(attempt_no),
-                EventSource::Core,
-                "task_reclaiming_after_node_disconnect",
-                "warn",
-                json!({
-                    "node_id": node_id,
-                    "attempt_no": attempt_no,
-                    "from": status,
-                    "to": TaskStatus::Reclaiming,
-                    "reclaim_deadline_at": reclaim_deadline_at,
-                }),
-            )
-            .await?;
-            tx.commit().await?;
-        }
-
-        Ok(())
     }
 
     pub async fn clone_task(

@@ -22,8 +22,9 @@ use crate::{
     config::AgentSettings,
     runtime::{ExecutorError, RuntimeCapabilityHints, StartTaskRequest, SuccessCheck},
     runtime_events::{
-        RuntimeEventSink, RuntimeNotification, RuntimeTaskEvent, read_log_stream,
-        read_progress_stream, runtime_session_epoch,
+        RuntimeEventSink, RuntimeLogStreamContext, RuntimeNotification,
+        RuntimeProgressStreamContext, RuntimeTaskEvent, read_log_stream, read_progress_stream,
+        runtime_session_epoch,
     },
     runtime_io::render_command_line,
     runtime_manager::RuntimeMonitorHandle,
@@ -42,7 +43,7 @@ use crate::{
         schedule_force_kill_processes_if_running, signal_process,
     },
     runtime_process_exit::{ProcessExitMonitorContext, spawn_process_exit_monitor},
-    runtime_process_monitors::spawn_companion_process_monitor,
+    runtime_process_monitors::{CompanionProcessMonitorContext, spawn_companion_process_monitor},
 };
 
 const START_ROLLBACK_FORCE_KILL_DELAY: Duration = Duration::from_millis(250);
@@ -580,16 +581,18 @@ pub(crate) fn spawn_process_stream_readers(
         tokio::spawn(async move {
             read_progress_stream(
                 stdout,
-                runtime_id,
-                progress_handle.task_id,
-                progress_handle.attempt_no,
-                runtime_lease_token(&progress_handle).unwrap_or_default(),
-                require_stream_online,
-                work_dir,
-                runtime_log_max_file_bytes,
-                runtime_log_tail_bytes,
-                events,
-                monitor_handle,
+                RuntimeProgressStreamContext {
+                    runtime_id,
+                    task_id: progress_handle.task_id,
+                    attempt_no: progress_handle.attempt_no,
+                    lease_token: runtime_lease_token(&progress_handle).unwrap_or_default(),
+                    require_stream_online,
+                    work_dir,
+                    max_file_bytes: runtime_log_max_file_bytes,
+                    tail_bytes: runtime_log_tail_bytes,
+                    events,
+                    monitor_handle,
+                },
             )
             .await;
         });
@@ -599,15 +602,17 @@ pub(crate) fn spawn_process_stream_readers(
         tokio::spawn(async move {
             read_log_stream(
                 stderr,
-                log_handle.task_id,
-                log_handle.attempt_no,
-                runtime_lease_token(&log_handle).unwrap_or_default(),
-                runtime_session_epoch(&log_handle),
-                "stderr".to_string(),
-                work_dir,
-                runtime_log_max_file_bytes,
-                runtime_log_tail_bytes,
-                events,
+                RuntimeLogStreamContext {
+                    task_id: log_handle.task_id,
+                    attempt_no: log_handle.attempt_no,
+                    lease_token: runtime_lease_token(&log_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&log_handle),
+                    stream: "stderr".to_string(),
+                    work_dir,
+                    max_file_bytes: runtime_log_max_file_bytes,
+                    tail_bytes: runtime_log_tail_bytes,
+                    events,
+                },
             )
             .await;
         });
@@ -739,29 +744,33 @@ fn start_prepared_companion_monitors(
         tokio::spawn(async move {
             read_log_stream(
                 stderr,
-                recording_log_handle.task_id,
-                recording_log_handle.attempt_no,
-                runtime_lease_token(&recording_log_handle).unwrap_or_default(),
-                runtime_session_epoch(&recording_log_handle),
-                "recording_stderr".to_string(),
-                work_dir,
-                runtime_log_max_file_bytes,
-                runtime_log_tail_bytes,
-                events,
+                RuntimeLogStreamContext {
+                    task_id: recording_log_handle.task_id,
+                    attempt_no: recording_log_handle.attempt_no,
+                    lease_token: runtime_lease_token(&recording_log_handle).unwrap_or_default(),
+                    session_epoch: runtime_session_epoch(&recording_log_handle),
+                    stream: "recording_stderr".to_string(),
+                    work_dir,
+                    max_file_bytes: runtime_log_max_file_bytes,
+                    tail_bytes: runtime_log_tail_bytes,
+                    events,
+                },
             )
             .await;
         });
     }
 
     spawn_companion_process_monitor(
-        runtime_id,
-        handle.task_id,
-        handle.attempt_no,
-        companion.process.pid,
-        companion.plan,
-        monitor_plan.work_dir.clone(),
-        monitor_plan.success_check.clone(),
-        monitor_handle,
+        CompanionProcessMonitorContext {
+            runtime_id,
+            task_id: handle.task_id,
+            attempt_no: handle.attempt_no,
+            companion_pid: companion.process.pid,
+            companion_plan: companion.plan,
+            work_dir: monitor_plan.work_dir.clone(),
+            success_check: monitor_plan.success_check.clone(),
+            monitor_handle,
+        },
         companion.child,
     );
 }

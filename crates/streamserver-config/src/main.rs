@@ -63,9 +63,10 @@ const MANAGED_ORDER: &[&str] = &[
     "AGENT_NODE_NAME",
     "PUBLIC_HOST",
     "AGENT_STREAM_ADDR",
-    "ZLM_API_HOST",
     "ZLM_API_BASE",
     "AGENT_HTTP_PORT",
+    "AGENT_MANAGEMENT_PORT",
+    "AGENT_ZLM_HOOK_PORT",
     "ZLM_HTTP_PORT",
     "ZLM_HTTPS_PORT",
     "ZLM_RTMP_PORT",
@@ -312,7 +313,7 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
             FieldDef {
                 key: "INSTANCE_NAME",
                 label: "实例名称",
-                kind: FieldKind::Text,
+                kind: FieldKind::ReadOnly,
                 scope: FieldScope::All,
                 help: "用于区分同一台机器上的不同 native 实例。同机多套部署时不要重复；只能使用字母、数字、横线 -、下划线 _、点 .、@，并以字母或数字开头。",
             },
@@ -373,18 +374,11 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 help: "跟随主网卡 IP 自动更新，用于播放地址。需要变更时请选择主网卡。",
             },
             FieldDef {
-                key: "ZLM_API_HOST",
-                label: "流媒体服务 API 地址",
-                kind: FieldKind::ReadOnly,
-                scope: FieldScope::Agent,
-                help: "跟随主网卡 IP 自动更新，用于控制面访问该节点流媒体服务接口。",
-            },
-            FieldDef {
                 key: "AGENT_PRIMARY_INTERFACE_NAME",
                 label: "主网卡",
                 kind: FieldKind::Interface(InterfaceTarget::Primary),
                 scope: FieldScope::Agent,
-                help: "普通网络流量优先使用的网卡。选择后会同时写入网卡名、IP、对外访问地址和流媒体服务 API 地址。",
+                help: "普通网络流量优先使用的网卡。选择后会同时写入网卡名、IP 和客户端播放使用的对外访问地址；ZLM 管理接口始终只由本机 Agent 通过 loopback 访问。",
             },
             FieldDef {
                 key: "AGENT_MULTICAST_INTERFACE_NAME",
@@ -457,6 +451,20 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 kind: FieldKind::Text,
                 scope: FieldScope::Agent,
                 help: "工作节点健康检查和本地接口使用的端口。host 网络下不能和本机已有服务冲突。",
+            },
+            FieldDef {
+                key: "AGENT_MANAGEMENT_PORT",
+                label: "工作节点管理端口",
+                kind: FieldKind::Text,
+                scope: FieldScope::Agent,
+                help: "Core 通过 mTLS 访问工作节点上传、删除等管理接口的端口。",
+            },
+            FieldDef {
+                key: "AGENT_ZLM_HOOK_PORT",
+                label: "ZLM Hook 本机入口端口",
+                kind: FieldKind::Text,
+                scope: FieldScope::Agent,
+                help: "只监听 loopback，由本机 ZLMediaKit 提交 Hook；不能对外暴露。",
             },
             FieldDef {
                 key: "ZLM_HTTP_PORT",
@@ -766,6 +774,7 @@ impl ConfigApp {
         } else {
             BTreeMap::new()
         };
+        let migrated_legacy_zlm_control = zlm_control_endpoint_needs_migration(&values);
         let mut interfaces = discover_interfaces();
         add_existing_interfaces(&mut interfaces, &values);
         apply_defaults(&mut values, &interfaces);
@@ -789,7 +798,11 @@ impl ConfigApp {
             uninstall_confirm: None,
             uninstall_task: None,
             restart_prompt_enabled: true,
-            message: "Enter 选择/编辑，Tab 切换页面，S 保存，Q 退出".to_string(),
+            message: if migrated_legacy_zlm_control {
+                "检测到旧版 ZLM 管理地址；已在编辑视图固定为本机 loopback，请按 S 保存".to_string()
+            } else {
+                "Enter 选择/编辑，Tab 切换页面，S 保存，Q 退出".to_string()
+            },
             storage_confirmed: false,
         })
     }
@@ -825,7 +838,7 @@ impl ConfigApp {
     fn set(&mut self, key: &str, value: impl Into<String>) {
         let value = value.into();
         // 安装角色和 CPU/GPU 基线由安装包决定，TUI 只允许修改附加配置。
-        if matches!(key, "INSTALL_ROLE" | "AGENT_ACCELERATION_MODE") {
+        if is_installer_identity_key(key) || key == "AGENT_ACCELERATION_MODE" {
             self.message = "该项由安装器决定，配置模块只展示不修改".to_string();
             return;
         }
@@ -863,7 +876,8 @@ impl ConfigApp {
     fn apply_env_overrides(&mut self) {
         // 非交互场景允许用环境变量覆盖 .env，但跳过安装器固定的内部字段。
         for key in MANAGED_ORDER {
-            if matches!(*key, "INSTALL_ROLE" | "AGENT_ACCELERATION_MODE")
+            if is_installer_identity_key(key)
+                || *key == "AGENT_ACCELERATION_MODE"
                 || is_hidden_fixed_key(key)
             {
                 continue;
@@ -1470,22 +1484,89 @@ fn write_env_file(path: &Path, values: &BTreeMap<String, String>) -> anyhow::Res
         push_env_entry(&mut output, key, value)?;
     }
 
-    fs::write(path, output).with_context(|| format!("failed to write {}", path.display()))
+    write_env_bytes_atomically(path, output.as_bytes())
+}
+
+fn write_env_bytes_atomically(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("{} must be a regular file, not a symlink", path.display());
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("streamserver.env");
+        let mut temporary_path = None;
+        let mut temporary_file = None;
+        for attempt in 0..64_u32 {
+            let candidate = parent.join(format!(
+                ".{file_name}.tmp.{}.{}",
+                std::process::id(),
+                attempt
+            ));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    temporary_path = Some(candidate);
+                    temporary_file = Some(file);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("failed to create temporary env file"),
+            }
+        }
+        let temporary_path = temporary_path
+            .ok_or_else(|| anyhow::anyhow!("failed to allocate a temporary env file"))?;
+        let result = (|| -> anyhow::Result<()> {
+            let mut file = temporary_file.expect("temporary file accompanies its path");
+            file.write_all(contents)?;
+            file.sync_all()?;
+            drop(file);
+            if let Ok(metadata) = fs::symlink_metadata(path) {
+                if metadata.file_type().is_symlink() {
+                    bail!("{} became a symlink during save", path.display());
+                }
+            }
+            fs::rename(&temporary_path, path)
+                .with_context(|| format!("failed to replace {}", path.display()))?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary_path);
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    }
 }
 
 fn push_env_entry(output: &mut String, key: &str, value: &str) -> anyhow::Result<()> {
     output.push_str(key);
     output.push('=');
-    if value.contains('\n') {
-        if value.contains('\'') {
-            bail!("{key} contains a single quote and cannot be written as a multiline value");
-        }
-        output.push('\'');
-        output.push_str(value);
-        output.push('\'');
-    } else {
-        output.push_str(value);
+    if value.contains('\'') {
+        bail!("{key} contains a single quote and cannot be written safely");
     }
+    output.push('\'');
+    output.push_str(value);
+    output.push('\'');
     output.push('\n');
     Ok(())
 }
@@ -1543,6 +1624,9 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
     }
 
     if values_have_worker(values) {
+        // A worker never receives the Core-facing callback credential. Its
+        // local ZLM API and Agent hook use independent installer-managed keys.
+        values.remove("HOOK_SHARED_SECRET");
         let default_host = default_interface(interfaces)
             .map(|interface| interface.ip.clone())
             .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -1553,7 +1637,7 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
     }
 
     if values_have_agent(values) {
-        // Agent 默认使用主网卡地址作为对外访问地址和本机 ZLM API 绑定地址。
+        // PUBLIC_HOST 只用于客户端媒体地址；ZLM 管理 API 只允许本机 Agent 走 loopback。
         default_if_missing(values, "NODE_ID", &generate_uuid());
         default_if_missing(values, "AGENT_NODE_NAME", &default_hostname());
         default_interface_values(values, interfaces);
@@ -1562,11 +1646,16 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
             .filter(|value| !value.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| "127.0.0.1".to_string());
-        values.insert("PUBLIC_HOST".to_string(), primary_ip.clone());
-        values.insert("ZLM_API_HOST".to_string(), primary_ip);
+        values.insert("PUBLIC_HOST".to_string(), primary_ip);
         default_if_missing(values, "AGENT_HTTP_PORT", "8081");
+        default_if_missing(values, "AGENT_MANAGEMENT_PORT", "8443");
+        default_if_missing(values, "AGENT_ZLM_HOOK_PORT", "18082");
         default_zlm_ports(values);
         sync_agent_endpoint_urls(values);
+        values.insert(
+            "ZLM_API_ALLOW_IP_RANGE".to_string(),
+            "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255".to_string(),
+        );
         default_if_missing(values, "ZLM_WWW_MOUNT_HOST_DIR", &legacy_www_mount_host_dir);
         default_if_missing(
             values,
@@ -1591,6 +1680,22 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         );
         default_if_missing(values, "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC", "30");
         default_if_missing(values, "WORK_ROOT", "/data/media/work");
+    } else {
+        // 纯 control-plane 不再持有任何节点 ZLM 直连地址或 Agent-local
+        // hook listener secret. These fields belong only on worker hosts.
+        for key in [
+            "ZLM_API_BASE",
+            "ZLM_API_SECRET",
+            "ZLM_API_ALLOW_IP_RANGE",
+            "AGENT_ZLM_HOOK_PORT",
+            "AGENT_ZLM_HOOK_ADDR",
+            "ZLM_HOOK_BASE",
+            "ZLM_HOOK_SHARED_SECRET",
+            "AGENT_ZLM_HOOK_QUEUE_CAPACITY",
+            "AGENT_ZLM_HOOK_TIMEOUT_SEC",
+        ] {
+            values.remove(key);
+        }
     }
 }
 
@@ -1622,37 +1727,33 @@ pub(crate) fn native_unit_basename(values: &BTreeMap<String, String>) -> String 
 
 fn default_native_systemd_units(values: &mut BTreeMap<String, String>) {
     let unit_base = native_unit_basename(values);
-    default_if_missing(values, "SYSTEMD_TARGET", &format!("{unit_base}.target"));
-    default_if_missing(
-        values,
-        "SYSTEMD_CORE_UNIT",
-        &format!("{unit_base}-core.service"),
+    values.insert("SYSTEMD_TARGET".to_string(), format!("{unit_base}.target"));
+    values.insert(
+        "SYSTEMD_CORE_UNIT".to_string(),
+        format!("{unit_base}-core.service"),
     );
-    default_if_missing(
-        values,
-        "SYSTEMD_AGENT_UNIT",
-        &format!("{unit_base}-agent.service"),
+    values.insert(
+        "SYSTEMD_AGENT_UNIT".to_string(),
+        format!("{unit_base}-agent.service"),
     );
-    default_if_missing(
-        values,
-        "SYSTEMD_ZLM_UNIT",
-        &format!("{unit_base}-zlm.service"),
+    values.insert(
+        "SYSTEMD_ZLM_UNIT".to_string(),
+        format!("{unit_base}-zlm.service"),
     );
-    default_if_missing(
-        values,
-        "SYSTEMD_POSTGRES_UNIT",
-        &format!("{unit_base}-postgres.service"),
+    values.insert(
+        "SYSTEMD_POSTGRES_UNIT".to_string(),
+        format!("{unit_base}-postgres.service"),
     );
 }
 
 fn sync_primary_interface_followers(values: &mut BTreeMap<String, String>) {
+    values.remove("ZLM_API_HOST");
     if let Some(primary_ip) = values
         .get("AGENT_PRIMARY_INTERFACE_IP")
         .filter(|value| !value.trim().is_empty())
         .cloned()
     {
-        values.insert("PUBLIC_HOST".to_string(), primary_ip.clone());
-        values.insert("ZLM_API_HOST".to_string(), primary_ip);
+        values.insert("PUBLIC_HOST".to_string(), primary_ip);
         sync_agent_endpoint_urls(values);
     }
 }
@@ -1661,6 +1762,7 @@ fn sync_agent_endpoint_urls(values: &mut BTreeMap<String, String>) {
     if !values_have_agent(values) {
         return;
     }
+    values.remove("ZLM_API_HOST");
 
     let zlm_http_port = values
         .get("ZLM_HTTP_PORT")
@@ -1672,20 +1774,54 @@ fn sync_agent_endpoint_urls(values: &mut BTreeMap<String, String>) {
         .filter(|value| !value.trim().is_empty())
         .cloned()
         .unwrap_or_else(|| "127.0.0.1".to_string());
-    let zlm_api_host = values
-        .get("ZLM_API_HOST")
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| public_host.clone());
-
     values.insert(
         "AGENT_STREAM_ADDR".to_string(),
         http_base_url(&public_host, &zlm_http_port),
     );
     values.insert(
         "ZLM_API_BASE".to_string(),
-        http_base_url(&zlm_api_host, &zlm_http_port),
+        http_base_url("127.0.0.1", &zlm_http_port),
     );
+    let management_port = values
+        .get("AGENT_MANAGEMENT_PORT")
+        .filter(|value| !value.trim().is_empty())
+        .map(String::as_str)
+        .unwrap_or("8443");
+    values.insert(
+        "AGENT_MANAGEMENT_ADDR".to_string(),
+        format!("0.0.0.0:{}", management_port.trim()),
+    );
+    let hook_port = values
+        .get("AGENT_ZLM_HOOK_PORT")
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| "18082".to_string());
+    values.insert(
+        "AGENT_ZLM_HOOK_ADDR".to_string(),
+        format!("127.0.0.1:{}", hook_port.trim()),
+    );
+    values.insert(
+        "ZLM_HOOK_BASE".to_string(),
+        format!("http://127.0.0.1:{}/internal/zlm-hooks", hook_port.trim()),
+    );
+}
+
+fn zlm_control_endpoint_needs_migration(values: &BTreeMap<String, String>) -> bool {
+    let has_legacy_host = values.contains_key("ZLM_API_HOST");
+    if values_have_agent(values) {
+        let port = values
+            .get("ZLM_HTTP_PORT")
+            .filter(|value| !value.trim().is_empty())
+            .map(String::as_str)
+            .unwrap_or("80");
+        let expected = http_base_url("127.0.0.1", port);
+        has_legacy_host
+            || values
+                .get("ZLM_API_BASE")
+                .is_none_or(|actual| actual != &expected)
+    } else {
+        has_legacy_host || values.contains_key("ZLM_API_BASE")
+    }
 }
 
 fn http_base_url(host: &str, port: &str) -> String {
@@ -1939,7 +2075,20 @@ fn is_legacy_allocation_key(key: &str) -> bool {
 }
 
 fn is_removed_env_key(key: &str) -> bool {
-    key == "AGENT_MAX_RUNTIME_SLOTS" || is_legacy_allocation_key(key)
+    matches!(key, "AGENT_MAX_RUNTIME_SLOTS" | "ZLM_API_HOST") || is_legacy_allocation_key(key)
+}
+
+fn is_installer_identity_key(key: &str) -> bool {
+    matches!(
+        key,
+        "INSTALL_ROLE"
+            | "INSTANCE_NAME"
+            | "SYSTEMD_TARGET"
+            | "SYSTEMD_CORE_UNIT"
+            | "SYSTEMD_AGENT_UNIT"
+            | "SYSTEMD_ZLM_UNIT"
+            | "SYSTEMD_POSTGRES_UNIT"
+    )
 }
 
 fn is_hidden_fixed_key(key: &str) -> bool {
@@ -2050,7 +2199,6 @@ fn required_text_field(key: &str) -> bool {
             | "NODE_ID"
             | "AGENT_NODE_NAME"
             | "PUBLIC_HOST"
-            | "ZLM_API_HOST"
             | "ZLM_WWW_MOUNT_HOST_DIR"
             | "ZLM_OUTPUT_MOUNT_HOST_DIR"
             | "AGENT_MAX_LIVE_RUNTIME_SLOTS"
@@ -2080,6 +2228,7 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
     if !choice_contains(INSTALL_ROLE_CHOICES, role) {
         bail!("INSTALL_ROLE must be one of the supported roles");
     }
+    validate_native_identity_mapping(values)?;
 
     if values_have_agent(values) {
         let network_mode = values
@@ -2089,6 +2238,19 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
         if network_mode != "host" {
             bail!("AGENT_NETWORK_MODE is fixed to host");
         }
+        if values.contains_key("ZLM_API_HOST") {
+            bail!("ZLM_API_HOST is obsolete; Agent ZLM control is loopback-only");
+        }
+        let zlm_http_port = values
+            .get("ZLM_HTTP_PORT")
+            .map(String::as_str)
+            .unwrap_or("80");
+        let expected_zlm_api_base = http_base_url("127.0.0.1", zlm_http_port);
+        if values.get("ZLM_API_BASE").map(String::as_str) != Some(expected_zlm_api_base.as_str()) {
+            bail!("ZLM_API_BASE must use the Agent-local loopback endpoint");
+        }
+    } else if values.contains_key("ZLM_API_HOST") || values.contains_key("ZLM_API_BASE") {
+        bail!("control-plane-only configuration must not contain a ZLM control endpoint");
     }
 
     validate_choice(values, "AUTH_MODE", AUTH_MODE_CHOICES)?;
@@ -2153,6 +2315,25 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_native_identity_mapping(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
+    let unit_base = native_unit_basename(values);
+    for (key, expected) in [
+        ("SYSTEMD_TARGET", format!("{unit_base}.target")),
+        ("SYSTEMD_CORE_UNIT", format!("{unit_base}-core.service")),
+        ("SYSTEMD_AGENT_UNIT", format!("{unit_base}-agent.service")),
+        ("SYSTEMD_ZLM_UNIT", format!("{unit_base}-zlm.service")),
+        (
+            "SYSTEMD_POSTGRES_UNIT",
+            format!("{unit_base}-postgres.service"),
+        ),
+    ] {
+        if values.get(key).map(String::as_str) != Some(expected.as_str()) {
+            bail!("{key} must match the immutable native instance identity");
+        }
+    }
     Ok(())
 }
 
@@ -2368,9 +2549,16 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
         "AGENT_STREAM_ADDR",
         "客户端访问该节点流媒体 HTTP 服务的基准地址。",
     ),
-    ("ZLM_API_HOST", "控制面访问该节点流媒体服务接口的地址。"),
-    ("ZLM_API_BASE", "控制面调用该节点 ZLM API 的完整基准地址。"),
+    (
+        "ZLM_API_BASE",
+        "本机 Agent 访问本机 ZLM 管理 API 的 loopback 基准地址。",
+    ),
     ("AGENT_HTTP_PORT", "工作节点本地接口端口。"),
+    ("AGENT_MANAGEMENT_PORT", "工作节点 mTLS 管理接口端口。"),
+    (
+        "AGENT_ZLM_HOOK_PORT",
+        "ZLMediaKit Hook 的 Agent 本机 loopback 入口端口。",
+    ),
     ("ZLM_HTTP_PORT", "流媒体 HTTP 播放和接口端口。"),
     ("ZLM_HTTPS_PORT", "流媒体 HTTPS 端口，0 表示关闭。"),
     ("ZLM_RTMP_PORT", "RTMP 播放/推流端口。"),
@@ -2610,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_interface_updates_public_and_api_hosts() {
+    fn primary_interface_updates_public_host_but_keeps_zlm_api_on_loopback() {
         let mut values = BTreeMap::new();
         values.insert("INSTALL_ROLE".to_string(), "worker-host-cpu".to_string());
         values.insert(
@@ -2636,8 +2824,11 @@ mod tests {
             values.get("AGENT_STREAM_ADDR").unwrap(),
             "http://10.0.0.8:18080"
         );
-        assert_eq!(values.get("ZLM_API_HOST").unwrap(), "10.0.0.8");
-        assert_eq!(values.get("ZLM_API_BASE").unwrap(), "http://10.0.0.8:18080");
+        assert!(!values.contains_key("ZLM_API_HOST"));
+        assert_eq!(
+            values.get("ZLM_API_BASE").unwrap(),
+            "http://127.0.0.1:18080"
+        );
     }
 
     #[test]
@@ -2654,8 +2845,8 @@ mod tests {
                 "AGENT_PRIMARY_INTERFACE_IP=172.16.1.2",
                 "PUBLIC_HOST=old.example",
                 "AGENT_STREAM_ADDR=http://old.example:80",
-                "ZLM_API_HOST=127.0.0.1",
-                "ZLM_API_BASE=http://127.0.0.1:80",
+                "ZLM_API_HOST=old-api.example",
+                "ZLM_API_BASE=http://old-api.example:80",
                 "ZLM_HTTP_PORT=8088",
             ]
             .join("\n"),
@@ -2666,9 +2857,158 @@ mod tests {
 
         assert_eq!(app.value("PUBLIC_HOST"), "172.16.1.2");
         assert_eq!(app.value("AGENT_STREAM_ADDR"), "http://172.16.1.2:8088");
-        assert_eq!(app.value("ZLM_API_HOST"), "172.16.1.2");
-        assert_eq!(app.value("ZLM_API_BASE"), "http://172.16.1.2:8088");
+        assert!(!app.values.contains_key("ZLM_API_HOST"));
+        assert_eq!(app.value("ZLM_API_BASE"), "http://127.0.0.1:8088");
+        assert!(app.message.contains("ZLM 管理地址"));
+        assert!(app.message.contains("loopback"));
 
+        let _ = fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn control_plane_drops_agent_only_zlm_control_endpoints() {
+        let mut values = BTreeMap::from([
+            ("INSTALL_ROLE".to_string(), "control-plane".to_string()),
+            ("ZLM_API_HOST".to_string(), "node.example".to_string()),
+            (
+                "ZLM_API_BASE".to_string(),
+                "http://node.example:8080".to_string(),
+            ),
+            (
+                "ZLM_API_ALLOW_IP_RANGE".to_string(),
+                "::1,127.0.0.1,10.0.0.0-10.255.255.255".to_string(),
+            ),
+            (
+                "ZLM_API_SECRET".to_string(),
+                "abcdef0123456789abcdef0123456789".to_string(),
+            ),
+            ("AGENT_ZLM_HOOK_PORT".to_string(), "18082".to_string()),
+            (
+                "AGENT_ZLM_HOOK_ADDR".to_string(),
+                "127.0.0.1:18082".to_string(),
+            ),
+            (
+                "ZLM_HOOK_BASE".to_string(),
+                "http://127.0.0.1:18082/internal/zlm-hooks".to_string(),
+            ),
+            (
+                "ZLM_HOOK_SHARED_SECRET".to_string(),
+                "0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            (
+                "AGENT_ZLM_HOOK_QUEUE_CAPACITY".to_string(),
+                "64".to_string(),
+            ),
+            ("AGENT_ZLM_HOOK_TIMEOUT_SEC".to_string(), "4".to_string()),
+        ]);
+
+        apply_defaults(&mut values, &[]);
+
+        assert!(!values.contains_key("ZLM_API_HOST"));
+        assert!(!values.contains_key("ZLM_API_BASE"));
+        assert!(!values.contains_key("ZLM_API_SECRET"));
+        assert!(!values.contains_key("ZLM_API_ALLOW_IP_RANGE"));
+        for key in [
+            "AGENT_ZLM_HOOK_PORT",
+            "AGENT_ZLM_HOOK_ADDR",
+            "ZLM_HOOK_BASE",
+            "ZLM_HOOK_SHARED_SECRET",
+            "AGENT_ZLM_HOOK_QUEUE_CAPACITY",
+            "AGENT_ZLM_HOOK_TIMEOUT_SEC",
+        ] {
+            assert!(!values.contains_key(key), "control-plane retained {key}");
+        }
+    }
+
+    #[test]
+    fn agent_security_listener_ports_are_managed_and_conflict_checked() {
+        for key in ["AGENT_MANAGEMENT_PORT", "AGENT_ZLM_HOOK_PORT"] {
+            assert!(MANAGED_ORDER.contains(&key));
+            assert!(REQUIRED_PORT_KEYS.contains(&key));
+            assert!(
+                page_fields(Page::Ports)
+                    .iter()
+                    .any(|field| field.key == key),
+                "{key} is not shown on the port page"
+            );
+        }
+
+        let mut values = BTreeMap::from([
+            ("INSTALL_ROLE".to_string(), "worker-host-cpu".to_string()),
+            (
+                "HOOK_SHARED_SECRET".to_string(),
+                "legacy-core-hook-0123456789abcdef".to_string(),
+            ),
+            (
+                "ZLM_API_SECRET".to_string(),
+                "abcdef0123456789abcdef0123456789".to_string(),
+            ),
+            (
+                "ZLM_HOOK_SHARED_SECRET".to_string(),
+                "0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            (
+                "ZLM_API_ALLOW_IP_RANGE".to_string(),
+                "::1,127.0.0.1,192.168.0.0-192.168.255.255".to_string(),
+            ),
+        ]);
+        apply_defaults(&mut values, &[]);
+        assert!(!values.contains_key("HOOK_SHARED_SECRET"));
+        assert_eq!(values["ZLM_API_SECRET"], "abcdef0123456789abcdef0123456789");
+        assert_eq!(
+            values["ZLM_HOOK_SHARED_SECRET"],
+            "0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            values["ZLM_API_ALLOW_IP_RANGE"],
+            "::1,127.0.0.1,10.0.0.0-10.255.255.255,172.16.0.0-172.31.255.255,192.168.0.0-192.168.255.255"
+        );
+        assert_eq!(values.get("AGENT_MANAGEMENT_PORT").unwrap(), "8443");
+        assert_eq!(values.get("AGENT_ZLM_HOOK_PORT").unwrap(), "18082");
+        assert_eq!(
+            values.get("AGENT_ZLM_HOOK_ADDR").unwrap(),
+            "127.0.0.1:18082"
+        );
+        assert_eq!(
+            values.get("ZLM_HOOK_BASE").unwrap(),
+            "http://127.0.0.1:18082/internal/zlm-hooks"
+        );
+
+        values.insert("AGENT_ZLM_HOOK_PORT".to_string(), "8443".to_string());
+        assert!(
+            ensure_configured_port_available(&values, "AGENT_ZLM_HOOK_PORT", 8443, str::to_string)
+                .is_err()
+        );
+
+        values.insert("AGENT_ZLM_HOOK_PORT".to_string(), "19082".to_string());
+        sync_agent_endpoint_urls(&mut values);
+        assert_eq!(values["AGENT_ZLM_HOOK_ADDR"], "127.0.0.1:19082");
+        assert_eq!(
+            values["ZLM_HOOK_BASE"],
+            "http://127.0.0.1:19082/internal/zlm-hooks"
+        );
+    }
+
+    #[test]
+    fn write_env_file_drops_legacy_zlm_api_host() {
+        let env_path = std::env::temp_dir().join(format!(
+            "streamserver-config-removed-zlm-api-host-test-{}.env",
+            std::process::id()
+        ));
+        let values = BTreeMap::from([
+            ("INSTALL_ROLE".to_string(), "worker-host-cpu".to_string()),
+            ("ZLM_API_HOST".to_string(), "remote.example".to_string()),
+            (
+                "ZLM_API_BASE".to_string(),
+                "http://127.0.0.1:18080".to_string(),
+            ),
+        ]);
+
+        write_env_file(&env_path, &values).unwrap();
+        let written = fs::read_to_string(&env_path).unwrap();
+
+        assert!(!written.contains("ZLM_API_HOST="));
+        assert!(written.contains("ZLM_API_BASE='http://127.0.0.1:18080'"));
         let _ = fs::remove_file(env_path);
     }
 
@@ -2713,14 +3053,30 @@ mod tests {
         let contents = fs::read_to_string(&env_path).unwrap();
         let lines = contents.lines().collect::<Vec<_>>();
 
-        assert!(
-            !lines
-                .iter()
-                .any(|line| *line == "AGENT_MAX_RUNTIME_SLOTS=3")
+        assert!(!lines.contains(&"AGENT_MAX_RUNTIME_SLOTS=3"));
+        assert!(lines.contains(&"AGENT_MAX_LIVE_RUNTIME_SLOTS='4'"));
+        assert!(lines.contains(&"AGENT_MAX_VOD_RUNTIME_SLOTS='5'"));
+        assert!(lines.contains(&"CUSTOM_KEEP='yes'"));
+
+        let _ = fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn write_env_file_quotes_shell_metacharacters_as_literal_data() {
+        let env_path = std::env::temp_dir().join(format!(
+            "streamserver-config-shell-literal-test-{}.env",
+            std::process::id()
+        ));
+        let malicious = "$(touch must-remain-literal)";
+        let values = BTreeMap::from([("HOOK_SHARED_SECRET".to_string(), malicious.to_string())]);
+
+        write_env_file(&env_path, &values).unwrap();
+        let contents = fs::read_to_string(&env_path).unwrap();
+        assert!(contents.contains("HOOK_SHARED_SECRET='$(touch must-remain-literal)'"));
+        assert_eq!(
+            parse_env_file(&env_path).unwrap()["HOOK_SHARED_SECRET"],
+            malicious
         );
-        assert!(lines.contains(&"AGENT_MAX_LIVE_RUNTIME_SLOTS=4"));
-        assert!(lines.contains(&"AGENT_MAX_VOD_RUNTIME_SLOTS=5"));
-        assert!(lines.contains(&"CUSTOM_KEEP=yes"));
 
         let _ = fs::remove_file(env_path);
     }
@@ -2743,8 +3099,8 @@ mod tests {
         app.save().expect("external_jwt must remain saveable");
 
         let saved = fs::read_to_string(&env_path).unwrap();
-        assert!(saved.lines().any(|line| line == "AUTH_MODE=external_jwt"));
-        assert!(saved.lines().any(|line| line == "AUTH_ENABLED=true"));
+        assert!(saved.lines().any(|line| line == "AUTH_MODE='external_jwt'"));
+        assert!(saved.lines().any(|line| line == "AUTH_ENABLED='true'"));
         assert!(saved.contains(&format!("JWT_PUBLIC_KEY='{PUBLIC_KEY}'")));
         assert_eq!(
             parse_env_file(&env_path).unwrap()["JWT_PUBLIC_KEY"],
@@ -2764,21 +3120,71 @@ mod tests {
     }
 
     #[test]
-    fn keeps_editing_when_instance_name_is_invalid() {
+    fn instance_name_is_read_only_after_installation() {
         let env_path = std::env::temp_dir().join(format!(
             "streamserver-config-instance-name-test-{}.env",
             std::process::id()
         ));
         let mut app = ConfigApp::load(env_path).unwrap();
-        app.page = Page::Basic;
-        app.selected = 1;
-        app.editing = Some("Stream Server".to_string());
+        let original = app.value("INSTANCE_NAME");
+        app.set("INSTANCE_NAME", "renamed-instance");
+        assert_eq!(app.value("INSTANCE_NAME"), original);
+        assert!(!app.message.is_empty());
+    }
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
+    #[test]
+    fn defaults_replace_stale_systemd_identity_with_instance_mapping() {
+        let mut values = BTreeMap::from([
+            ("DEPLOY_MODE".to_string(), "native".to_string()),
+            ("INSTALL_ROLE".to_string(), "control-plane".to_string()),
+            ("INSTANCE_NAME".to_string(), "identity-test".to_string()),
+            ("SYSTEMD_TARGET".to_string(), "forged.target".to_string()),
+            (
+                "SYSTEMD_CORE_UNIT".to_string(),
+                "forged-core.service".to_string(),
+            ),
+        ]);
 
-        assert_eq!(app.editing.as_deref(), Some("Stream Server"));
-        assert!(app.message.contains("实例名称"));
+        apply_defaults(&mut values, &[]);
+
+        assert_eq!(values["SYSTEMD_TARGET"], "ss-identity-test.target");
+        assert_eq!(values["SYSTEMD_CORE_UNIT"], "ss-identity-test-core.service");
+        assert!(validate_native_identity_mapping(&values).is_ok());
+    }
+
+    #[test]
+    fn identity_validation_rejects_mismatched_systemd_mapping() {
+        let mut values = BTreeMap::from([
+            ("INSTANCE_NAME".to_string(), "identity-test".to_string()),
+            ("SYSTEMD_TARGET".to_string(), "forged.target".to_string()),
+        ]);
+        default_native_systemd_units(&mut values);
+        values.insert("SYSTEMD_TARGET".to_string(), "forged.target".to_string());
+
+        assert!(validate_native_identity_mapping(&values).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_save_replaces_inode_held_by_preopened_writer() {
+        use std::{fs::OpenOptions, io::Write};
+
+        let env_path = std::env::temp_dir().join(format!(
+            "streamserver-config-preopened-env-test-{}.env",
+            std::process::id()
+        ));
+        fs::write(&env_path, b"OLD=1\n").unwrap();
+        let mut old_writer = OpenOptions::new().write(true).open(&env_path).unwrap();
+        let values = BTreeMap::from([("DEPLOY_MODE".to_string(), "native".to_string())]);
+
+        write_env_file(&env_path, &values).unwrap();
+        old_writer.write_all(b"STALE_WRITER=1\n").unwrap();
+        old_writer.sync_all().unwrap();
+
+        let saved = fs::read_to_string(&env_path).unwrap();
+        assert!(saved.contains("DEPLOY_MODE='native'"));
+        assert!(!saved.contains("STALE_WRITER"));
+        let _ = fs::remove_file(env_path);
     }
 
     #[test]

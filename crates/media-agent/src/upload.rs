@@ -1,16 +1,29 @@
 use std::{
     collections::BTreeSet,
+    future::Future,
     io::SeekFrom,
     path::{Component, Path as FsPath, PathBuf},
     process::Stdio,
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::{CStr, CString, OsStr},
+    io,
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        unix::ffi::OsStrExt,
+    },
+};
 
 use anyhow::Context;
 use axum::{
     Json,
-    body::Body,
-    extract::{Multipart, Path as AxumPath, State, multipart::Field},
+    body::{Body, Bytes},
+    extract::{
+        Multipart, Path as AxumPath, State,
+        multipart::{Field, MultipartError},
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -41,6 +54,7 @@ pub(crate) struct UploadConfig {
     pub probe_timeout: Duration,
     pub ffprobe_bin: String,
     pub public_media_base_url: Option<String>,
+    pub chunk_idle_timeout: Duration,
 }
 
 impl UploadConfig {
@@ -50,8 +64,21 @@ impl UploadConfig {
             .trim()
             .trim_end_matches('/')
             .to_string();
-        let public_media_base_url =
-            (!explicit_media_base_url.is_empty()).then_some(explicit_media_base_url);
+        let public_media_base_url = if !explicit_media_base_url.is_empty() {
+            Some(explicit_media_base_url)
+        } else {
+            let public_media_addr = settings
+                .public_media_addr
+                .trim()
+                .parse::<std::net::SocketAddr>()
+                .context("AGENT_PUBLIC_MEDIA_ADDR must be a socket address")?;
+            public_media_addr.ip().is_loopback().then(|| {
+                let tls_configured = !settings.public_media_tls_cert_path.trim().is_empty()
+                    && !settings.public_media_tls_key_path.trim().is_empty();
+                let scheme = if tls_configured { "https" } else { "http" };
+                format!("{scheme}://{public_media_addr}")
+            })
+        };
         let allowed_extensions = settings
             .upload_allowed_extensions
             .iter()
@@ -70,6 +97,7 @@ impl UploadConfig {
             probe_timeout: Duration::from_secs(settings.upload_probe_timeout_sec),
             ffprobe_bin: settings.ffprobe_bin.trim().to_string(),
             public_media_base_url,
+            chunk_idle_timeout: Duration::from_secs(settings.management_chunk_idle_timeout_sec),
         })
     }
 }
@@ -329,6 +357,312 @@ pub(crate) async fn delete_media_file(
     }
 }
 
+#[cfg(target_os = "linux")]
+struct SecureUploadDestination {
+    root: PathBuf,
+    target_path: PathBuf,
+    parent_fd: OwnedFd,
+    target_name: CString,
+    temp_name: CString,
+    committed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SecureUploadDestination {
+    fn temp_handle_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            self.parent_fd.as_raw_fd(),
+            self.temp_name.to_string_lossy()
+        ))
+    }
+
+    fn remove_temp(&self) {
+        unsafe {
+            libc::unlinkat(self.parent_fd.as_raw_fd(), self.temp_name.as_ptr(), 0);
+        }
+    }
+
+    fn commit(mut self) -> Result<PathBuf, UploadError> {
+        verify_upload_path_beneath(&self.root, &self.target_path, false)?;
+        let before = fstatat_no_follow(self.parent_fd.as_raw_fd(), &self.temp_name)
+            .context("inspect upload temp file before commit failed")?;
+        if before.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(UploadError::bad_request(
+                "upload temp path must be a regular file",
+            ));
+        }
+
+        atomic_rename_noreplace(
+            self.parent_fd.as_raw_fd(),
+            &self.temp_name,
+            self.parent_fd.as_raw_fd(),
+            &self.target_name,
+        )
+        .map_err(|error| UploadError::internal(format!("commit upload file failed: {error}")))?;
+
+        let verified = (|| -> Result<(), UploadError> {
+            let after = fstatat_no_follow(self.parent_fd.as_raw_fd(), &self.target_name)
+                .context("inspect committed upload file failed")?;
+            if after.st_mode & libc::S_IFMT != libc::S_IFREG
+                || after.st_dev != before.st_dev
+                || after.st_ino != before.st_ino
+            {
+                return Err(UploadError::bad_request(
+                    "committed upload path identity changed",
+                ));
+            }
+            verify_upload_path_beneath(&self.root, &self.target_path, true)?;
+            if unsafe { libc::fsync(self.parent_fd.as_raw_fd()) } != 0 {
+                return Err(UploadError::internal(format!(
+                    "sync upload directory failed: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+            Ok(())
+        })();
+        if let Err(error) = verified {
+            unsafe {
+                libc::unlinkat(self.parent_fd.as_raw_fd(), self.target_name.as_ptr(), 0);
+            }
+            return Err(error);
+        }
+        self.committed = true;
+        Ok(self.target_path.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SecureUploadDestination {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.remove_temp();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn create_secure_upload_destination(
+    work_root: &FsPath,
+    relative: &FsPath,
+    temp_file_name: &str,
+) -> Result<(SecureUploadDestination, fs::File), UploadError> {
+    fs::create_dir_all(work_root)
+        .await
+        .context("create upload root failed")?;
+    let root_metadata = fs::symlink_metadata(work_root)
+        .await
+        .context("inspect upload root failed")?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(UploadError::bad_request(
+            "upload root must be a real directory",
+        ));
+    }
+    let root = fs::canonicalize(work_root)
+        .await
+        .context("canonicalize upload root failed")?;
+    let target_name = relative
+        .file_name()
+        .ok_or_else(|| UploadError::bad_request("upload target file name missing"))?;
+    let parent_relative = relative
+        .parent()
+        .ok_or_else(|| UploadError::bad_request("upload target parent missing"))?;
+    let target_name = cstring_component(target_name)?;
+    let temp_name = cstring_component(OsStr::new(temp_file_name))?;
+    verify_relative_directory_path(parent_relative)?;
+
+    let root_name = CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| UploadError::bad_request("upload root contains NUL"))?;
+    let root_fd = unsafe {
+        libc::open(
+            root_name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(UploadError::internal(format!(
+            "open upload root failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let mut parent_fd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for component in parent_relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(UploadError::bad_request(
+                "upload directory path must be relative",
+            ));
+        };
+        let component = cstring_component(component)?;
+        let created = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), component.as_ptr(), 0o750) };
+        if created != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(UploadError::internal(format!(
+                    "create upload directory failed: {error}"
+                )));
+            }
+        }
+        let child_fd = unsafe {
+            libc::openat(
+                parent_fd.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if child_fd < 0 {
+            return Err(UploadError::bad_request(format!(
+                "upload directory path is not a real directory: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        parent_fd = unsafe { OwnedFd::from_raw_fd(child_fd) };
+    }
+
+    let temp_fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            temp_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if temp_fd < 0 {
+        return Err(UploadError::internal(format!(
+            "create upload temp file failed: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    let std_file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(temp_fd) });
+    let target_path = root.join(relative);
+    let destination = SecureUploadDestination {
+        root,
+        target_path,
+        parent_fd,
+        target_name,
+        temp_name,
+        committed: false,
+    };
+    Ok((destination, fs::File::from_std(std_file)))
+}
+
+#[cfg(target_os = "linux")]
+fn cstring_component(value: &OsStr) -> Result<CString, UploadError> {
+    if value.is_empty() || value.as_bytes().contains(&b'/') {
+        return Err(UploadError::bad_request("upload path component is invalid"));
+    }
+    CString::new(value.as_bytes())
+        .map_err(|_| UploadError::bad_request("upload path component contains NUL"))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_relative_directory_path(path: &FsPath) -> Result<(), UploadError> {
+    if path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        Ok(())
+    } else {
+        Err(UploadError::bad_request(
+            "upload directory path must contain only normal relative components",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fstatat_no_follow(parent_fd: i32, name: &CString) -> io::Result<libc::stat> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let result = unsafe {
+        libc::fstatat(
+            parent_fd,
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(unsafe { metadata.assume_init() })
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn atomic_rename_noreplace(
+    old_directory_fd: RawFd,
+    old_name: &CStr,
+    new_directory_fd: RawFd,
+    new_name: &CStr,
+) -> io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            old_directory_fd,
+            old_name.as_ptr(),
+            new_directory_fd,
+            new_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    match result {
+        0 => Ok(()),
+        -1 => Err(io::Error::last_os_error()),
+        unexpected => Err(io::Error::other(format!(
+            "renameat2 syscall returned unexpected status {unexpected}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_upload_path_beneath(
+    root: &FsPath,
+    target: &FsPath,
+    target_must_exist: bool,
+) -> Result<(), UploadError> {
+    let canonical_root =
+        std::fs::canonicalize(root).context("canonicalize upload root during commit failed")?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| UploadError::internal("upload target parent missing"))?;
+    let canonical_parent =
+        std::fs::canonicalize(parent).context("canonicalize upload parent during commit failed")?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(UploadError::bad_request(
+            "upload target escaped the configured root",
+        ));
+    }
+    let relative_parent = parent
+        .strip_prefix(root)
+        .map_err(|_| UploadError::bad_request("upload parent escaped configured root"))?;
+    let mut current = root.to_path_buf();
+    for component in relative_parent.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)
+            .context("inspect upload directory during commit failed")?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(UploadError::bad_request(
+                "upload directory path must not contain symbolic links",
+            ));
+        }
+    }
+    if target_must_exist {
+        let metadata =
+            std::fs::symlink_metadata(target).context("inspect committed upload target failed")?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(UploadError::bad_request(
+                "committed upload target must be a regular file",
+            ));
+        }
+        let canonical_target =
+            std::fs::canonicalize(target).context("canonicalize committed upload target failed")?;
+        if !canonical_target.starts_with(&canonical_root) {
+            return Err(UploadError::bad_request(
+                "committed upload target escaped configured root",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn persist_uploaded_file(
     config: &UploadConfig,
     node_id: Uuid,
@@ -349,22 +683,24 @@ async fn persist_uploaded_file(
         .join(format!("{:02}", now.day()))
         .join(format!("{upload_id}.{extension}"));
     let source_url = path_to_url(&relative);
-    let target_path = config.work_root.join(&relative);
-    let parent = target_path
-        .parent()
-        .ok_or_else(|| UploadError::internal("upload target parent missing"))?;
-    fs::create_dir_all(parent)
-        .await
-        .context("create upload directory failed")?;
-
-    let temp_path = target_path.with_extension(format!("{extension}.uploading-{upload_id}"));
-    let mut file = fs::File::create(&temp_path)
-        .await
-        .context("create upload temp file failed")?;
+    let target_file_name = relative
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| UploadError::internal("upload target file name missing"))?;
+    let temp_file_name = format!("{target_file_name}.uploading-{upload_id}");
+    #[cfg(target_os = "linux")]
+    let (destination, mut file) =
+        create_secure_upload_destination(&config.work_root, &relative, &temp_file_name).await?;
+    #[cfg(not(target_os = "linux"))]
+    compile_error!("media-agent secure upload writes require Linux");
+    let temp_path = destination.temp_handle_path();
     let mut hasher = Sha256::new();
     let mut file_size = 0_u64;
 
-    while let Some(chunk) = field.chunk().await? {
+    while let Some(chunk) =
+        next_upload_chunk_with_idle_cleanup(field.chunk(), config.chunk_idle_timeout, &temp_path)
+            .await?
+    {
         let next_size = file_size
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| UploadError::bad_request("upload file is too large"))?;
@@ -379,6 +715,7 @@ async fn persist_uploaded_file(
         file_size = next_size;
     }
     file.flush().await.context("flush upload file failed")?;
+    file.sync_all().await.context("sync upload file failed")?;
     drop(file);
 
     if file_size == 0 {
@@ -386,12 +723,7 @@ async fn persist_uploaded_file(
         return Err(UploadError::bad_request("upload file must not be empty"));
     }
 
-    if let Err(error) = fs::rename(&temp_path, &target_path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(UploadError::internal(format!(
-            "commit upload file failed: {error}"
-        )));
-    }
+    let target_path = destination.commit()?;
 
     let duration_sec = probe_duration_sec_or_default(config, &target_path).await;
 
@@ -415,6 +747,29 @@ async fn persist_uploaded_file(
         content_type,
         created_at: now.timestamp_millis(),
     })
+}
+
+async fn next_upload_chunk_with_idle_cleanup<F>(
+    next_chunk: F,
+    idle_timeout: Duration,
+    partial_path: &FsPath,
+) -> Result<Option<Bytes>, UploadError>
+where
+    F: Future<Output = Result<Option<Bytes>, MultipartError>>,
+{
+    match timeout(idle_timeout, next_chunk).await {
+        Ok(Ok(chunk)) => Ok(chunk),
+        Ok(Err(error)) => {
+            let _ = fs::remove_file(partial_path).await;
+            Err(error.into())
+        }
+        Err(_) => {
+            let _ = fs::remove_file(partial_path).await;
+            Err(UploadError::request_timeout(
+                "upload body was idle for too long",
+            ))
+        }
+    }
 }
 
 async fn probe_duration_sec_or_default(config: &UploadConfig, path: &FsPath) -> u64 {
@@ -525,7 +880,7 @@ fn extension_from_file_name(value: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn normalize_media_relative_path(value: &str) -> Result<PathBuf, UploadError> {
+pub(crate) fn normalize_media_relative_path(value: &str) -> Result<PathBuf, UploadError> {
     let trimmed = value.trim().trim_start_matches('/');
     if trimmed.is_empty() {
         return Err(UploadError::bad_request("media path must not be empty"));
@@ -575,7 +930,7 @@ fn normalize_path_components(path: PathBuf) -> PathBuf {
     normalized
 }
 
-fn path_to_url(path: &FsPath) -> String {
+pub(crate) fn path_to_url(path: &FsPath) -> String {
     path.components()
         .filter_map(|component| match component {
             Component::Normal(segment) => Some(segment.to_string_lossy().to_string()),
@@ -624,6 +979,13 @@ impl UploadError {
             message: message.into(),
         }
     }
+
+    fn request_timeout(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<anyhow::Error> for UploadError {
@@ -659,13 +1021,16 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(target_os = "linux")]
+    use super::atomic_rename_noreplace;
     use super::{
         DEFAULT_UPLOAD_DURATION_SEC, UPLOAD_DURATION_ANALYZE_DURATION_US,
         UPLOAD_DURATION_PROBE_SIZE_BYTES, UploadConfig, content_type_from_extension,
-        delete_media_file, normalize_media_relative_path, parse_single_byte_range,
-        probe_duration_sec, probe_duration_sec_or_default, serve_media_file,
+        create_secure_upload_destination, delete_media_file, next_upload_chunk_with_idle_cleanup,
+        normalize_media_relative_path, parse_single_byte_range, probe_duration_sec,
+        probe_duration_sec_or_default, serve_media_file,
     };
-    use crate::{AgentReadiness, AppState};
+    use crate::{AgentReadiness, AppState, config::AgentSettings};
     use axum::{
         body::to_bytes,
         extract::{Path as AxumPath, State},
@@ -673,6 +1038,29 @@ mod tests {
     };
     use chrono::Utc;
     use uuid::Uuid;
+
+    #[test]
+    fn upload_config_derives_loopback_public_media_base_from_its_listener() {
+        let mut settings = AgentSettings {
+            public_media_addr: "127.0.0.1:18081".to_string(),
+            ..AgentSettings::default()
+        };
+
+        let config = UploadConfig::from_settings(&settings).expect("loopback upload config");
+        assert_eq!(
+            config.public_media_base_url.as_deref(),
+            Some("http://127.0.0.1:18081")
+        );
+
+        settings.public_media_addr = "[::1]:18443".to_string();
+        settings.public_media_tls_cert_path = "/etc/streamserver/public.pem".to_string();
+        settings.public_media_tls_key_path = "/etc/streamserver/public.key".to_string();
+        let config = UploadConfig::from_settings(&settings).expect("TLS loopback upload config");
+        assert_eq!(
+            config.public_media_base_url.as_deref(),
+            Some("https://[::1]:18443")
+        );
+    }
 
     #[test]
     fn normalize_media_relative_path_rejects_parent_segments() {
@@ -724,12 +1112,73 @@ mod tests {
             probe_timeout: Duration::from_secs(5),
             ffprobe_bin: ffprobe_bin.to_string_lossy().to_string(),
             public_media_base_url: None,
+            chunk_idle_timeout: Duration::from_secs(30),
         }
     }
 
     #[cfg(unix)]
     fn temp_upload_probe_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{name}-{}", uuid::Uuid::now_v7()))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_rename_noreplace_moves_source_to_missing_target() {
+        use std::{ffi::CString, os::fd::AsRawFd};
+
+        let temp_root = temp_upload_probe_root("streamserver-atomic-rename-success");
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        std::fs::write(temp_root.join("source"), b"source-content")
+            .expect("source should be written");
+        let directory = std::fs::File::open(&temp_root).expect("directory should open");
+
+        atomic_rename_noreplace(
+            directory.as_raw_fd(),
+            &CString::new("source").unwrap(),
+            directory.as_raw_fd(),
+            &CString::new("target").unwrap(),
+        )
+        .expect("rename should succeed");
+
+        assert!(!temp_root.join("source").exists());
+        assert_eq!(
+            std::fs::read(temp_root.join("target")).expect("target should be readable"),
+            b"source-content"
+        );
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_rename_noreplace_preserves_both_files_when_target_exists() {
+        use std::{ffi::CString, io::ErrorKind, os::fd::AsRawFd};
+
+        let temp_root = temp_upload_probe_root("streamserver-atomic-rename-existing");
+        std::fs::create_dir_all(&temp_root).expect("temp root should be created");
+        std::fs::write(temp_root.join("source"), b"source-content")
+            .expect("source should be written");
+        std::fs::write(temp_root.join("target"), b"target-content")
+            .expect("target should be written");
+        let directory = std::fs::File::open(&temp_root).expect("directory should open");
+
+        let error = atomic_rename_noreplace(
+            directory.as_raw_fd(),
+            &CString::new("source").unwrap(),
+            directory.as_raw_fd(),
+            &CString::new("target").unwrap(),
+        )
+        .expect_err("rename must not replace an existing target");
+
+        assert_eq!(error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(temp_root.join("source")).expect("source should remain readable"),
+            b"source-content"
+        );
+        assert_eq!(
+            std::fs::read(temp_root.join("target")).expect("target should remain readable"),
+            b"target-content"
+        );
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[cfg(unix)]
@@ -741,6 +1190,7 @@ mod tests {
                 ffmpeg_available: true,
                 ffprobe_available: true,
                 work_root_exists: true,
+                zlm_hook_listener_available: true,
             },
             node_id: Uuid::now_v7(),
             upload: UploadConfig {
@@ -750,6 +1200,7 @@ mod tests {
                 probe_timeout: Duration::from_secs(5),
                 ffprobe_bin: "ffprobe".to_string(),
                 public_media_base_url: None,
+                chunk_idle_timeout: Duration::from_secs(30),
             },
         }
     }
@@ -823,6 +1274,88 @@ exit 1
         assert!(media_path.exists());
 
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_chunk_idle_timeout_removes_partial_file() {
+        let temp_root = temp_upload_probe_root("streamserver-upload-idle-cleanup");
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let partial = temp_root.join("partial.uploading-test");
+        std::fs::write(&partial, b"partial").unwrap();
+
+        let result = next_upload_chunk_with_idle_cleanup(
+            std::future::pending::<
+                Result<Option<axum::body::Bytes>, axum::extract::multipart::MultipartError>,
+            >(),
+            Duration::from_millis(20),
+            &partial,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(!partial.exists());
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_chunk_timeout_is_idle_not_total_duration() {
+        let temp_root = temp_upload_probe_root("streamserver-upload-idle-not-total");
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let partial = temp_root.join("partial.uploading-test");
+        std::fs::write(&partial, b"partial").unwrap();
+        let started = std::time::Instant::now();
+
+        for _ in 0..4 {
+            let chunk = next_upload_chunk_with_idle_cleanup(
+                async {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                    Ok::<_, axum::extract::multipart::MultipartError>(Some(
+                        axum::body::Bytes::from_static(b"chunk"),
+                    ))
+                },
+                Duration::from_millis(40),
+                &partial,
+            )
+            .await
+            .unwrap();
+            assert!(chunk.is_some());
+        }
+
+        assert!(started.elapsed() > Duration::from_millis(40));
+        assert!(partial.exists());
+        let _ = std::fs::remove_dir_all(temp_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn upload_rejects_date_directory_symlink_without_writing_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp_root = temp_upload_probe_root("streamserver-upload-symlink-parent");
+        let work_root = temp_root.join("work");
+        let outside = temp_root.join("outside");
+        let node_id = Uuid::now_v7();
+        let date_parent = work_root
+            .join("uploads")
+            .join(node_id.to_string())
+            .join("2026")
+            .join("07");
+        std::fs::create_dir_all(&date_parent).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, date_parent.join("12")).unwrap();
+        let relative = PathBuf::from("uploads")
+            .join(node_id.to_string())
+            .join("2026/07/12/clip.mp4");
+
+        let result =
+            create_secure_upload_destination(&work_root, &relative, "clip.mp4.uploading-test")
+                .await;
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[cfg(unix)]

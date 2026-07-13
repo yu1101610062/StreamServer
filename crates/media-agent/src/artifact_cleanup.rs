@@ -461,10 +461,12 @@ impl ArtifactCleanupManager {
         self.cleanup_volume_to_metric(
             observations,
             active_handles,
-            threshold_percent,
-            target_percent,
-            "artifact volume usage",
-            "inactive task directories or running task segments",
+            CleanupMetricPolicy {
+                threshold_percent,
+                target_percent,
+                metric_name: "artifact volume usage",
+                candidate_label: "inactive task directories or running task segments",
+            },
             || sample_disk_percent(observations[0].root.as_path()),
         )
     }
@@ -473,10 +475,7 @@ impl ArtifactCleanupManager {
         &self,
         observations: &[BucketObservation],
         active_handles: &[RuntimeHandle],
-        threshold_percent: f64,
-        target_percent: f64,
-        metric_name: &str,
-        candidate_label: &str,
+        policy: CleanupMetricPolicy<'_>,
         mut sample_metric_percent: impl FnMut() -> io::Result<f64>,
     ) -> CleanupVolumeResult {
         let mut metric_percent = sample_metric_percent().unwrap_or_else(|_| {
@@ -497,7 +496,7 @@ impl ArtifactCleanupManager {
         // 先清理完整的非活跃任务目录；每删一个候选后都重新采样磁盘，
         // 这样可以尽早停止并减少对历史产物的破坏。
         for candidate in candidates {
-            if metric_percent < target_percent {
+            if metric_percent < policy.target_percent {
                 break;
             }
             if let Err(error) = delete_cleanup_candidate(&candidate) {
@@ -524,7 +523,7 @@ impl ArtifactCleanupManager {
             }
         }
 
-        if metric_percent >= target_percent {
+        if metric_percent >= policy.target_percent {
             // 完整任务目录不足以释放空间时，再清理运行中 HLS 的过期 segment。
             // MP4 和最新直播片段不进这里，避免破坏正在写入或播放的文件。
             let running_candidates = collect_running_cleanup_candidates(
@@ -533,7 +532,7 @@ impl ArtifactCleanupManager {
                 &self.inner.layout,
             );
             for candidate in running_candidates {
-                if metric_percent < target_percent {
+                if metric_percent < policy.target_percent {
                     break;
                 }
                 match fs::remove_file(&candidate.path) {
@@ -568,16 +567,19 @@ impl ArtifactCleanupManager {
             }
         }
 
-        let reason = if metric_percent >= threshold_percent {
+        let reason = if metric_percent >= policy.threshold_percent {
             if deleted_task_ids.is_empty() && deleted_running_paths.is_empty() {
                 format!(
-                    "{metric_name} {:.1}% exceeds threshold {:.1}% and no {candidate_label} are eligible for cleanup",
-                    metric_percent, threshold_percent
+                    "{} {:.1}% exceeds threshold {:.1}% and no {} are eligible for cleanup",
+                    policy.metric_name,
+                    metric_percent,
+                    policy.threshold_percent,
+                    policy.candidate_label
                 )
             } else {
                 format!(
-                    "{metric_name} {:.1}% remains above threshold {:.1}% after cleanup",
-                    metric_percent, threshold_percent
+                    "{} {:.1}% remains above threshold {:.1}% after cleanup",
+                    policy.metric_name, metric_percent, policy.threshold_percent
                 )
             }
         } else {
@@ -749,6 +751,14 @@ struct CleanupVolumeResult {
     deleted_running_paths: Vec<PathBuf>,
     final_percent: f64,
     reason: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CleanupMetricPolicy<'a> {
+    threshold_percent: f64,
+    target_percent: f64,
+    metric_name: &'a str,
+    candidate_label: &'a str,
 }
 
 pub fn artifact_buckets_for_task_spec(spec: &TaskSpec) -> Vec<ArtifactBucket> {
@@ -1186,8 +1196,8 @@ fn sample_disk(path: &Path) -> io::Result<DiskSample> {
     }
 
     let stat = unsafe { stat.assume_init() };
-    let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
-    let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
+    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
     if total == 0 {
         return Ok(DiskSample { percent_used: 0.0 });
     }

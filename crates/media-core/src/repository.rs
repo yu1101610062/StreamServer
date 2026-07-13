@@ -6,6 +6,8 @@ mod tests;
 
 #[path = "repository_agent_events.rs"]
 mod repository_agent_events;
+#[path = "repository_agent_identity.rs"]
+mod repository_agent_identity;
 #[path = "repository_artifacts.rs"]
 mod repository_artifacts;
 #[path = "repository_attempt_state.rs"]
@@ -40,14 +42,27 @@ mod repository_zlm_hooks;
 pub use repository_agent_events::{
     AgentTaskEventRecord, TaskLogBatchRecord, TaskProgressRecord, TaskSnapshotRecord,
 };
+pub use repository_agent_identity::{
+    AgentCertificateRotationAcknowledgement, AgentCertificateRotationBundle,
+    AgentCertificateRotationIssue, AgentCertificateRotationRequest,
+    AgentCertificateRotationTakeoverContext, AgentControlSessionClaim,
+    AgentControlSessionClaimOutcome, AgentEnrollmentBundle, AgentEnrollmentPreflightOutcome,
+    AgentEnrollmentRequest, AgentManagementRotationActivationOutcome,
+    AgentManagementRotationActivationRequest, AgentSessionWriteOutcome,
+    CompleteAgentCertificateRotationOutcome, ConsumeAgentEnrollmentOutcome,
+    CreateAgentEnrollmentOutcome, NewAgentEnrollment, NewIssuedAgentCertificate,
+    StageAgentCertificateRotationOutcome,
+};
 pub use repository_artifacts::{
     FileArtifactKind, FileArtifactListFilter, FileArtifactSummary, MediaUploadAssetDeleteTarget,
     MediaUploadAssetListFilter, MediaUploadAssetSummary, NewMediaUploadAsset, RecordFileSummary,
     RecordListFilter,
 };
+#[allow(unused_imports)]
 pub use repository_auth::{
-    AuthUser, MachineAllowlistEntry, MachineAllowlistWrite, NewRefreshSession,
-    SecurityAuditEventRecord,
+    AuthUser, BootstrapAdminPasswordProbe, BootstrapAdminPasswordState,
+    BootstrapAdminReconcileOutcome, MachineAllowlistEntry, MachineAllowlistWrite,
+    NewRefreshSession, SecurityAuditEventRecord,
 };
 pub use repository_callback_outbox::{CallbackDeliverySummary, CallbackOutboxJob};
 pub use repository_core::TaskRepository;
@@ -62,7 +77,7 @@ pub use repository_lifecycle::{
     TaskCloneCommonOverride, TaskCloneOverride, TaskCloneScheduleOverride,
 };
 pub use repository_models::{AttemptSummary, RepoError, TaskDetail, TaskListFilter, TaskSummary};
-pub use repository_nodes::{NodeDebugTarget, NodeHeartbeatSummary, NodeSummary};
+pub use repository_nodes::{NodeHeartbeatSummary, NodeSummary};
 pub use repository_schedules::CronScheduleEntry;
 pub use repository_streams::{
     HookEventListFilter, HookEventSummary, StreamListFilter, StreamSummary,

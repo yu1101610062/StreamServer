@@ -478,6 +478,26 @@ pub(crate) fn update_companion_recording_metadata(
     runtime.metadata["companion_recording"] = json!(companion);
 }
 
+pub(crate) fn resolved_spec_from_handle(handle: &RuntimeHandle) -> Option<TaskSpec> {
+    handle
+        .metadata
+        .get("resolved_spec")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TaskSpec>(value).ok())
+}
+
+pub(crate) fn task_runtime_mode_from_handle(handle: &RuntimeHandle) -> Option<TaskRuntimeMode> {
+    resolved_spec_from_handle(handle).map(|spec| task_runtime_mode(&spec))
+}
+
+pub(crate) fn startup_probe_from_handle(handle: &RuntimeHandle) -> Option<StartupProbe> {
+    handle
+        .metadata
+        .get("startup_probe")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,24 +524,4 @@ mod tests {
         assert_eq!(process.pid, std::process::id() as i32);
         assert_eq!(process.pid_start_time, None);
     }
-}
-
-pub(crate) fn resolved_spec_from_handle(handle: &RuntimeHandle) -> Option<TaskSpec> {
-    handle
-        .metadata
-        .get("resolved_spec")
-        .cloned()
-        .and_then(|value| serde_json::from_value::<TaskSpec>(value).ok())
-}
-
-pub(crate) fn task_runtime_mode_from_handle(handle: &RuntimeHandle) -> Option<TaskRuntimeMode> {
-    resolved_spec_from_handle(handle).map(|spec| task_runtime_mode(&spec))
-}
-
-pub(crate) fn startup_probe_from_handle(handle: &RuntimeHandle) -> Option<StartupProbe> {
-    handle
-        .metadata
-        .get("startup_probe")
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
 }

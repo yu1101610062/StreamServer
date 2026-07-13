@@ -238,6 +238,7 @@ impl TaskRepository {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)] // The arguments are the authenticated hook evidence row.
     pub async fn record_zlm_lost_task_event_hook(
         &self,
         server_id: &str,

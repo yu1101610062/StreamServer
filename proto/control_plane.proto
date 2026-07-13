@@ -17,6 +17,10 @@ message AgentEnvelope {
     TaskLogBatch task_log_batch = 5;
     TaskProgress task_progress = 6;
     TaskSnapshot task_snapshot = 7;
+    CertificateRotationRequest certificate_rotation_request = 8;
+    CertificateRotationActivated certificate_rotation_activated = 9;
+    ZlmDebugResponse zlm_debug_response = 10;
+    ZlmHookRequest zlm_hook_request = 11;
   }
 }
 
@@ -28,19 +32,24 @@ message CoreEnvelope {
     ProbeCapabilities probe_capabilities = 3;
     AdoptOrphans adopt_orphans = 4;
     TaskRecordingControl task_recording_control = 5;
+    CertificateRotationBundle certificate_rotation_bundle = 6;
+    ActivateCertificateRotation activate_certificate_rotation = 7;
+    ZlmDebugRequest zlm_debug_request = 8;
+    CertificateRotationReset certificate_rotation_reset = 9;
+    ZlmHookResponse zlm_hook_response = 10;
   }
 }
 
 message Register {
-  // 节点注册字段会落库并参与调度、URL 外部化和 ZLM Hook 关联。
+  // 节点注册字段参与调度和媒体地址外部化；管理目标只由认证 peer IP、证书 SAN 与 management_port 构造。
   string node_id = 1;
   string node_name = 2;
   string agent_version = 3;
   string hostname = 4;
   repeated string labels = 5;
   repeated string interfaces = 6;
-  string zlm_api_base = 7;
-  string zlm_api_secret = 8;
+  string zlm_api_base = 7 [deprecated = true];
+  string zlm_api_secret = 8 [deprecated = true];
   string agent_stream_addr = 9;
   string network_mode = 10;
   string ffmpeg_bin = 11;
@@ -50,7 +59,169 @@ message Register {
   string output_mount_relative_prefix_hls = 15;
   uint32 zlm_rtmp_port = 16;
   uint32 zlm_rtsp_port = 17;
-  string agent_http_base_url = 18;
+  string agent_http_base_url = 18 [deprecated = true];
+  uint32 management_port = 19;
+  uint64 management_upload_max_bytes = 20;
+}
+
+// Agent-generated CSRs are bound to one idempotent rotation transaction. The
+// authenticated stream supplies the node identity, so node_id is not repeated.
+message CertificateRotationRequest {
+  string rotation_id = 1;
+  string control_csr_pem = 2;
+  string management_csr_pem = 3;
+}
+
+// A staged bundle expires if it is not activated before expires_at_ms. The
+// certificate metadata lets the Agent validate the response before persisting it.
+message CertificateRotationBundle {
+  string rotation_id = 1;
+  int64 expires_at_ms = 2;
+  string control_certificate_pem = 3;
+  string control_fingerprint_sha256 = 4;
+  string control_serial_number = 5;
+  int64 control_not_before_ms = 6;
+  int64 control_not_after_ms = 7;
+  string management_certificate_pem = 8;
+  string management_fingerprint_sha256 = 9;
+  string management_serial_number = 10;
+  int64 management_not_before_ms = 11;
+  int64 management_not_after_ms = 12;
+  string agent_client_issuer_ca_pem = 13;
+  string control_plane_server_ca_pem = 14;
+  string management_client_ca_pem = 15;
+  string capability_jwt_public_key_pem = 16;
+  string capability_jwt_kid = 17;
+}
+
+// The old and new identities overlap only until the supplied deadline.
+message ActivateCertificateRotation {
+  string rotation_id = 1;
+  int64 previous_identity_expires_at_ms = 2;
+}
+
+// Presence of this message is the successful activation acknowledgement.
+message CertificateRotationActivated {
+  string rotation_id = 1;
+  int64 activated_at_ms = 2;
+  string control_fingerprint_sha256 = 3;
+  string management_fingerprint_sha256 = 4;
+}
+
+enum CertificateRotationResetReason {
+  CERTIFICATE_ROTATION_RESET_REASON_UNSPECIFIED = 0;
+  CERTIFICATE_ROTATION_RESET_REASON_EXPIRED = 1;
+}
+
+// Core sends this only for an authenticated, exact rotation transaction whose
+// staged bundle expired before activation. The Agent may discard only that
+// pending transaction and immediately request a fresh rotation identifier.
+message CertificateRotationReset {
+  string rotation_id = 1;
+  CertificateRotationResetReason reason = 2;
+}
+
+enum ZlmDebugOperation {
+  ZLM_DEBUG_OPERATION_UNSPECIFIED = 0;
+  ZLM_DEBUG_OPERATION_LIST_MEDIA = 1;
+  ZLM_DEBUG_OPERATION_LIST_SESSIONS = 2;
+  ZLM_DEBUG_OPERATION_LIST_PLAYERS = 3;
+  ZLM_DEBUG_OPERATION_GET_STATISTIC = 4;
+  ZLM_DEBUG_OPERATION_GET_THREADS_LOAD = 5;
+  ZLM_DEBUG_OPERATION_GET_WORK_THREADS_LOAD = 6;
+  ZLM_DEBUG_OPERATION_KICK_SESSION = 7;
+  ZLM_DEBUG_OPERATION_KICK_SESSIONS = 8;
+  ZLM_DEBUG_OPERATION_CLOSE_STREAM = 9;
+  ZLM_DEBUG_OPERATION_SNAPSHOT = 10;
+}
+
+// The operation allowlist and typed parameter union prevent Core from sending
+// an arbitrary ZLM API path, secret, or parameter map to an Agent.
+message ZlmDebugRequest {
+  string request_id = 1;
+  ZlmDebugOperation operation = 2;
+  oneof parameters {
+    ZlmMediaFilter media_filter = 3;
+    ZlmKickSessionParameters kick_session = 4;
+    ZlmKickSessionsParameters kick_sessions = 5;
+    ZlmCloseStreamParameters close_stream = 6;
+    ZlmSnapshotParameters snapshot = 7;
+  }
+}
+
+message ZlmMediaFilter {
+  string schema = 1;
+  string vhost = 2;
+  string app = 3;
+  string stream = 4;
+}
+
+message ZlmKickSessionParameters {
+  string session_id = 1;
+}
+
+message ZlmKickSessionsParameters {
+  uint32 local_port = 1;
+  string peer_ip = 2;
+}
+
+message ZlmCloseStreamParameters {
+  string schema = 1;
+  string vhost = 2;
+  string app = 3;
+  string stream = 4;
+  bool force = 5;
+}
+
+message ZlmSnapshotParameters {
+  string source_url = 1;
+  uint32 timeout_sec = 2;
+  uint32 expire_sec = 3;
+}
+
+enum ZlmDebugResponseStatus {
+  ZLM_DEBUG_RESPONSE_STATUS_UNSPECIFIED = 0;
+  ZLM_DEBUG_RESPONSE_STATUS_SUCCEEDED = 1;
+  ZLM_DEBUG_RESPONSE_STATUS_FAILED = 2;
+}
+
+// Implementations must enforce their configured response-size limit before
+// constructing this message and set truncated when a JSON response is clipped.
+message ZlmDebugResponse {
+  string request_id = 1;
+  ZlmDebugOperation operation = 2;
+  ZlmDebugResponseStatus status = 3;
+  oneof payload {
+    string json_payload = 4;
+    ZlmSnapshotPayload snapshot = 5;
+    ZlmDebugError error = 6;
+  }
+  bool truncated = 7;
+}
+
+message ZlmSnapshotPayload {
+  string content_type = 1;
+  bytes data = 2;
+}
+
+message ZlmDebugError {
+  string code = 1;
+  string message = 2;
+}
+
+// ZLM hooks enter through the Agent's local listener. Core derives the media
+// server identity from the authenticated control-stream session; neither a
+// remote server identifier nor the ZLM API secret is part of this contract.
+message ZlmHookRequest {
+  string request_id = 1;
+  string hook_name = 2;
+  string body_json = 3;
+}
+
+message ZlmHookResponse {
+  string request_id = 1;
+  uint32 http_status = 2;
+  string body_json = 3;
 }
 
 message Heartbeat {

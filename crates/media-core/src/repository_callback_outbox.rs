@@ -21,7 +21,7 @@ impl TaskRepository {
         let limit = limit.clamp(1, 100);
         // outbox worker 只领取到期任务，按 deliver_after/created_at 保持近似 FIFO；
         // limit 上限防止一次调度占用数据库连接太久。
-        Ok(sqlx::query(
+        sqlx::query(
             r#"
             select
               id,
@@ -45,7 +45,7 @@ impl TaskRepository {
         .await?
         .into_iter()
         .map(|row| CallbackOutboxJob::from_row(&row))
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
     }
 
     pub async fn mark_callback_delivered(
@@ -327,6 +327,7 @@ impl TaskRepository {
         .map_err(Into::into)
     }
 
+    #[allow(clippy::too_many_arguments)] // R3 claim records will replace this legacy enqueue shape.
     async fn enqueue_callback_job(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,

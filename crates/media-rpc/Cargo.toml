@@ -11,3 +11,6 @@ tonic.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
+
+[dev-dependencies]
+prost-types = "0.13.5"

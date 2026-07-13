@@ -35,6 +35,7 @@ impl TaskRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // R3 TaskTransitionService will own this transition input.
     pub(super) async fn validate_attempt_ownership(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -162,6 +163,7 @@ impl TaskRepository {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)] // R3 TaskTransitionService will own this transition input.
     pub(super) async fn reconcile_exited_snapshot(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -318,6 +320,7 @@ impl TaskRepository {
         Ok(consecutive)
     }
 
+    #[allow(clippy::too_many_arguments)] // R3 TaskTransitionService will own this transition input.
     pub(super) async fn complete_task_attempt(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,
@@ -445,6 +448,7 @@ impl TaskRepository {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // R3 TaskTransitionService will own this transition input.
     pub(super) async fn mark_task_lost(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,

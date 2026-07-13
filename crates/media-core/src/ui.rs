@@ -15,8 +15,8 @@ use std::{
 use tokio::fs;
 
 use crate::{
-    AppState, PeerAddress, auth::ApiPermission, authorize_business_request, error::AppError,
-    repository::TaskPreview,
+    AppState, PeerAddress, auth::ApiPermission, authenticated_session, authorize_business_request,
+    error::AppError, repository::TaskPreview,
 };
 use media_domain::TaskSpec;
 
@@ -47,7 +47,7 @@ pub(crate) async fn current_session(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<CurrentSessionResponse>, AppError> {
-    let principal = state.auth.session(&headers)?;
+    let principal = authenticated_session(&state, &headers).await?;
     Ok(Json(CurrentSessionResponse {
         auth_enabled: state.auth.enabled(),
         auth_mode: state.auth.mode(),

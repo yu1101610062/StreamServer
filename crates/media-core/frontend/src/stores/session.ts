@@ -78,10 +78,13 @@ export const useSessionStore = defineStore("session", () => {
 
   async function logout() {
     const currentRefreshToken = readRefreshToken();
-    if (currentRefreshToken) {
-      await authApi.logout(currentRefreshToken, { skipAuth: true });
+    try {
+      if (currentRefreshToken) {
+        await authApi.logout(currentRefreshToken, { skipAuth: true });
+      }
+    } finally {
+      clearSession();
     }
-    clearSession();
   }
 
   function clearSession() {

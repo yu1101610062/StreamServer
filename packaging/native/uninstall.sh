@@ -94,11 +94,40 @@ resolve_install_dir() {
     fi
   fi
   [ -d "${INSTALL_DIR}" ] || fail "安装目录不存在: ${INSTALL_DIR}"
-  INSTALL_DIR="$(cd "${INSTALL_DIR}" && pwd)"
+  [ ! -L "${INSTALL_DIR}" ] \
+    || fail "native installation directory must not be a symbolic link"
+  INSTALL_DIR="$(cd -P "${INSTALL_DIR}" && pwd -P)"
 }
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || fail "卸载 systemd 服务需要 root，请使用 root 执行 uninstall.sh"
+}
+
+mode_is_not_group_or_world_writable() {
+  local mode="$1"
+  [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#${mode} & 8#022) == 0 ))
+}
+
+assert_trusted_install_control_boundary() {
+  local env_file="${INSTALL_DIR}/.env"
+  local mode
+  [ ! -L "${INSTALL_DIR}" ] && [ -d "${INSTALL_DIR}" ] \
+    || fail "native install control boundary is not a real directory"
+  [ "$(stat -c '%u' -- "${INSTALL_DIR}")" = 0 ] \
+    || fail "native install control boundary must be root-owned"
+  mode="$(stat -c '%a' -- "${INSTALL_DIR}")" \
+    || fail "cannot inspect native install control boundary"
+  mode_is_not_group_or_world_writable "${mode}" \
+    || fail "native install control boundary must not be group/world writable"
+  [ ! -L "${env_file}" ] && [ -f "${env_file}" ] \
+    || fail "native instance environment must be a regular non-symbolic file"
+  [ "$(stat -c '%u' -- "${env_file}")" = 0 ] \
+    || fail "native instance environment must be root-owned"
+  mode="$(stat -c '%a' -- "${env_file}")" \
+    || fail "cannot inspect native instance environment"
+  mode_is_not_group_or_world_writable "${mode}" \
+    || fail "native instance environment must not be group/world writable"
 }
 
 load_env() {
@@ -107,6 +136,27 @@ load_env() {
   # shellcheck disable=SC1090
   . "${env_file}"
   [ "${DEPLOY_MODE:-}" = "native" ] || fail "不是 native 实例目录: ${INSTALL_DIR}"
+}
+
+validate_loaded_native_identity() {
+  local unit_basename
+  case "${INSTALL_ROLE:-}" in
+    control-plane|worker-host-cpu|worker-host-gpu|all-in-one-host-cpu|all-in-one-host-gpu) ;;
+    *) fail "native instance has an invalid INSTALL_ROLE" ;;
+  esac
+  case "${INSTANCE_NAME:-}" in
+    ''|-*|*[!A-Za-z0-9_.@-]*) fail "native instance has an invalid INSTANCE_NAME" ;;
+  esac
+  case "${INSTANCE_NAME}" in
+    ss-*) unit_basename="${INSTANCE_NAME}" ;;
+    *) unit_basename="ss-${INSTANCE_NAME}" ;;
+  esac
+  [ "${SYSTEMD_TARGET:-}" = "${unit_basename}.target" ] \
+    && [ "${SYSTEMD_CORE_UNIT:-}" = "${unit_basename}-core.service" ] \
+    && [ "${SYSTEMD_AGENT_UNIT:-}" = "${unit_basename}-agent.service" ] \
+    && [ "${SYSTEMD_ZLM_UNIT:-}" = "${unit_basename}-zlm.service" ] \
+    && [ "${SYSTEMD_POSTGRES_UNIT:-}" = "${unit_basename}-postgres.service" ] \
+    || fail "native instance systemd identity does not match INSTANCE_NAME"
 }
 
 validate_unit_name() {
@@ -219,9 +269,14 @@ assert_safe_install_dir_for_purge() {
       ;;
   esac
   count="$(component_count "${INSTALL_DIR}")"
-  [ "${count}" -ge 3 ] || fail "安装目录层级过浅，拒绝 purge: ${INSTALL_DIR}"
+  # The installer supports standard two-component roots such as
+  # /home/streamserver and /opt/streamserver-<instance>. Root ownership and
+  # the exact native instance identity below form the destructive boundary.
+  [ "${count}" -ge 2 ] || fail "安装目录层级过浅，拒绝 purge: ${INSTALL_DIR}"
   [ -f "${INSTALL_DIR}/.env" ] || fail "缺少 .env，拒绝 purge: ${INSTALL_DIR}"
   [ "${DEPLOY_MODE:-}" = "native" ] || fail "不是 native 实例，拒绝 purge: ${INSTALL_DIR}"
+  assert_trusted_install_control_boundary
+  validate_loaded_native_identity
 }
 
 choose_data_policy() {
@@ -261,7 +316,9 @@ main() {
   parse_args "$@"
   resolve_install_dir
   require_root
+  assert_trusted_install_control_boundary
   load_env
+  validate_loaded_native_identity
   choose_data_policy
   stop_and_remove_units
   case "${DATA_POLICY}" in

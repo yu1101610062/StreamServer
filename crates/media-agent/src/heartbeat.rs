@@ -22,6 +22,18 @@ struct CpuCounters {
     idle: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct HeartbeatSampleInput {
+    pub(crate) running_tasks: u32,
+    pub(crate) starting_tasks: u32,
+    pub(crate) stopping_tasks: u32,
+    pub(crate) orphaned_tasks: u32,
+    pub(crate) runtime_slot_loads: Vec<RuntimeSlotLoad>,
+    pub(crate) zlm_alive: bool,
+    pub(crate) ffmpeg_alive: bool,
+    pub(crate) gpu_runtime: Vec<GpuRuntimeStats>,
+}
+
 impl HeartbeatSampler {
     pub fn new(
         work_root: impl Into<String>,
@@ -34,17 +46,7 @@ impl HeartbeatSampler {
         }
     }
 
-    pub fn sample(
-        &mut self,
-        running_tasks: u32,
-        starting_tasks: u32,
-        stopping_tasks: u32,
-        orphaned_tasks: u32,
-        runtime_slot_loads: Vec<RuntimeSlotLoad>,
-        zlm_alive: bool,
-        ffmpeg_alive: bool,
-        gpu_runtime: Vec<GpuRuntimeStats>,
-    ) -> HeartbeatSnapshot {
+    pub fn sample(&mut self, input: HeartbeatSampleInput) -> HeartbeatSnapshot {
         // 上传盘与产物盘可能不是同一个挂载点：上传盘来自 work_root，产物盘优先来自清理器采样。
         let cpu_percent = self.sample_cpu_percent().unwrap_or(0.0);
         let mem_percent = sample_mem_percent().unwrap_or(0.0);
@@ -67,16 +69,16 @@ impl HeartbeatSampler {
             upload_disk_total_bytes: upload_disk.total_bytes,
             upload_disk_available_bytes: upload_disk.available_bytes,
             upload_disk_used_percent: upload_disk.used_percent,
-            running_tasks,
-            starting_tasks,
-            stopping_tasks,
-            orphaned_tasks,
-            runtime_slot_loads,
-            zlm_alive,
-            ffmpeg_alive,
+            running_tasks: input.running_tasks,
+            starting_tasks: input.starting_tasks,
+            stopping_tasks: input.stopping_tasks,
+            orphaned_tasks: input.orphaned_tasks,
+            runtime_slot_loads: input.runtime_slot_loads,
+            zlm_alive: input.zlm_alive,
+            ffmpeg_alive: input.ffmpeg_alive,
             artifact_cleanup_blocked,
             artifact_cleanup_block_reason,
-            gpu_runtime,
+            gpu_runtime: input.gpu_runtime,
         }
     }
 
@@ -156,8 +158,8 @@ fn sample_disk(path: &str) -> Option<DiskSample> {
     }
 
     let stat = unsafe { stat.assume_init() };
-    let total = (stat.f_blocks as u64).saturating_mul(stat.f_frsize as u64);
-    let free = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
+    let free = stat.f_bavail.saturating_mul(stat.f_frsize);
     if total == 0 {
         return Some(DiskSample::default());
     }

@@ -39,11 +39,11 @@ use crate::{
     runtime_process::RuntimeSlotClass,
     runtime_recording::{LiveRelayRecording, build_live_relay_recording},
     runtime_transcode::{
-        InternalIngressProtocol, append_live_mpegts_multicast_bridge_args, append_process_args,
-        append_process_args_with_profile, append_single_audio_output_maps,
-        build_internal_stream_output, resolve_stream_ingest_audio_copy_probe_input_args,
-        select_internal_ingress_protocol, should_loop_file_to_live_input,
-        should_stabilize_live_mpegts_multicast_bridge, stream_ingest_probe_input_args,
+        InternalIngressProtocol, ProcessArgsContext, append_live_mpegts_multicast_bridge_args,
+        append_process_args, append_single_audio_output_maps, build_internal_stream_output,
+        resolve_stream_ingest_audio_copy_probe_input_args, select_internal_ingress_protocol,
+        should_loop_file_to_live_input, should_stabilize_live_mpegts_multicast_bridge,
+        stream_ingest_probe_input_args,
     },
     runtime_zlm::ZLM_RUNTIME_VHOST,
 };
@@ -233,16 +233,18 @@ pub(crate) fn build_file_transcode_plan(
     };
     let profile = probe_input_media_profile(settings, spec, input_url.as_str());
     let mut args = ffmpeg_base_args_without_maps(input_url.clone(), false);
-    let audio_copy_decoration = append_process_args_with_profile(
+    let audio_copy_decoration = append_process_args(
         &mut args,
         settings,
         spec,
-        "copy_or_transcode",
-        input_url.as_str(),
-        output.format.as_str(),
-        VideoOutputPolicy::KeepSourceFamily,
-        AudioOutputPolicy::Aac,
-        Some(&profile),
+        ProcessArgsContext {
+            default_mode: "copy_or_transcode",
+            input_url: input_url.as_str(),
+            output_format: output.format.as_str(),
+            video_policy: VideoOutputPolicy::KeepSourceFamily,
+            audio_policy: AudioOutputPolicy::Aac,
+            input_profile: Some(&profile),
+        },
     )?;
     append_single_audio_output_maps(
         &mut args,
@@ -338,16 +340,18 @@ pub(crate) fn build_stream_ingest_realtime_plan(
         }
         insert_ffmpeg_input_args(&mut args, input_args);
     }
-    let audio_copy_decoration = append_process_args_with_profile(
+    let audio_copy_decoration = append_process_args(
         &mut args,
         settings,
         spec,
-        "copy_or_transcode",
-        input_url.as_str(),
-        process_output_format,
-        VideoOutputPolicy::CopyWhitelistedElseH264,
-        AudioOutputPolicy::CopyWhitelistedElseAac,
-        Some(&profile),
+        ProcessArgsContext {
+            default_mode: "copy_or_transcode",
+            input_url: input_url.as_str(),
+            output_format: process_output_format,
+            video_policy: VideoOutputPolicy::CopyWhitelistedElseH264,
+            audio_policy: AudioOutputPolicy::CopyWhitelistedElseAac,
+            input_profile: Some(&profile),
+        },
     )?;
     if !matches!(ingress_protocol, InternalIngressProtocol::Rtmp) {
         args.extend(["-threads".to_string(), "0".to_string()]);
@@ -434,16 +438,18 @@ pub(crate) fn build_stream_ingest_fast_record_plan(
             vec!["-stream_loop".to_string(), "-1".to_string()],
         );
     }
-    let audio_copy_decoration = append_process_args_with_profile(
+    let audio_copy_decoration = append_process_args(
         &mut args,
         settings,
         spec,
-        "copy_or_transcode",
-        input_url.as_str(),
-        preferred_output_format,
-        VideoOutputPolicy::CopyWhitelistedElseH264,
-        AudioOutputPolicy::CopyWhitelistedElseAac,
-        Some(&profile),
+        ProcessArgsContext {
+            default_mode: "copy_or_transcode",
+            input_url: input_url.as_str(),
+            output_format: preferred_output_format,
+            video_policy: VideoOutputPolicy::CopyWhitelistedElseH264,
+            audio_policy: AudioOutputPolicy::CopyWhitelistedElseAac,
+            input_profile: Some(&profile),
+        },
     )?;
     args.extend(["-threads".to_string(), "0".to_string()]);
     if let Some(duration_sec) = spec.record.duration_sec {
@@ -523,16 +529,18 @@ pub(crate) fn build_stream_ingest_fast_record_plan(
                 "mp4".to_string(),
                 mp4_output.target.clone(),
             ]);
-            let hls_audio_copy_decoration = append_process_args_with_profile(
+            let hls_audio_copy_decoration = append_process_args(
                 &mut args,
                 settings,
                 spec,
-                "copy_or_transcode",
-                input_url.as_str(),
-                hls_output.format.as_str(),
-                VideoOutputPolicy::CopyWhitelistedElseH264,
-                AudioOutputPolicy::CopyWhitelistedElseAac,
-                Some(&profile),
+                ProcessArgsContext {
+                    default_mode: "copy_or_transcode",
+                    input_url: input_url.as_str(),
+                    output_format: hls_output.format.as_str(),
+                    video_policy: VideoOutputPolicy::CopyWhitelistedElseH264,
+                    audio_policy: AudioOutputPolicy::CopyWhitelistedElseAac,
+                    input_profile: Some(&profile),
+                },
             )?;
             args.extend(["-threads".to_string(), "0".to_string()]);
             if let Some(duration_sec) = spec.record.duration_sec {
@@ -627,11 +635,14 @@ pub(crate) fn build_multicast_bridge_plan(
             &mut args,
             settings,
             spec,
-            "passthrough",
-            input_url.as_str(),
-            output.format.as_str(),
-            VideoOutputPolicy::ForceH264,
-            AudioOutputPolicy::Aac,
+            ProcessArgsContext {
+                default_mode: "passthrough",
+                input_url: input_url.as_str(),
+                output_format: output.format.as_str(),
+                video_policy: VideoOutputPolicy::ForceH264,
+                audio_policy: AudioOutputPolicy::Aac,
+                input_profile: None,
+            },
         )?;
         if let Some(filter) =
             audio_copy_decoration.and_then(|value| value.filter_for_output(output.format.as_str()))

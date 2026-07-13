@@ -2,6 +2,7 @@
 Description=StreamServer native services (__INSTANCE_NAME__)
 Wants=network-online.target
 After=network-online.target
+__ADMIN_HANDOFF_CONDITION__
 
 [Install]
 WantedBy=multi-user.target

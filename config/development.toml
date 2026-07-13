@@ -2,12 +2,12 @@
 level = "debug"
 
 [core]
-insecure_dev = true
 hook_source_allowlist = ["127.0.0.1"]
 storage_allowlist = ["./data/media/work", "./data/zlm/www"]
 
 [agent]
 work_root = "./data/media/work"
+zlm_hook_shared_secret = "development-only-zlm-hook-secret"
 mp4_record_segment_sec = 7200
 hls_record_segment_sec = 60
 

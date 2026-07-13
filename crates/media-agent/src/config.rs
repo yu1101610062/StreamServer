@@ -1,6 +1,29 @@
-use std::{path::Path, str::FromStr};
+use std::{env::VarError, ffi::OsString, net::SocketAddr, path::Path, str::FromStr};
 
 use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentEnvironment {
+    Development,
+    Production,
+}
+
+impl AgentEnvironment {
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "development" => Ok(Self::Development),
+            "production" => Ok(Self::Production),
+            _ => anyhow::bail!("STREAMSERVER_ENV must be exactly `development` or `production`"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Development => "development",
+            Self::Production => "production",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -36,8 +59,36 @@ impl Default for LoggingSettings {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentSettings {
-    #[serde(default = "default_http_addr")]
-    pub http_addr: String,
+    #[serde(default = "default_public_media_addr")]
+    pub public_media_addr: String,
+    #[serde(default)]
+    pub public_media_expose: bool,
+    #[serde(default)]
+    pub public_media_tls_cert_path: String,
+    #[serde(default)]
+    pub public_media_tls_key_path: String,
+    #[serde(default = "default_management_addr")]
+    pub management_addr: String,
+    #[serde(default = "default_management_tls_cert_path")]
+    pub management_tls_cert_path: String,
+    #[serde(default = "default_management_tls_key_path")]
+    pub management_tls_key_path: String,
+    #[serde(default = "default_management_tls_client_ca_path")]
+    pub management_tls_client_ca_path: String,
+    #[serde(default = "default_management_capability_jwt_public_key_path")]
+    pub management_capability_jwt_public_key_path: String,
+    #[serde(default = "default_management_max_concurrency")]
+    pub management_max_concurrency: usize,
+    #[serde(default = "default_management_chunk_idle_timeout_sec")]
+    pub management_chunk_idle_timeout_sec: u64,
+    #[serde(default = "default_zlm_hook_addr")]
+    pub zlm_hook_addr: String,
+    #[serde(default)]
+    pub zlm_hook_shared_secret: String,
+    #[serde(default = "default_zlm_hook_queue_capacity")]
+    pub zlm_hook_queue_capacity: usize,
+    #[serde(default = "default_zlm_hook_timeout_sec")]
+    pub zlm_hook_timeout_sec: u64,
     #[serde(default)]
     pub node_id: String,
     #[serde(default = "default_node_name")]
@@ -50,6 +101,8 @@ pub struct AgentSettings {
     pub key_path: String,
     #[serde(default = "default_ca_path")]
     pub ca_path: String,
+    #[serde(default = "default_identity_dir")]
+    pub identity_dir: String,
     #[serde(default)]
     pub tls_domain_name: String,
     #[serde(default = "default_ffmpeg_bin")]
@@ -143,13 +196,29 @@ pub struct AgentArtifactCleanupSettings {
 impl Default for AgentSettings {
     fn default() -> Self {
         Self {
-            http_addr: default_http_addr(),
+            public_media_addr: default_public_media_addr(),
+            public_media_expose: false,
+            public_media_tls_cert_path: String::new(),
+            public_media_tls_key_path: String::new(),
+            management_addr: default_management_addr(),
+            management_tls_cert_path: default_management_tls_cert_path(),
+            management_tls_key_path: default_management_tls_key_path(),
+            management_tls_client_ca_path: default_management_tls_client_ca_path(),
+            management_capability_jwt_public_key_path:
+                default_management_capability_jwt_public_key_path(),
+            management_max_concurrency: default_management_max_concurrency(),
+            management_chunk_idle_timeout_sec: default_management_chunk_idle_timeout_sec(),
+            zlm_hook_addr: default_zlm_hook_addr(),
+            zlm_hook_shared_secret: String::new(),
+            zlm_hook_queue_capacity: default_zlm_hook_queue_capacity(),
+            zlm_hook_timeout_sec: default_zlm_hook_timeout_sec(),
             node_id: String::new(),
             node_name: default_node_name(),
             core_endpoint: default_core_endpoint(),
             cert_path: default_cert_path(),
             key_path: default_key_path(),
             ca_path: default_ca_path(),
+            identity_dir: default_identity_dir(),
             tls_domain_name: String::new(),
             ffmpeg_bin: default_ffmpeg_bin(),
             ffprobe_bin: default_ffprobe_bin(),
@@ -205,15 +274,16 @@ impl Default for AgentArtifactCleanupSettings {
 
 impl Settings {
     pub fn load() -> anyhow::Result<Self> {
-        let environment = match std::env::var("STREAMSERVER_ENV") {
-            Ok(value) => value,
-            Err(_) => "development".into(),
-        };
+        let environment =
+            environment_from_var(std::env::var("STREAMSERVER_ENV").map(OsString::from))?
+                .as_str()
+                .to_string();
         let builder = config::Config::builder()
             .add_source(config::File::with_name("config/base").required(false))
             .add_source(config::File::with_name(&format!("config/{environment}")).required(false));
 
         let config = builder.build()?;
+        reject_legacy_listener_config(&config)?;
         reject_legacy_runtime_slot_config(&config)?;
         require_runtime_slot_config(&config)?;
         let mut file_settings = config.try_deserialize::<FileSettings>()?;
@@ -229,15 +299,96 @@ impl Settings {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
+        let environment = self.environment_kind()?;
+        let public_media_addr =
+            parse_listener_addr("AGENT_PUBLIC_MEDIA_ADDR", &self.agent.public_media_addr)?;
+        let management_addr =
+            parse_listener_addr("AGENT_MANAGEMENT_ADDR", &self.agent.management_addr)?;
+        let zlm_hook_addr = parse_listener_addr("AGENT_ZLM_HOOK_ADDR", &self.agent.zlm_hook_addr)?;
+        let public_tls_fields = [
+            self.agent.public_media_tls_cert_path.trim(),
+            self.agent.public_media_tls_key_path.trim(),
+        ];
+        let public_tls_configured = public_tls_fields.iter().all(|value| !value.is_empty());
         anyhow::ensure!(
-            !self.agent.http_addr.trim().is_empty(),
-            "agent.http_addr must not be empty"
+            public_tls_fields.iter().all(|value| value.is_empty()) || public_tls_configured,
+            "AGENT_PUBLIC_MEDIA_TLS_CERT_PATH and AGENT_PUBLIC_MEDIA_TLS_KEY_PATH must be configured together"
+        );
+        if environment == AgentEnvironment::Production && !public_media_addr.ip().is_loopback() {
+            anyhow::ensure!(
+                self.agent.public_media_expose,
+                "production non-loopback AGENT_PUBLIC_MEDIA_ADDR requires AGENT_PUBLIC_MEDIA_EXPOSE=true"
+            );
+            anyhow::ensure!(
+                public_tls_configured,
+                "production non-loopback public media listener requires TLS"
+            );
+        }
+        if environment == AgentEnvironment::Development {
+            let management_tls_fields = [
+                self.agent.management_tls_cert_path.trim(),
+                self.agent.management_tls_key_path.trim(),
+                self.agent.management_tls_client_ca_path.trim(),
+                self.agent.management_capability_jwt_public_key_path.trim(),
+            ];
+            anyhow::ensure!(
+                management_tls_fields.iter().all(|value| !value.is_empty()),
+                "development Agent management listener requires server cert/key, Core client CA, and capability JWT public key"
+            );
+            anyhow::ensure!(
+                management_tls_fields
+                    .iter()
+                    .all(|value| Path::new(value).is_absolute()),
+                "development Agent management TLS and capability key paths must be absolute"
+            );
+        }
+        anyhow::ensure!(
+            (1..=32).contains(&self.agent.management_max_concurrency),
+            "AGENT_MANAGEMENT_MAX_CONCURRENCY must be between 1 and 32"
         );
         anyhow::ensure!(
-            self.agent.node_id.trim().is_empty()
-                || uuid::Uuid::parse_str(self.agent.node_id.trim()).is_ok(),
-            "AGENT_NODE_ID must be a valid UUID when provided"
+            (1..=300).contains(&self.agent.management_chunk_idle_timeout_sec),
+            "AGENT_MANAGEMENT_CHUNK_IDLE_TIMEOUT_SEC must be between 1 and 300"
         );
+        anyhow::ensure!(
+            management_addr.port() > 0,
+            "AGENT_MANAGEMENT_ADDR port must be greater than 0"
+        );
+        anyhow::ensure!(
+            zlm_hook_addr.ip().is_loopback() && zlm_hook_addr.port() > 0,
+            "AGENT_ZLM_HOOK_ADDR must be a loopback listener with a non-zero port"
+        );
+        let zlm_hook_secret = self.agent.zlm_hook_shared_secret.as_bytes();
+        anyhow::ensure!(
+            !zlm_hook_secret.is_empty()
+                && zlm_hook_secret.len() <= 256
+                && zlm_hook_secret.iter().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-')
+                }),
+            "ZLM_HOOK_SHARED_SECRET must be a non-empty URL-safe token of at most 256 bytes"
+        );
+        if environment == AgentEnvironment::Production {
+            anyhow::ensure!(
+                zlm_hook_secret.len() >= 32,
+                "production ZLM_HOOK_SHARED_SECRET must contain at least 32 bytes"
+            );
+        }
+        anyhow::ensure!(
+            (1..=1024).contains(&self.agent.zlm_hook_queue_capacity),
+            "AGENT_ZLM_HOOK_QUEUE_CAPACITY must be between 1 and 1024"
+        );
+        anyhow::ensure!(
+            (1..=4).contains(&self.agent.zlm_hook_timeout_sec),
+            "AGENT_ZLM_HOOK_TIMEOUT_SEC must be between 1 and 4 so Agent fails before ZLM's 5-second hook timeout"
+        );
+        if !self.agent.node_id.trim().is_empty() {
+            let configured_node = uuid::Uuid::parse_str(self.agent.node_id.trim())
+                .map_err(|_| anyhow::anyhow!("AGENT_NODE_ID must be a valid UUID when provided"))?;
+            anyhow::ensure!(
+                !configured_node.is_nil(),
+                "AGENT_NODE_ID must not be the nil UUID"
+            );
+        }
         anyhow::ensure!(
             !self.agent.node_name.trim().is_empty(),
             "AGENT_NODE_NAME must not be empty"
@@ -246,7 +397,25 @@ impl Settings {
             !self.agent.core_endpoint.trim().is_empty(),
             "AGENT_CORE_ENDPOINT must not be empty"
         );
-        if self.agent.core_endpoint.starts_with("https://") {
+        anyhow::ensure!(
+            self.agent.identity_dir.trim().is_empty()
+                || Path::new(self.agent.identity_dir.trim()).is_absolute(),
+            "AGENT_IDENTITY_DIR must be an absolute path when provided"
+        );
+        if environment == AgentEnvironment::Production {
+            anyhow::ensure!(
+                self.agent.core_endpoint.starts_with("https://"),
+                "production AGENT_CORE_ENDPOINT must use https with Agent mTLS"
+            );
+            anyhow::ensure!(
+                !self.agent.identity_dir.trim().is_empty()
+                    && Path::new(self.agent.identity_dir.trim()).is_absolute(),
+                "production AGENT_IDENTITY_DIR must be an absolute path"
+            );
+        }
+        if self.agent.core_endpoint.starts_with("https://")
+            && self.agent.identity_dir.trim().is_empty()
+        {
             anyhow::ensure!(
                 !self.agent.cert_path.trim().is_empty(),
                 "AGENT_CERT_PATH must not be empty when AGENT_CORE_ENDPOINT uses https"
@@ -367,13 +536,64 @@ impl Settings {
 
         Ok(())
     }
+
+    pub(crate) fn environment_kind(&self) -> anyhow::Result<AgentEnvironment> {
+        AgentEnvironment::parse(&self.environment)
+    }
 }
 
 fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     // 环境变量覆盖发生在文件配置反序列化之后、validate 之前；这里只负责把文本
     // 转成字段值，跨字段依赖仍统一交给 validate()。
-    if let Some(value) = env("AGENT_HTTP_ADDR") {
-        settings.agent.http_addr = value;
+    reject_legacy_agent_http_addr(env("AGENT_HTTP_ADDR"))?;
+    if let Some(value) = env("AGENT_PUBLIC_MEDIA_ADDR") {
+        settings.agent.public_media_addr = value;
+    }
+    if let Some(value) = env("AGENT_PUBLIC_MEDIA_EXPOSE") {
+        settings.agent.public_media_expose = parse_bool(&value);
+    }
+    if let Some(value) = env("AGENT_PUBLIC_MEDIA_TLS_CERT_PATH") {
+        settings.agent.public_media_tls_cert_path = value;
+    }
+    if let Some(value) = env("AGENT_PUBLIC_MEDIA_TLS_KEY_PATH") {
+        settings.agent.public_media_tls_key_path = value;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_ADDR") {
+        settings.agent.management_addr = value;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_TLS_CERT_PATH") {
+        settings.agent.management_tls_cert_path = value;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_TLS_KEY_PATH") {
+        settings.agent.management_tls_key_path = value;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_TLS_CLIENT_CA_PATH") {
+        settings.agent.management_tls_client_ca_path = value;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_CAPABILITY_JWT_PUBLIC_KEY_PATH") {
+        settings.agent.management_capability_jwt_public_key_path = value;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_MAX_CONCURRENCY") {
+        settings.agent.management_max_concurrency =
+            parse_required_env("AGENT_MANAGEMENT_MAX_CONCURRENCY", &value)?;
+    }
+    if let Some(value) = env("AGENT_MANAGEMENT_CHUNK_IDLE_TIMEOUT_SEC") {
+        settings.agent.management_chunk_idle_timeout_sec =
+            parse_required_env("AGENT_MANAGEMENT_CHUNK_IDLE_TIMEOUT_SEC", &value)?;
+    }
+    if let Some(value) = env("AGENT_ZLM_HOOK_ADDR") {
+        settings.agent.zlm_hook_addr = value;
+    }
+    if let Some(value) = env("ZLM_HOOK_SHARED_SECRET") {
+        settings.agent.zlm_hook_shared_secret = value;
+    }
+    if let Some(value) = env("AGENT_ZLM_HOOK_QUEUE_CAPACITY") {
+        settings.agent.zlm_hook_queue_capacity =
+            parse_required_env("AGENT_ZLM_HOOK_QUEUE_CAPACITY", &value)?;
+    }
+    if let Some(value) = env("AGENT_ZLM_HOOK_TIMEOUT_SEC") {
+        settings.agent.zlm_hook_timeout_sec =
+            parse_required_env("AGENT_ZLM_HOOK_TIMEOUT_SEC", &value)?;
     }
     if let Some(value) = env("AGENT_NODE_ID") {
         settings.agent.node_id = value;
@@ -392,6 +612,9 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     }
     if let Some(value) = env("AGENT_CA_PATH") {
         settings.agent.ca_path = value;
+    }
+    if let Some(value) = env("AGENT_IDENTITY_DIR") {
+        settings.agent.identity_dir = value;
     }
     if let Some(value) = env("AGENT_TLS_DOMAIN_NAME") {
         settings.agent.tls_domain_name = value;
@@ -564,8 +787,51 @@ fn env(name: &str) -> Option<String> {
     }
 }
 
+fn reject_legacy_agent_http_addr(value: Option<String>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        value.is_none(),
+        "AGENT_HTTP_ADDR is no longer supported; configure AGENT_PUBLIC_MEDIA_ADDR and AGENT_MANAGEMENT_ADDR"
+    );
+    Ok(())
+}
+
+fn environment_from_var(value: Result<OsString, VarError>) -> anyhow::Result<AgentEnvironment> {
+    match value {
+        Ok(value) => AgentEnvironment::parse(
+            value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("STREAMSERVER_ENV must be valid UTF-8"))?,
+        ),
+        Err(VarError::NotPresent) => Ok(AgentEnvironment::Development),
+        Err(VarError::NotUnicode(_)) => {
+            anyhow::bail!("STREAMSERVER_ENV must be valid UTF-8")
+        }
+    }
+}
+
+fn parse_listener_addr(name: &str, value: &str) -> anyhow::Result<SocketAddr> {
+    let addr = value
+        .trim()
+        .parse::<SocketAddr>()
+        .map_err(|_| anyhow::anyhow!("{name} must be an IP socket address"))?;
+    anyhow::ensure!(addr.port() > 0, "{name} port must be greater than 0");
+    Ok(addr)
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes")
+}
+
 fn config_key_present(config: &config::Config, key: &str) -> bool {
     config.get::<config::Value>(key).is_ok()
+}
+
+fn reject_legacy_listener_config(config: &config::Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !config_key_present(config, "agent.http_addr"),
+        "agent.http_addr has been removed; use agent.public_media_addr and agent.management_addr"
+    );
+    Ok(())
 }
 
 fn reject_legacy_runtime_slot_config(config: &config::Config) -> anyhow::Result<()> {
@@ -629,8 +895,48 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
-fn default_http_addr() -> String {
-    "0.0.0.0:8081".to_string()
+fn default_public_media_addr() -> String {
+    "127.0.0.1:8081".to_string()
+}
+
+fn default_management_addr() -> String {
+    "0.0.0.0:8443".to_string()
+}
+
+fn default_management_tls_cert_path() -> String {
+    "/var/lib/streamserver/agent/identity/management-server-cert.pem".to_string()
+}
+
+fn default_management_tls_key_path() -> String {
+    "/var/lib/streamserver/agent/identity/management-server-key.pem".to_string()
+}
+
+fn default_management_tls_client_ca_path() -> String {
+    "/var/lib/streamserver/agent/identity/management-client-ca.pem".to_string()
+}
+
+fn default_management_capability_jwt_public_key_path() -> String {
+    "/var/lib/streamserver/agent/identity/capability-jwt-public-key.pem".to_string()
+}
+
+fn default_management_max_concurrency() -> usize {
+    4
+}
+
+fn default_management_chunk_idle_timeout_sec() -> u64 {
+    30
+}
+
+fn default_zlm_hook_addr() -> String {
+    "127.0.0.1:18082".to_string()
+}
+
+fn default_zlm_hook_queue_capacity() -> usize {
+    64
+}
+
+fn default_zlm_hook_timeout_sec() -> u64 {
+    4
 }
 
 fn default_node_name() -> String {
@@ -651,6 +957,10 @@ fn default_key_path() -> String {
 
 fn default_ca_path() -> String {
     "certs/ca.pem".to_string()
+}
+
+fn default_identity_dir() -> String {
+    "/var/lib/streamserver/agent/identity".to_string()
 }
 
 fn default_ffmpeg_bin() -> String {
@@ -772,4 +1082,237 @@ fn default_artifact_cleanup_strategy() -> String {
 
 fn default_artifact_cleanup_check_interval_sec() -> u64 {
     30
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env::VarError, ffi::OsString};
+
+    use super::*;
+
+    fn production_settings() -> Settings {
+        let mut settings = Settings {
+            environment: "production".to_string(),
+            logging: LoggingSettings::default(),
+            agent: AgentSettings::default(),
+        };
+        settings.agent.zlm_hook_shared_secret = "0123456789abcdef0123456789abcdef".to_string();
+        settings
+    }
+
+    #[test]
+    fn production_requires_https_control_plane() {
+        let settings = production_settings();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn production_requires_absolute_identity_directory() {
+        let mut settings = production_settings();
+        settings.agent.core_endpoint = "https://core.example.test:50051".to_string();
+        settings.agent.identity_dir = "relative/identity".to_string();
+        assert!(settings.validate().is_err());
+        settings.agent.identity_dir = "/var/lib/streamserver/agent/identity".to_string();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn environment_is_a_fail_closed_allowlist() {
+        for invalid in ["prod", "Production", "production ", "staging"] {
+            let mut settings = production_settings();
+            settings.environment = invalid.to_string();
+            assert!(
+                settings.validate().is_err(),
+                "unexpectedly accepted environment {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enrolled_identity_does_not_require_legacy_tls_paths() {
+        let mut settings = production_settings();
+        settings.agent.core_endpoint = "https://core.example.test:50051".to_string();
+        settings.agent.identity_dir = "/var/lib/streamserver/agent/identity".to_string();
+        settings.agent.cert_path.clear();
+        settings.agent.key_path.clear();
+        settings.agent.ca_path.clear();
+        settings.agent.management_tls_cert_path.clear();
+        settings.agent.management_tls_key_path.clear();
+        settings.agent.management_tls_client_ca_path.clear();
+        settings
+            .agent
+            .management_capability_jwt_public_key_path
+            .clear();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn explicit_development_node_id_must_not_be_nil() {
+        let mut settings = production_settings();
+        settings.environment = "development".to_string();
+        settings.agent.node_id = uuid::Uuid::nil().to_string();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn missing_environment_defaults_to_development_but_non_unicode_is_rejected() {
+        assert_eq!(
+            environment_from_var(Err(VarError::NotPresent)).unwrap(),
+            AgentEnvironment::Development
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let invalid = OsString::from_vec(vec![0xff, 0xfe]);
+            let error = environment_from_var(Err(VarError::NotUnicode(invalid))).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("STREAMSERVER_ENV must be valid UTF-8")
+            );
+        }
+    }
+
+    #[test]
+    fn public_listener_defaults_to_loopback_and_management_has_safe_limits() {
+        let settings = AgentSettings::default();
+
+        assert_eq!(settings.public_media_addr, "127.0.0.1:8081");
+        assert!(!settings.public_media_expose);
+        assert_eq!(settings.management_addr, "0.0.0.0:8443");
+        assert_eq!(settings.management_max_concurrency, 4);
+        assert_eq!(settings.management_chunk_idle_timeout_sec, 30);
+        assert_eq!(settings.zlm_hook_addr, "127.0.0.1:18082");
+        assert_eq!(settings.zlm_hook_queue_capacity, 64);
+        assert_eq!(settings.zlm_hook_timeout_sec, 4);
+    }
+
+    #[test]
+    fn zlm_hook_listener_is_loopback_and_production_secret_is_strong() {
+        let mut settings = production_settings();
+        settings.agent.core_endpoint = "https://core.example.test:50051".to_string();
+
+        settings.agent.zlm_hook_addr = "0.0.0.0:18082".to_string();
+        assert!(settings.validate().is_err());
+        settings.agent.zlm_hook_addr = "127.0.0.1:18082".to_string();
+
+        settings.agent.zlm_hook_shared_secret.clear();
+        assert!(settings.validate().is_err());
+        settings.agent.zlm_hook_shared_secret = "short-secret".to_string();
+        assert!(settings.validate().is_err());
+        settings.agent.zlm_hook_shared_secret = "0123456789abcdef0123456789abcdef".to_string();
+        assert!(settings.validate().is_ok());
+
+        settings.agent.zlm_hook_queue_capacity = 0;
+        assert!(settings.validate().is_err());
+        settings.agent.zlm_hook_queue_capacity = 64;
+        settings.agent.zlm_hook_timeout_sec = 0;
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn zlm_hook_relay_timeout_stays_below_zlm_timeout_in_every_environment() {
+        let mut production = production_settings();
+        production.agent.core_endpoint = "https://core.example.test:50051".to_string();
+        production.agent.zlm_hook_timeout_sec = 5;
+        let production_error = production.validate().unwrap_err();
+        assert!(
+            production_error
+                .to_string()
+                .contains("AGENT_ZLM_HOOK_TIMEOUT_SEC must be between 1 and 4")
+        );
+
+        let mut development = production;
+        development.environment = "development".to_string();
+        development.agent.zlm_hook_shared_secret = "development-hook-secret".to_string();
+        let development_error = development.validate().unwrap_err();
+        assert!(
+            development_error
+                .to_string()
+                .contains("AGENT_ZLM_HOOK_TIMEOUT_SEC must be between 1 and 4")
+        );
+    }
+
+    #[test]
+    fn legacy_agent_http_addr_override_is_rejected_instead_of_opening_a_bypass_listener() {
+        assert!(reject_legacy_agent_http_addr(None).is_ok());
+        let error = reject_legacy_agent_http_addr(Some("0.0.0.0:8081".to_string())).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("AGENT_HTTP_ADDR is no longer supported")
+        );
+    }
+
+    #[test]
+    fn legacy_agent_http_addr_file_key_is_rejected_instead_of_silently_ignored() {
+        let config = config::Config::builder()
+            .set_override("agent.http_addr", "0.0.0.0:8081")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(reject_legacy_listener_config(&config).is_err());
+    }
+
+    #[test]
+    fn production_non_loopback_public_listener_requires_explicit_exposure_and_tls() {
+        let mut settings = production_settings();
+        settings.agent.core_endpoint = "https://core.example.test:50051".to_string();
+        settings.agent.public_media_addr = "0.0.0.0:8081".to_string();
+        settings.agent.public_media_expose = false;
+        settings.agent.public_media_tls_cert_path.clear();
+        settings.agent.public_media_tls_key_path.clear();
+        assert!(settings.validate().is_err());
+
+        settings.agent.public_media_expose = true;
+        assert!(settings.validate().is_err());
+
+        settings.agent.public_media_tls_cert_path = "/etc/streamserver/public.pem".to_string();
+        settings.agent.public_media_tls_key_path = "/etc/streamserver/public.key".to_string();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn management_listener_always_requires_complete_mtls_material() {
+        let mut settings = production_settings();
+        settings.environment = "development".to_string();
+        settings.agent.management_tls_cert_path.clear();
+        settings.agent.management_tls_key_path.clear();
+        settings.agent.management_tls_client_ca_path.clear();
+        settings
+            .agent
+            .management_capability_jwt_public_key_path
+            .clear();
+        assert!(settings.validate().is_err());
+
+        settings.agent.management_tls_cert_path =
+            "/var/lib/streamserver/agent/identity/management-cert.pem".to_string();
+        settings.agent.management_tls_key_path =
+            "/var/lib/streamserver/agent/identity/management-key.pem".to_string();
+        settings.agent.management_tls_client_ca_path =
+            "/var/lib/streamserver/agent/identity/ca-cert.pem".to_string();
+        settings.agent.management_capability_jwt_public_key_path =
+            "/var/lib/streamserver/agent/identity/capability-jwt-public.pem".to_string();
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn management_port_and_limits_are_fail_closed() {
+        let mut settings = production_settings();
+        settings.agent.core_endpoint = "https://core.example.test:50051".to_string();
+
+        settings.agent.management_addr = "0.0.0.0:0".to_string();
+        assert!(settings.validate().is_err());
+        settings.agent.management_addr = "0.0.0.0:8443".to_string();
+
+        settings.agent.management_max_concurrency = 0;
+        assert!(settings.validate().is_err());
+        settings.agent.management_max_concurrency = 4;
+
+        settings.agent.management_chunk_idle_timeout_sec = 0;
+        assert!(settings.validate().is_err());
+    }
 }

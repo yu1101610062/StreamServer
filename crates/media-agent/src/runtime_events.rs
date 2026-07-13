@@ -27,7 +27,41 @@ pub(crate) const MAX_LOG_BATCH_BYTES: usize = 512 * 1024;
 const LOG_LINE_TRUNCATED_MARKER: &str = " ... [truncated]";
 const SECONDS_PER_DAY: u64 = 86_400;
 
+pub(crate) struct RuntimeProgressStreamContext {
+    pub(crate) runtime_id: Uuid,
+    pub(crate) task_id: Uuid,
+    pub(crate) attempt_no: i32,
+    pub(crate) lease_token: String,
+    pub(crate) require_stream_online: bool,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) max_file_bytes: u64,
+    pub(crate) tail_bytes: usize,
+    pub(crate) events: RuntimeEventSink,
+    pub(crate) monitor_handle: RuntimeMonitorHandle,
+}
+
+pub(crate) struct RuntimeLogStreamContext {
+    pub(crate) task_id: Uuid,
+    pub(crate) attempt_no: i32,
+    pub(crate) lease_token: String,
+    pub(crate) session_epoch: u64,
+    pub(crate) stream: String,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) max_file_bytes: u64,
+    pub(crate) tail_bytes: usize,
+    pub(crate) events: RuntimeEventSink,
+}
+
+struct DiagnosticLogLine<'a> {
+    line: &'a str,
+    bytes_written: u64,
+    tail_bytes: usize,
+    file_truncated: bool,
+}
+
 #[derive(Debug, Clone)]
+// The prefix keeps the durable event/log/progress/snapshot channels explicit at call sites.
+#[allow(clippy::enum_variant_names)]
 pub enum RuntimeNotification {
     TaskEvent(RuntimeTaskEvent),
     TaskLogBatch(RuntimeTaskLogBatch),
@@ -148,7 +182,7 @@ impl RuntimeDiagnosticLogState {
         if self.tail.len() > tail_bytes {
             let overflow = self.tail.len() - tail_bytes;
             let mut split = overflow;
-            while split < self.tail.len() && !std::str::from_utf8(&self.tail[split..]).is_ok() {
+            while split < self.tail.len() && std::str::from_utf8(&self.tail[split..]).is_err() {
                 split += 1;
             }
             self.tail.drain(..split.min(self.tail.len()));
@@ -259,22 +293,24 @@ impl RuntimeEventSink {
             .or_insert_with(|| RuntimeDiagnosticLogState::new(stream.to_string(), path));
     }
 
-    pub fn observe_diagnostic_log_line(
+    fn observe_diagnostic_log_line(
         &self,
         task_id: Uuid,
         attempt_no: i32,
         stream: &str,
-        line: &str,
-        bytes_written: u64,
-        tail_bytes: usize,
-        file_truncated: bool,
+        observation: DiagnosticLogLine<'_>,
     ) {
         let mut logs = self
             .diagnostic_logs
             .write()
             .expect("diagnostic logs lock poisoned");
         if let Some(log) = logs.get_mut(&RuntimeLogKey::new(task_id, attempt_no, stream)) {
-            log.observe(line, bytes_written, tail_bytes, file_truncated);
+            log.observe(
+                observation.line,
+                observation.bytes_written,
+                observation.tail_bytes,
+                observation.file_truncated,
+            );
         }
     }
 
@@ -477,26 +513,17 @@ fn open_runtime_log_file(
 
 pub(crate) async fn read_progress_stream(
     stdout: tokio::process::ChildStdout,
-    runtime_id: Uuid,
-    task_id: Uuid,
-    attempt_no: i32,
-    lease_token: String,
-    require_stream_online: bool,
-    work_dir: PathBuf,
-    max_file_bytes: u64,
-    tail_bytes: usize,
-    events: RuntimeEventSink,
-    monitor_handle: RuntimeMonitorHandle,
+    context: RuntimeProgressStreamContext,
 ) {
     let mut reader = BufReader::new(stdout).lines();
     let mut current = HashMap::<String, String>::new();
     let mut log_file = open_runtime_log_file(
-        &events,
-        task_id,
-        attempt_no,
-        &work_dir,
+        &context.events,
+        context.task_id,
+        context.attempt_no,
+        &context.work_dir,
         "stdout",
-        max_file_bytes,
+        context.max_file_bytes,
     );
 
     while let Ok(Some(line)) = reader.next_line().await {
@@ -505,21 +532,23 @@ pub(crate) async fn read_progress_stream(
             continue;
         }
         let (bytes_written, file_truncated) = log_file.append_line(&line);
-        events.observe_diagnostic_log_line(
-            task_id,
-            attempt_no,
+        context.events.observe_diagnostic_log_line(
+            context.task_id,
+            context.attempt_no,
             "stdout",
-            &line,
-            bytes_written,
-            tail_bytes,
-            file_truncated,
+            DiagnosticLogLine {
+                line: &line,
+                bytes_written,
+                tail_bytes: context.tail_bytes,
+                file_truncated,
+            },
         );
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
         current.insert(key.to_string(), value.to_string());
         if key == "progress" {
-            let Some(snapshot) = monitor_handle.snapshot().await else {
+            let Some(snapshot) = context.monitor_handle.snapshot().await else {
                 return;
             };
             let stream_online = snapshot
@@ -528,15 +557,15 @@ pub(crate) async fn read_progress_stream(
                 .get("stream_online")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            if require_stream_online && !stream_online {
+            if context.require_stream_online && !stream_online {
                 current.clear();
                 continue;
             }
             let session_epoch = runtime_session_epoch(&snapshot.handle);
             let progress = RuntimeTaskProgress {
-                task_id,
-                attempt_no,
-                lease_token: lease_token.clone(),
+                task_id: context.task_id,
+                attempt_no: context.attempt_no,
+                lease_token: context.lease_token.clone(),
                 session_epoch,
                 frame: parse_u64(current.get("frame")),
                 fps: parse_f64(current.get("fps")),
@@ -546,11 +575,12 @@ pub(crate) async fn read_progress_stream(
                 dup_frames: parse_u64(current.get("dup_frames")),
                 drop_frames: parse_u64(current.get("drop_frames")),
             };
-            monitor_handle
+            context
+                .monitor_handle
                 .send_event(RuntimeInternalEvent::ProgressObserved(
                     ProgressObservedEvent {
-                        runtime_id,
-                        generation: monitor_handle.generation(),
+                        runtime_id: context.runtime_id,
+                        generation: context.monitor_handle.generation(),
                         progress,
                     },
                 ))
@@ -561,14 +591,9 @@ pub(crate) async fn read_progress_stream(
 }
 
 fn flush_log_batch(
-    task_id: Uuid,
-    attempt_no: i32,
-    lease_token: &str,
-    session_epoch: u64,
-    stream: &str,
+    context: &RuntimeLogStreamContext,
     batch: &mut Vec<(String, usize)>,
     source_line_count: &mut usize,
-    events: &RuntimeEventSink,
 ) {
     if batch.is_empty() {
         return;
@@ -584,39 +609,33 @@ fn flush_log_batch(
     let emitted_line_count = *source_line_count;
     *source_line_count = 0;
 
-    let _ = events.send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
-        task_id,
-        attempt_no,
-        lease_token: lease_token.to_string(),
-        session_epoch,
-        stream: stream.to_string(),
-        lines,
-        source_line_count: emitted_line_count,
-    }));
+    let _ = context
+        .events
+        .send(RuntimeNotification::TaskLogBatch(RuntimeTaskLogBatch {
+            task_id: context.task_id,
+            attempt_no: context.attempt_no,
+            lease_token: context.lease_token.clone(),
+            session_epoch: context.session_epoch,
+            stream: context.stream.clone(),
+            lines,
+            source_line_count: emitted_line_count,
+        }));
 }
 
 pub(crate) async fn read_log_stream(
     stderr: tokio::process::ChildStderr,
-    task_id: Uuid,
-    attempt_no: i32,
-    lease_token: String,
-    session_epoch: u64,
-    stream: String,
-    work_dir: PathBuf,
-    max_file_bytes: u64,
-    tail_bytes: usize,
-    events: RuntimeEventSink,
+    context: RuntimeLogStreamContext,
 ) {
     let mut reader = BufReader::new(stderr).lines();
     let mut batch = Vec::new();
     let mut source_line_count = 0usize;
     let mut log_file = open_runtime_log_file(
-        &events,
-        task_id,
-        attempt_no,
-        &work_dir,
-        &stream,
-        max_file_bytes,
+        &context.events,
+        context.task_id,
+        context.attempt_no,
+        &context.work_dir,
+        &context.stream,
+        context.max_file_bytes,
     );
 
     'outer: loop {
@@ -626,16 +645,7 @@ pub(crate) async fn read_log_stream(
             match timeout(LOG_BATCH_FLUSH_INTERVAL, reader.next_line()).await {
                 Ok(result) => result,
                 Err(_) => {
-                    flush_log_batch(
-                        task_id,
-                        attempt_no,
-                        &lease_token,
-                        session_epoch,
-                        &stream,
-                        &mut batch,
-                        &mut source_line_count,
-                        &events,
-                    );
+                    flush_log_batch(&context, &mut batch, &mut source_line_count);
                     continue;
                 }
             }
@@ -653,14 +663,16 @@ pub(crate) async fn read_log_stream(
         }
 
         let (bytes_written, file_truncated) = log_file.append_line(&line);
-        events.observe_diagnostic_log_line(
-            task_id,
-            attempt_no,
-            &stream,
-            &line,
-            bytes_written,
-            tail_bytes,
-            file_truncated,
+        context.events.observe_diagnostic_log_line(
+            context.task_id,
+            context.attempt_no,
+            &context.stream,
+            DiagnosticLogLine {
+                line: &line,
+                bytes_written,
+                tail_bytes: context.tail_bytes,
+                file_truncated,
+            },
         );
         source_line_count += 1;
         if let Some((last_line, count)) = batch.last_mut() {
@@ -674,30 +686,12 @@ pub(crate) async fn read_log_stream(
         }
 
         if batch.len() >= MAX_LOG_BATCH_LINES || source_line_count >= MAX_LOG_BATCH_LINES {
-            flush_log_batch(
-                task_id,
-                attempt_no,
-                &lease_token,
-                session_epoch,
-                &stream,
-                &mut batch,
-                &mut source_line_count,
-                &events,
-            );
+            flush_log_batch(&context, &mut batch, &mut source_line_count);
             continue 'outer;
         }
     }
 
-    flush_log_batch(
-        task_id,
-        attempt_no,
-        &lease_token,
-        session_epoch,
-        &stream,
-        &mut batch,
-        &mut source_line_count,
-        &events,
-    );
+    flush_log_batch(&context, &mut batch, &mut source_line_count);
 }
 
 pub(crate) fn runtime_session_epoch(handle: &RuntimeHandle) -> u64 {
@@ -804,11 +798,21 @@ mod tests {
             PathBuf::from("/tmp/streamserver-test-stderr.log"),
         );
 
-        sink.observe_diagnostic_log_line(task_id, 1, "stderr", "abcdef", 7, 4, false);
+        sink.observe_diagnostic_log_line(
+            task_id,
+            1,
+            "stderr",
+            DiagnosticLogLine {
+                line: "abcdef",
+                bytes_written: 7,
+                tail_bytes: 4,
+                file_truncated: false,
+            },
+        );
         let logs = sink.diagnostic_logs(task_id, 1);
 
         assert_eq!(logs.len(), 1);
-        assert_eq!(logs[0].tail.as_bytes().len(), 4);
+        assert_eq!(logs[0].tail.len(), 4);
         assert!(logs[0].tail_truncated);
         assert!(!logs[0].file_truncated);
         assert_eq!(logs[0].size_bytes, 7);

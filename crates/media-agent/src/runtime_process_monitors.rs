@@ -28,6 +28,17 @@ use crate::{
     runtime_recovery::classify_adopted_exit,
 };
 
+pub(crate) struct CompanionProcessMonitorContext {
+    pub(crate) runtime_id: Uuid,
+    pub(crate) task_id: Uuid,
+    pub(crate) attempt_no: i32,
+    pub(crate) companion_pid: i32,
+    pub(crate) companion_plan: CompanionProcessPlan,
+    pub(crate) work_dir: PathBuf,
+    pub(crate) success_check: SuccessCheck,
+    pub(crate) monitor_handle: RuntimeMonitorHandle,
+}
+
 pub(crate) async fn wait_for_companion_pids_exit(
     processes: &[ProcessIdentity],
     timeout_after_signal: Duration,
@@ -45,16 +56,19 @@ pub(crate) async fn wait_for_companion_pids_exit(
 }
 
 pub(crate) fn spawn_companion_process_monitor(
-    runtime_id: Uuid,
-    task_id: Uuid,
-    attempt_no: i32,
-    companion_pid: i32,
-    companion_plan: CompanionProcessPlan,
-    work_dir: PathBuf,
-    success_check: SuccessCheck,
-    monitor_handle: RuntimeMonitorHandle,
+    context: CompanionProcessMonitorContext,
     mut child: tokio::process::Child,
 ) {
+    let CompanionProcessMonitorContext {
+        runtime_id,
+        task_id,
+        attempt_no,
+        companion_pid,
+        companion_plan,
+        work_dir,
+        success_check,
+        monitor_handle,
+    } = context;
     tokio::spawn(async move {
         let status = child.wait().await;
         {
@@ -97,7 +111,6 @@ pub(crate) fn spawn_companion_process_monitor(
                     },
                 ))
                 .await;
-            return;
         }
     });
 }

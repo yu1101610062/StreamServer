@@ -17,6 +17,7 @@ CONTRACT_DEPENDENCY_INSTALL = (
     "python3 -m pip install --disable-pip-version-check --no-deps "
     "-r tests/requirements-ci.txt"
 )
+AGENT_IDENTITY_MIGRATION_GATE = "bash tests/agent_identity_migration_test.sh"
 RUST_QUALITY_GATES = (
     "python3 tests/ci_workflow_contract_test.py",
     "cargo fmt --all -- --check",
@@ -55,6 +56,7 @@ RUST_RUN_STEPS = {
     "Verify PostgreSQL connection": (
         'psql "${TEST_DATABASE_URL}" -v ON_ERROR_STOP=1 -c "select 1"'
     ),
+    "Verify legacy Agent identity migration": AGENT_IDENTITY_MIGRATION_GATE,
     "Check Rust formatting": RUST_QUALITY_GATES[1],
     "Run Clippy": RUST_QUALITY_GATES[2],
     "Test full Rust workspace": RUST_QUALITY_GATES[3],

@@ -109,4 +109,16 @@ describe("session store initialize", () => {
     expect(clientMocks.clearAccessToken).toHaveBeenCalled();
     expect(clientMocks.writeRefreshToken).toHaveBeenCalledWith("");
   });
+
+  it("clears stale local tokens even when remote logout fails", async () => {
+    clientMocks.readRefreshToken.mockReturnValueOnce("already-revoked-refresh-token");
+    authMocks.logout.mockRejectedValueOnce(new ApiError("already revoked", 403));
+    const store = useSessionStore();
+
+    await expect(store.logout()).rejects.toMatchObject({ status: 403 });
+
+    expect(clientMocks.clearAccessToken).toHaveBeenCalled();
+    expect(clientMocks.writeRefreshToken).toHaveBeenCalledWith("");
+    expect(store.session).toBeNull();
+  });
 });

@@ -15,6 +15,7 @@ use super::{
 };
 
 impl TaskRepository {
+    #[allow(clippy::too_many_arguments)] // The arguments mirror one immutable event row.
     pub(super) async fn insert_event(
         &self,
         tx: &mut sqlx::Transaction<'_, Postgres>,

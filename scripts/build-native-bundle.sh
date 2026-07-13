@@ -17,7 +17,6 @@ TEMP_STAGE_DIR=""
 
 DEFAULT_APT_MIRROR="http://mirrors.aliyun.com"
 DEFAULT_CARGO_REGISTRY_MIRROR="sparse+https://rsproxy.cn/index/"
-DEFAULT_NPM_REGISTRY_MIRROR="https://registry.npmmirror.com"
 DOCKERHUB_MIRROR_HOST="m.daocloud.io"
 NATIVE_RUNTIME_CACHE_DIR="${NATIVE_RUNTIME_CACHE_DIR:-${ROOT_DIR}/.build-cache/native-runtime}"
 NATIVE_RUNTIME_CACHE_EXTRACTOR_VERSION="20260602-1"
@@ -79,7 +78,6 @@ dockerhub_library_mirror_ref() {
 
 APT_MIRROR="$(resolve_env_or_default APT_MIRROR "${DEFAULT_APT_MIRROR}")"
 CARGO_REGISTRY_MIRROR="$(resolve_env_or_default CARGO_REGISTRY_MIRROR "${DEFAULT_CARGO_REGISTRY_MIRROR}")"
-NPM_REGISTRY_MIRROR="$(resolve_env_or_default NPM_REGISTRY_MIRROR "${DEFAULT_NPM_REGISTRY_MIRROR}")"
 RUST_BUILDER_IMAGE="$(resolve_env_or_default RUST_BUILDER_IMAGE "$(dockerhub_library_mirror_ref 'rust:1.85-bookworm')")"
 MEDIA_AGENT_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:8.1-ubuntu2404')"
 MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE="$(resolve_env_or_default MEDIA_AGENT_GPU_RUNTIME_BASE_IMAGE 'jrottenberg/ffmpeg:8.1-nvidia2404')"
@@ -914,26 +912,54 @@ verification_recommended_location=target-server
 EOF
 }
 
+normalize_bundle_permissions() {
+  local bundle_root="$1"
+  python3 - "${bundle_root}" <<'PY'
+import os
+import pathlib
+import stat
+import sys
+
+root = pathlib.Path(sys.argv[1])
+root_mode = root.lstat().st_mode
+if stat.S_ISDIR(root_mode):
+    os.chmod(root, stat.S_IMODE(root_mode) & ~0o7022, follow_symlinks=False)
+for directory, directories, files in os.walk(root, followlinks=False):
+    for name in directories + files:
+        path = pathlib.Path(directory) / name
+        mode = path.lstat().st_mode
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+            continue
+        current = stat.S_IMODE(mode)
+        normalized = current & ~0o7022
+        if normalized != current:
+            os.chmod(path, normalized, follow_symlinks=False)
+PY
+}
+
 write_checksums() {
   local bundle_root="$1"
   (
     cd "${bundle_root}"
     if command -v shasum >/dev/null 2>&1; then
-      find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while read -r file; do
+      find . -type f ! -path ./SHA256SUMS -print | LC_ALL=C sort | while read -r file; do
         shasum -a 256 "${file#./}"
       done >SHA256SUMS
     else
-      find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while read -r file; do
+      find . -type f ! -path ./SHA256SUMS -print | LC_ALL=C sort | while read -r file; do
         sha256sum "${file#./}"
       done >SHA256SUMS
     fi
   )
+  chmod 0644 "${bundle_root}/SHA256SUMS"
 }
 
 assert_no_docker_runtime_assets() {
   local bundle_root="$1"
   # Docker 只允许作为构建期提取工具，安装包内不得带 Compose 或镜像运行时资产。
-  if find "${bundle_root}" \( -path '*/images/*' -o -name compose.yml -o -name docker-compose.yml -o -name streamserver-compose \) | grep -q .; then
+  if [ -n "$(find "${bundle_root}" \
+    \( -path '*/images/*' -o -name compose.yml -o -name docker-compose.yml \
+      -o -name streamserver-compose \) -print -quit)" ]; then
     fail "native 包中发现 Docker/Compose 运行时资产"
   fi
   if [ -d "${bundle_root}/tools/docker" ]; then
@@ -1055,6 +1081,7 @@ main() {
 
   write_manifest "${bundle_root}" "${bundle_version}" "${include_postgres}" "${include_worker}" "${include_gpu}"
   write_build_info "${bundle_root}" "${bundle_name}" "${version}"
+  normalize_bundle_permissions "${bundle_root}"
   write_checksums "${bundle_root}"
   assert_no_docker_runtime_assets "${bundle_root}"
   create_archive "${stage_dir}" "${bundle_name}" "${archive_path}"

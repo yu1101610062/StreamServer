@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useMutation, useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
@@ -15,10 +15,16 @@ const sessionStore = useSessionStore();
 const currentPassword = ref("");
 const newPassword = ref("");
 const allowlistText = ref("");
+const canManageAllowlist = computed(
+  () =>
+    !sessionStore.session?.must_change_password &&
+    sessionStore.hasPermission("security_write"),
+);
 
 const allowlistQuery = useQuery({
   queryKey: ["security", "machine-allowlist"],
   queryFn: () => securityApi.listMachineAllowlist(),
+  enabled: canManageAllowlist,
 });
 
 watch(
@@ -67,7 +73,12 @@ const changePasswordMutation = useMutation({
     ElMessage.success("密码已更新，请重新登录");
     currentPassword.value = "";
     newPassword.value = "";
-    await sessionStore.logout();
+    try {
+      await sessionStore.logout();
+    } catch {
+      // Password change already revoked the server-side sessions; local cleanup
+      // happens in logout's finally block even if this best-effort call fails.
+    }
     await router.push("/login");
   },
   onError: (error) => ElMessage.error(errorMessage(error)),
@@ -82,7 +93,10 @@ async function saveAllowlist() {
 
 <template>
   <section class="page-grid">
-    <PageHeader title="安全设置" description="维护当前账号密码，以及机器 API 白名单。" />
+    <PageHeader
+      title="安全设置"
+      :description="canManageAllowlist ? '维护当前账号密码，以及机器 API 白名单。' : '请先修改一次性初始密码。'"
+    />
 
     <div class="metric-grid">
       <div class="surface-card metric-card">
@@ -119,7 +133,7 @@ async function saveAllowlist() {
       </el-form>
     </div>
 
-    <div class="surface-card">
+    <div v-if="canManageAllowlist" class="surface-card">
       <h3 class="page-section-title">机器 API 白名单</h3>
       <p class="subtle">每行一条，格式为 <code>IP/CIDR # 说明</code>。说明可选，以 <code>#</code> 开头的整行会被忽略。</p>
       <el-input

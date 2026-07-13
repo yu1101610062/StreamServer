@@ -1,0 +1,12 @@
+# Linux entrypoints and service definitions must remain executable/parseable
+# when the repository is edited from Windows.
+.gitattributes text eol=lf
+*.sh text eol=lf
+*.service text eol=lf
+*.target text eol=lf
+*.socket text eol=lf
+*.timer text eol=lf
+
+# CI runners consume these files directly on Linux as well.
+*.yml text eol=lf
+*.yaml text eol=lf

@@ -1,6 +1,7 @@
 import { createRouter, createWebHistory } from "vue-router";
 
 import { useSessionStore } from "@/stores/session";
+import { routeAccessRedirect } from "@/router/access-guard";
 
 const routes = [
   { path: "/", redirect: "/overview" },
@@ -45,17 +46,15 @@ router.beforeEach(async (to) => {
   if (sessionStore.loading) {
     await sessionStore.initialize();
   }
-  if (to.meta.public) {
-    return true;
-  }
-  if (!sessionStore.isAuthenticated) {
-    return {
-      path: "/login",
-      query: { next: to.fullPath },
-    };
-  }
-  if (to.meta.permission && !sessionStore.hasPermission(String(to.meta.permission))) {
-    return "/overview";
-  }
-  return true;
+  return (
+    routeAccessRedirect({
+      destinationName: to.name,
+      destinationPath: to.fullPath,
+      isPublic: Boolean(to.meta.public),
+      isAuthenticated: sessionStore.isAuthenticated,
+      mustChangePassword: Boolean(sessionStore.session?.must_change_password),
+      requiredPermission: to.meta.permission ? String(to.meta.permission) : null,
+      permissions: sessionStore.session?.permissions ?? [],
+    }) ?? true
+  );
 });

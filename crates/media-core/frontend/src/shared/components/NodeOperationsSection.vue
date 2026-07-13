@@ -239,7 +239,7 @@ function slotLoadSummary(loads?: RuntimeSlotLoad[] | null) {
             <el-descriptions-item label="节点 ID">{{ selectedNode.id }}</el-descriptions-item>
             <el-descriptions-item label="主机名">{{ selectedNode.hostname }}</el-descriptions-item>
             <el-descriptions-item label="流地址">{{ selectedNode.agent_stream_addr }}</el-descriptions-item>
-            <el-descriptions-item label="ZLM API">{{ selectedNode.zlm_api_base }}</el-descriptions-item>
+            <el-descriptions-item label="ZLM 管理">经认证 Agent 控制流转发</el-descriptions-item>
             <el-descriptions-item label="网络模式">{{ selectedNode.network_mode }}</el-descriptions-item>
             <el-descriptions-item label="最近上报">{{ formatTime(selectedNode.last_seen_at) }}</el-descriptions-item>
             <el-descriptions-item label="能力采集时间">{{ formatTime(selectedNode.capability_captured_at) }}</el-descriptions-item>

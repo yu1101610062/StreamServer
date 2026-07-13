@@ -268,6 +268,10 @@ pub enum RepoError {
     TaskNotFound(Uuid),
     #[error("auth user {0} was not found")]
     AuthUserNotFound(String),
+    #[error("authentication handoff schema is partially applied or inconsistent")]
+    AuthHandoffSchemaIncomplete,
+    #[error("agent identity repository invariant failed: {0}")]
+    AgentIdentityInvariant(String),
     #[error("node {0} was not found")]
     NodeNotFound(Uuid),
     #[error("media upload asset {0} was not found")]

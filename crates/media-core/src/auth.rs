@@ -65,7 +65,10 @@ impl AuthConfig {
             }
         }
     }
-    pub fn session(&self, headers: &HeaderMap) -> Result<AuthenticatedPrincipal, AppError> {
+    pub(crate) fn verify_session_claims(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthenticatedPrincipal, AppError> {
         if self.mode == AuthMode::Disabled {
             return Ok(AuthenticatedPrincipal::disabled_admin());
         }
@@ -73,16 +76,11 @@ impl AuthConfig {
         let verifier = self.verifier.as_ref().ok_or_else(|| {
             AppError::Internal("auth is enabled but verifier is missing".to_string())
         })?;
-        verifier.verify(headers)
-    }
-
-    pub fn authorize(
-        &self,
-        headers: &HeaderMap,
-        permission: ApiPermission,
-    ) -> Result<AuthenticatedPrincipal, AppError> {
-        let principal = self.session(headers)?;
-        principal.require_permission(permission)?;
+        let mut principal = verifier.verify(headers)?;
+        if self.mode == AuthMode::ExternalJwt {
+            principal.credential_version = None;
+            principal.must_change_password = false;
+        }
         Ok(principal)
     }
 
@@ -106,12 +104,20 @@ impl AuthConfig {
         &self,
         subject: &str,
         role: ApiRole,
+        credential_version: i64,
+        must_change_password: bool,
     ) -> anyhow::Result<IssuedAccessToken> {
         let signer = self
             .signer
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("access token signing is not available"))?;
-        signer.issue(subject, role, self.access_token_ttl)
+        signer.issue(
+            subject,
+            role,
+            Some(credential_version),
+            must_change_password,
+            self.access_token_ttl,
+        )
     }
 }
 
@@ -228,6 +234,8 @@ impl JwtSigner {
         &self,
         subject: &str,
         role: ApiRole,
+        credential_version: Option<i64>,
+        must_change_password: bool,
         ttl: Duration,
     ) -> anyhow::Result<IssuedAccessToken> {
         let now = Utc::now();
@@ -235,6 +243,8 @@ impl JwtSigner {
         let claims = JwtClaims {
             sub: subject.to_string(),
             role,
+            credential_version,
+            must_change_password,
             jti: Uuid::now_v7().to_string(),
             iat: now.timestamp(),
             nbf: now.timestamp(),
@@ -291,6 +301,7 @@ pub struct AuthenticatedPrincipal {
     role: ApiRole,
     kind: PrincipalKind,
     must_change_password: bool,
+    credential_version: Option<i64>,
 }
 
 impl AuthenticatedPrincipal {
@@ -300,6 +311,7 @@ impl AuthenticatedPrincipal {
             role: ApiRole::Admin,
             kind: PrincipalKind::Disabled,
             must_change_password: false,
+            credential_version: None,
         }
     }
 
@@ -314,7 +326,8 @@ impl AuthenticatedPrincipal {
             subject: claims.sub.trim().to_string(),
             role: claims.role,
             kind: PrincipalKind::User,
-            must_change_password: false,
+            must_change_password: claims.must_change_password,
+            credential_version: claims.credential_version,
         })
     }
 
@@ -324,6 +337,7 @@ impl AuthenticatedPrincipal {
             role: ApiRole::Admin,
             kind: PrincipalKind::Machine,
             must_change_password: false,
+            credential_version: None,
         }
     }
 
@@ -339,11 +353,24 @@ impl AuthenticatedPrincipal {
         self.must_change_password
     }
 
+    pub fn credential_version(&self) -> Option<i64> {
+        self.credential_version
+    }
+
+    pub fn is_user(&self) -> bool {
+        self.kind == PrincipalKind::User
+    }
+
     pub fn is_machine(&self) -> bool {
         self.kind == PrincipalKind::Machine
     }
 
     pub fn require_permission(&self, permission: ApiPermission) -> Result<(), AppError> {
+        if self.kind == PrincipalKind::User && self.must_change_password {
+            return Err(AppError::Forbidden(
+                "password change is required before accessing administrative APIs".to_string(),
+            ));
+        }
         let allowed = match self.kind {
             PrincipalKind::Disabled | PrincipalKind::User => true,
             PrincipalKind::Machine => matches!(
@@ -375,6 +402,10 @@ impl AuthenticatedPrincipal {
 struct JwtClaims {
     sub: String,
     role: ApiRole,
+    #[serde(rename = "urn:streamserver:credential_version", default)]
+    credential_version: Option<i64>,
+    #[serde(rename = "urn:streamserver:must_change_password", default)]
+    must_change_password: bool,
     jti: String,
     iat: i64,
     nbf: i64,

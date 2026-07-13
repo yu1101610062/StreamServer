@@ -7,6 +7,8 @@ pub(crate) const REQUIRED_PORT_KEYS: &[&str] = &[
     "CORE_HTTP_PORT",
     "CORE_GRPC_PORT",
     "AGENT_HTTP_PORT",
+    "AGENT_MANAGEMENT_PORT",
+    "AGENT_ZLM_HOOK_PORT",
     "ZLM_HTTP_PORT",
     "ZLM_RTMP_PORT",
     "ZLM_RTSP_PORT",

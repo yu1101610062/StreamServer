@@ -514,7 +514,7 @@ fn detail_panel(app: &ConfigApp) -> Paragraph<'static> {
         }
         FieldKind::ReadOnly => {
             lines.push(Line::from(""));
-            if matches!(field.key, "PUBLIC_HOST" | "ZLM_API_HOST") {
+            if field.key == "PUBLIC_HOST" {
                 lines.push(warning_line(
                     "该项跟随主网卡 IP 自动更新，配置模块不单独修改。",
                 ));

@@ -13,6 +13,7 @@ import type {
 } from "@/shared/api/types";
 import MediaLink from "@/shared/components/MediaLink.vue";
 import PageHeader from "@/shared/components/PageHeader.vue";
+import { isNodeUploadReady } from "@/shared/node-availability";
 import { copyText } from "@/shared/utils/clipboard";
 import { errorMessage, formatBytes, formatPercent, formatTime, shortId } from "@/shared/utils/format";
 
@@ -52,7 +53,7 @@ const assetsQuery = useQuery({
 });
 
 const uploadReadyNodes = computed(() =>
-  (nodesQuery.data.value ?? []).filter((node) => nodeUploadReady(node)),
+  (nodesQuery.data.value ?? []).filter((node) => isNodeUploadReady(node)),
 );
 
 const uploadedNodeId = computed(() => {
@@ -98,16 +99,6 @@ function elapsedLabel(value?: number | null) {
     return "—";
   }
   return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 2)}s`;
-}
-
-function nodeUploadReady(node: NodeSummary) {
-  return (
-    node.healthy &&
-    node.control_connected &&
-    node.connected !== false &&
-    node.ffmpeg_alive !== false &&
-    Boolean(node.agent_http_base_url?.trim())
-  );
 }
 
 function nodeLabels(node: NodeSummary) {
@@ -369,7 +360,7 @@ async function deleteAsset(asset: MediaUploadAssetSummary) {
             </el-table-column>
             <el-table-column label="状态" min-width="100">
               <template #default="{ row }">
-                <el-tag v-if="nodeUploadReady(row)" type="success">可用</el-tag>
+                <el-tag v-if="isNodeUploadReady(row)" type="success">可用</el-tag>
                 <el-tag v-else type="warning">不可用</el-tag>
               </template>
             </el-table-column>

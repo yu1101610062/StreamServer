@@ -47,11 +47,11 @@ flowchart LR
     Web -->|"HTTPS + JWT"| Core
     Core <-->|"SQL 5432"| DB
 
-    AAgent -->|"gRPC ControlPlane\nregister / heartbeat / start / stop / events"| Core
-    BAgent -->|"gRPC ControlPlane\nmTLS 可选"| Core
+    AAgent <-->|"mTLS ControlPlane\nregister / heartbeat / start / stop / events / Hook relay"| Core
+    BAgent <-->|"mTLS ControlPlane\nproduction 强制 mTLS"| Core
 
-    AZLM -->|"HTTP Hook\nshared secret + source allowlist"| Core
-    BZLM -->|"HTTP Hook"| Core
+    AZLM -->|"HTTP loopback Hook\nAgent-local secret :18082"| AAgent
+    BZLM -->|"HTTP loopback Hook"| BAgent
 
     AAgent -->|"本地 REST API"| AZLM
     AAgent -->|"spawn / stop / monitor"| AFF
@@ -109,13 +109,13 @@ flowchart TB
     LB --> Core
     Core <-->|"SQL"| DB
 
-    Agent1 -->|"gRPC ControlPlane"| Core
-    Agent2 -->|"gRPC ControlPlane"| Core
-    Agent3 -->|"gRPC ControlPlane"| Core
+    Agent1 <-->|"mTLS ControlPlane + Hook relay"| Core
+    Agent2 <-->|"mTLS ControlPlane + Hook relay"| Core
+    Agent3 <-->|"mTLS ControlPlane + Hook relay"| Core
 
-    ZLM1 -->|"Hook"| Core
-    ZLM2 -->|"Hook"| Core
-    ZLM3 -->|"Hook"| Core
+    ZLM1 -->|"loopback Hook"| Agent1
+    ZLM2 -->|"loopback Hook"| Agent2
+    ZLM3 -->|"loopback Hook"| Agent3
 
     Agent1 --> ZLM1
     Agent1 --> FF1
@@ -217,8 +217,8 @@ flowchart LR
     end
 
     Core <-->|"5432"| DB
-    Agent -->|"gRPC 50051"| Core
-    ZLM -->|"Hook"| Core
+    Agent <-->|"mTLS gRPC 50051\n含 Hook relay"| Core
+    ZLM -->|"HTTP loopback Hook\n默认 18082"| Agent
     Agent -->|"本地 API"| ZLM
 ```
 
@@ -276,8 +276,9 @@ flowchart LR
     end
 
     User -->|"HTTPS + JWT"| Core
-    Agent -->|"gRPC\nproduction mTLS"| Core
-    ZLM -->|"HTTP Hook\nshared secret + allowlist"| Core
+    Agent <-->|"gRPC\nproduction mTLS\n含 Hook relay"| Core
+    Core -->|"HTTPS management\nmTLS + capability JWT"| Agent
+    ZLM -->|"HTTP loopback Hook\nAgent-local secret"| Agent
     Core -->|"SQL 内网访问"| DB
 ```
 
@@ -285,18 +286,16 @@ flowchart LR
 
 - 外部业务访问只打到 `media-core`。
 - `media-core <-> media-agent` 在 production 必须使用 mTLS；仅 development + loopback + `--insecure-dev` 可使用明文。
-- `media-core <-> ZLM` 通过 Hook shared secret 和源地址白名单约束。
+- ZLM 只以 Agent-local secret 访问同机 loopback ingress；Hook 经既有 mTLS ControlPlane 到 Core，节点身份只来自认证 session。Core 不开放 production ZLM 网络回调入口。
 - PostgreSQL 不对业务侧开放。
 
 证书与密钥准备规则：
 
-- production 的 Agent 必须连接 `https://` gRPC endpoint，并手工准备：
-  - Core 服务端证书
-  - Core 服务端私钥
-  - 客户端 CA
-  - Agent 客户端证书
-  - Agent 客户端私钥
-  - Agent 使用的 CA
+- Core 初始化三套密钥和信任根：Agent control/management leaf issuer、Core gRPC/HTTP server CA、Core management client CA；三套根证书及其私钥不得复用。
+- 管理员为待注册节点创建一个 10 分钟、一次性的 enrollment token。Agent 在本地生成 control 与 management 两把私钥和 CSR，只通过 Core HTTPS enrollment API 交换 CSR、证书和公开信任材料；Agent 私钥不会离开节点。
+- Agent control 与 management 证书有效期为 90 天，任一证书剩余不超过 30 天时在既有 mTLS 会话内发起双证书轮换。旧新证书只在受控重叠窗口内同时有效。
+- Core 只从 Agent control leaf 的 `spiffe://streamserver/agent/<node_id>` URI SAN 取得节点身份；注册首包中的 `node_id` 只做一致性校验。
+- Core 访问 Agent management listener 时使用独立的 Core client 证书，并在 CA/DNS 校验后精确 pin Agent 当前或待轮换 management leaf。上传和删除还要求绑定节点、操作、路径、字节上限、`jti` 与短有效期的 capability JWT。
 
 ## 9. 端口与流量矩阵
 
@@ -307,7 +306,8 @@ flowchart LR
 | ControlPlane gRPC | `media-agent` | `media-core` | `50051` | 注册、心跳、任务下发 |
 | PostgreSQL | `media-core` | `postgres` | `5432` | 状态与审计真相库 |
 | ZLM API | `media-agent` | 节点本地 ZLM | 由配置决定 | 本地节点内调用 |
-| ZLM Hook | 节点本地 ZLM | `media-core` | 复用 HTTP API | 回调 |
+| ZLM Hook（本机段） | 节点本地 ZLM | `media-agent` loopback ingress | `18082` | query secret 仅存在本机，端口不得对外开放 |
+| ZLM Hook relay | `media-agent` | `media-core` | 复用 `50051` mTLS ControlPlane | request/response，不携带 secret 或自报节点身份 |
 | RTSP 播放 | 播放端 | 节点 ZLM | `554` 等 | 由 ZLM 决定 |
 | RTMP 播放/推流 | 推流端 / 播放端 | 节点 ZLM | `1935` 等 | 由 ZLM 决定 |
 | HTTP-TS/HLS/fMP4 | 浏览器 / 播放端 | 节点 ZLM | `80/443/自定义` | 由 ZLM 决定 |
@@ -326,8 +326,9 @@ flowchart LR
 ### 10.2 推荐的首版上线路径
 
 1. 可在 development 的 loopback 地址上用 `media-core --insecure-dev` 做本机验证。
-2. 切换 production 前准备 Core HTTP TLS（若需非 loopback）和完整 gRPC mTLS 证书链，并完成管理员迁移。
-3. 再根据是否需要组播，决定节点网络模式使用 `bridge`、`host` 还是 `macvlan`。
+2. production 首次启动先完成一次性管理员密码交付与 Core 内部 PKI 初始化；非 loopback HTTP/gRPC listener 必须使用与访问主机名或 IP 匹配的服务端证书。
+3. 管理员为每个节点分别创建 enrollment token，在目标 Agent 本地完成注册并确认 control gRPC 与 management mTLS 双向可用。
+4. 再根据是否需要组播，决定节点网络模式使用 `bridge`、`host` 还是 `macvlan`。
 
 ### 10.3 不建议的形态
 

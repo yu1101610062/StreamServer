@@ -12,7 +12,7 @@
 - Content-Type: `application/json`
 - 需要幂等保护的业务写接口使用 `Idempotency-Key` 请求头；当前 `POST /tasks` 必填
 - 鉴权方式：`Authorization: Bearer <token>`
-- 若部署配置 `core.auth_mode = "disabled"`，则北向 API 关闭 JWT 鉴权，默认按平台管理员权限放行
+- `core.auth_mode = "disabled"` 仅允许用于 development、HTTP/gRPC 均绑定 loopback 且显式使用 `media-core --insecure-dev` 的本机调试；production 启动时会拒绝该配置
 - 时间统一返回 RFC 3339
 
 ### 2.2 幂等规则
@@ -73,7 +73,7 @@
 
 - `core.auth_mode = "local_password"`：启用本地密码登录、刷新令牌、退出和改密码接口。
 - `core.auth_mode = "external_jwt"`：业务接口只验证外部 JWT；本地密码登录接口返回 `403 FORBIDDEN`。
-- `core.auth_mode = "disabled"`：关闭 JWT 鉴权，按平台管理员权限放行。
+- `core.auth_mode = "disabled"`：仅限 development + loopback + `--insecure-dev` 的本机调试；production 不接受该模式。
 - 业务接口在启用鉴权时可使用 `Authorization: Bearer <token>`；未带 Bearer 时，仅允许来源 IP 命中机器 API 白名单的业务请求。机器白名单不授予安全配置权限。
 
 #### `GET /me`
@@ -315,7 +315,8 @@ VOD 偏移录制示例：
 - 真实路径为 `<work_root>/<relative path>`。
 - 返回的 `sourceUrl` 用于后续任务 `input.kind=file`；返回的 `httpUrl` 用于页面预览、下载与排查。
 - Core 会将上传结果写入 `media_upload_assets` 台账；后续任务仍依赖 `sourceUrl` 中的 `<node_id>` 做节点亲和调度。
-- Core 代理上传到 Agent HTTP 接口时使用节点注册上报的 `agent_http_base_url` 生成目标地址；该地址由 Agent 根据 `AGENT_STREAM_ADDR` 的 scheme/host 与 `AGENT_HTTP_ADDR` 的端口自动生成，不需要额外配置上传地址模板。
+- Agent 注册只上报 management listener 的端口和上传上限，不上报可供 Core 信任的管理 URL。Core 使用当前 mTLS 控制会话的认证 peer IP、节点证书中固定的 DNS SAN 与该端口构造 HTTPS 目标，并固定 DNS 解析到该 peer IP。
+- Core 为每次上传签发最多 120 秒的短期 capability JWT，绑定 `aud=agent:<node_id>`、`op=upload`、路径前缀、最大字节数、`jti` 与有效期；Agent management listener 同时要求 Core mTLS 身份和该 capability。公开媒体 listener 不挂载上传或删除接口。
 - 自动选择节点时先过滤健康、在线、标签匹配、上传盘空间满足请求大小的节点，再按 `upload_disk_available_bytes` 从大到小排序。
 
 响应示例：
@@ -325,7 +326,7 @@ VOD 偏移录制示例：
   "id": "019d77d3-a942-7c91-8e82-ff963ccf1222",
   "fileName": "origin.mp4",
   "sourceUrl": "uploads/019d77d3-a942-7c91-8e82-ff963ccf1222/2026/04/29/019d77d3-a942-7c91-8e82-ff963ccf1223.mp4",
-  "httpUrl": "http://agent.example/media/uploads/019d77d3-a942-7c91-8e82-ff963ccf1222/2026/04/29/019d77d3-a942-7c91-8e82-ff963ccf1223.mp4",
+  "httpUrl": "https://media.example/media/uploads/019d77d3-a942-7c91-8e82-ff963ccf1222/2026/04/29/019d77d3-a942-7c91-8e82-ff963ccf1223.mp4",
   "durationSec": 123,
   "fileSize": 123456789,
   "sha256": "hex",

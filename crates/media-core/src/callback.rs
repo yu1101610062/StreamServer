@@ -258,7 +258,7 @@ fn truncate_text(value: &str) -> Option<String> {
         .take(RESPONSE_BODY_LIMIT)
         .collect::<String>();
     if trimmed.chars().count() > RESPONSE_BODY_LIMIT {
-        truncated.push_str("…");
+        truncated.push('…');
     }
     Some(truncated)
 }

@@ -212,13 +212,13 @@ pub(crate) async fn run_runtime_stop_worker(
             stop_live_relay_recording_for_handle(&controls, &worker.handle).await?;
             close_live_relay(&controls, &worker.handle, true).await?;
             Ok(RuntimeStopOutcome::Terminal(
-                live_relay_stop_terminal_commit(&controls.settings, &worker),
+                live_relay_stop_terminal_commit(controls.settings, &worker),
             ))
         }
         Some(TaskRuntimeMode::ZlmRtpServer) => {
             close_rtp_receive(&controls, &worker.stopping_handle).await?;
             Ok(RuntimeStopOutcome::Terminal(rtp_stop_terminal_commit(
-                &controls.settings,
+                controls.settings,
                 &worker,
             )))
         }

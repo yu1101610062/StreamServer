@@ -8,19 +8,50 @@ use sqlx::Postgres;
 use uuid::Uuid;
 
 use super::{
-    DEFAULT_MAX_CONSECUTIVE_FAILURES, OwnershipMode, RepoError, TaskRepository,
-    relative_http_url_from_path, retry_enabled_on_disconnect, start_rejected_retry_limit,
-    sticky_reconnect_active,
+    AgentSessionWriteOutcome, DEFAULT_MAX_CONSECUTIVE_FAILURES, OwnershipMode, RepoError,
+    TaskRepository, relative_http_url_from_path, retry_enabled_on_disconnect,
+    start_rejected_retry_limit, sticky_reconnect_active,
 };
 
 impl TaskRepository {
+    #[cfg(test)]
     pub async fn record_agent_task_event(
         &self,
         node_id: Uuid,
         event: AgentTaskEventRecord,
     ) -> Result<(), RepoError> {
+        self.record_agent_task_event_inner(node_id, None, event)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn record_agent_task_event_for_session(
+        &self,
+        node_id: Uuid,
+        session_id: Uuid,
+        event: AgentTaskEventRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        self.record_agent_task_event_inner(node_id, Some(session_id), event)
+            .await
+    }
+
+    async fn record_agent_task_event_inner(
+        &self,
+        node_id: Uuid,
+        session_id: Option<Uuid>,
+        event: AgentTaskEventRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        if let Some(session_id) = session_id {
+            if !self
+                .lock_current_agent_control_session(&mut tx, node_id, session_id, now)
+                .await?
+            {
+                tx.commit().await?;
+                return Ok(AgentSessionWriteOutcome::FencedSession);
+            }
+        }
         // adopted/orphaned 是 agent 在重连后回报的事实，可能不是当前 owner；
         // 其余事件必须严格来自当前租约持有者，防止旧 agent 覆盖新 attempt。
         let ownership_mode = if matches!(event.event_type.as_str(), "adopted" | "orphaned") {
@@ -41,7 +72,7 @@ impl TaskRepository {
             .await?
         else {
             tx.commit().await?;
-            return Ok(());
+            return Ok(AgentSessionWriteOutcome::IgnoredStaleAttempt);
         };
         let sticky_reconnect_active = sticky_reconnect_active(&ownership)?;
 
@@ -506,15 +537,35 @@ impl TaskRepository {
                 .await?;
             }
         }
-        Ok(())
+        Ok(AgentSessionWriteOutcome::Applied)
     }
 
-    pub async fn record_agent_log_batch(
+    pub async fn record_agent_log_batch_for_session(
         &self,
         node_id: Uuid,
+        session_id: Uuid,
         batch: TaskLogBatchRecord,
-    ) -> Result<(), RepoError> {
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        self.record_agent_log_batch_inner(node_id, Some(session_id), batch)
+            .await
+    }
+
+    async fn record_agent_log_batch_inner(
+        &self,
+        node_id: Uuid,
+        session_id: Option<Uuid>,
+        batch: TaskLogBatchRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(session_id) = session_id {
+            if !self
+                .lock_current_agent_control_session(&mut tx, node_id, session_id, Utc::now())
+                .await?
+            {
+                tx.commit().await?;
+                return Ok(AgentSessionWriteOutcome::FencedSession);
+            }
+        }
         let Some(_ownership) = self
             .validate_attempt_ownership(
                 &mut tx,
@@ -528,19 +579,50 @@ impl TaskRepository {
             .await?
         else {
             tx.commit().await?;
-            return Ok(());
+            return Ok(AgentSessionWriteOutcome::IgnoredStaleAttempt);
         };
         tx.commit().await?;
-        Ok(())
+        Ok(AgentSessionWriteOutcome::Applied)
     }
 
+    #[cfg(test)]
     pub async fn record_agent_progress(
         &self,
         node_id: Uuid,
         progress: TaskProgressRecord,
     ) -> Result<(), RepoError> {
+        self.record_agent_progress_inner(node_id, None, progress)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn record_agent_progress_for_session(
+        &self,
+        node_id: Uuid,
+        session_id: Uuid,
+        progress: TaskProgressRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        self.record_agent_progress_inner(node_id, Some(session_id), progress)
+            .await
+    }
+
+    async fn record_agent_progress_inner(
+        &self,
+        node_id: Uuid,
+        session_id: Option<Uuid>,
+        progress: TaskProgressRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        if let Some(session_id) = session_id {
+            if !self
+                .lock_current_agent_control_session(&mut tx, node_id, session_id, now)
+                .await?
+            {
+                tx.commit().await?;
+                return Ok(AgentSessionWriteOutcome::FencedSession);
+            }
+        }
         let Some(_ownership) = self
             .validate_attempt_ownership(
                 &mut tx,
@@ -554,7 +636,7 @@ impl TaskRepository {
             .await?
         else {
             tx.commit().await?;
-            return Ok(());
+            return Ok(AgentSessionWriteOutcome::IgnoredStaleAttempt);
         };
         let payload = json!({
             "node_id": node_id,
@@ -586,16 +668,47 @@ impl TaskRepository {
         .await?;
 
         tx.commit().await?;
-        Ok(())
+        Ok(AgentSessionWriteOutcome::Applied)
     }
 
+    #[cfg(test)]
     pub async fn record_agent_snapshot(
         &self,
         node_id: Uuid,
         snapshot: TaskSnapshotRecord,
     ) -> Result<(), RepoError> {
+        self.record_agent_snapshot_inner(node_id, None, snapshot)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn record_agent_snapshot_for_session(
+        &self,
+        node_id: Uuid,
+        session_id: Uuid,
+        snapshot: TaskSnapshotRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
+        self.record_agent_snapshot_inner(node_id, Some(session_id), snapshot)
+            .await
+    }
+
+    async fn record_agent_snapshot_inner(
+        &self,
+        node_id: Uuid,
+        session_id: Option<Uuid>,
+        snapshot: TaskSnapshotRecord,
+    ) -> Result<AgentSessionWriteOutcome, RepoError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
+        if let Some(session_id) = session_id {
+            if !self
+                .lock_current_agent_control_session(&mut tx, node_id, session_id, now)
+                .await?
+            {
+                tx.commit().await?;
+                return Ok(AgentSessionWriteOutcome::FencedSession);
+            }
+        }
         let Some(ownership) = self
             .validate_attempt_ownership(
                 &mut tx,
@@ -609,7 +722,7 @@ impl TaskRepository {
             .await?
         else {
             tx.commit().await?;
-            return Ok(());
+            return Ok(AgentSessionWriteOutcome::IgnoredStaleAttempt);
         };
         if snapshot.state.eq_ignore_ascii_case("exited") {
             self.insert_event(
@@ -670,7 +783,7 @@ impl TaskRepository {
         }
 
         tx.commit().await?;
-        Ok(())
+        Ok(AgentSessionWriteOutcome::Applied)
     }
 
     async fn upsert_stream_binding_from_snapshot(

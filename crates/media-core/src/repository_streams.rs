@@ -191,13 +191,13 @@ impl TaskRepository {
         builder.push(" order by received_at desc, id desc limit ");
         builder.push_bind(i64::from(filter.limit.unwrap_or(50).clamp(1, 200)));
 
-        Ok(builder
+        builder
             .build()
             .fetch_all(&self.pool)
             .await?
             .into_iter()
             .map(|row| HookEventSummary::from_row(&row))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 

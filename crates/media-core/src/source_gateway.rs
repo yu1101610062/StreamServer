@@ -307,7 +307,7 @@ fn default_prefetch_target_path(task_id: Uuid, kind: InputKind, source_url: &str
         .and_then(|path| path.rsplit('/').next())
         .and_then(|name| name.rsplit_once('.').map(|(_, ext)| ext))
         .filter(|ext| !ext.trim().is_empty())
-        .unwrap_or_else(|| match kind {
+        .unwrap_or(match kind {
             InputKind::Hls => "m3u8",
             InputKind::HttpTs => "ts",
             _ => "mp4",

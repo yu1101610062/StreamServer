@@ -30,6 +30,16 @@ pub(crate) enum InternalIngressProtocol {
     Rtsp,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProcessArgsContext<'a> {
+    pub(crate) default_mode: &'a str,
+    pub(crate) input_url: &'a str,
+    pub(crate) output_format: &'a str,
+    pub(crate) video_policy: VideoOutputPolicy,
+    pub(crate) audio_policy: AudioOutputPolicy,
+    pub(crate) input_profile: Option<&'a InputMediaProfile>,
+}
+
 impl InternalIngressProtocol {
     pub(crate) fn schema(self) -> &'static str {
         match self {
@@ -94,46 +104,18 @@ pub(crate) fn append_process_args(
     args: &mut Vec<String>,
     settings: &AgentSettings,
     spec: &TaskSpec,
-    default_mode: &str,
-    input_url: &str,
-    output_format: &str,
-    video_policy: VideoOutputPolicy,
-    audio_policy: AudioOutputPolicy,
+    context: ProcessArgsContext<'_>,
 ) -> Result<Option<AudioCopyDecoration>, ExecutorError> {
-    append_process_args_with_profile(
-        args,
-        settings,
-        spec,
-        default_mode,
-        input_url,
-        output_format,
-        video_policy,
-        audio_policy,
-        None,
-    )
-}
-
-pub(crate) fn append_process_args_with_profile(
-    args: &mut Vec<String>,
-    settings: &AgentSettings,
-    spec: &TaskSpec,
-    default_mode: &str,
-    input_url: &str,
-    output_format: &str,
-    video_policy: VideoOutputPolicy,
-    audio_policy: AudioOutputPolicy,
-    input_profile: Option<&InputMediaProfile>,
-) -> Result<Option<AudioCopyDecoration>, ExecutorError> {
-    let mode = normalized_process_mode(spec, default_mode);
+    let mode = normalized_process_mode(spec, context.default_mode);
     match mode {
         "passthrough" => {
             // passthrough 明确要求全复制，只在必要时追加封装格式需要的音频 bitstream filter。
             let audio_copy_decoration = resolve_passthrough_audio_copy_decoration(
                 settings,
                 spec,
-                input_url,
-                output_format,
-                input_profile,
+                context.input_url,
+                context.output_format,
+                context.input_profile,
             );
             args.extend([
                 "-c:v".to_string(),
@@ -146,10 +128,10 @@ pub(crate) fn append_process_args_with_profile(
         "copy_or_transcode" | "force_transcode" => {
             // copy_or_transcode 先基于探测结果尝试复制，不满足封装/策略时只转码必要的轨道。
             let probed_profile;
-            let selection_profile = match input_profile {
+            let selection_profile = match context.input_profile {
                 Some(profile) => Some(profile),
                 None => {
-                    probed_profile = probe_input_media_profile(settings, spec, input_url);
+                    probed_profile = probe_input_media_profile(settings, spec, context.input_url);
                     Some(&probed_profile)
                 }
             };
@@ -157,11 +139,10 @@ pub(crate) fn append_process_args_with_profile(
                 settings,
                 spec,
                 mode,
-                input_url,
-                output_format,
-                video_policy,
-                audio_policy,
-                selection_profile,
+                ProcessArgsContext {
+                    input_profile: selection_profile,
+                    ..context
+                },
             );
             if !selection.input_args.is_empty() {
                 insert_ffmpeg_input_args(args, selection.input_args);
@@ -210,38 +191,41 @@ fn resolve_process_selection(
     settings: &AgentSettings,
     spec: &TaskSpec,
     mode: &str,
-    input_url: &str,
-    output_format: &str,
-    video_policy: VideoOutputPolicy,
-    audio_policy: AudioOutputPolicy,
-    input_profile: Option<&InputMediaProfile>,
+    context: ProcessArgsContext<'_>,
 ) -> TranscodeSelection {
     if mode == "force_transcode" {
         // 强制转码仍使用探测到的输入视频族来选择 H.264/HEVC 输出编码器。
-        if let Some(profile) = input_profile {
+        if let Some(profile) = context.input_profile {
             return resolve_transcode_selection_for_input_family(
                 settings,
                 profile.video_family,
-                video_policy,
-                audio_policy,
+                context.video_policy,
+                context.audio_policy,
             );
         }
-        return resolve_transcode_selection(settings, spec, input_url, video_policy, audio_policy);
+        return resolve_transcode_selection(
+            settings,
+            spec,
+            context.input_url,
+            context.video_policy,
+            context.audio_policy,
+        );
     }
 
     let probed_profile;
-    let profile = match input_profile {
+    let profile = match context.input_profile {
         Some(profile) => profile,
         None => {
-            probed_profile = probe_input_media_profile(settings, spec, input_url);
+            probed_profile = probe_input_media_profile(settings, spec, context.input_url);
             &probed_profile
         }
     };
-    let video_copy = should_copy_video_stream(spec, output_format, profile, video_policy);
+    let video_copy =
+        should_copy_video_stream(spec, context.output_format, profile, context.video_policy);
     let audio_copy = resolve_audio_copy_selection(
-        output_format,
+        context.output_format,
         profile,
-        audio_policy,
+        context.audio_policy,
         process_requires_audio_transcode(spec),
     );
     // 视频和音频都可复制时不插入额外输入参数，最大限度保留原始码流。
@@ -257,8 +241,8 @@ fn resolve_process_selection(
     let transcode = resolve_transcode_selection_for_input_family(
         settings,
         profile.video_family,
-        video_policy,
-        audio_policy,
+        context.video_policy,
+        context.audio_policy,
     );
 
     TranscodeSelection {

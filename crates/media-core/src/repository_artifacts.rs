@@ -69,7 +69,7 @@ impl TaskRepository {
         &self,
         task_id: Uuid,
     ) -> Result<Vec<RecordFileSummary>, RepoError> {
-        Ok(sqlx::query(
+        sqlx::query(
             r#"
             select
               rf.id,
@@ -103,7 +103,7 @@ impl TaskRepository {
         .await?
         .into_iter()
         .map(|row| RecordFileSummary::from_row(&row))
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
     }
 
     pub async fn list_file_artifacts(
@@ -282,10 +282,9 @@ impl TaskRepository {
             select
               a.node_id,
               a.source_url,
-              a.file_deleted,
-              n.agent_http_base_url
+              a.file_size,
+              a.file_deleted
             from media_upload_assets a
-            join media_nodes n on n.id = a.node_id
             where a.id = $1
             "#,
         )
@@ -296,8 +295,8 @@ impl TaskRepository {
             Ok(MediaUploadAssetDeleteTarget {
                 node_id: row.try_get("node_id")?,
                 source_url: row.try_get("source_url")?,
+                file_size: row.try_get("file_size")?,
                 file_deleted: row.try_get("file_deleted")?,
-                agent_http_base_url: row.try_get("agent_http_base_url")?,
             })
         })
         .transpose()
@@ -338,7 +337,7 @@ impl TaskRepository {
         &self,
         task_id: Uuid,
     ) -> Result<Vec<FileArtifactSummary>, RepoError> {
-        Ok(sqlx::query(
+        sqlx::query(
             r#"
             select
               ta.id,
@@ -368,7 +367,7 @@ impl TaskRepository {
         .await?
         .into_iter()
         .map(|row| FileArtifactSummary::from_row(&row))
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
     }
 
     async fn count_record_files(&self, filter: &RecordListFilter) -> Result<u64, RepoError> {
@@ -608,8 +607,8 @@ pub struct MediaUploadAssetSummary {
 pub struct MediaUploadAssetDeleteTarget {
     pub node_id: Uuid,
     pub source_url: String,
+    pub file_size: i64,
     pub file_deleted: bool,
-    pub agent_http_base_url: String,
 }
 
 impl MediaUploadAssetSummary {

@@ -689,7 +689,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       role: "admin",
       must_change_password: false,
       permissions: ["task_read", "task_write", "record_read", "node_read", "debug_read", "security_write"],
-      environment: "production",
+      environment: "development",
     },
   },
   {
@@ -1726,7 +1726,7 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       id: "019dd784-e69c-7db1-869a-9ee97226a427",
       fileName: "origin.mp4",
       sourceUrl: "uploads/cc74d485-3ff7-41fa-bd58-bdce7b42e81c/2026/04/29/019dd784-e69c-7db1-869a-9ee97226a427.mp4",
-      httpUrl: "http://172.17.13.196:8081/media/uploads/cc74d485-3ff7-41fa-bd58-bdce7b42e81c/2026/04/29/019dd784-e69c-7db1-869a-9ee97226a427.mp4",
+      httpUrl: "https://media.example/media/uploads/cc74d485-3ff7-41fa-bd58-bdce7b42e81c/2026/04/29/019dd784-e69c-7db1-869a-9ee97226a427.mp4",
       durationSec: 604,
       fileSize: 328172988,
       sha256: "a2b7b0f58d3e558bbd2d4a43494d9728b059f7305af6731380fc0450b1f6cd79",
@@ -1734,7 +1734,8 @@ const baseExternalApiDocs: ExternalApiDoc[] = [
       createdAt: 1777437304476,
     },
     notes: [
-      "Core 使用节点注册上报的 agent_http_base_url 代理到 Agent，不再配置上传地址模板。",
+      "Core 使用当前 mTLS 控制会话的认证 peer IP、节点证书 DNS SAN 和注册端口访问 Agent management listener，不信任 Agent 自报管理 URL。",
+      "每次上传还必须通过 Core 临时签发且绑定节点、操作、路径、大小和有效期的 capability JWT；公开媒体 listener 不提供写接口。",
       "未指定 node_id 时，Core 会在满足标签和健康条件的节点中优先选择上传盘剩余空间更大的节点。",
       "Agent 的 ffprobe 时长探测为尽力而为；探测失败不阻断上传，durationSec 返回 0。",
       "上传成功后 Core 会写入上传产物台账，可通过 GET /api/v1/uploads/media 查询。",
