@@ -47,6 +47,7 @@ struct PrefetchState {
     source_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_reason: Option<String>,
+    time_slice_applied: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +243,7 @@ async fn create_prefetch(
             status: "pending".to_string(),
             source_url: None,
             failure_reason: None,
+            time_slice_applied: false,
         },
     );
 
@@ -270,21 +272,27 @@ async fn create_prefetch(
         prefetches.insert(
             task_id,
             match result {
-                Ok(()) => PrefetchState {
+                Ok(outcome) => PrefetchState {
                     status: "ready".to_string(),
                     source_url: Some(target_path),
                     failure_reason: None,
+                    time_slice_applied: outcome.time_slice_applied(),
                 },
                 Err(error) => PrefetchState {
                     status: "failed".to_string(),
                     source_url: None,
                     failure_reason: Some(error.to_string()),
+                    time_slice_applied: false,
                 },
             },
         );
     });
 
-    (StatusCode::ACCEPTED, Json(json!({"status": "pending"}))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "pending", "time_slice_applied": false})),
+    )
+        .into_response()
 }
 
 async fn get_prefetch(

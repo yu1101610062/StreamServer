@@ -2640,9 +2640,9 @@ PY
   pid=\$!
   for _ in \$(seq 1 100); do
     if curl --fail --silent --show-error \
-      \"http://127.0.0.1:\${public_port}/health/live\" >/dev/null \
+      \"http://127.0.0.1:\${public_port}/health/live\" >/dev/null 2>&1 \
       && curl --fail --silent --show-error \
-        \"http://127.0.0.1:\${public_port}/health/ready\" >/dev/null; then
+        \"http://127.0.0.1:\${public_port}/health/ready\" >/dev/null 2>&1; then
       kill -0 \"\${pid}\" >/dev/null 2>&1
       exit 0
     fi
@@ -2693,7 +2693,7 @@ PY
   pid=\$!
   for _ in \$(seq 1 50); do
     if curl --fail --silent --show-error \
-      \"http://127.0.0.1:\${gateway_port}/api/healthz\" >/dev/null; then
+      \"http://127.0.0.1:\${gateway_port}/api/healthz\" >/dev/null 2>&1; then
       kill -0 \"\${pid}\" >/dev/null 2>&1
       echo 'gateway health endpoint is ready while process is alive'
       exit 0

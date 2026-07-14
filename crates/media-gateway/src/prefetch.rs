@@ -1,12 +1,19 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
+    process::Stdio,
 };
 
 use anyhow::{Context, ensure};
 use serde::Deserialize;
-use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tokio::{
+    fs,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use uuid::Uuid;
+
+const FFMPEG_STDERR_TAIL_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -25,13 +32,26 @@ pub(crate) struct PrefetchJob {
     pub(crate) duration_sec: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefetchOutcome {
+    FullDownload,
+    TimeSlice,
+}
+
+impl PrefetchOutcome {
+    pub(crate) fn time_slice_applied(self) -> bool {
+        matches!(self, Self::TimeSlice)
+    }
+}
+
 pub(crate) async fn execute_prefetch(
     http: reqwest::Client,
     ffmpeg_bin: &Path,
     job: PrefetchJob,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PrefetchOutcome> {
     if job.start_offset_sec.is_none() && job.duration_sec.is_none() {
-        return download_to_file(http, &job.source_url, &job.final_path).await;
+        download_to_file(http, &job.source_url, &job.final_path).await?;
+        return Ok(PrefetchOutcome::FullDownload);
     }
     let source_kind = job
         .source_kind
@@ -41,7 +61,8 @@ pub(crate) async fn execute_prefetch(
             clip_single_file(ffmpeg_bin, &job, source_kind).await
         }
         PrefetchSourceKind::Hls => clip_hls(ffmpeg_bin, &job).await,
-    }
+    }?;
+    Ok(PrefetchOutcome::TimeSlice)
 }
 
 async fn clip_hls(ffmpeg_bin: &Path, job: &PrefetchJob) -> anyhow::Result<()> {
@@ -238,7 +259,7 @@ async fn validate_staged_media(ffmpeg_bin: &Path, input_path: &Path) -> anyhow::
         OsString::from("-i"),
         input_path.as_os_str().to_os_string(),
         OsString::from("-map"),
-        OsString::from("0:v:0"),
+        OsString::from("0:v?"),
         OsString::from("-map"),
         OsString::from("0:a?"),
         OsString::from("-c"),
@@ -253,19 +274,62 @@ async fn validate_staged_media(ffmpeg_bin: &Path, input_path: &Path) -> anyhow::
 }
 
 async fn run_ffmpeg(ffmpeg_bin: &Path, args: &[OsString]) -> anyhow::Result<()> {
-    let output = Command::new(ffmpeg_bin)
+    let mut command = Command::new(ffmpeg_bin);
+    command
         .args(args)
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to start ffmpeg at {}", ffmpeg_bin.display()))?;
-    if output.status.success() {
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed to capture ffmpeg stderr")?;
+    let (status, stderr_tail) = tokio::try_join!(
+        async {
+            child
+                .wait()
+                .await
+                .context("failed while waiting for ffmpeg")
+        },
+        async {
+            drain_bounded_stderr_tail(stderr)
+                .await
+                .context("failed while reading ffmpeg stderr")
+        }
+    )?;
+    if status.success() {
         return Ok(());
     }
-    let stderr: String = String::from_utf8_lossy(&output.stderr)
-        .chars()
-        .take(4096)
-        .collect();
-    anyhow::bail!("ffmpeg exited with {}: {}", output.status, stderr.trim());
+    let stderr = String::from_utf8_lossy(&stderr_tail);
+    anyhow::bail!("ffmpeg exited with {status}: {}", stderr.trim());
+}
+
+async fn drain_bounded_stderr_tail(mut stderr: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    let mut tail = Vec::with_capacity(FFMPEG_STDERR_TAIL_LIMIT);
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stderr.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(tail);
+        }
+        if read >= FFMPEG_STDERR_TAIL_LIMIT {
+            tail.clear();
+            tail.extend_from_slice(&chunk[read - FFMPEG_STDERR_TAIL_LIMIT..read]);
+            continue;
+        }
+        let overflow = tail
+            .len()
+            .saturating_add(read)
+            .saturating_sub(FFMPEG_STDERR_TAIL_LIMIT);
+        if overflow > 0 {
+            tail.drain(..overflow);
+        }
+        tail.extend_from_slice(&chunk[..read]);
+    }
 }
 
 fn temporary_file_path(final_path: &Path, label: &str) -> PathBuf {

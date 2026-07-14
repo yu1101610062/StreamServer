@@ -115,6 +115,8 @@ HLS 使用任务级暂存目录生成播放列表和分片；FFmpeg 成功退出
 
 Prefetch 保持现有 `pending -> ready|failed` 状态模型。
 
+内部 Prefetch 状态响应增加 `time_slice_applied` 证明字段。只有 FFmpeg 时间片路径完成、输出验证通过并成功发布后，Gateway 才返回 `true`；普通完整下载、`pending` 和 `failed` 均返回 `false`。Core 请求了正偏移量或长度时，只接受同时携带 `ready` 和 `time_slice_applied=true` 的响应；旧 Gateway 缺少该字段时按 `false` 处理并拒绝重写，避免静默丢失时间窗口。无时间参数的 Prefetch 不要求该证明，因此仍兼容旧 Gateway 响应。
+
 以下情况标记为 `failed`：
 
 - FFmpeg 不存在或无法启动。

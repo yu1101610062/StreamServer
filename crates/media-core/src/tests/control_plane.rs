@@ -368,6 +368,97 @@ fn source_gateway_normalizes_zero_vod_offset_before_prefetch() {
     ));
 }
 
+async fn spawn_prefetch_gateway_stub(response: Value) -> anyhow::Result<(String, JoinHandle<()>)> {
+    use axum::{extract::State, routing::get, routing::post};
+
+    async fn prefetch_response(State(response): State<Value>) -> Json<Value> {
+        Json(response)
+    }
+
+    let app = Router::new()
+        .route("/api/prefetch", post(prefetch_response))
+        .route("/api/prefetch/{task_id}", get(prefetch_response))
+        .with_state(response);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("prefetch gateway stub should run");
+    });
+    Ok((format!("http://{addr}"), handle))
+}
+
+#[tokio::test]
+async fn source_gateway_rejects_old_ready_response_for_requested_time_slice() -> anyhow::Result<()>
+{
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000334")?;
+    let expected_source_url = format!("imports/{task_id}/source.mp4");
+    let (gateway_base, gateway) = spawn_prefetch_gateway_stub(json!({
+        "status": "ready",
+        "source_url": expected_source_url
+    }))
+    .await?;
+    let mut spec = sample_spec(
+        InputKind::HttpMp4,
+        Some("http://customer.example/archive.mp4"),
+        None,
+    )
+    .resolved();
+    spec.input.start_offset_sec = Some(600);
+    spec.record.enabled = Some(true);
+    spec.record.duration_sec = Some(180);
+
+    let error = crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?
+        .prepare_task_spec(task_id, &spec)
+        .await
+        .expect_err("an old ready response must not silently discard a requested time window");
+
+    assert!(matches!(
+        error,
+        crate::source_gateway::SourceGatewayError::Rejected(ref reason)
+            if reason.contains("time slice")
+    ));
+    assert_eq!(spec.input.kind, Some(InputKind::HttpMp4));
+    assert_eq!(spec.input.start_offset_sec, Some(600));
+    assert_eq!(spec.record.duration_sec, Some(180));
+    gateway.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_gateway_accepts_old_ready_response_without_time_slice() -> anyhow::Result<()> {
+    let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000335")?;
+    let expected_source_url = format!("imports/{task_id}/source.mp4");
+    let (gateway_base, gateway) = spawn_prefetch_gateway_stub(json!({
+        "status": "ready",
+        "source_url": expected_source_url
+    }))
+    .await?;
+    let spec = sample_spec(
+        InputKind::HttpMp4,
+        Some("http://customer.example/archive.mp4"),
+        None,
+    )
+    .resolved();
+
+    let rewritten = crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?
+        .prepare_task_spec(task_id, &spec)
+        .await?
+        .expect("no-time prefetch should remain compatible with an old Gateway");
+
+    assert_eq!(rewritten.input.kind, Some(InputKind::File));
+    assert_eq!(rewritten.input.source_mode, Some(SourceMode::Vod));
+    assert_eq!(
+        rewritten.input.url.as_deref(),
+        Some(expected_source_url.as_str())
+    );
+    assert_eq!(rewritten.input.start_offset_sec, None);
+    assert_eq!(rewritten.record.duration_sec, None);
+    gateway.abort();
+    Ok(())
+}
+
 struct TestDatabase {
     _slot: tokio::sync::OwnedSemaphorePermit,
     admin_pool: PgPool,

@@ -121,9 +121,13 @@ async fn prefetch_downloads_http_source_to_shared_storage_path() -> anyhow::Resu
         )
         .await?;
     assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created_body: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await?)?;
+    assert_eq!(created_body["time_slice_applied"], false);
 
     let status = wait_prefetch_ready(app, task_id).await?;
     assert_eq!(status["status"], "ready");
+    assert_eq!(status["time_slice_applied"], false);
     assert_eq!(
         status["source_url"],
         "imports/00000000-0000-0000-0000-000000000222/source.mp4"
@@ -228,8 +232,9 @@ fn assert_fake_ffmpeg_validation_invocation(script: &std::path::Path) -> anyhow:
     let args: Vec<&str> = args_text.lines().collect();
     let input = args.iter().position(|value| *value == "-i").expect("-i");
     assert!(args[input + 1].contains(".part"));
-    assert!(args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
+    assert!(args.windows(2).any(|pair| pair == ["-map", "0:v?"]));
     assert!(args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
+    assert!(!args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
     assert!(args.windows(2).any(|pair| pair == ["-c", "copy"]));
     assert!(args.windows(2).any(|pair| pair == ["-f", "null"]));
     assert_eq!(args.last(), Some(&"-"));
@@ -302,6 +307,25 @@ fn install_fake_ffmpeg_playlist_only(root: &std::path::Path) -> anyhow::Result<P
     Ok(script)
 }
 
+#[cfg(unix)]
+fn install_noisy_failing_ffmpeg(root: &std::path::Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-ffmpeg-noisy-failure");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+awk 'BEGIN { for (i = 0; i < 10000; i++) print "synthetic noisy ffmpeg diagnostic padding" }' >&2
+printf 'synthetic noisy ffmpeg tail marker\n' >&2
+exit 23
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions)?;
+    Ok(script)
+}
+
 async fn wait_prefetch_terminal(app: Router, task_id: uuid::Uuid) -> anyhow::Result<Value> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
@@ -359,9 +383,13 @@ async fn prefetch_time_slice_uses_input_seek_duration_and_stream_copy() -> anyho
         )
         .await?;
     assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created_body: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await?)?;
+    assert_eq!(created_body["time_slice_applied"], false);
 
     let status = wait_prefetch_terminal(app, task_id).await?;
     assert_eq!(status["status"], "ready");
+    assert_eq!(status["time_slice_applied"], true);
     assert_eq!(
         std::fs::read(temp.join("imports/00000000-0000-0000-0000-000000000333/source.mp4"))?,
         b"slice-bytes"
@@ -422,6 +450,7 @@ async fn failed_ffmpeg_marks_prefetch_failed_without_publishing_target() -> anyh
     assert_eq!(created.status(), StatusCode::ACCEPTED);
     let status = wait_prefetch_terminal(app, task_id).await?;
     assert_eq!(status["status"], "failed");
+    assert_eq!(status["time_slice_applied"], false);
     assert!(
         status["failure_reason"]
             .as_str()
@@ -432,6 +461,61 @@ async fn failed_ffmpeg_marks_prefetch_failed_without_publishing_target() -> anyh
             .join("imports/00000000-0000-0000-0000-000000000555/source.ts")
             .exists()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn noisy_ffmpeg_failure_is_drained_and_reason_stays_bounded() -> anyhow::Result<()> {
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_noisy_failing_ffmpeg(&temp)?;
+    let state = GatewayState::new(GatewayConfig {
+        public_base_url: "http://media:18080".to_string(),
+        work_root: temp.clone(),
+        ffmpeg_bin: ffmpeg,
+    });
+    let app = build_app(state);
+    let task_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000562")?;
+    let final_target = temp.join("imports/00000000-0000-0000-0000-000000000562/source.mp4");
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/prefetch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "task_id": task_id,
+                        "source_url": "http://customer.example/archive.mp4",
+                        "target_path": "imports/00000000-0000-0000-0000-000000000562/source.mp4",
+                        "source_kind": "http_mp4",
+                        "duration_sec": 5
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_prefetch_terminal(app, task_id),
+    )
+    .await
+    .expect("draining stderr must not deadlock on a full pipe")?;
+    assert_eq!(status["status"], "failed");
+    let reason = status["failure_reason"].as_str().expect("failure reason");
+    assert!(reason.contains("exit status: 23"));
+    assert!(reason.contains("synthetic noisy ffmpeg tail marker"));
+    assert!(
+        reason.len() <= 4_200,
+        "failure reason was {} bytes",
+        reason.len()
+    );
+    assert_eq!(status["time_slice_applied"], false);
+    assert!(!final_target.exists());
     Ok(())
 }
 

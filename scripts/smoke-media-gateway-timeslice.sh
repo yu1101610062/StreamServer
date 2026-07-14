@@ -11,6 +11,8 @@ source_pid=
 cleanup() {
   [ -z "${gateway_pid:-}" ] || kill "${gateway_pid}" >/dev/null 2>&1 || true
   [ -z "${source_pid:-}" ] || kill "${source_pid}" >/dev/null 2>&1 || true
+  [ -z "${gateway_pid:-}" ] || wait "${gateway_pid}" 2>/dev/null || true
+  [ -z "${source_pid:-}" ] || wait "${source_pid}" 2>/dev/null || true
   rm -rf -- "${ROOT}"
 }
 trap cleanup EXIT
@@ -33,6 +35,10 @@ mkdir -p "${ROOT}/source" "${ROOT}/work"
   -f lavfi -i sine=frequency=1000:sample_rate=48000 \
   -t 12 -c:v libx264 -g 50 -pix_fmt yuv420p -c:a aac -movflags +faststart \
   "${ROOT}/source/input.mp4"
+"${FFMPEG_BIN}" -v error -y \
+  -f lavfi -i sine=frequency=750:sample_rate=48000 \
+  -t 8 -c:a aac -movflags +faststart \
+  "${ROOT}/source/audio-only.mp4"
 
 python3 -m http.server "${source_port}" --bind 127.0.0.1 \
   --directory "${ROOT}/source" >"${ROOT}/source.log" 2>&1 &
@@ -46,7 +52,7 @@ MEDIA_GATEWAY_FFMPEG_BIN="${FFMPEG_BIN}" \
 gateway_pid=$!
 
 for _ in $(seq 1 100); do
-  curl -fsS "http://127.0.0.1:${gateway_port}/api/healthz" >/dev/null && break
+  curl -fsS "http://127.0.0.1:${gateway_port}/api/healthz" >/dev/null 2>&1 && break
   sleep 0.05
 done
 
@@ -87,6 +93,46 @@ python3 - "${duration}" <<'PY'
 import sys
 duration = float(sys.argv[1])
 assert 3.0 <= duration <= 5.5, duration
+PY
+
+audio_task_id=00000000-0000-0000-0000-000000000667
+curl -fsS -X POST "http://127.0.0.1:${gateway_port}/api/prefetch" \
+  -H 'content-type: application/json' \
+  -d "{\"task_id\":\"${audio_task_id}\",\"source_url\":\"http://127.0.0.1:${source_port}/audio-only.mp4\",\"target_path\":\"imports/${audio_task_id}/source.mp4\",\"source_kind\":\"http_mp4\",\"start_offset_sec\":2,\"duration_sec\":3}" \
+  >/dev/null
+
+audio_status=
+audio_ready_observed=false
+for _ in $(seq 1 200); do
+  audio_status="$(curl -fsS "http://127.0.0.1:${gateway_port}/api/prefetch/${audio_task_id}")"
+  python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "ready" else 1)' \
+    <<<"${audio_status}" && { audio_ready_observed=true; break; }
+  python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") != "failed" else 1)' \
+    <<<"${audio_status}" || { printf '%s\n' "${audio_status}" >&2; exit 1; }
+  sleep 0.05
+done
+if [ "${audio_ready_observed}" != true ]; then
+  printf 'audio-only prefetch did not reach ready: %s\n' "${audio_status}" >&2
+  exit 1
+fi
+
+audio_input_json="$(${FFPROBE_BIN} -v error -show_entries stream=codec_type,codec_name,sample_rate,channels -of json "${ROOT}/source/audio-only.mp4")"
+audio_output_json="$(${FFPROBE_BIN} -v error -show_entries stream=codec_type,codec_name,sample_rate,channels -of json "${ROOT}/work/imports/${audio_task_id}/source.mp4")"
+python3 - "${audio_input_json}" "${audio_output_json}" <<'PY'
+import json, sys
+source = json.loads(sys.argv[1])["streams"]
+output = json.loads(sys.argv[2])["streams"]
+keys = ("codec_type", "codec_name", "sample_rate", "channels")
+normalize = lambda streams: [{k: stream.get(k) for k in keys if k in stream} for stream in streams]
+assert [stream.get("codec_type") for stream in output] == ["audio"], output
+assert normalize(source) == normalize(output), (normalize(source), normalize(output))
+PY
+
+audio_duration="$(${FFPROBE_BIN} -v error -show_entries format=duration -of default=nk=1:nw=1 "${ROOT}/work/imports/${audio_task_id}/source.mp4")"
+python3 - "${audio_duration}" <<'PY'
+import sys
+duration = float(sys.argv[1])
+assert 2.0 <= duration <= 4.5, duration
 PY
 
 echo "media-gateway time-slice smoke passed"

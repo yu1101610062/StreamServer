@@ -83,6 +83,8 @@ struct PrefetchResponse {
     source_url: Option<String>,
     #[serde(default)]
     failure_reason: Option<String>,
+    #[serde(default)]
+    time_slice_applied: bool,
 }
 
 impl SourceGatewayClient {
@@ -202,7 +204,9 @@ impl SourceGatewayClient {
                     .error_for_status()?
                     .json()
                     .await?;
-                self.wait_for_prefetch(*task_id, response).await
+                let time_slice_requested = start_offset_sec.is_some() || duration_sec.is_some();
+                self.wait_for_prefetch(*task_id, response, time_slice_requested)
+                    .await
             }
         }
     }
@@ -211,11 +215,18 @@ impl SourceGatewayClient {
         &self,
         task_id: Uuid,
         mut response: PrefetchResponse,
+        time_slice_requested: bool,
     ) -> Result<GatewayActionResult, SourceGatewayError> {
         let deadline = Instant::now() + self.prefetch_timeout;
         loop {
             match response.status.as_str() {
                 "ready" => {
+                    if time_slice_requested && !response.time_slice_applied {
+                        return Err(SourceGatewayError::Rejected(
+                            "ready prefetch response did not attest the requested time slice"
+                                .to_string(),
+                        ));
+                    }
                     let source_url = response.source_url.ok_or_else(|| {
                         SourceGatewayError::Rejected(
                             "ready prefetch response is missing source_url".to_string(),
