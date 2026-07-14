@@ -2687,6 +2687,7 @@ PY
   MEDIA_GATEWAY_BIND_ADDR=127.0.0.1:\${gateway_port} \
   MEDIA_GATEWAY_PUBLIC_BASE_URL=http://127.0.0.1:1 \
   MEDIA_GATEWAY_WORK_ROOT=\"\${tmp}/work\" \
+  MEDIA_GATEWAY_FFMPEG_BIN=\"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg\" \
   RUST_LOG=info \
     "\${VERIFY_ROOT}/binaries/media-gateway-linux-amd64" &
   pid=\$!

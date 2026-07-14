@@ -42,6 +42,10 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 
 默认 FFmpeg runtime 固定为 `8.1` 系列：CPU 包使用 `jrottenberg/ffmpeg:8.1-ubuntu2404`，GPU 包使用 `jrottenberg/ffmpeg:8.1-nvidia2404`。GPU 节点要求 NVIDIA 驱动满足 FFmpeg/NVIDIA Video Codec SDK 13 系列运行时要求，生产基线按 `570+` 驱动准备；Linux 4.x 内核上的 T4/P4 等老卡优先锁定经过现场验证的 R580/R595 生产分支驱动。
 
+`media-gateway` 对没有时间参数的点播源继续执行普通 HTTP 下载；当 Core 传入 `input.start_offset_sec` 或 `record.duration_sec` 时，Gateway 使用 FFmpeg 输入侧 seek、`-t` 和 `-c copy` 生成共享存储时间片。该过程不转码，编码、分辨率、帧率和音频参数保持不变，但容器索引、时间戳和 HLS 分片边界会重新生成，起点精度受关键帧约束。
+
+Gateway 主机通过 `MEDIA_GATEWAY_FFMPEG_BIN` 指定 FFmpeg；未设置时依次回退到 `FFMPEG_BIN` 和 PATH 中的 `ffmpeg`。worker/all-in-one 可以复用 Native 安装器生成的 `FFMPEG_BIN`，独立 Gateway 或 core-only 主机必须显式提供可执行文件。源站不支持 Range、HLS 分片定位或容器快速 seek 时，Gateway 不会在共享存储落完整源文件，但网络侧仍可能读取偏移量之前的数据。
+
 ## 2. 目标服务器验收
 
 构建完成后推荐在实际目标服务器上验证：
