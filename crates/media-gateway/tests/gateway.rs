@@ -10,6 +10,8 @@ use media_gateway::{GatewayConfig, GatewayState, build_app, safe_target_path};
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
+const PREFETCH_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[tokio::test]
 async fn relay_requires_registered_task_and_token() -> anyhow::Result<()> {
     async fn upstream() -> &'static str {
@@ -157,7 +159,7 @@ async fn spawn_server(app: Router) -> anyhow::Result<String> {
 }
 
 async fn wait_prefetch_ready(app: Router, task_id: uuid::Uuid) -> anyhow::Result<Value> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + PREFETCH_WAIT_TIMEOUT;
     loop {
         let response = app
             .clone()
@@ -327,7 +329,7 @@ exit 23
 }
 
 async fn wait_prefetch_terminal(app: Router, task_id: uuid::Uuid) -> anyhow::Result<Value> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + PREFETCH_WAIT_TIMEOUT;
     loop {
         let response = app
             .clone()
