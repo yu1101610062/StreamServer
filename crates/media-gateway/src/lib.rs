@@ -4,7 +4,6 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
 use axum::{
     Json, Router,
     body::Body,
@@ -15,13 +14,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::{fs, io::AsyncWriteExt, sync::Mutex};
+use tokio::sync::Mutex;
 use uuid::Uuid;
+
+mod prefetch;
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub public_base_url: String,
     pub work_root: PathBuf,
+    pub ffmpeg_bin: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +60,12 @@ struct PrefetchRequest {
     task_id: Uuid,
     source_url: String,
     target_path: String,
+    #[serde(default)]
+    source_kind: Option<prefetch::PrefetchSourceKind>,
+    #[serde(default)]
+    start_offset_sec: Option<u32>,
+    #[serde(default)]
+    duration_sec: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +218,23 @@ async fn create_prefetch(
         )
             .into_response();
     };
+    let start_offset_sec = request.start_offset_sec.filter(|value| *value > 0);
+    if request.duration_sec == Some(0) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "duration_sec must be greater than 0"})),
+        )
+            .into_response();
+    }
+    if (start_offset_sec.is_some() || request.duration_sec.is_some())
+        && request.source_kind.is_none()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "source_kind is required for time-slice prefetch"})),
+        )
+            .into_response();
+    }
 
     state.prefetches.lock().await.insert(
         request.task_id,
@@ -225,8 +250,22 @@ async fn create_prefetch(
     let source_url = request.source_url;
     let http = state.http.clone();
     let prefetches = state.prefetches.clone();
+    let ffmpeg_bin = state.config.ffmpeg_bin.clone();
+    let source_kind = request.source_kind;
+    let duration_sec = request.duration_sec;
     tokio::spawn(async move {
-        let result = download_to_file(http, &source_url, &final_path).await;
+        let result = prefetch::execute_prefetch(
+            http,
+            &ffmpeg_bin,
+            prefetch::PrefetchJob {
+                source_url,
+                final_path,
+                source_kind,
+                start_offset_sec,
+                duration_sec,
+            },
+        )
+        .await;
         let mut prefetches = prefetches.lock().await;
         prefetches.insert(
             task_id,
@@ -257,37 +296,6 @@ async fn get_prefetch(
         Some(status) => Json(status).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-async fn download_to_file(
-    http: reqwest::Client,
-    source_url: &str,
-    final_path: &Path,
-) -> anyhow::Result<()> {
-    let part_path = final_path.with_extension(format!(
-        "{}.part",
-        final_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("download")
-    ));
-    if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    let mut response = http
-        .get(source_url)
-        .send()
-        .await?
-        .error_for_status()
-        .context("source download failed")?;
-    let mut file = fs::File::create(&part_path).await?;
-    while let Some(chunk) = response.chunk().await? {
-        file.write_all(&chunk).await?;
-    }
-    file.flush().await?;
-    drop(file);
-    fs::rename(&part_path, final_path).await?;
-    Ok(())
 }
 
 fn is_http_url(value: &str) -> bool {
