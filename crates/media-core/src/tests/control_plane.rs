@@ -271,6 +271,7 @@ fn source_gateway_rewrites_live_http_input_to_relay_url() -> anyhow::Result<()> 
         None,
     )
     .resolved();
+    spec.input.start_offset_sec = Some(0);
 
     let action = crate::source_gateway::plan_gateway_action(&spec, task_id)
         .expect("live http input should use media relay");
@@ -285,6 +286,7 @@ fn source_gateway_rewrites_live_http_input_to_relay_url() -> anyhow::Result<()> 
 
     assert_eq!(spec.input.kind, Some(InputKind::HttpFlv));
     assert_eq!(spec.input.source_mode, Some(SourceMode::Live));
+    assert_eq!(spec.input.start_offset_sec, None);
     assert_eq!(
         spec.input.url.as_deref(),
         Some("http://media:18080/relay/00000000-0000-0000-0000-000000000111?token=t")
@@ -293,17 +295,33 @@ fn source_gateway_rewrites_live_http_input_to_relay_url() -> anyhow::Result<()> 
 }
 
 #[test]
-fn source_gateway_rewrites_vod_http_input_to_shared_file_path() -> anyhow::Result<()> {
+fn source_gateway_rewrites_vod_http_time_window_to_shared_file_path() -> anyhow::Result<()> {
     let task_id = Uuid::parse_str("00000000-0000-0000-0000-000000000222")?;
-    let mut spec = sample_spec(
+    let mut requested_spec = sample_spec(
         InputKind::HttpMp4,
         Some("http://customer.example/archive.mp4"),
         None,
     )
     .resolved();
+    requested_spec.input.start_offset_sec = Some(600);
+    requested_spec.record.enabled = Some(true);
+    requested_spec.record.duration_sec = Some(180);
+    let mut spec = requested_spec.clone();
 
     let action = crate::source_gateway::plan_gateway_action(&spec, task_id)
         .expect("vod http input should use media prefetch");
+    assert_eq!(
+        action,
+        crate::source_gateway::GatewayAction::Prefetch {
+            task_id,
+            source_url: "http://customer.example/archive.mp4".to_string(),
+            target_path: "imports/00000000-0000-0000-0000-000000000222/source.mp4".to_string(),
+            source_kind: InputKind::HttpMp4,
+            start_offset_sec: Some(600),
+            duration_sec: Some(180),
+        }
+    );
+
     crate::source_gateway::apply_gateway_result(
         &mut spec,
         action,
@@ -314,11 +332,40 @@ fn source_gateway_rewrites_vod_http_input_to_shared_file_path() -> anyhow::Resul
 
     assert_eq!(spec.input.kind, Some(InputKind::File));
     assert_eq!(spec.input.source_mode, Some(SourceMode::Vod));
+    assert_eq!(spec.input.start_offset_sec, None);
+    assert_eq!(spec.record.duration_sec, Some(180));
+    assert_eq!(requested_spec.input.start_offset_sec, Some(600));
     assert_eq!(
         spec.input.url.as_deref(),
         Some("imports/00000000-0000-0000-0000-000000000222/source.mp4")
     );
     Ok(())
+}
+
+#[test]
+fn source_gateway_normalizes_zero_vod_offset_before_prefetch() {
+    let task_id = Uuid::from_u128(0x333);
+    let mut spec = sample_spec(
+        InputKind::HttpTs,
+        Some("http://customer.example/archive"),
+        None,
+    )
+    .resolved();
+    spec.input.source_mode = Some(SourceMode::Vod);
+    spec.input.start_offset_sec = Some(0);
+
+    let action = crate::source_gateway::plan_gateway_action(&spec, task_id)
+        .expect("vod http input should use media prefetch");
+    assert!(matches!(
+        action,
+        crate::source_gateway::GatewayAction::Prefetch {
+            source_kind: InputKind::HttpTs,
+            start_offset_sec: None,
+            duration_sec: None,
+            ref target_path,
+            ..
+        } if target_path == &format!("imports/{task_id}/source.ts")
+    ));
 }
 
 struct TestDatabase {

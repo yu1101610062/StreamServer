@@ -19,6 +19,9 @@ pub(crate) enum GatewayAction {
         task_id: Uuid,
         source_url: String,
         target_path: String,
+        source_kind: InputKind,
+        start_offset_sec: Option<u32>,
+        duration_sec: Option<u32>,
     },
 }
 
@@ -66,6 +69,11 @@ struct PrefetchRequest {
     task_id: Uuid,
     source_url: String,
     target_path: String,
+    source_kind: InputKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start_offset_sec: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_sec: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +182,9 @@ impl SourceGatewayClient {
                 task_id,
                 source_url,
                 target_path,
+                source_kind,
+                start_offset_sec,
+                duration_sec,
             } => {
                 let response: PrefetchResponse = self
                     .http
@@ -182,6 +193,9 @@ impl SourceGatewayClient {
                         task_id: *task_id,
                         source_url: source_url.clone(),
                         target_path: target_path.clone(),
+                        source_kind: *source_kind,
+                        start_offset_sec: *start_offset_sec,
+                        duration_sec: *duration_sec,
                     })
                     .send()
                     .await?
@@ -263,7 +277,10 @@ pub(crate) fn plan_gateway_action(spec: &TaskSpec, task_id: Uuid) -> Option<Gate
             Some(GatewayAction::Prefetch {
                 task_id,
                 source_url: source_url.to_string(),
-                target_path: default_prefetch_target_path(task_id, kind, source_url),
+                target_path: default_prefetch_target_path(task_id, kind),
+                source_kind: kind,
+                start_offset_sec: spec.input.start_offset_sec.filter(|value| *value > 0),
+                duration_sec: spec.record.duration_sec,
             })
         }
         _ => None,
@@ -283,7 +300,6 @@ pub(crate) fn apply_gateway_result(
                 ));
             }
             spec.input.url = Some(relay_url);
-            Ok(())
         }
         (GatewayAction::Prefetch { .. }, GatewayActionResult::Prefetch { source_url }) => {
             if source_url.trim().is_empty() || source_url.starts_with("uploads/") {
@@ -294,23 +310,19 @@ pub(crate) fn apply_gateway_result(
             spec.input.kind = Some(InputKind::File);
             spec.input.source_mode = Some(SourceMode::Vod);
             spec.input.url = Some(source_url);
-            Ok(())
         }
-        _ => Err(SourceGatewayError::ActionMismatch),
+        _ => return Err(SourceGatewayError::ActionMismatch),
     }
+    spec.input.start_offset_sec = None;
+    Ok(())
 }
 
-fn default_prefetch_target_path(task_id: Uuid, kind: InputKind, source_url: &str) -> String {
-    let ext = source_url
-        .split('?')
-        .next()
-        .and_then(|path| path.rsplit('/').next())
-        .and_then(|name| name.rsplit_once('.').map(|(_, ext)| ext))
-        .filter(|ext| !ext.trim().is_empty())
-        .unwrap_or(match kind {
-            InputKind::Hls => "m3u8",
-            InputKind::HttpTs => "ts",
-            _ => "mp4",
-        });
+fn default_prefetch_target_path(task_id: Uuid, kind: InputKind) -> String {
+    let ext = match kind {
+        InputKind::Hls => "m3u8",
+        InputKind::HttpTs => "ts",
+        InputKind::HttpMp4 => "mp4",
+        _ => unreachable!("only HTTP VOD inputs use prefetch targets"),
+    };
     format!("imports/{task_id}/source.{ext}")
 }
