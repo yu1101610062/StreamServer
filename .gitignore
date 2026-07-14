@@ -4,6 +4,7 @@
 /data
 /.artifacts
 /.codex
+/.worktrees
 /dist
 /crates/media-core/frontend/node_modules
 /crates/media-core/ui
