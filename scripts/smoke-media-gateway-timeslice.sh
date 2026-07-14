@@ -57,14 +57,19 @@ curl -fsS -X POST "http://127.0.0.1:${gateway_port}/api/prefetch" \
   >/dev/null
 
 status=
+ready_observed=false
 for _ in $(seq 1 200); do
   status="$(curl -fsS "http://127.0.0.1:${gateway_port}/api/prefetch/${task_id}")"
   python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") == "ready" else 1)' \
-    <<<"${status}" && break
+    <<<"${status}" && { ready_observed=true; break; }
   python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("status") != "failed" else 1)' \
     <<<"${status}" || { printf '%s\n' "${status}" >&2; exit 1; }
   sleep 0.05
 done
+if [ "${ready_observed}" != true ]; then
+  printf 'prefetch did not reach ready: %s\n' "${status}" >&2
+  exit 1
+fi
 
 input_json="$(${FFPROBE_BIN} -v error -show_entries stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels -of json "${ROOT}/source/input.mp4")"
 output_json="$(${FFPROBE_BIN} -v error -show_entries stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels -of json "${ROOT}/work/imports/${task_id}/source.mp4")"

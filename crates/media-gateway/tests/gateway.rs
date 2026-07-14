@@ -182,9 +182,13 @@ fn install_fake_ffmpeg(root: &std::path::Path, exit_code: i32) -> anyhow::Result
     let script = root.join(format!("fake-ffmpeg-{exit_code}"));
     let body = if exit_code == 0 {
         r#"#!/bin/sh
-printf '%s\n' "$@" > "${0}.args"
 last=
 for arg in "$@"; do last="$arg"; done
+if [ "$last" = "-" ]; then
+  printf '%s\n' "$@" > "${0}.validation.args"
+  exit 0
+fi
+printf '%s\n' "$@" > "${0}.args"
 mkdir -p "$(dirname "$last")"
 case "$last" in
   *.m3u8)
@@ -213,6 +217,59 @@ exit 0
 
 fn fake_ffmpeg_args_path(script: &std::path::Path) -> PathBuf {
     PathBuf::from(format!("{}.args", script.display()))
+}
+
+fn fake_ffmpeg_validation_args_path(script: &std::path::Path) -> PathBuf {
+    PathBuf::from(format!("{}.validation.args", script.display()))
+}
+
+fn assert_fake_ffmpeg_validation_invocation(script: &std::path::Path) -> anyhow::Result<()> {
+    let args_text = std::fs::read_to_string(fake_ffmpeg_validation_args_path(script))?;
+    let args: Vec<&str> = args_text.lines().collect();
+    let input = args.iter().position(|value| *value == "-i").expect("-i");
+    assert!(args[input + 1].contains(".part"));
+    assert!(args.windows(2).any(|pair| pair == ["-map", "0:v:0"]));
+    assert!(args.windows(2).any(|pair| pair == ["-map", "0:a?"]));
+    assert!(args.windows(2).any(|pair| pair == ["-c", "copy"]));
+    assert!(args.windows(2).any(|pair| pair == ["-f", "null"]));
+    assert_eq!(args.last(), Some(&"-"));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_fake_ffmpeg_with_invalid_media(root: &std::path::Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-ffmpeg-invalid-media");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+last=
+for arg in "$@"; do last="$arg"; done
+if [ "$last" = "-" ]; then
+  printf '%s\n' "$@" > "${0}.validation.args"
+  printf 'synthetic media validation failure' >&2
+  exit 9
+fi
+printf '%s\n' "$@" > "${0}.args"
+mkdir -p "$(dirname "$last")"
+case "$last" in
+  *.m3u8)
+    base="$(basename "$last" .m3u8)"
+    printf '#EXTM3U\n#EXT-X-ENDLIST\n%s-00000.ts\n' "$base" > "$last"
+    printf 'invalid-segment-bytes' > "$(dirname "$last")/${base}-00000.ts"
+    ;;
+  *)
+    printf 'invalid-media-bytes' > "$last"
+    ;;
+esac
+exit 0
+"#,
+    )?;
+    let mut permissions = std::fs::metadata(&script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions)?;
+    Ok(script)
 }
 
 #[cfg(unix)]
@@ -325,6 +382,7 @@ async fn prefetch_time_slice_uses_input_seek_duration_and_stream_copy() -> anyho
             .iter()
             .any(|value| matches!(*value, "-vf" | "-af" | "-r" | "-b:v"))
     );
+    assert_fake_ffmpeg_validation_invocation(&ffmpeg)?;
     Ok(())
 }
 
@@ -420,6 +478,56 @@ async fn missing_ffmpeg_output_marks_prefetch_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_nonempty_ffmpeg_output_fails_validation_and_cleans_staging() -> anyhow::Result<()>
+{
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_fake_ffmpeg_with_invalid_media(&temp)?;
+    let state = GatewayState::new(GatewayConfig {
+        public_base_url: "http://media:18080".to_string(),
+        work_root: temp.clone(),
+        ffmpeg_bin: ffmpeg.clone(),
+    });
+    let app = build_app(state);
+    let task_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000560")?;
+    let target_dir = temp.join("imports/00000000-0000-0000-0000-000000000560");
+    let final_target = target_dir.join("source.mp4");
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/prefetch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "task_id": task_id,
+                        "source_url": "http://customer.example/archive.mp4",
+                        "target_path": "imports/00000000-0000-0000-0000-000000000560/source.mp4",
+                        "source_kind": "http_mp4",
+                        "duration_sec": 5
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+
+    let status = wait_prefetch_terminal(app, task_id).await?;
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["failure_reason"]
+            .as_str()
+            .is_some_and(|value| value.contains("ffmpeg output validation failed"))
+    );
+    assert!(!final_target.exists());
+    assert_eq!(std::fs::read_dir(&target_dir)?.count(), 0);
+    assert_fake_ffmpeg_validation_invocation(&ffmpeg)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn time_slice_requires_source_kind_and_positive_duration() -> anyhow::Result<()> {
     let temp = test_temp_dir()?;
@@ -480,7 +588,7 @@ async fn prefetch_hls_time_slice_publishes_playlist_and_segments_together() -> a
     let state = GatewayState::new(GatewayConfig {
         public_base_url: "http://media:18080".to_string(),
         work_root: temp.clone(),
-        ffmpeg_bin: ffmpeg,
+        ffmpeg_bin: ffmpeg.clone(),
     });
     let app = build_app(state);
     let task_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000444")?;
@@ -511,6 +619,7 @@ async fn prefetch_hls_time_slice_publishes_playlist_and_segments_together() -> a
     let final_dir = temp.join("imports/00000000-0000-0000-0000-000000000444");
     assert!(final_dir.join("source.m3u8").is_file());
     assert!(final_dir.join("source-00000.ts").is_file());
+    assert_fake_ffmpeg_validation_invocation(&ffmpeg)?;
     Ok(())
 }
 
@@ -558,5 +667,54 @@ async fn hls_without_media_segment_fails_without_publishing_directory() -> anyho
             .join("imports/00000000-0000-0000-0000-000000000559")
             .exists()
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn invalid_hls_output_fails_validation_and_cleans_staging() -> anyhow::Result<()> {
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_fake_ffmpeg_with_invalid_media(&temp)?;
+    let state = GatewayState::new(GatewayConfig {
+        public_base_url: "http://media:18080".to_string(),
+        work_root: temp.clone(),
+        ffmpeg_bin: ffmpeg.clone(),
+    });
+    let app = build_app(state);
+    let task_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000561")?;
+    let imports_dir = temp.join("imports");
+    let final_dir = imports_dir.join("00000000-0000-0000-0000-000000000561");
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/prefetch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "task_id": task_id,
+                        "source_url": "http://customer.example/archive.m3u8",
+                        "target_path": "imports/00000000-0000-0000-0000-000000000561/source.m3u8",
+                        "source_kind": "hls",
+                        "duration_sec": 5
+                    })
+                    .to_string(),
+                ))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+
+    let status = wait_prefetch_terminal(app, task_id).await?;
+    assert_eq!(status["status"], "failed");
+    assert!(
+        status["failure_reason"]
+            .as_str()
+            .is_some_and(|value| value.contains("ffmpeg output validation failed"))
+    );
+    assert!(!final_dir.exists());
+    assert_eq!(std::fs::read_dir(&imports_dir)?.count(), 0);
+    assert_fake_ffmpeg_validation_invocation(&ffmpeg)?;
     Ok(())
 }

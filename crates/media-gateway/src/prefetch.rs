@@ -106,6 +106,7 @@ async fn clip_hls(ffmpeg_bin: &Path, job: &PrefetchJob) -> anyhow::Result<()> {
             }
         }
         ensure!(has_segment, "ffmpeg produced no HLS media segment");
+        validate_staged_media(ffmpeg_bin, &playlist_path).await?;
         fs::rename(&stage_dir, final_dir).await?;
         Ok(())
     }
@@ -177,6 +178,7 @@ async fn clip_single_file(
             metadata.is_file() && metadata.len() > 0,
             "ffmpeg produced an empty time slice"
         );
+        validate_staged_media(ffmpeg_bin, &stage_path).await?;
         fs::rename(&stage_path, &job.final_path).await?;
         Ok(())
     }
@@ -225,6 +227,29 @@ fn base_clip_args(job: &PrefetchJob) -> Vec<OsString> {
         .map(OsString::from),
     );
     args
+}
+
+async fn validate_staged_media(ffmpeg_bin: &Path, input_path: &Path) -> anyhow::Result<()> {
+    let args = [
+        OsString::from("-hide_banner"),
+        OsString::from("-nostdin"),
+        OsString::from("-loglevel"),
+        OsString::from("error"),
+        OsString::from("-i"),
+        input_path.as_os_str().to_os_string(),
+        OsString::from("-map"),
+        OsString::from("0:v:0"),
+        OsString::from("-map"),
+        OsString::from("0:a?"),
+        OsString::from("-c"),
+        OsString::from("copy"),
+        OsString::from("-f"),
+        OsString::from("null"),
+        OsString::from("-"),
+    ];
+    run_ffmpeg(ffmpeg_bin, &args)
+        .await
+        .context("ffmpeg output validation failed")
 }
 
 async fn run_ffmpeg(ffmpeg_bin: &Path, args: &[OsString]) -> anyhow::Result<()> {
