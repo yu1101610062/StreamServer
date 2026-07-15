@@ -2760,7 +2760,7 @@ if [ "${BUNDLE_WORKER_SUPPORT}" = true ]; then
     for binary in "${ffmpeg}" "${ffprobe}"; do
       output=$("${loader}" --library-path "${library_path}" "${binary}" -hide_banner -h protocol=tls 2>&1)
       printf "%s\n" "${output}" | grep -Eq -- "tls_verify.*default false"
-      printf "%s\n" "${output}" | grep -Eq -- "(^|[[:space:]])verify.*default false"
+      printf "%s\n" "${output}" | grep -Eq -- "(^|[[:space:]])-verify[[:space:]].*default false"
     done
   '
   run_shell "ffmpeg cpu HEVC to FLV smoke" "tmp=\$(mktemp -d); trap 'rm -rf \"\${tmp}\"' EXIT; \"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/lib/ld-linux-x86-64.so.2\" --library-path \"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/lib\" \"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg\" -hide_banner -f lavfi -i testsrc=size=128x72:rate=1 -t 1 -c:v libx265 -an -f flv -y \"\$tmp/hevc-test.flv\" && test -s \"\$tmp/hevc-test.flv\""
