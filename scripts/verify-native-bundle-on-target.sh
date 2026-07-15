@@ -2758,7 +2758,7 @@ if [ "${BUNDLE_WORKER_SUPPORT}" = true ]; then
     ffmpeg="${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg"
     ffprobe="${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffprobe"
     for binary in "${ffmpeg}" "${ffprobe}"; do
-      output=$("${loader}" --library-path "${library_path}" "${binary}" -hide_banner -h protocol=https 2>&1)
+      output=$("${loader}" --library-path "${library_path}" "${binary}" -hide_banner -h protocol=tls 2>&1)
       printf "%s\n" "${output}" | grep -Eq -- "tls_verify.*default false"
       printf "%s\n" "${output}" | grep -Eq -- "(^|[[:space:]])verify.*default false"
     done
