@@ -4057,7 +4057,16 @@ upgrade_entry_fingerprint() {
     {
       printf '%s\0%s\0' "${relative}" "${entry_type}"
       if [ "${fingerprint_mode}" = full ]; then
-        stat -c '%f\0%u\0%g\0%h\0%s\0%y\0' -- "${path}" || exit 1
+        if [ "${entry_type}" = d ]; then
+          # A directory's st_size is an allocation detail and is not preserved
+          # by cp -a across filesystems (or even by a fresh copy on the same
+          # filesystem). The sorted inventory below already commits to every
+          # child, while mode/owner/link-count/mtime retain the meaningful
+          # directory metadata required by the rollback guard.
+          stat -c '%f\0%u\0%g\0%h\0-\0%y\0' -- "${path}" || exit 1
+        else
+          stat -c '%f\0%u\0%g\0%h\0%s\0%y\0' -- "${path}" || exit 1
+        fi
       fi
       case "${entry_type}" in
         f)

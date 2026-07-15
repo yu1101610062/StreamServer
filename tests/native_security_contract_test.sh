@@ -2302,6 +2302,26 @@ success_line="$(printf '%s\n' "${mutation_function_body}" \
   [ "${find_failure_status}" -ne 0 ]
 )
 
+# Directory st_size reflects filesystem allocation rather than tree content.
+# A directory that once held many entries can remain larger than a fresh cp -a
+# snapshot even when every path, byte, and meaningful metadata field matches.
+(
+  set +x
+  source_tree="${TMP_DIR}/directory-size-fingerprint-source"
+  snapshot_tree="${TMP_DIR}/directory-size-fingerprint-snapshot"
+  mkdir -p "${source_tree}/empty-cache"
+  for index in $(seq 1 1024); do
+    : >"${source_tree}/empty-cache/entry-${index}"
+  done
+  rm -f "${source_tree}/empty-cache/"entry-*
+  touch -t 202401010000.00 "${source_tree}" "${source_tree}/empty-cache"
+  cp -a "${source_tree}" "${snapshot_tree}"
+  [ "$(stat -c '%s' "${source_tree}/empty-cache")" != \
+    "$(stat -c '%s' "${snapshot_tree}/empty-cache")" ]
+  [ "$(upgrade_entry_fingerprint "${source_tree}")" = \
+    "$(upgrade_entry_fingerprint "${snapshot_tree}")" ]
+)
+
 # Package trees are fully staged and audited before an existing runtime is
 # removed.  Both an unsafe source and an unsafe post-copy result must leave the
 # previously installed target byte-for-byte and metadata-for-metadata intact.
