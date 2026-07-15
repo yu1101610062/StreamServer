@@ -4229,6 +4229,22 @@ done
   }
   systemctl() { printf '%s\n' not-found; return 1; }
   [ "$(capture_upgrade_unit_enablement ss-missing.service)" = not-found ]
+  systemctl() {
+    case "$*" in
+      *'is-enabled ss-old-systemd-missing.service')
+        printf '%s\n' \
+          'Failed to get unit file state: No such file or directory' >&2
+        return 1
+        ;;
+      *'show --property LoadState --value ss-old-systemd-missing.service')
+        printf '%s\n' not-found
+        return 0
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  [ "$(capture_upgrade_unit_enablement \
+    ss-old-systemd-missing.service)" = not-found ]
 )
 
 # Even if an armed transaction reaches EXIT with status zero, a failed

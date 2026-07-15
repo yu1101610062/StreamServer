@@ -4726,11 +4726,22 @@ clear_upgrade_boot_fence() {
 capture_upgrade_unit_enablement() {
   local unit="$1"
   local deadline="${2:-$((SECONDS + 10))}"
+  local load_state=""
   local state=""
   state="$(bounded_upgrade_systemctl \
     "${deadline}" is-enabled "${unit}" 2>/dev/null)" || true
   state="$(printf '%s\n' "${state}" | sed -n '1p')"
-  [ -n "${state}" ] || return 1
+  if [ -z "${state}" ]; then
+    # Older systemd releases report a missing unit only on stderr and leave
+    # is-enabled stdout empty. Confirm absence through LoadState so a DBus or
+    # timeout failure can never be snapshotted as not-found.
+    load_state="$(bounded_upgrade_systemctl \
+      "${deadline}" show --property LoadState --value "${unit}" 2>/dev/null)" \
+      || true
+    load_state="$(printf '%s\n' "${load_state}" | sed -n '1p')"
+    [ "${load_state}" = not-found ] || return 1
+    state=not-found
+  fi
   case "${state}" in
     enabled|enabled-runtime|disabled|masked|masked-runtime|static|indirect|generated|transient|linked|linked-runtime|alias|not-found) ;;
     *) return 1 ;;
