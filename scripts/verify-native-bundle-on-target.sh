@@ -416,7 +416,7 @@ spawn ssh -p $port -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=n
 expect {
   -re "(?i)yes/no|fingerprint" { send -- "yes\r"; exp_continue }
   -re "(?i)password:" { send -- "$pass\r"; log_user 1; exp_continue }
-  eof
+  eof {}
   timeout {
     set child [exp_pid]
     catch {exec kill -TERM $child}
@@ -473,7 +473,7 @@ expect {
 send -- $payload
 send -- "\004"
 expect {
-  eof
+  eof {}
   timeout {
     set child [exp_pid]
     catch {exec kill -TERM $child}
@@ -550,7 +550,7 @@ spawn scp -P $port -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=n
 expect {
   -re "(?i)yes/no|fingerprint" { send -- "yes\r"; exp_continue }
   -re "(?i)password:" { send -- "$pass\r"; log_user 1; exp_continue }
-  eof
+  eof {}
   timeout {
     set child [exp_pid]
     catch {exec kill -TERM $child}
