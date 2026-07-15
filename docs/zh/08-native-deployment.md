@@ -42,20 +42,42 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 
 默认 FFmpeg runtime 固定为 `8.1` 系列：CPU 包使用 `jrottenberg/ffmpeg:8.1-ubuntu2404`，GPU 包使用 `jrottenberg/ffmpeg:8.1-nvidia2404`。GPU 节点要求 NVIDIA 驱动满足 FFmpeg/NVIDIA Video Codec SDK 13 系列运行时要求，生产基线按 `570+` 驱动准备；Linux 4.x 内核上的 T4/P4 等老卡优先锁定经过现场验证的 R580/R595 生产分支驱动。
 
-`media-gateway` 对没有时间参数的点播源继续执行普通 HTTP 下载；当 Core 传入 `input.start_offset_sec` 或 `record.duration_sec` 时，Gateway 使用 FFmpeg 输入侧 seek、`-t` 和 `-c copy` 生成共享存储时间片。该过程不转码，编码、分辨率、帧率和音频参数保持不变，但容器索引、时间戳和 HLS 分片边界会重新生成，起点精度受关键帧约束。
+`media-gateway` 对普通 MP4/TS 点播执行 HTTP 下载；HLS 点播即使没有时间参数也会通过 FFmpeg 将播放列表和分片完整物化到共享目录。当 Core 传入 `input.start_offset_sec` 或 `record.duration_sec` 时，Gateway 使用 FFmpeg 输入侧 seek、`-t` 和 `-c copy` 生成共享存储时间片。该过程不转码，编码、分辨率、帧率和音频参数保持不变，但容器索引、时间戳和 HLS 分片边界会重新生成，起点精度受关键帧约束。
 
-Gateway 主机通过 `MEDIA_GATEWAY_FFMPEG_BIN` 指定 FFmpeg；未设置时依次回退到 `FFMPEG_BIN` 和 PATH 中的 `ffmpeg`。worker/all-in-one 可以复用 Native 安装器生成的 `FFMPEG_BIN`，独立 Gateway 或 core-only 主机必须显式提供可执行文件。源站不支持 Range、HLS 分片定位或容器快速 seek 时，Gateway 不会在共享存储落完整源文件，但网络侧仍可能读取偏移量之前的数据。
+Gateway 主机通过 `MEDIA_GATEWAY_FFMPEG_BIN` 指定 FFmpeg；未设置时依次回退到 `FFMPEG_BIN` 和 PATH 中的 `ffmpeg`。`MEDIA_GATEWAY_FFPROBE_BIN` 用于校验原子发布前的本地输出，未设置时默认使用 FFmpeg 同目录下的 `ffprobe`。worker/all-in-one 可以复用 Native 安装器生成的运行时，独立 Gateway 或 core-only 主机必须显式提供可执行文件。源站不支持 Range、HLS 分片定位或容器快速 seek 时，Gateway 不会在共享存储落完整源文件，但网络侧仍可能读取偏移量之前的数据。
+
+大批量现场任务建议显式使用以下 Gateway 边界。下载与 FFmpeg 各自使用 FIFO 队列，排队任务不建立上游连接或启动子进程；`0` 的排队超时表示不限排队时长：
+
+```ini
+MEDIA_GATEWAY_MAX_QUEUED_PREFETCHES=4096
+MEDIA_GATEWAY_MAX_ACTIVE_DOWNLOADS=4
+MEDIA_GATEWAY_MAX_ACTIVE_FFMPEG=2
+MEDIA_GATEWAY_FFPROBE_BIN=/opt/streamserver/runtime/ffmpeg/bin/ffprobe
+MEDIA_GATEWAY_PREFETCH_QUEUE_TIMEOUT_MS=0
+MEDIA_GATEWAY_PREFETCH_EXECUTION_TIMEOUT_MS=21600000
+MEDIA_GATEWAY_SOURCE_CONNECT_TIMEOUT_MS=10000
+MEDIA_GATEWAY_SOURCE_READ_IDLE_TIMEOUT_MS=60000
+MEDIA_GATEWAY_MAX_PREFETCH_RECORDS=8192
+MEDIA_GATEWAY_PREFETCH_TERMINAL_RETENTION_SEC=3600
+MEDIA_GATEWAY_RELAY_CANCEL_WAIT_MS=5000
+MEDIA_GATEWAY_PREFETCH_CANCEL_WAIT_MS=30000
+MEDIA_GATEWAY_CANCEL_TOMBSTONE_TTL_SEC=3600
+MEDIA_GATEWAY_MAX_ACTIVE_RELAYS=32
+MEDIA_GATEWAY_MAX_RELAY_REGISTRATIONS=256
+MEDIA_GATEWAY_RELAY_RECONNECT_GRACE_SEC=600
+MEDIA_GATEWAY_RELAY_UNOPENED_TTL_SEC=86400
+```
 
 Core 通过以下配置启用 Source Gateway：
 
 ```ini
 SOURCE_GATEWAY_BASE_URL=https://gateway.example/bohui/media/
 SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY=false
-SOURCE_GATEWAY_PREFETCH_POLL_MS=1000
-SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=600000
+SOURCE_GATEWAY_PREFETCH_POLL_MS=5000
+SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=0
 ```
 
-`SOURCE_GATEWAY_BASE_URL` 为空时整个 Gateway 改写链路关闭。启用时必须使用 HTTPS；客户端会保留基准地址中的路径前缀、禁用系统代理并拒绝跟随 HTTP 重定向。`SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY` 默认 `false`，且只接受 `true`/`false`；显式设为 `true` 时，仅 Core 的 Source Gateway 专用客户端跳过证书链、有效期和主机名验证。该开关不影响 Core/Agent mTLS、Agent 管理接口、其他 HTTP 客户端或 FFmpeg/FFprobe。开启后传输仍加密，但对端身份不再可信，应同时使用固定入口地址和网络访问控制，并在 Core 启动日志中核对一次性风险警告。
+`SOURCE_GATEWAY_BASE_URL` 为空时整个 Gateway 改写链路关闭。启用时必须使用 HTTPS；客户端会保留基准地址中的路径前缀、禁用系统代理并拒绝跟随 HTTP 重定向。Core 提交点播后不在创建接口内等待，排队阶段遵循 Gateway 返回的 30 秒提示、运行阶段遵循 5 秒提示；`SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=0` 表示 Core 不设置总等待时限。`SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY` 默认 `false`，且只接受 `true`/`false`；显式设为 `true` 时，仅 Core 的 Source Gateway 专用客户端跳过证书链、有效期和主机名验证。该开关不影响 Core/Agent mTLS、Agent 管理接口、其他 HTTP 客户端或 FFmpeg/FFprobe。开启后传输仍加密，但对端身份不再可信，应同时使用固定入口地址和网络访问控制，并在 Core 启动日志中核对一次性风险警告。
 
 ## 2. 目标服务器验收
 

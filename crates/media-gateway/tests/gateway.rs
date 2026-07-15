@@ -1,12 +1,23 @@
-use std::path::PathBuf;
+use std::{
+    convert::Infallible,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     Router,
-    body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    body::{Body, Bytes, to_bytes},
+    http::{HeaderMap, Request, StatusCode, header},
+    response::Response,
     routing::get,
 };
-use media_gateway::{GatewayConfig, GatewayState, build_app, safe_target_path};
+use media_gateway::{
+    GatewayConfig, GatewayRuntimeConfig, GatewayState, build_app, safe_target_path,
+};
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
@@ -241,6 +252,21 @@ fn assert_fake_ffmpeg_validation_invocation(script: &std::path::Path) -> anyhow:
     assert!(args.windows(2).any(|pair| pair == ["-f", "null"]));
     assert_eq!(args.last(), Some(&"-"));
     Ok(())
+}
+
+#[cfg(unix)]
+fn install_fake_ffprobe(root: &std::path::Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join("fake-ffprobe");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"${0}.args\"\nprintf 'video\\n'\n",
+    )?;
+    let mut permissions = std::fs::metadata(&script)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions)?;
+    Ok(script)
 }
 
 #[cfg(unix)]
@@ -711,6 +737,150 @@ async fn prefetch_hls_time_slice_publishes_playlist_and_segments_together() -> a
 
 #[cfg(unix)]
 #[tokio::test]
+async fn prefetch_hls_without_time_slice_still_materializes_playlist_and_segments()
+-> anyhow::Result<()> {
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_fake_ffmpeg(&temp, 0)?;
+    let state = GatewayState::new(GatewayConfig {
+        public_base_url: "http://media:18080".to_string(),
+        work_root: temp.clone(),
+        ffmpeg_bin: ffmpeg.clone(),
+    });
+    let app = build_app(state);
+    let task_id = uuid::Uuid::from_u128(0x445);
+    let created = post_json(
+        &app,
+        "/api/prefetch",
+        json!({
+            "task_id": task_id,
+            "source_url": "http://customer.example/archive.m3u8",
+            "target_path": format!("imports/{task_id}/source.m3u8"),
+            "source_kind": "hls"
+        }),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let status = wait_prefetch_terminal(app, task_id).await?;
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["time_slice_applied"], false);
+    let final_dir = temp.join(format!("imports/{task_id}"));
+    assert!(final_dir.join("source.m3u8").is_file());
+    assert!(final_dir.join("source-00000.ts").is_file());
+    let args = std::fs::read_to_string(fake_ffmpeg_args_path(&ffmpeg))?;
+    assert!(!args.lines().any(|argument| argument == "-t"));
+    assert_fake_ffmpeg_validation_invocation(&ffmpeg)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn production_prefetch_validation_uses_cancelable_ffprobe() -> anyhow::Result<()> {
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_fake_ffmpeg(&temp, 0)?;
+    let ffprobe = install_fake_ffprobe(&temp)?;
+    let task_id = uuid::Uuid::from_u128(0x446);
+    let app = test_gateway_app(
+        temp.clone(),
+        ffmpeg,
+        GatewayRuntimeConfig {
+            ffprobe_bin: Some(ffprobe.clone()),
+            ..GatewayRuntimeConfig::default()
+        },
+    );
+    let created = post_json(
+        &app,
+        "/api/prefetch",
+        json!({
+            "task_id": task_id,
+            "source_url": "http://customer.example/archive.mp4",
+            "target_path": format!("imports/{task_id}/source.mp4"),
+            "source_kind": "http_mp4",
+            "duration_sec": 5
+        }),
+    )
+    .await?;
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        wait_prefetch_terminal(app, task_id).await?["status"],
+        "ready"
+    );
+
+    let args = std::fs::read_to_string(format!("{}.args", ffprobe.display()))?;
+    assert!(args.lines().any(|value| value == "stream=codec_type"));
+    assert!(args.lines().any(|value| value.contains(".part")));
+    assert!(
+        !args
+            .lines()
+            .any(|value| { matches!(value, "-tls_verify" | "-ca_file" | "-verifyhost") })
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reset_reuses_an_atomically_published_hls_directory() -> anyhow::Result<()> {
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_fake_ffmpeg(&temp, 0)?;
+    let task_id = uuid::Uuid::from_u128(0x447);
+    let app = test_gateway_app(temp, ffmpeg.clone(), GatewayRuntimeConfig::default());
+    let payload = json!({
+        "task_id": task_id,
+        "source_url": "http://customer.example/archive.m3u8",
+        "target_path": format!("imports/{task_id}/source.m3u8"),
+        "source_kind": "hls"
+    });
+    assert_eq!(
+        post_json(&app, "/api/prefetch", payload.clone())
+            .await?
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        wait_prefetch_terminal(app.clone(), task_id).await?["status"],
+        "ready"
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tasks/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/reset"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    std::fs::remove_file(fake_ffmpeg_args_path(&ffmpeg))?;
+    assert_eq!(
+        post_json(&app, "/api/prefetch", payload).await?.status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        wait_prefetch_terminal(app, task_id).await?["status"],
+        "ready"
+    );
+    assert!(
+        !fake_ffmpeg_args_path(&ffmpeg).exists(),
+        "published HLS was downloaded again after reset"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn hls_without_media_segment_fails_without_publishing_directory() -> anyhow::Result<()> {
     let temp = test_temp_dir()?;
     let ffmpeg = install_fake_ffmpeg_playlist_only(&temp)?;
@@ -802,5 +972,660 @@ async fn invalid_hls_output_fails_validation_and_cleans_staging() -> anyhow::Res
     assert!(!final_dir.exists());
     assert_eq!(std::fs::read_dir(&imports_dir)?.count(), 0);
     assert_fake_ffmpeg_validation_invocation(&ffmpeg)?;
+    Ok(())
+}
+
+fn test_gateway_app(
+    work_root: PathBuf,
+    ffmpeg_bin: PathBuf,
+    runtime: GatewayRuntimeConfig,
+) -> Router {
+    build_app(GatewayState::with_runtime_config(
+        GatewayConfig {
+            public_base_url: "http://media:18080".to_string(),
+            work_root,
+            ffmpeg_bin,
+        },
+        runtime,
+    ))
+}
+
+async fn post_json(app: &Router, uri: &str, body: Value) -> anyhow::Result<Response> {
+    Ok(app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await?)
+}
+
+#[tokio::test]
+async fn prefetch_queue_accepts_4096_waiters_and_rejects_the_next_request() -> anyhow::Result<()> {
+    #[derive(Clone)]
+    struct BlockingSource {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    async fn blocked_source(
+        axum::extract::State(state): axum::extract::State<BlockingSource>,
+    ) -> &'static str {
+        state.entered.notify_one();
+        state.release.notified().await;
+        "download"
+    }
+
+    let source_state = BlockingSource {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let upstream = spawn_server(
+        Router::new()
+            .route("/source.ts", get(blocked_source))
+            .with_state(source_state.clone()),
+    )
+    .await?;
+    let temp = test_temp_dir()?;
+    let app = test_gateway_app(
+        temp,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig {
+            max_queued_prefetches: 4096,
+            max_active_downloads: 1,
+            max_active_ffmpeg: 1,
+            max_prefetch_records: 5000,
+            ..GatewayRuntimeConfig::default()
+        },
+    );
+
+    let active_id = uuid::Uuid::from_u128(10_000);
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/prefetch",
+            json!({
+                "task_id": active_id,
+                "source_url": format!("{upstream}/source.ts"),
+                "target_path": format!("imports/{active_id}/source.ts")
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(Duration::from_secs(2), source_state.entered.notified()).await?;
+
+    for index in 0..4096_u128 {
+        let task_id = uuid::Uuid::from_u128(20_000 + index);
+        let response = post_json(
+            &app,
+            "/api/prefetch",
+            json!({
+                "task_id": task_id,
+                "source_url": format!("{upstream}/source.ts"),
+                "target_path": format!("imports/{task_id}/source.ts")
+            }),
+        )
+        .await?;
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "index={index}");
+    }
+
+    let rejected_id = uuid::Uuid::from_u128(99_999);
+    let rejected = post_json(
+        &app,
+        "/api/prefetch",
+        json!({
+            "task_id": rejected_id,
+            "source_url": format!("{upstream}/source.ts"),
+            "target_path": format!("imports/{rejected_id}/source.ts")
+        }),
+    )
+    .await?;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(rejected.headers()[header::RETRY_AFTER], "30");
+
+    let status = app
+        .clone()
+        .oneshot(Request::builder().uri("/api/status").body(Body::empty())?)
+        .await?;
+    let status: Value = serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await?)?;
+    assert_eq!(status["prefetch"]["records"], 4097);
+    assert_eq!(status["prefetch"]["queued"], 4096);
+    assert_eq!(status["prefetch"]["running"], 1);
+    assert_eq!(status["prefetch"]["active_downloads"], 1);
+    assert_eq!(status["prefetch"]["queue_high_water"], 4096);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancel_running_download_closes_source_and_removes_part_file() -> anyhow::Result<()> {
+    async fn endless_source() -> Response {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(Bytes::from_static(b"first-chunk"));
+            std::future::pending::<()>().await;
+        };
+        Response::new(Body::from_stream(stream))
+    }
+
+    let upstream = spawn_server(Router::new().route("/endless.ts", get(endless_source))).await?;
+    let temp = test_temp_dir()?;
+    let task_id = uuid::Uuid::from_u128(31_001);
+    let target_dir = temp.join(format!("imports/{task_id}"));
+    let app = test_gateway_app(
+        temp,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig {
+            max_active_downloads: 1,
+            ..GatewayRuntimeConfig::default()
+        },
+    );
+    let response = post_json(
+        &app,
+        "/api/prefetch",
+        json!({
+            "task_id": task_id,
+            "source_url": format!("{upstream}/endless.ts"),
+            "target_path": format!("imports/{task_id}/source.ts")
+        }),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if std::fs::read_dir(&target_dir)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+
+    let canceled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(canceled.status(), StatusCode::NO_CONTENT);
+    assert!(
+        std::fs::read_dir(&target_dir)?
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
+    );
+    let status = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/prefetch/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status: Value = serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await?)?;
+    assert_eq!(status["status"], "canceled");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_running_ffmpeg_waits_for_process_exit_and_cleans_stage() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_temp_dir()?;
+    let pid_file = temp.join("ffmpeg.pid");
+    let ffmpeg = temp.join("blocking-ffmpeg");
+    std::fs::write(
+        &ffmpeg,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&ffmpeg)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ffmpeg, permissions)?;
+
+    let task_id = uuid::Uuid::from_u128(31_002);
+    let target_dir = temp.join(format!("imports/{task_id}"));
+    let app = test_gateway_app(
+        temp,
+        ffmpeg,
+        GatewayRuntimeConfig {
+            max_active_ffmpeg: 1,
+            ..GatewayRuntimeConfig::default()
+        },
+    );
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/prefetch",
+            json!({
+                "task_id": task_id,
+                "source_url": "http://customer.example/archive.mp4",
+                "target_path": format!("imports/{task_id}/source.mp4"),
+                "source_kind": "http_mp4",
+                "duration_sec": 60
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let pid: i32 = std::fs::read_to_string(&pid_file)?.parse()?;
+
+    let canceled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(canceled.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "ffmpeg process survived cancel"
+    );
+    assert!(
+        !target_dir.exists()
+            || std::fs::read_dir(&target_dir)?
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancel_running_ffprobe_waits_for_process_exit_and_cleans_stage() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_temp_dir()?;
+    let ffmpeg = install_fake_ffmpeg(&temp, 0)?;
+    let pid_file = temp.join("ffprobe.pid");
+    let ffprobe = temp.join("blocking-ffprobe");
+    std::fs::write(
+        &ffprobe,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    )?;
+    let mut permissions = std::fs::metadata(&ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&ffprobe, permissions)?;
+
+    let task_id = uuid::Uuid::from_u128(31_007);
+    let target_dir = temp.join(format!("imports/{task_id}"));
+    let app = test_gateway_app(
+        temp,
+        ffmpeg,
+        GatewayRuntimeConfig {
+            max_active_ffmpeg: 1,
+            ffprobe_bin: Some(ffprobe),
+            ..GatewayRuntimeConfig::default()
+        },
+    );
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/prefetch",
+            json!({
+                "task_id": task_id,
+                "source_url": "http://customer.example/archive.mp4",
+                "target_path": format!("imports/{task_id}/source.mp4"),
+                "source_kind": "http_mp4",
+                "duration_sec": 60
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !pid_file.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let pid: i32 = std::fs::read_to_string(&pid_file)?.parse()?;
+
+    let canceled = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(canceled.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "ffprobe process survived cancel"
+    );
+    assert!(
+        !target_dir.exists()
+            || std::fs::read_dir(&target_dir)?
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn relay_delete_ends_active_stream_and_old_url_returns_not_found() -> anyhow::Result<()> {
+    async fn endless_relay() -> Response {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, Infallible>(Bytes::from_static(b"relay-start"));
+            std::future::pending::<()>().await;
+        };
+        Response::new(Body::from_stream(stream))
+    }
+
+    let upstream = spawn_server(Router::new().route("/live.ts", get(endless_relay))).await?;
+    let temp = test_temp_dir()?;
+    let app = test_gateway_app(
+        temp,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig::default(),
+    );
+    let task_id = uuid::Uuid::from_u128(31_003);
+    let created = post_json(
+        &app,
+        "/api/relays",
+        json!({
+            "task_id": task_id,
+            "source_url": format!("{upstream}/live.ts"),
+            "source_kind": "http_ts"
+        }),
+    )
+    .await?;
+    let created: Value = serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await?)?;
+    let relay_url = reqwest::Url::parse(created["relay_url"].as_str().expect("relay_url"))?;
+    let relay_uri = format!(
+        "{}?{}",
+        relay_url.path(),
+        relay_url.query().expect("relay query")
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri(&relay_uri).body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let reader = tokio::spawn(async move { to_bytes(response.into_body(), usize::MAX).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let deleted = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let bytes = tokio::time::timeout(Duration::from_secs(1), reader).await???;
+    assert_eq!(bytes.as_ref(), b"relay-start");
+
+    let stale = app
+        .oneshot(Request::builder().uri(relay_uri).body(Body::empty())?)
+        .await?;
+    assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hls_relay_rewrites_nested_playlists_uri_attributes_and_range_segments()
+-> anyhow::Result<()> {
+    #[derive(Clone, Default)]
+    struct HlsState {
+        range_hits: Arc<AtomicUsize>,
+    }
+
+    async fn master() -> impl axum::response::IntoResponse {
+        (
+            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            "#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"audio\",URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"audio\"\nvideo/index.m3u8?auth=abc\n",
+        )
+    }
+
+    async fn media() -> impl axum::response::IntoResponse {
+        (
+            [(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            "#EXTM3U\n#EXT-X-MAP:URI=\"../init.mp4\"\n#EXT-X-KEY:METHOD=AES-128,URI=\"/keys/key.bin?key=1\"\n#EXTINF:6,\nsegment-1.ts?auth=abc\n#EXT-X-ENDLIST\n",
+        )
+    }
+
+    async fn segment(
+        axum::extract::State(state): axum::extract::State<HlsState>,
+        headers: HeaderMap,
+    ) -> impl axum::response::IntoResponse {
+        if headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            == Some("bytes=0-6")
+        {
+            state.range_hits.fetch_add(1, Ordering::SeqCst);
+        }
+        (
+            StatusCode::PARTIAL_CONTENT,
+            [
+                (header::CONTENT_TYPE, "video/mp2t"),
+                (header::CONTENT_RANGE, "bytes 0-6/20"),
+                (header::ACCEPT_RANGES, "bytes"),
+            ],
+            "segment",
+        )
+    }
+
+    let hls_state = HlsState::default();
+    let upstream = spawn_server(
+        Router::new()
+            .route("/master.m3u8", get(master))
+            .route("/video/index.m3u8", get(media))
+            .route("/video/segment-1.ts", get(segment))
+            .with_state(hls_state.clone()),
+    )
+    .await?;
+    let app = test_gateway_app(
+        test_temp_dir()?,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig::default(),
+    );
+    let task_id = uuid::Uuid::from_u128(31_004);
+    let created = post_json(
+        &app,
+        "/api/relays",
+        json!({
+            "task_id": task_id,
+            "source_url": format!("{upstream}/master.m3u8?session=customer"),
+            "source_kind": "hls"
+        }),
+    )
+    .await?;
+    let created: Value = serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await?)?;
+    let relay_url = reqwest::Url::parse(created["relay_url"].as_str().expect("relay_url"))?;
+    let relay_uri = format!("{}?{}", relay_url.path(), relay_url.query().unwrap());
+    let top = app
+        .clone()
+        .oneshot(Request::builder().uri(relay_uri).body(Body::empty())?)
+        .await?;
+    let top = String::from_utf8(to_bytes(top.into_body(), usize::MAX).await?.to_vec())?;
+    assert!(!top.contains("127.0.0.1"));
+    assert!(top.contains("#EXT-X-MEDIA:TYPE=AUDIO"));
+    assert!(top.matches("/hls/").count() >= 2);
+    let nested_url = top
+        .lines()
+        .find(|line| !line.starts_with('#') && line.contains("/hls/"))
+        .expect("rewritten nested playlist");
+    let nested_url = reqwest::Url::parse(nested_url)?;
+    let nested_uri = format!("{}?{}", nested_url.path(), nested_url.query().unwrap());
+    let nested = app
+        .clone()
+        .oneshot(Request::builder().uri(nested_uri).body(Body::empty())?)
+        .await?;
+    let nested = String::from_utf8(to_bytes(nested.into_body(), usize::MAX).await?.to_vec())?;
+    assert!(!nested.contains("../init.mp4"));
+    assert!(!nested.contains("/keys/key.bin"));
+    assert!(!nested.contains("segment-1.ts"));
+    assert!(nested.contains("#EXT-X-MAP:URI=\"http://media:18080/relay/"));
+    assert!(nested.contains("#EXT-X-KEY:METHOD=AES-128,URI=\"http://media:18080/relay/"));
+
+    let segment_url = nested
+        .lines()
+        .find(|line| !line.starts_with('#') && line.contains("/hls/"))
+        .expect("rewritten segment");
+    let segment_url = reqwest::Url::parse(segment_url)?;
+    let segment_uri = format!("{}?{}", segment_url.path(), segment_url.query().unwrap());
+    let segment = app
+        .oneshot(
+            Request::builder()
+                .uri(segment_uri)
+                .header(header::RANGE, "bytes=0-6")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(segment.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(segment.headers()[header::CONTENT_RANGE], "bytes 0-6/20");
+    assert_eq!(
+        to_bytes(segment.into_body(), usize::MAX).await?.as_ref(),
+        b"segment"
+    );
+    assert_eq!(hls_state.range_hits.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn relay_creation_is_idempotent_rejects_source_changes_and_requires_reset_after_cancel()
+-> anyhow::Result<()> {
+    let app = test_gateway_app(
+        test_temp_dir()?,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig::default(),
+    );
+    let task_id = uuid::Uuid::from_u128(31_005);
+    let payload = json!({
+        "task_id": task_id,
+        "source_url": "http://customer.example/live.flv",
+        "source_kind": "http_flv"
+    });
+    let first = post_json(&app, "/api/relays", payload.clone()).await?;
+    let first: Value = serde_json::from_slice(&to_bytes(first.into_body(), usize::MAX).await?)?;
+    let second = post_json(&app, "/api/relays", payload).await?;
+    let second: Value = serde_json::from_slice(&to_bytes(second.into_body(), usize::MAX).await?)?;
+    assert_eq!(first["relay_url"], second["relay_url"]);
+
+    let self_retry = post_json(
+        &app,
+        "/api/relays",
+        json!({
+            "task_id": task_id,
+            "source_url": first["relay_url"],
+            "source_kind": "http_flv"
+        }),
+    )
+    .await?;
+    let self_retry: Value =
+        serde_json::from_slice(&to_bytes(self_retry.into_body(), usize::MAX).await?)?;
+    assert_eq!(first["relay_url"], self_retry["relay_url"]);
+
+    let self_chain = post_json(
+        &app,
+        "/api/relays",
+        json!({
+            "task_id": uuid::Uuid::from_u128(31_006),
+            "source_url": first["relay_url"],
+            "source_kind": "http_flv"
+        }),
+    )
+    .await?;
+    assert_eq!(self_chain.status(), StatusCode::CONFLICT);
+
+    let conflict = post_json(
+        &app,
+        "/api/relays",
+        json!({
+            "task_id": task_id,
+            "source_url": "http://customer.example/other.flv",
+            "source_kind": "http_flv"
+        }),
+    )
+    .await?;
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/tasks/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/relays",
+            json!({
+                "task_id": task_id,
+                "source_url": "http://customer.example/live.flv",
+                "source_kind": "http_flv"
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/reset"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/relays",
+            json!({
+                "task_id": task_id,
+                "source_url": "http://customer.example/live.flv",
+                "source_kind": "http_flv"
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::OK
+    );
     Ok(())
 }

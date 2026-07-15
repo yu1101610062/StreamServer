@@ -17,7 +17,7 @@ use std::{
         Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -70,7 +70,7 @@ use crate::repository::{
     RecordingControlCommand, RepoError, TaskLogBatchRecord, TaskProgressRecord, TaskRepository,
     TaskSnapshotRecord,
 };
-use crate::source_gateway::SourceGatewayClient;
+use crate::source_gateway::{GatewayPreparation, SourceGatewayClient};
 
 const CONTROL_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_STREAM_BUFFER: usize = 32;
@@ -98,6 +98,8 @@ const CERTIFICATE_ROTATION_MANAGEMENT_PROBE_TIMEOUT: Duration = Duration::from_s
 pub struct ControlPlaneService {
     repository: Arc<TaskRepository>,
     source_gateway: Option<SourceGatewayClient>,
+    gateway_poll_not_before: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    gateway_task_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
     sessions: Arc<Mutex<HashMap<Uuid, SessionHandle>>>,
     core_instance_id: Uuid,
     agent_identity: Option<AgentIdentityService>,
@@ -747,6 +749,8 @@ impl ControlPlaneService {
         Self {
             repository,
             source_gateway: None,
+            gateway_poll_not_before: Arc::new(Mutex::new(HashMap::new())),
+            gateway_task_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             core_instance_id,
             agent_identity: None,
@@ -781,6 +785,8 @@ impl ControlPlaneService {
         Self {
             repository,
             source_gateway: Some(source_gateway),
+            gateway_poll_not_before: Arc::new(Mutex::new(HashMap::new())),
+            gateway_task_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             core_instance_id,
             agent_identity: None,
@@ -1773,23 +1779,57 @@ impl ControlPlaneService {
         lock_pending_zlm(&self.pending_zlm).len()
     }
 
+    async fn gateway_task_lock(&self, task_id: Uuid) -> Arc<Mutex<()>> {
+        self.gateway_task_locks
+            .lock()
+            .await
+            .entry(task_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     pub async fn dispatch_task(&self, task_id: Uuid) -> Result<(), ControlPlaneError> {
+        let _gateway_guard = if self.source_gateway.is_some() {
+            Some(self.gateway_task_lock(task_id).await.lock_owned().await)
+        } else {
+            None
+        };
+        let not_before = self
+            .gateway_poll_not_before
+            .lock()
+            .await
+            .get(&task_id)
+            .copied();
+        if not_before.is_some_and(|not_before| Instant::now() < not_before) {
+            return Ok(());
+        }
         self.repository.ensure_task_queued(task_id).await?;
         let mut resolved_spec =
             serde_json::from_value::<TaskSpec>(self.repository.get_resolved_spec(task_id).await?)?;
         if let Some(source_gateway) = &self.source_gateway {
             match source_gateway
-                .prepare_task_spec(task_id, &resolved_spec)
+                .prepare_task_spec_once(task_id, &resolved_spec)
                 .await
             {
-                Ok(Some(rewritten_spec)) => {
+                Ok(GatewayPreparation::Ready(rewritten_spec)) => {
+                    self.gateway_poll_not_before.lock().await.remove(&task_id);
                     self.repository
                         .update_queued_resolved_spec(task_id, &rewritten_spec)
                         .await?;
-                    resolved_spec = rewritten_spec;
+                    resolved_spec = *rewritten_spec;
                 }
-                Ok(None) => {}
+                Ok(GatewayPreparation::Pending { poll_after }) => {
+                    self.gateway_poll_not_before
+                        .lock()
+                        .await
+                        .insert(task_id, Instant::now() + poll_after);
+                    return Ok(());
+                }
+                Ok(GatewayPreparation::NotRequired) => {
+                    self.gateway_poll_not_before.lock().await.remove(&task_id);
+                }
                 Err(error) => {
+                    self.gateway_poll_not_before.lock().await.remove(&task_id);
                     let reason = error.to_string();
                     self.repository
                         .fail_queued_task(task_id, "source_gateway_failed", &reason)
@@ -1930,14 +1970,17 @@ impl ControlPlaneService {
         grace_period_sec: u32,
         force_after_sec: u32,
     ) -> Result<(), ControlPlaneError> {
+        let _gateway_guard = if self.source_gateway.is_some() {
+            Some(self.gateway_task_lock(task_id).await.lock_owned().await)
+        } else {
+            None
+        };
+        self.gateway_poll_not_before.lock().await.remove(&task_id);
         if let Some(source_gateway) = &self.source_gateway {
-            if let Err(error) = source_gateway.delete_relay(task_id).await {
-                warn!(
-                    task_id = %task_id,
-                    error = %error,
-                    "failed to delete source gateway relay during stop"
-                );
-            }
+            source_gateway
+                .cancel_task(task_id)
+                .await
+                .map_err(|error| ControlPlaneError::SourceGateway(error.to_string()))?;
         }
         let Some(command) = self
             .repository
@@ -1992,6 +2035,19 @@ impl ControlPlaneService {
             "stop_task sent to agent"
         );
 
+        Ok(())
+    }
+
+    pub async fn reset_gateway_task(&self, task_id: Uuid) -> Result<(), ControlPlaneError> {
+        let Some(source_gateway) = &self.source_gateway else {
+            return Ok(());
+        };
+        let _gateway_guard = self.gateway_task_lock(task_id).await.lock_owned().await;
+        source_gateway
+            .reset_task(task_id)
+            .await
+            .map_err(|error| ControlPlaneError::SourceGateway(error.to_string()))?;
+        self.gateway_poll_not_before.lock().await.remove(&task_id);
         Ok(())
     }
 
@@ -3907,6 +3963,8 @@ pub enum ControlPlaneError {
     NoConnectedNode,
     #[error("media-agent {0} is not connected")]
     NodeDisconnected(Uuid),
+    #[error("source gateway is unavailable: {0}")]
+    SourceGateway(String),
     #[error(transparent)]
     Repository(#[from] RepoError),
     #[error(transparent)]

@@ -1630,11 +1630,15 @@ name = "media-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum 0.8.8",
+ "futures-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
@@ -3212,6 +3216,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

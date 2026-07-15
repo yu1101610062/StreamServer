@@ -1370,9 +1370,14 @@ async fn start_task(
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let current = state.repository.get_task_summary(task_id).await?;
     match current.status {
-        media_domain::TaskStatus::Created
-        | media_domain::TaskStatus::Failed
-        | media_domain::TaskStatus::Canceled => {
+        media_domain::TaskStatus::Created | media_domain::TaskStatus::Failed => {
+            state
+                .repository
+                .transition_task(task_id, TaskOperation::Start)
+                .await?;
+        }
+        media_domain::TaskStatus::Canceled => {
+            state.control_plane.reset_gateway_task(task_id).await?;
             state
                 .repository
                 .transition_task(task_id, TaskOperation::Start)
@@ -1404,18 +1409,6 @@ async fn stop_task(
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
     let current = state.repository.get_task_summary(task_id).await?;
     if current.status == media_domain::TaskStatus::Stopping {
-        let stop_intent_persisted = if current.current_attempt_no > 0 {
-            state
-                .repository
-                .attempt_has_stop_intent(task_id, current.current_attempt_no)
-                .await?
-        } else {
-            true
-        };
-        if stop_intent_persisted {
-            return Ok((StatusCode::ACCEPTED, Json(current)));
-        }
-
         state
             .control_plane
             .request_stop(task_id, "user_requested", 30, 5)
@@ -1443,16 +1436,22 @@ async fn cancel_task(
 ) -> Result<(StatusCode, Json<repository::TaskSummary>), AppError> {
     let _principal =
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
-    let task = state
-        .repository
-        .transition_task(task_id, TaskOperation::Cancel)
-        .await?;
-    if task.status == media_domain::TaskStatus::Stopping {
+    let current = state.repository.get_task_summary(task_id).await?;
+    let task = if matches!(
+        current.status,
+        media_domain::TaskStatus::Canceled | media_domain::TaskStatus::Stopping
+    ) {
+        current
+    } else {
         state
-            .control_plane
-            .request_stop(task_id, "user_canceled", 30, 5)
-            .await?;
-    }
+            .repository
+            .transition_task(task_id, TaskOperation::Cancel)
+            .await?
+    };
+    state
+        .control_plane
+        .request_stop(task_id, "user_canceled", 30, 5)
+        .await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 

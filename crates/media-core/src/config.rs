@@ -293,9 +293,10 @@ impl Settings {
                 "SOURCE_GATEWAY_PREFETCH_POLL_MS must be positive"
             );
             anyhow::ensure!(
-                self.core.source_gateway_prefetch_timeout_ms
-                    >= self.core.source_gateway_prefetch_poll_ms,
-                "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
+                self.core.source_gateway_prefetch_timeout_ms == 0
+                    || self.core.source_gateway_prefetch_timeout_ms
+                        >= self.core.source_gateway_prefetch_poll_ms,
+                "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be 0 or greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
             );
         }
         Ok(())
@@ -758,11 +759,11 @@ fn default_callback_settle_delay_ms() -> u64 {
 }
 
 fn default_source_gateway_prefetch_poll_ms() -> u64 {
-    1_000
+    5_000
 }
 
 fn default_source_gateway_prefetch_timeout_ms() -> u64 {
-    600_000
+    0
 }
 
 pub fn parse_duration_spec(value: &str) -> anyhow::Result<Duration> {

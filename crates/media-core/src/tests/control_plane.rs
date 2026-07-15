@@ -1,6 +1,9 @@
 use super::*;
 use crate::test_database::{acquire_test_database_slot, config_from_env, finish_setup};
-use std::net::Ipv4Addr;
+use std::{
+    net::Ipv4Addr,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use axum::{Json, Router, http::StatusCode};
 use media_domain::{
@@ -637,6 +640,63 @@ async fn spawn_source_gateway_stub(
             .expect("source gateway stub should run");
     });
     Ok((format!("http://{addr}"), calls, handle))
+}
+
+async fn spawn_pending_prefetch_gateway_stub()
+-> anyhow::Result<(String, Arc<AtomicUsize>, Arc<AtomicUsize>, JoinHandle<()>)> {
+    use axum::{
+        extract::Path,
+        routing::{get, post},
+    };
+
+    #[derive(Clone)]
+    struct PrefetchStubState {
+        posts: Arc<AtomicUsize>,
+        gets: Arc<AtomicUsize>,
+    }
+
+    async fn submit(
+        axum::extract::State(state): axum::extract::State<PrefetchStubState>,
+    ) -> Json<Value> {
+        state.posts.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "status": "pending",
+            "phase": "queued",
+            "queue_position": 1,
+            "poll_after_ms": 50,
+            "time_slice_applied": false
+        }))
+    }
+
+    async fn poll(
+        axum::extract::State(state): axum::extract::State<PrefetchStubState>,
+        Path(task_id): Path<Uuid>,
+    ) -> Json<Value> {
+        state.gets.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "status": "ready",
+            "source_url": format!("imports/{task_id}/source.mp4"),
+            "time_slice_applied": false
+        }))
+    }
+
+    let posts = Arc::new(AtomicUsize::new(0));
+    let gets = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/api/prefetch", post(submit))
+        .route("/api/prefetch/{task_id}", get(poll))
+        .with_state(PrefetchStubState {
+            posts: posts.clone(),
+            gets: gets.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("prefetch gateway stub should run");
+    });
+    Ok((format!("http://{addr}"), posts, gets, handle))
 }
 
 fn sample_immediate_task_spec() -> TaskSpec {
@@ -3615,6 +3675,62 @@ async fn dispatch_task_rewrites_live_http_source_through_gateway() -> anyhow::Re
     let sent_spec: TaskSpec = serde_json::from_str(&command.resolved_spec_json)?;
     assert_eq!(sent_spec.input.url.as_deref(), Some(stored_url.as_str()));
     assert_eq!(calls.lock().await.len(), 1);
+
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn dispatch_task_returns_while_gateway_prefetch_is_pending_and_defers_the_next_poll()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let (gateway_base, posts, gets, _gateway) = spawn_pending_prefetch_gateway_stub().await?;
+    let service = ControlPlaneService::with_source_gateway(
+        repository.clone(),
+        crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?,
+    );
+    let mut spec = sample_immediate_task_spec();
+    spec.input.kind = Some(InputKind::HttpMp4);
+    spec.input.source_mode = Some(SourceMode::Vod);
+    spec.input.url = Some("http://customer.example/archive.mp4".to_string());
+    let task = match repository
+        .create_task(
+            "source-gateway-vod-pending",
+            "source-gateway-vod-pending-hash",
+            spec,
+        )
+        .await?
+    {
+        crate::repository::CreateTaskResult::Fresh(task)
+        | crate::repository::CreateTaskResult::Replay(task) => task,
+    };
+    repository.ensure_task_queued(task.id).await?;
+
+    timeout(Duration::from_secs(1), service.dispatch_task(task.id)).await??;
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        repository.get_task_summary(task.id).await?.status,
+        TaskStatus::Queued
+    );
+
+    service.dispatch_task(task.id).await?;
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert_eq!(gets.load(Ordering::SeqCst), 0);
+
+    tokio::time::sleep(Duration::from_millis(70)).await;
+    assert!(matches!(
+        service.dispatch_task(task.id).await,
+        Err(ControlPlaneError::NoConnectedNode)
+    ));
+    assert_eq!(posts.load(Ordering::SeqCst), 1);
+    assert_eq!(gets.load(Ordering::SeqCst), 1);
+    let (stored_kind, stored_url) = resolved_spec_input(&db.pool, task.id).await?;
+    assert_eq!(stored_kind, "file");
+    assert_eq!(stored_url, format!("imports/{}/source.mp4", task.id));
 
     db.cleanup().await?;
     Ok(())

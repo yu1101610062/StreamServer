@@ -2564,8 +2564,8 @@ run_shell "media-core auth check-config smoke" "
     CORE_GRPC_TLS_CLIENT_CA_PATH=\"\${tmp}/listener-cert.pem\" \
     SOURCE_GATEWAY_BASE_URL=https://172.21.26.25/bohui/media/ \
     SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY=true \
-    SOURCE_GATEWAY_PREFETCH_POLL_MS=1000 \
-    SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=600000 \
+    SOURCE_GATEWAY_PREFETCH_POLL_MS=5000 \
+    SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=0 \
     STORAGE_ALLOWLIST=\"\${tmp}\" \
     "\${VERIFY_ROOT}/binaries/media-core-linux-amd64" auth check-config \
       | grep -Fq 'authentication and Agent CA configuration is valid'
@@ -2714,6 +2714,23 @@ PY
   MEDIA_GATEWAY_PUBLIC_BASE_URL=http://127.0.0.1:1 \
   MEDIA_GATEWAY_WORK_ROOT=\"\${tmp}/work\" \
   MEDIA_GATEWAY_FFMPEG_BIN=\"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg\" \
+  MEDIA_GATEWAY_FFPROBE_BIN=\"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffprobe\" \
+  MEDIA_GATEWAY_MAX_QUEUED_PREFETCHES=4096 \
+  MEDIA_GATEWAY_MAX_ACTIVE_DOWNLOADS=4 \
+  MEDIA_GATEWAY_MAX_ACTIVE_FFMPEG=2 \
+  MEDIA_GATEWAY_PREFETCH_QUEUE_TIMEOUT_MS=0 \
+  MEDIA_GATEWAY_PREFETCH_EXECUTION_TIMEOUT_MS=21600000 \
+  MEDIA_GATEWAY_SOURCE_CONNECT_TIMEOUT_MS=10000 \
+  MEDIA_GATEWAY_SOURCE_READ_IDLE_TIMEOUT_MS=60000 \
+  MEDIA_GATEWAY_MAX_PREFETCH_RECORDS=8192 \
+  MEDIA_GATEWAY_PREFETCH_TERMINAL_RETENTION_SEC=3600 \
+  MEDIA_GATEWAY_RELAY_CANCEL_WAIT_MS=5000 \
+  MEDIA_GATEWAY_PREFETCH_CANCEL_WAIT_MS=30000 \
+  MEDIA_GATEWAY_CANCEL_TOMBSTONE_TTL_SEC=3600 \
+  MEDIA_GATEWAY_MAX_ACTIVE_RELAYS=32 \
+  MEDIA_GATEWAY_MAX_RELAY_REGISTRATIONS=256 \
+  MEDIA_GATEWAY_RELAY_RECONNECT_GRACE_SEC=600 \
+  MEDIA_GATEWAY_RELAY_UNOPENED_TTL_SEC=86400 \
   RUST_LOG=info \
     "\${VERIFY_ROOT}/binaries/media-gateway-linux-amd64" &
   pid=\$!
@@ -2721,6 +2738,10 @@ PY
     if curl --fail --silent --show-error \
       \"http://127.0.0.1:\${gateway_port}/api/healthz\" >/dev/null 2>&1; then
       kill -0 \"\${pid}\" >/dev/null 2>&1
+      curl --fail --silent --show-error \
+        \"http://127.0.0.1:\${gateway_port}/api/readyz\" | grep -Fq '\"status\":\"ready\"'
+      curl --fail --silent --show-error \
+        \"http://127.0.0.1:\${gateway_port}/api/status\" | grep -Fq '\"queue_high_water\":0'
       echo 'gateway health endpoint is ready while process is alive'
       exit 0
     fi
@@ -2744,8 +2765,8 @@ run_shell "streamserver-config non-interactive smoke" "
   test -s \"\${tmp}/component.env\"
   grep -Fq \"SOURCE_GATEWAY_BASE_URL=''\" \"\${tmp}/component.env\"
   grep -Fq \"SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY='false'\" \"\${tmp}/component.env\"
-  grep -Fq \"SOURCE_GATEWAY_PREFETCH_POLL_MS='1000'\" \"\${tmp}/component.env\"
-  grep -Fq \"SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS='600000'\" \"\${tmp}/component.env\"
+  grep -Fq \"SOURCE_GATEWAY_PREFETCH_POLL_MS='5000'\" \"\${tmp}/component.env\"
+  grep -Fq \"SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS='0'\" \"\${tmp}/component.env\"
 "
 
 section "FFmpeg Runtime"

@@ -375,14 +375,14 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 label: "Gateway 预取轮询毫秒",
                 kind: FieldKind::Text,
                 scope: FieldScope::Core,
-                help: "Core 查询点播预取状态的间隔，必须为正整数。",
+                help: "Gateway 未返回 poll_after_ms 时，Core 查询点播预取状态的默认间隔，必须为正整数。",
             },
             FieldDef {
                 key: "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
                 label: "Gateway 预取超时毫秒",
                 kind: FieldKind::Text,
                 scope: FieldScope::Core,
-                help: "Core 等待点播预取完成的总时长，必须不小于轮询间隔。",
+                help: "兼容配置；0 表示排队与预取不设置 Core 侧总超时。非 0 时必须不小于轮询间隔。",
             },
             FieldDef {
                 key: "NODE_ID",
@@ -1655,8 +1655,8 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         default_if_missing(values, "AUTH_REFRESH_TOKEN_TTL", "7d");
         default_if_missing(values, "SOURCE_GATEWAY_BASE_URL", "");
         default_if_missing(values, "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY", "false");
-        default_if_missing(values, "SOURCE_GATEWAY_PREFETCH_POLL_MS", "1000");
-        default_if_missing(values, "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS", "600000");
+        default_if_missing(values, "SOURCE_GATEWAY_PREFETCH_POLL_MS", "5000");
+        default_if_missing(values, "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS", "0");
     } else {
         for key in [
             "SOURCE_GATEWAY_BASE_URL",
@@ -2386,15 +2386,10 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
             bail!("SOURCE_GATEWAY_PREFETCH_POLL_MS must be greater than 0");
         }
     }
-    if let Some(timeout_ms) = source_gateway_timeout_ms {
-        if timeout_ms == 0 {
-            bail!("SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than 0");
-        }
-    }
     if let (Some(poll_ms), Some(timeout_ms)) = (source_gateway_poll_ms, source_gateway_timeout_ms) {
-        if timeout_ms < poll_ms {
+        if timeout_ms != 0 && timeout_ms < poll_ms {
             bail!(
-                "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
+                "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be 0 or greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
             );
         }
     }
@@ -2649,7 +2644,7 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
     ),
     (
         "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
-        "点播预取总超时毫秒数。",
+        "兼容的点播预取总超时毫秒数；0 表示不设置 Core 侧总超时。",
     ),
     ("AUTH_ENABLED", "是否启用鉴权。"),
     ("NODE_ID", "工作节点唯一 ID，已上线后不要随意修改。"),
@@ -2784,8 +2779,8 @@ mod tests {
         apply_defaults(&mut core, &[]);
         assert_eq!(core["SOURCE_GATEWAY_BASE_URL"], "");
         assert_eq!(core["SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY"], "false");
-        assert_eq!(core["SOURCE_GATEWAY_PREFETCH_POLL_MS"], "1000");
-        assert_eq!(core["SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS"], "600000");
+        assert_eq!(core["SOURCE_GATEWAY_PREFETCH_POLL_MS"], "5000");
+        assert_eq!(core["SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS"], "0");
         for key in [
             "SOURCE_GATEWAY_BASE_URL",
             "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",

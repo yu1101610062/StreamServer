@@ -1,10 +1,14 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use media_domain::{InputKind, SourceMode, TaskSpec};
 use reqwest::{Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::time::{Instant, sleep};
+use tokio::{sync::Mutex, time::sleep};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -15,6 +19,7 @@ pub(crate) enum GatewayAction {
     Relay {
         task_id: Uuid,
         source_url: String,
+        source_kind: InputKind,
     },
     Prefetch {
         task_id: Uuid,
@@ -32,6 +37,13 @@ pub(crate) enum GatewayActionResult {
     Prefetch { source_url: String },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GatewayPreparation {
+    NotRequired,
+    Pending { poll_after: Duration },
+    Ready(Box<TaskSpec>),
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum SourceGatewayError {
     #[error("{0}")]
@@ -42,8 +54,6 @@ pub(crate) enum SourceGatewayError {
     Request(#[from] reqwest::Error),
     #[error("source gateway rejected task: {0}")]
     Rejected(String),
-    #[error("source gateway prefetch timed out")]
-    PrefetchTimeout,
 }
 
 #[derive(Debug, Clone)]
@@ -51,13 +61,15 @@ pub(crate) struct SourceGatewayClient {
     http: reqwest::Client,
     base_url: Url,
     prefetch_poll_interval: Duration,
-    prefetch_timeout: Duration,
+    submitted_prefetches: Arc<Mutex<HashSet<Uuid>>>,
+    prefetch_poll_hints: Arc<Mutex<HashMap<Uuid, Duration>>>,
 }
 
 #[derive(Debug, Serialize)]
 struct RelayRequest {
     task_id: Uuid,
     source_url: String,
+    source_kind: InputKind,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +92,10 @@ struct PrefetchRequest {
 #[derive(Debug, Deserialize)]
 struct PrefetchResponse {
     status: String,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    poll_after_ms: Option<u64>,
     #[serde(default)]
     source_url: Option<String>,
     #[serde(default)]
@@ -135,7 +151,7 @@ impl SourceGatewayClient {
         tls_insecure_skip_verify: bool,
         require_https: bool,
         prefetch_poll_interval: Duration,
-        prefetch_timeout: Duration,
+        _prefetch_timeout: Duration,
     ) -> Result<Self, SourceGatewayError> {
         let base_url = normalize_base_url(base_url, require_https)?;
         let mut builder = reqwest::Client::builder()
@@ -155,38 +171,83 @@ impl SourceGatewayClient {
             http: builder.build()?,
             base_url,
             prefetch_poll_interval,
-            prefetch_timeout,
+            submitted_prefetches: Arc::new(Mutex::new(HashSet::new())),
+            prefetch_poll_hints: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_task_spec(
         &self,
         task_id: Uuid,
         spec: &TaskSpec,
     ) -> Result<Option<TaskSpec>, SourceGatewayError> {
+        match self.prepare_task_spec_once(task_id, spec).await? {
+            GatewayPreparation::NotRequired | GatewayPreparation::Pending { .. } => Ok(None),
+            GatewayPreparation::Ready(spec) => Ok(Some(*spec)),
+        }
+    }
+
+    pub(crate) async fn prepare_task_spec_once(
+        &self,
+        task_id: Uuid,
+        spec: &TaskSpec,
+    ) -> Result<GatewayPreparation, SourceGatewayError> {
         let Some(action) = plan_gateway_action(spec, task_id) else {
-            return Ok(None);
+            return Ok(GatewayPreparation::NotRequired);
         };
-        let result = self.execute_action(&action).await?;
+        let Some(result) = self.execute_action(&action).await? else {
+            let poll_after = self.prefetch_poll_after(task_id).await?;
+            return Ok(GatewayPreparation::Pending { poll_after });
+        };
         let mut rewritten = spec.clone();
         apply_gateway_result(&mut rewritten, action, result)?;
         rewritten
             .validate()
             .map_err(|error| SourceGatewayError::InvalidSpec(error.to_string()))?;
-        Ok(Some(rewritten))
+        Ok(GatewayPreparation::Ready(Box::new(rewritten)))
     }
 
-    pub(crate) async fn delete_relay(&self, task_id: Uuid) -> Result<(), SourceGatewayError> {
+    pub(crate) async fn cancel_task(&self, task_id: Uuid) -> Result<(), SourceGatewayError> {
+        let endpoint = self.endpoint(&format!("/api/tasks/{task_id}"))?;
+        let mut last_error = None;
+        for attempt in 1..=3 {
+            match self.http.delete(endpoint.clone()).send().await {
+                Ok(response)
+                    if response.status().is_success()
+                        || response.status() == reqwest::StatusCode::NOT_FOUND =>
+                {
+                    self.submitted_prefetches.lock().await.remove(&task_id);
+                    self.prefetch_poll_hints.lock().await.remove(&task_id);
+                    return Ok(());
+                }
+                Ok(response) => {
+                    last_error = Some(format!("gateway cancel returned {}", response.status()));
+                }
+                Err(error) => last_error = Some(error.to_string()),
+            }
+            if attempt < 3 {
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+        Err(SourceGatewayError::Rejected(
+            last_error.unwrap_or_else(|| "gateway cancel failed".to_string()),
+        ))
+    }
+
+    pub(crate) async fn reset_task(&self, task_id: Uuid) -> Result<(), SourceGatewayError> {
         let response = self
             .http
-            .delete(self.endpoint(&format!("/api/relays/{task_id}"))?)
+            .post(self.endpoint(&format!("/api/tasks/{task_id}/reset"))?)
             .send()
             .await?;
         if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+            self.submitted_prefetches.lock().await.remove(&task_id);
+            self.prefetch_poll_hints.lock().await.remove(&task_id);
             Ok(())
         } else {
             Err(SourceGatewayError::Rejected(format!(
-                "delete relay returned {}",
+                "gateway reset returned {}",
                 response.status()
             )))
         }
@@ -195,11 +256,12 @@ impl SourceGatewayClient {
     async fn execute_action(
         &self,
         action: &GatewayAction,
-    ) -> Result<GatewayActionResult, SourceGatewayError> {
+    ) -> Result<Option<GatewayActionResult>, SourceGatewayError> {
         match action {
             GatewayAction::Relay {
                 task_id,
                 source_url,
+                source_kind,
             } => {
                 let response: RelayResponse = self
                     .http
@@ -207,15 +269,16 @@ impl SourceGatewayClient {
                     .json(&RelayRequest {
                         task_id: *task_id,
                         source_url: source_url.clone(),
+                        source_kind: *source_kind,
                     })
                     .send()
                     .await?
                     .error_for_status()?
                     .json()
                     .await?;
-                Ok(GatewayActionResult::Relay {
+                Ok(Some(GatewayActionResult::Relay {
                     relay_url: response.relay_url,
-                })
+                }))
             }
             GatewayAction::Prefetch {
                 task_id,
@@ -225,75 +288,113 @@ impl SourceGatewayClient {
                 start_offset_sec,
                 duration_sec,
             } => {
-                let response: PrefetchResponse = self
-                    .http
-                    .post(self.endpoint("/api/prefetch")?)
-                    .json(&PrefetchRequest {
-                        task_id: *task_id,
-                        source_url: source_url.clone(),
-                        target_path: target_path.clone(),
-                        source_kind: *source_kind,
-                        start_offset_sec: *start_offset_sec,
-                        duration_sec: *duration_sec,
-                    })
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
+                let submitted = self.submitted_prefetches.lock().await.contains(task_id);
+                let response = if submitted {
+                    let response = self
+                        .http
+                        .get(self.endpoint(&format!("/api/prefetch/{task_id}"))?)
+                        .send()
+                        .await?;
+                    if response.status() == reqwest::StatusCode::NOT_FOUND {
+                        self.submitted_prefetches.lock().await.remove(task_id);
+                        self.http
+                            .post(self.endpoint("/api/prefetch")?)
+                            .json(&PrefetchRequest {
+                                task_id: *task_id,
+                                source_url: source_url.clone(),
+                                target_path: target_path.clone(),
+                                source_kind: *source_kind,
+                                start_offset_sec: *start_offset_sec,
+                                duration_sec: *duration_sec,
+                            })
+                            .send()
+                            .await?
+                    } else {
+                        response
+                    }
+                } else {
+                    self.http
+                        .post(self.endpoint("/api/prefetch")?)
+                        .json(&PrefetchRequest {
+                            task_id: *task_id,
+                            source_url: source_url.clone(),
+                            target_path: target_path.clone(),
+                            source_kind: *source_kind,
+                            start_offset_sec: *start_offset_sec,
+                            duration_sec: *duration_sec,
+                        })
+                        .send()
+                        .await?
+                };
+                let response: PrefetchResponse = response.error_for_status()?.json().await?;
+                self.submitted_prefetches.lock().await.insert(*task_id);
                 let time_slice_requested = start_offset_sec.is_some() || duration_sec.is_some();
-                self.wait_for_prefetch(*task_id, response, time_slice_requested)
+                self.map_prefetch_response(*task_id, response, time_slice_requested)
                     .await
             }
         }
     }
 
-    async fn wait_for_prefetch(
+    async fn map_prefetch_response(
         &self,
         task_id: Uuid,
-        mut response: PrefetchResponse,
+        response: PrefetchResponse,
         time_slice_requested: bool,
-    ) -> Result<GatewayActionResult, SourceGatewayError> {
-        let deadline = Instant::now() + self.prefetch_timeout;
-        loop {
-            match response.status.as_str() {
-                "ready" => {
-                    if time_slice_requested && !response.time_slice_applied {
-                        return Err(SourceGatewayError::Rejected(
-                            "ready prefetch response did not attest the requested time slice"
-                                .to_string(),
-                        ));
-                    }
-                    let source_url = response.source_url.ok_or_else(|| {
-                        SourceGatewayError::Rejected(
-                            "ready prefetch response is missing source_url".to_string(),
-                        )
-                    })?;
-                    return Ok(GatewayActionResult::Prefetch { source_url });
-                }
-                "failed" => {
+    ) -> Result<Option<GatewayActionResult>, SourceGatewayError> {
+        match response.status.as_str() {
+            "ready" => {
+                if time_slice_requested && !response.time_slice_applied {
                     return Err(SourceGatewayError::Rejected(
-                        response
-                            .failure_reason
-                            .unwrap_or_else(|| "prefetch failed".to_string()),
+                        "ready prefetch response did not attest the requested time slice"
+                            .to_string(),
                     ));
                 }
-                _ => {
-                    if Instant::now() >= deadline {
-                        return Err(SourceGatewayError::PrefetchTimeout);
-                    }
-                    sleep(self.prefetch_poll_interval).await;
-                    response = self
-                        .http
-                        .get(self.endpoint(&format!("/api/prefetch/{task_id}"))?)
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json()
-                        .await?;
-                }
+                let source_url = response.source_url.ok_or_else(|| {
+                    SourceGatewayError::Rejected(
+                        "ready prefetch response is missing source_url".to_string(),
+                    )
+                })?;
+                self.submitted_prefetches.lock().await.remove(&task_id);
+                self.prefetch_poll_hints.lock().await.remove(&task_id);
+                Ok(Some(GatewayActionResult::Prefetch { source_url }))
             }
+            "failed" | "canceled" => {
+                self.submitted_prefetches.lock().await.remove(&task_id);
+                self.prefetch_poll_hints.lock().await.remove(&task_id);
+                Err(SourceGatewayError::Rejected(
+                    response
+                        .failure_reason
+                        .unwrap_or_else(|| format!("prefetch {}", response.status)),
+                ))
+            }
+            "pending" => {
+                let poll_after = response
+                    .poll_after_ms
+                    .map(Duration::from_millis)
+                    .unwrap_or_else(|| match response.phase.as_deref() {
+                        Some("queued") => Duration::from_secs(30),
+                        _ => self.prefetch_poll_interval,
+                    });
+                self.prefetch_poll_hints
+                    .lock()
+                    .await
+                    .insert(task_id, poll_after);
+                Ok(None)
+            }
+            status => Err(SourceGatewayError::Rejected(format!(
+                "unknown prefetch status {status}"
+            ))),
         }
+    }
+
+    async fn prefetch_poll_after(&self, task_id: Uuid) -> Result<Duration, SourceGatewayError> {
+        Ok(self
+            .prefetch_poll_hints
+            .lock()
+            .await
+            .get(&task_id)
+            .copied()
+            .unwrap_or(self.prefetch_poll_interval))
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, SourceGatewayError> {
@@ -371,6 +472,7 @@ pub(crate) fn plan_gateway_action(spec: &TaskSpec, task_id: Uuid) -> Option<Gate
             Some(GatewayAction::Relay {
                 task_id,
                 source_url: source_url.to_string(),
+                source_kind: kind,
             })
         }
         (InputKind::HttpMp4, Some(SourceMode::Vod))
@@ -628,5 +730,123 @@ mod tests {
             .unwrap();
         });
         Ok((format!("https://{address}/bohui/media/"), handle, server))
+    }
+
+    #[tokio::test]
+    async fn prefetch_submission_is_nonblocking_and_honors_gateway_poll_hints() -> anyhow::Result<()>
+    {
+        use axum::{Json, extract::State, routing::post};
+        use serde_json::json;
+
+        #[derive(Clone, Default)]
+        struct StubState {
+            posts: Arc<AtomicUsize>,
+            gets: Arc<AtomicUsize>,
+        }
+
+        async fn submit(State(state): State<StubState>) -> Json<serde_json::Value> {
+            state.posts.fetch_add(1, Ordering::SeqCst);
+            Json(json!({
+                "status": "pending",
+                "phase": "queued",
+                "queue_position": 126,
+                "poll_after_ms": 30000,
+                "time_slice_applied": false
+            }))
+        }
+
+        async fn poll(State(state): State<StubState>) -> Json<serde_json::Value> {
+            let call = state.gets.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Json(json!({
+                    "status": "pending",
+                    "phase": "running",
+                    "poll_after_ms": 5000,
+                    "time_slice_applied": false
+                }))
+            } else {
+                Json(json!({
+                    "status": "ready",
+                    "source_url": "imports/00000000-0000-0000-0000-000000009001/source.mp4",
+                    "time_slice_applied": false
+                }))
+            }
+        }
+
+        let stub = StubState::default();
+        let app = Router::new()
+            .route("/api/prefetch", post(submit))
+            .route("/api/prefetch/{task_id}", get(poll))
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = SourceGatewayClient::new_for_test(&base)?;
+        let task_id = Uuid::from_u128(0x9001);
+        let action = GatewayAction::Prefetch {
+            task_id,
+            source_url: "http://customer.example/source.mp4".to_string(),
+            target_path: format!("imports/{task_id}/source.mp4"),
+            source_kind: InputKind::HttpMp4,
+            start_offset_sec: None,
+            duration_sec: None,
+        };
+
+        let started = std::time::Instant::now();
+        assert_eq!(client.execute_action(&action).await?, None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            client.prefetch_poll_after(task_id).await?,
+            Duration::from_secs(30)
+        );
+        assert_eq!(stub.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.gets.load(Ordering::SeqCst), 0);
+
+        assert_eq!(client.execute_action(&action).await?, None);
+        assert_eq!(
+            client.prefetch_poll_after(task_id).await?,
+            Duration::from_secs(5)
+        );
+        assert_eq!(stub.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.gets.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            client.execute_action(&action).await?,
+            Some(GatewayActionResult::Prefetch {
+                source_url: format!("imports/{task_id}/source.mp4")
+            })
+        );
+        assert_eq!(stub.posts.load(Ordering::SeqCst), 1);
+        assert_eq!(stub.gets.load(Ordering::SeqCst), 2);
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unified_gateway_cancel_retries_three_times_through_prefixed_base_url()
+    -> anyhow::Result<()> {
+        use axum::{extract::State, routing::delete};
+
+        async fn cancel(State(calls): State<Arc<AtomicUsize>>) -> StatusCode {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::NO_CONTENT
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/bohui/media/api/tasks/{task_id}", delete(cancel))
+            .with_state(calls.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}/bohui/media/", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        SourceGatewayClient::new_for_test(&base)?
+            .cancel_task(Uuid::from_u128(0x9002))
+            .await?;
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        server.abort();
+        Ok(())
     }
 }

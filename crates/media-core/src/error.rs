@@ -126,6 +126,13 @@ fn control_plane_error_parts(error: ControlPlaneError) -> ErrorResponseParts {
             Value::Null,
         )
             .into(),
+        ControlPlaneError::SourceGateway(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SOURCE_GATEWAY_UNAVAILABLE",
+            message,
+            Value::Null,
+        )
+            .into(),
         ControlPlaneError::Repository(error) => repo_error_parts(error),
         ControlPlaneError::Serde(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
