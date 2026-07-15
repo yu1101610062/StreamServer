@@ -720,7 +720,8 @@ main() {
 
     remote_base="${REMOTE_DIR%/}"
     remote_run_dir="$(ssh_run \
-      "umask 077; mkdir -p $(shell_quote "${remote_base}"); mktemp -d $(shell_quote "${remote_base}/target-run.XXXXXXXX")")"
+      "umask 077; mkdir -p $(shell_quote "${remote_base}"); mktemp -d $(shell_quote "${remote_base}/target-run.XXXXXXXX")" \
+      | tr -d '\r' | tail -n 1)"
     case "${remote_run_dir}" in
       "${remote_base}"/target-run.*) ;;
       *) fail "远端未返回预期的私有验证目录" ;;
@@ -763,6 +764,8 @@ POSTGRES_SMOKE_TMP=""
 POSTGRES_SMOKE_CONTROL_DIR=""
 POSTGRES_SMOKE_TOOL_DIR=""
 POSTGRES_SMOKE_SOCKET_DIR=""
+POSTGRES_SMOKE_RUNTIME_DIR=""
+POSTGRES_SMOKE_RUNTIME_DIR_OWNED=0
 POSTGRES_SMOKE_PID_REGISTRY=""
 RUN_WORK=""
 BUNDLE_VERSION=""
@@ -966,6 +969,12 @@ cleanup_postgres_smoke() {
     rm -rf -- "${POSTGRES_SMOKE_SOCKET_DIR}"
     POSTGRES_SMOKE_SOCKET_DIR=""
   fi
+  if [ "${POSTGRES_SMOKE_RUNTIME_DIR_OWNED:-0}" -eq 1 ] \
+    && [ -n "${POSTGRES_SMOKE_RUNTIME_DIR:-}" ]; then
+    rm -rf -- "${POSTGRES_SMOKE_RUNTIME_DIR}"
+  fi
+  POSTGRES_SMOKE_RUNTIME_DIR=""
+  POSTGRES_SMOKE_RUNTIME_DIR_OWNED=0
   if [ -n "${POSTGRES_SMOKE_CONTROL_DIR:-}" ]; then
     rm -rf -- "${POSTGRES_SMOKE_CONTROL_DIR}"
     POSTGRES_SMOKE_CONTROL_DIR=""
@@ -1639,10 +1648,27 @@ run_bounded_capture() {
   fi
   rm -f -- "${gate_path}" "${command_ready}" "${reader_ready}"
 
-  if wait -n -p completed_pid "${command_pid}" "${reader_pid}"; then
-    first_status=0
+  if [ "${BASH_VERSINFO[0]}" -ge 5 ]; then
+    if wait -n -p completed_pid "${command_pid}" "${reader_pid}"; then
+      first_status=0
+    else
+      first_status=$?
+    fi
   else
-    first_status=$?
+    while process_is_live_non_zombie "${command_pid}" \
+      && process_is_live_non_zombie "${reader_pid}"; do
+      sleep 0.01
+    done
+    if ! process_is_live_non_zombie "${command_pid}"; then
+      completed_pid="${command_pid}"
+    else
+      completed_pid="${reader_pid}"
+    fi
+    if wait "${completed_pid}"; then
+      first_status=0
+    else
+      first_status=$?
+    fi
   fi
   if [ "${completed_pid}" = "${reader_pid}" ]; then
     reader_status="${first_status}"
@@ -1766,7 +1792,7 @@ def reject(message: str) -> None:
 
 try:
     with tarfile.open(archive_path, mode="r:gz") as archive:
-        members: list[tarfile.TarInfo] = []
+        members = []
         probe_logical_size = 0
         member = archive.next()
         while member is not None:
@@ -1782,9 +1808,9 @@ try:
             member = archive.next()
         if not members:
             reject("archive is empty")
-        seen: set[str] = set()
-        top_levels: set[str] = set()
-        expected_inventory: dict[str, tuple[str, int, str]] = {}
+        seen = set()
+        top_levels = set()
+        expected_inventory = {}
         logical_size = 0
         for member in members:
             raw_name = member.name
@@ -1894,11 +1920,17 @@ try:
         top_dir = next(iter(top_levels))
         previous_umask = os.umask(0)
         try:
-            archive.extractall(path=extract_root, members=members, filter="data")
+            if sys.version_info >= (3, 12):
+                archive.extractall(path=extract_root, members=members, filter="data")
+            else:
+                # Older tarfile versions have no extraction filter. Every member,
+                # path, link target, type, mode and expansion bound was validated
+                # above before this extraction call.
+                archive.extractall(path=extract_root, members=members)
         finally:
             os.umask(previous_umask)
 
-        actual_paths: set[str] = set()
+        actual_paths = set()
         for directory, directories, files in os.walk(extract_root, followlinks=False):
             for entry in directories + files:
                 actual_paths.add(
@@ -1933,10 +1965,12 @@ try:
                 # Restore safe modes only through canonical owning entries.
                 # A hardlink is another path to the same inode and must never be
                 # chmodded independently because that would mutate its target.
+                # The private extraction tree and the lstat/type checks above
+                # make the Python 3.6-compatible chmod safe here.
                 path = extract_root / name
-                os.chmod(path, expected_mode, follow_symlinks=False)
+                os.chmod(path, expected_mode)
 
-        inode_modes: dict[tuple[int, int], tuple[int, str]] = {}
+        inode_modes = {}
         for name, (expected_type, expected_mode, _) in expected_inventory.items():
             if expected_type == "symlink":
                 continue
@@ -1995,7 +2029,7 @@ except OSError as error:
     print(f"cannot read SHA256SUMS: {error}", file=sys.stderr)
     raise SystemExit(1)
 
-listed: dict[str, str] = {}
+listed = {}
 for line_number, line in enumerate(lines, start=1):
     match = line_pattern.fullmatch(line)
     if match is None:
@@ -2017,7 +2051,7 @@ for line_number, line in enumerate(lines, start=1):
         raise SystemExit(1)
     listed[name] = digest
 
-actual: set[str] = set()
+actual = set()
 for directory, _, files in os.walk(root, followlinks=False):
     for filename in files:
         path = pathlib.Path(directory) / filename
@@ -2071,8 +2105,8 @@ append "- bundle: $(basename "${BUNDLE}")"
 append "- docker_present: $(command -v docker >/dev/null 2>&1 && echo yes || echo no)"
 append "- docker_required: no"
 
-if [ "${BASH_VERSINFO[0]}" -lt 5 ]; then
-  record_failure "Bash 5 or newer is required for bounded process capture"
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  record_failure "Bash 4 or newer is required for bounded process capture"
 fi
 for bootstrap_command in python3 timeout setsid mkfifo truncate; do
   command -v "${bootstrap_command}" >/dev/null 2>&1 \
@@ -2163,7 +2197,8 @@ abort_gate_if_failed "package structure and integrity gate"
 check_static_binary() {
   local label="$1"
   local path="$2"
-  local file_output ldd_output file_status=0 ldd_status=0
+  local file_output ldd_output program_output dynamic_output
+  local file_status=0 ldd_status=0 program_status=0 dynamic_status=0
   local output_truncated=0
   [ -x "${path}" ] || { record_failure "${label} executable missing: ${path}"; return; }
 
@@ -2183,7 +2218,11 @@ check_static_binary() {
     record_failure "${label} file inspection failed"
     return
   fi
-  if ! grep -Eq '^ELF 64-bit LSB (pie )?executable, x86-64,' \
+  # Older libmagic versions report static PIE executables as "shared object"
+  # and even label them "dynamically linked". Treat `file` as an identity
+  # hint, then use readelf's INTERP and NEEDED entries as the linkage truth.
+  if ! grep -Eq \
+      '^ELF 64-bit LSB (pie )?(executable|shared object), x86-64,' \
       "${file_output}"; then
     append_capped_output "${file_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
       || true
@@ -2191,17 +2230,31 @@ check_static_binary() {
     record_failure "${label} is not a Linux x86-64 ELF executable"
     return
   fi
-  if ! grep -Eiq 'statically linked|static-pie linked' "${file_output}"; then
+  program_output="$(mktemp "${RUN_WORK}/static-program.XXXXXXXX")"
+  dynamic_output="$(mktemp "${RUN_WORK}/static-dynamic.XXXXXXXX")"
+  run_bounded_capture "${program_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
+    "${SMOKE_COMMAND_TIMEOUT_SEC}" env LC_ALL=C readelf -W -l "${path}" \
+    || program_status=$?
+  run_bounded_capture "${dynamic_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
+    "${SMOKE_COMMAND_TIMEOUT_SEC}" env LC_ALL=C readelf -W -d "${path}" \
+    || dynamic_status=$?
+  if [ "${program_status}" -ne 0 ] || [ "${dynamic_status}" -ne 0 ] \
+    || grep -Fq ' INTERP ' "${program_output}" \
+    || grep -Fq '(NEEDED)' "${dynamic_output}"; then
     append_capped_output "${file_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
       || true
+    append_capped_output "${program_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
+      || true
+    append_capped_output "${dynamic_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
+      || true
     append "\`\`\`"
-    record_failure "${label} is not statically linked"
+    record_failure "${label} is not static according to readelf"
     return
   fi
   append_capped_output "${file_output}" "${COMMAND_OUTPUT_LIMIT_BYTES}" \
     || output_truncated=1
   append "\`\`\`"
-  record_ok "${label} file identity is Linux x86-64 static ELF"
+  record_ok "${label} file identity is Linux x86-64 static ELF by readelf"
 
   append ""
   append "### ${label} ldd"
@@ -2241,14 +2294,25 @@ runtime_bounded_capture() {
   local path="$5"
   local lib_dir="$6"
   shift 6
-  local loader
+  local loader runtime_python_home
   loader="$(runtime_loader "${lib_dir}")"
+  runtime_python_home="${STREAMSERVER_RUNTIME_PYTHONHOME:-}"
   case "${operation}" in
     execute)
-      if [ -n "${loader}" ]; then
+      if [ -n "${loader}" ] && [ -n "${runtime_python_home}" ]; then
+        run_bounded_capture "${output_file}" "${byte_limit}" \
+          "${timeout_seconds}" \
+          env PYTHONHOME="${runtime_python_home}" \
+            "${loader}" --library-path "${lib_dir}" "${path}" "$@"
+      elif [ -n "${loader}" ]; then
         run_bounded_capture "${output_file}" "${byte_limit}" \
           "${timeout_seconds}" \
           "${loader}" --library-path "${lib_dir}" "${path}" "$@"
+      elif [ -n "${runtime_python_home}" ]; then
+        run_bounded_capture "${output_file}" "${byte_limit}" \
+          "${timeout_seconds}" \
+          env PYTHONHOME="${runtime_python_home}" \
+            LD_LIBRARY_PATH="${lib_dir}" "${path}" "$@"
       else
         run_bounded_capture "${output_file}" "${byte_limit}" \
           "${timeout_seconds}" \
@@ -2619,10 +2683,13 @@ run_shell "media-agent liveness/readiness smoke" "
     -subj /CN=streamserver-agent-verifier \
     -keyout \"\${tmp}/management-key.pem\" \
     -out \"\${tmp}/management-cert.pem\" >/dev/null 2>&1
-  openssl genpkey -algorithm ED25519 \
-    -out \"\${tmp}/capability-private.pem\" >/dev/null 2>&1
-  openssl pkey -in \"\${tmp}/capability-private.pem\" -pubout \
-    -out \"\${tmp}/capability-public.pem\" >/dev/null 2>&1
+  # Use a known-valid Ed25519 SPKI fixture. Older target OpenSSL builds can
+  # emit Ed25519 encodings that jsonwebtoken deliberately rejects.
+  printf '%s\n' \
+    '-----BEGIN PUBLIC KEY-----' \
+    'MCowBQYDK2VwAyEAA5Q5gilpT0f2fcLhC7l30Wou7Ng/gESlFWWx8z6TGJw=' \
+    '-----END PUBLIC KEY-----' \
+    >\"\${tmp}/capability-public.pem\"
   read -r public_port management_port hook_port < <(python3 - <<'PY'
 import socket
 sockets = [socket.socket() for _ in range(3)]
@@ -2800,11 +2867,13 @@ fi
 
 section "ZLMediaKit Runtime"
 if [ "${BUNDLE_WORKER_SUPPORT}" = true ]; then
-  if [ -d "${ROOT}/runtime/zlm/python" ]; then
-    export PYTHONHOME="${ROOT}/runtime/zlm/python"
-  fi
   [ -f "${ROOT}/runtime/zlm/default.pem" ] && record_ok "default.pem exists" || record_failure "default.pem missing"
-  check_runtime_binary "MediaServer" "${ROOT}/runtime/zlm/MediaServer" "${ROOT}/runtime/zlm/lib" -v
+  inspect_runtime_binary \
+    "MediaServer" "${ROOT}/runtime/zlm/MediaServer" "${ROOT}/runtime/zlm/lib"
+  STREAMSERVER_RUNTIME_PYTHONHOME="${ROOT}/runtime/zlm/python" \
+    run_runtime_capture \
+      "MediaServer version" \
+      "${ROOT}/runtime/zlm/MediaServer" "${ROOT}/runtime/zlm/lib" -v
   run_shell "ZLM statistic smoke" "
     tmp=\$(mktemp -d)
     port=\$((23000 + RANDOM % 10000))
@@ -2905,14 +2974,18 @@ if [ "${BUNDLE_POSTGRES_RUNTIME}" = true ]; then
     local tmp control_dir socket_dir port pgroot pgwrap command_name runner_prefix pid
     local pg_pkglib_dir pg_share_dir pg_library_path extension_manifest loader
     local next_port_value next_port_file started_pid nobody_uid="" nobody_gid=""
+    local permission_expectation permission_path expected_owner_mode
+    local actual_owner_mode unsafe_wrapper
     tmp="${POSTGRES_SMOKE_TMP}"
     control_dir="${POSTGRES_SMOKE_CONTROL_DIR}"
     socket_dir="${POSTGRES_SMOKE_SOCKET_DIR}"
     [ -d "${tmp}" ] && [ -d "${control_dir}" ] \
       && [ -d "${POSTGRES_SMOKE_TOOL_DIR}" ] \
+      && [ -d "${POSTGRES_SMOKE_RUNTIME_DIR}" ] \
       && [ -d "${socket_dir}" ] \
       && [ -f "${POSTGRES_SMOKE_PID_REGISTRY}" ] || return 1
     trap cleanup_postgres_smoke EXIT
+    ROOT="${POSTGRES_SMOKE_RUNTIME_DIR}"
     next_port_value=$((25432 + RANDOM % 10000))
     next_port_file="${control_dir}/next-port"
     printf '%s\n' "${next_port_value}" >"${next_port_file}"
@@ -3102,21 +3175,48 @@ EOF
     done < <(postgres_command_names)
 
     if [ "$(id -u)" -eq 0 ]; then
-      command -v setpriv >/dev/null
-      nobody_uid="$(id -u nobody)"
-      nobody_gid="$(id -g nobody)"
-      chmod 711 "${WORK_DIR}" "${RUN_WORK}" "${RUN_WORK}/extract"
-      [ "$(stat -Lc '%u:%a' "${control_dir}")" = "0:700" ]
-      [ "$(stat -Lc '%u:%a' "${POSTGRES_SMOKE_PID_REGISTRY}")" = "0:600" ]
-      [ "$(stat -Lc '%u:%a' "${POSTGRES_SMOKE_TOOL_DIR}")" = "0:755" ]
-      [ "$(stat -Lc '%u:%a' "${pgwrap}")" = "0:755" ]
-      [ -z "$(find "${pgwrap}" -maxdepth 1 -type f \
-        \( ! -uid 0 -o -perm /022 \) -print -quit)" ]
+      command -v setpriv >/dev/null || {
+        echo "setpriv is required for root PostgreSQL smoke"
+        return 1
+      }
+      nobody_uid="$(id -u nobody)" || {
+        echo "nobody user is required for root PostgreSQL smoke"
+        return 1
+      }
+      nobody_gid="$(id -g nobody)" || {
+        echo "nobody group is required for root PostgreSQL smoke"
+        return 1
+      }
+      for permission_expectation in \
+        "${control_dir}|0:700" \
+        "${POSTGRES_SMOKE_PID_REGISTRY}|0:600" \
+        "${POSTGRES_SMOKE_TOOL_DIR}|0:755" \
+        "${pgwrap}|0:755"; do
+        permission_path="${permission_expectation%%|*}"
+        expected_owner_mode="${permission_expectation#*|}"
+        actual_owner_mode="$(stat -Lc '%u:%a' "${permission_path}")" || {
+          echo "cannot stat PostgreSQL smoke control path: ${permission_path}"
+          return 1
+        }
+        [ "${actual_owner_mode}" = "${expected_owner_mode}" ] || {
+          echo "unexpected PostgreSQL smoke control permissions: path=${permission_path} expected=${expected_owner_mode} actual=${actual_owner_mode}"
+          return 1
+        }
+      done
+      unsafe_wrapper="$(find "${pgwrap}" -maxdepth 1 -type f \
+        \( ! -uid 0 -o -perm /022 \) -print -quit)"
+      [ -z "${unsafe_wrapper}" ] || {
+        echo "PostgreSQL smoke wrapper is not root-owned and non-writable: ${unsafe_wrapper}"
+        return 1
+      }
       setpriv --reuid="${nobody_uid}" --regid="${nobody_gid}" \
         --clear-groups -- sh -c \
         'test ! -w "$1" && test ! -w "$2" && test -x "$2"' \
         verifier-permissions "${POSTGRES_SMOKE_PID_REGISTRY}" \
-        "${pgwrap}/postgres"
+        "${pgwrap}/postgres" || {
+          echo "runtime user isolation check failed for PostgreSQL smoke controls"
+          return 1
+        }
       echo "PostgreSQL root control state is isolated from the runtime user"
       chown "${nobody_uid}:${nobody_gid}" "${tmp}"
       chmod 700 "${tmp}"
@@ -3460,11 +3560,44 @@ EOF
     echo "logical replication smoke ok"
 
   }
-  POSTGRES_SMOKE_TMP="$(mktemp -d "${RUN_WORK}/postgres-smoke.XXXXXXXX")"
+  if [ "$(id -u)" -eq 0 ]; then
+    # PostgreSQL refuses to run as root. Keep the extracted bundle private and
+    # expose only a root-owned, non-writable copy needed by the `nobody` smoke
+    # process under independently traversable /tmp directories. Do not hard
+    # link here: archive ownership metadata may map to a live target UID.
+    POSTGRES_SMOKE_TMP="$(mktemp -d /tmp/ss-pg-data.XXXXXXXX)"
+    POSTGRES_SMOKE_TOOL_DIR="$(mktemp -d /tmp/ss-pg-tools.XXXXXXXX)"
+    POSTGRES_SMOKE_RUNTIME_DIR="$(mktemp -d /tmp/ss-pg-runtime.XXXXXXXX)"
+    POSTGRES_SMOKE_RUNTIME_DIR_OWNED=1
+    chmod 700 "${POSTGRES_SMOKE_TMP}"
+    chmod 755 "${POSTGRES_SMOKE_TOOL_DIR}" "${POSTGRES_SMOKE_RUNTIME_DIR}"
+    mkdir -m 755 -p \
+      "${POSTGRES_SMOKE_RUNTIME_DIR}/runtime" \
+      "${POSTGRES_SMOKE_RUNTIME_DIR}/binaries" \
+      "${POSTGRES_SMOKE_RUNTIME_DIR}/ui"
+    cp -a -- "${ROOT}/runtime/postgres" \
+      "${POSTGRES_SMOKE_RUNTIME_DIR}/runtime/"
+    cp -a -- "${ROOT}/binaries/media-core-linux-amd64" \
+      "${POSTGRES_SMOKE_RUNTIME_DIR}/binaries/"
+    cp -a -- "${ROOT}/ui/media-core" \
+      "${POSTGRES_SMOKE_RUNTIME_DIR}/ui/"
+    chown -R 0:0 "${POSTGRES_SMOKE_RUNTIME_DIR}"
+    unsafe_runtime_path="$(find "${POSTGRES_SMOKE_RUNTIME_DIR}" \
+      ! -type l \( ! -uid 0 -o -perm /022 \) -print -quit)"
+    [ -z "${unsafe_runtime_path}" ] || {
+      printf 'unsafe PostgreSQL smoke runtime view: %s\n' \
+        "${unsafe_runtime_path}" >&2
+      exit 1
+    }
+  else
+    POSTGRES_SMOKE_TMP="$(mktemp -d "${RUN_WORK}/postgres-smoke.XXXXXXXX")"
+    POSTGRES_SMOKE_TOOL_DIR="$(mktemp -d \
+      "${RUN_WORK}/postgres-tools.XXXXXXXX")"
+    POSTGRES_SMOKE_RUNTIME_DIR="${ROOT}"
+    POSTGRES_SMOKE_RUNTIME_DIR_OWNED=0
+  fi
   POSTGRES_SMOKE_CONTROL_DIR="$(mktemp -d \
     "${RUN_WORK}/postgres-control.XXXXXXXX")"
-  POSTGRES_SMOKE_TOOL_DIR="$(mktemp -d \
-    "${RUN_WORK}/postgres-tools.XXXXXXXX")"
   POSTGRES_SMOKE_SOCKET_DIR="$(mktemp -d /tmp/ss-pg.XXXXXXXX)"
   chmod 700 "${POSTGRES_SMOKE_CONTROL_DIR}"
   chmod 755 "${POSTGRES_SMOKE_TOOL_DIR}"
@@ -3481,6 +3614,7 @@ EOF
   set +e
   export ROOT WORK_DIR RUN_WORK POSTGRES_SMOKE_TMP POSTGRES_SMOKE_CONTROL_DIR \
     POSTGRES_SMOKE_TOOL_DIR POSTGRES_SMOKE_SOCKET_DIR \
+    POSTGRES_SMOKE_RUNTIME_DIR POSTGRES_SMOKE_RUNTIME_DIR_OWNED \
     POSTGRES_SMOKE_PID_REGISTRY
   export -f \
     postgres_smoke \
@@ -3674,7 +3808,7 @@ else
   mkfifo -m 600 \"\${remote_start_gate}\"
   : >\"\${remote_start_ready}\"
   chmod 600 \"\${remote_start_ready}\"
-  setsid --fork --wait bash --noprofile --norc -e -u -o pipefail -c '
+  setsid bash --noprofile --norc -e -u -o pipefail -c '
     ready_file=\$1
     gate_file=\$2
     shift 2

@@ -903,8 +903,8 @@ write_build_info() {
 bundle_name=${bundle_name}
 version=${version}
 built_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-builder_os=$(uname -s)
-builder_arch=$(uname -m)
+builder_os=Linux
+builder_arch=x86_64
 git_commit=${commit}
 bundle_variant=${NATIVE_VARIANT}
 target_runtime=docker-free

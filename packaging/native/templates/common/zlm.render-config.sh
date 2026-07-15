@@ -30,7 +30,10 @@ replace_placeholder() {
   local placeholder="$1"
   local key="$2"
   local value="${!key}"
-  rendered="${rendered//"${placeholder}"/"${value}"}"
+  # Bash 4.2 treats quotes embedded inside this parameter substitution as
+  # literal replacement characters. The outer assignment already prevents
+  # splitting and globbing; keep the operands unquoted for 4.2 compatibility.
+  rendered="${rendered//${placeholder}/${value}}"
 }
 
 export AGENT_MP4_RECORD_SEGMENT_SEC="${AGENT_MP4_RECORD_SEGMENT_SEC:-7200}"
