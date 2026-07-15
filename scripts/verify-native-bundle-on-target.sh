@@ -412,7 +412,7 @@ set connect_timeout $env(STREAMSERVER_SSH_CONNECT_TIMEOUT)
 set alive_interval $env(STREAMSERVER_SSH_ALIVE_INTERVAL)
 set alive_count $env(STREAMSERVER_SSH_ALIVE_COUNT_MAX)
 log_user 0
-spawn ssh -p $port -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -o ConnectTimeout=$connect_timeout -o ServerAliveInterval=$alive_interval -o ServerAliveCountMax=$alive_count $target $command
+spawn ssh -T -p $port -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -o ConnectTimeout=$connect_timeout -o ServerAliveInterval=$alive_interval -o ServerAliveCountMax=$alive_count $target $command
 expect {
   -re "(?i)yes/no|fingerprint" { send -- "yes\r"; exp_continue }
   -re "(?i)password:" { send -- "$pass\r"; log_user 1; exp_continue }
@@ -453,7 +453,7 @@ set alive_interval $env(STREAMSERVER_SSH_ALIVE_INTERVAL)
 set alive_count $env(STREAMSERVER_SSH_ALIVE_COUNT_MAX)
 set payload [read stdin]
 log_user 0
-spawn ssh -p $port -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -o ConnectTimeout=$connect_timeout -o ServerAliveInterval=$alive_interval -o ServerAliveCountMax=$alive_count $target $command
+spawn ssh -T -p $port -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -o ConnectTimeout=$connect_timeout -o ServerAliveInterval=$alive_interval -o ServerAliveCountMax=$alive_count $target $command
 expect {
   -re "(?i)yes/no|fingerprint" { send -- "yes\r"; exp_continue }
   -re "(?i)password:" { send -- "$pass\r"; log_user 1 }
@@ -495,7 +495,7 @@ ssh_run() {
     ssh_expect "${command}" "${timeout_seconds}"
   else
     deadline_exec "${timeout_seconds}" \
-      ssh -p "${SSH_PORT}" \
+      ssh -T -p "${SSH_PORT}" \
         -o StrictHostKeyChecking=accept-new \
         -o BatchMode=yes \
         -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT_SEC}" \
@@ -512,7 +512,7 @@ ssh_stream() {
     ssh_expect_stream "${command}" "${timeout_seconds}"
   else
     deadline_exec "${timeout_seconds}" \
-      ssh -p "${SSH_PORT}" \
+      ssh -T -p "${SSH_PORT}" \
         -o StrictHostKeyChecking=accept-new \
         -o BatchMode=yes \
         -o "ConnectTimeout=${SSH_CONNECT_TIMEOUT_SEC}" \
