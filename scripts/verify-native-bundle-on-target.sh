@@ -2562,10 +2562,36 @@ run_shell "media-core auth check-config smoke" "
     CORE_GRPC_TLS_CERT_PATH=\"\${tmp}/listener-cert.pem\" \
     CORE_GRPC_TLS_KEY_PATH=\"\${tmp}/listener-key.pem\" \
     CORE_GRPC_TLS_CLIENT_CA_PATH=\"\${tmp}/listener-cert.pem\" \
+    SOURCE_GATEWAY_BASE_URL=https://172.21.26.25/bohui/media/ \
+    SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY=true \
+    SOURCE_GATEWAY_PREFETCH_POLL_MS=1000 \
+    SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=600000 \
     STORAGE_ALLOWLIST=\"\${tmp}\" \
     "\${VERIFY_ROOT}/binaries/media-core-linux-amd64" auth check-config \
       | grep -Fq 'authentication and Agent CA configuration is valid'
 "
+run_shell "media-core Source Gateway config fail-closed smoke" '
+  if output=$(env -i \
+    PATH="${PATH}" \
+    HOME="${TMPDIR:-/tmp}" \
+    STREAMSERVER_ENV=development \
+    SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY=not-a-boolean \
+    "${VERIFY_ROOT}/binaries/media-core-linux-amd64" auth check-config 2>&1); then
+    exit 1
+  fi
+  printf "%s\n" "${output}" | grep -Fq "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY must be true or false"
+
+  if output=$(env -i \
+    PATH="${PATH}" \
+    HOME="${TMPDIR:-/tmp}" \
+    STREAMSERVER_ENV=development \
+    DATABASE_URL=postgresql://127.0.0.1:9/native_verifier \
+    SOURCE_GATEWAY_BASE_URL=http://172.21.26.25/bohui/media/ \
+    "${VERIFY_ROOT}/binaries/media-core-linux-amd64" auth check-config 2>&1); then
+    exit 1
+  fi
+  printf "%s\n" "${output}" | grep -Fq "SOURCE_GATEWAY_BASE_URL must use https"
+'
 run_shell "media-agent command parser smoke" \
   "output=\$(\"\${VERIFY_ROOT}/binaries/media-agent-linux-amd64\" __native_verifier_smoke__ 2>&1) && exit 1; printf '%s\\n' \"\${output}\" | grep -Fq 'unknown media-agent command'"
 run_shell "media-agent liveness/readiness smoke" "
@@ -2716,12 +2742,27 @@ run_shell "streamserver-config non-interactive smoke" "
       --non-interactive \
       --no-restart-prompt
   test -s \"\${tmp}/component.env\"
+  grep -Fq \"SOURCE_GATEWAY_BASE_URL=''\" \"\${tmp}/component.env\"
+  grep -Fq \"SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY='false'\" \"\${tmp}/component.env\"
+  grep -Fq \"SOURCE_GATEWAY_PREFETCH_POLL_MS='1000'\" \"\${tmp}/component.env\"
+  grep -Fq \"SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS='600000'\" \"\${tmp}/component.env\"
 "
 
 section "FFmpeg Runtime"
 if [ "${BUNDLE_WORKER_SUPPORT}" = true ]; then
   check_runtime_binary "ffmpeg cpu" "${ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg" "${ROOT}/runtime/ffmpeg/cpu/lib" -version
   check_runtime_binary "ffprobe cpu" "${ROOT}/runtime/ffmpeg/cpu/bin/ffprobe" "${ROOT}/runtime/ffmpeg/cpu/lib" -version
+  run_shell "ffmpeg cpu HTTPS verification defaults stay disabled" '
+    loader="${VERIFY_ROOT}/runtime/ffmpeg/cpu/lib/ld-linux-x86-64.so.2"
+    library_path="${VERIFY_ROOT}/runtime/ffmpeg/cpu/lib"
+    ffmpeg="${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg"
+    ffprobe="${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffprobe"
+    for binary in "${ffmpeg}" "${ffprobe}"; do
+      output=$("${loader}" --library-path "${library_path}" "${binary}" -hide_banner -h protocol=https 2>&1)
+      printf "%s\n" "${output}" | grep -Eq -- "tls_verify.*default false"
+      printf "%s\n" "${output}" | grep -Eq -- "(^|[[:space:]])verify.*default false"
+    done
+  '
   run_shell "ffmpeg cpu HEVC to FLV smoke" "tmp=\$(mktemp -d); trap 'rm -rf \"\${tmp}\"' EXIT; \"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/lib/ld-linux-x86-64.so.2\" --library-path \"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/lib\" \"\${VERIFY_ROOT}/runtime/ffmpeg/cpu/bin/ffmpeg\" -hide_banner -f lavfi -i testsrc=size=128x72:rate=1 -t 1 -c:v libx265 -an -f flv -y \"\$tmp/hevc-test.flv\" && test -s \"\$tmp/hevc-test.flv\""
 fi
 if [ "${BUNDLE_GPU_SUPPORT}" = true ]; then

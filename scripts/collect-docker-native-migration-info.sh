@@ -370,7 +370,7 @@ log "writing summary"
   for f in "${OUT}"/redacted/container_env/*.env; do
     [ -f "$f" ] || continue
     echo "### $(basename "$f")"
-    grep -E '^(DEPLOY_MODE|INSTALL_ROLE|DATABASE_URL|POSTGRES_|CORE_|AGENT_|NODE_ID|ZLM_|WORK_ROOT|STREAMSERVER_UI_DIR|AUTH_|HOOK_|STORAGE_ALLOWLIST|PUBLIC_|FFMPEG_BIN|FFPROBE_BIN)=' "$f" || true
+    grep -E '^(DEPLOY_MODE|INSTALL_ROLE|DATABASE_URL|POSTGRES_|CORE_|AGENT_|NODE_ID|ZLM_|WORK_ROOT|STREAMSERVER_UI_DIR|AUTH_|HOOK_|STORAGE_ALLOWLIST|SOURCE_GATEWAY_|PUBLIC_|FFMPEG_BIN|FFPROBE_BIN)=' "$f" || true
   done
 } >"${OUT}/summary.txt"
 

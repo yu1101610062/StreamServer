@@ -120,4 +120,18 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn https_input_does_not_enable_ffmpeg_certificate_verification_flags() {
+        let args = ffmpeg_base_args(
+            "https://172.21.26.25/bohui/media/relay/test".to_string(),
+            true,
+        );
+        for forbidden in ["-tls_verify", "-ca_file", "-verifyhost"] {
+            assert!(
+                !args.iter().any(|arg| arg == forbidden),
+                "unexpected FFmpeg TLS verification flag {forbidden}"
+            );
+        }
+    }
 }

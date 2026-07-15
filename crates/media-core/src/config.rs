@@ -118,6 +118,8 @@ pub struct CoreSettings {
     pub storage_allowlist: Vec<String>,
     #[serde(default)]
     pub source_gateway_base_url: String,
+    #[serde(default)]
+    pub source_gateway_tls_insecure_skip_verify: bool,
     #[serde(default = "default_source_gateway_prefetch_poll_ms")]
     pub source_gateway_prefetch_poll_ms: u64,
     #[serde(default = "default_source_gateway_prefetch_timeout_ms")]
@@ -162,6 +164,7 @@ impl Default for CoreSettings {
             callback_shared_secret: String::new(),
             storage_allowlist: default_storage_allowlist(),
             source_gateway_base_url: String::new(),
+            source_gateway_tls_insecure_skip_verify: false,
             source_gateway_prefetch_poll_ms: default_source_gateway_prefetch_poll_ms(),
             source_gateway_prefetch_timeout_ms: default_source_gateway_prefetch_timeout_ms(),
         }
@@ -267,6 +270,24 @@ impl Settings {
             "CALLBACK_SETTLE_DELAY_MS must be positive"
         );
         if !self.core.source_gateway_base_url.trim().is_empty() {
+            let source_gateway_url = reqwest::Url::parse(self.core.source_gateway_base_url.trim())
+                .map_err(|error| anyhow::anyhow!("invalid SOURCE_GATEWAY_BASE_URL: {error}"))?;
+            anyhow::ensure!(
+                source_gateway_url.scheme() == "https",
+                "SOURCE_GATEWAY_BASE_URL must use https"
+            );
+            anyhow::ensure!(
+                source_gateway_url.host_str().is_some(),
+                "SOURCE_GATEWAY_BASE_URL must include a host"
+            );
+            anyhow::ensure!(
+                source_gateway_url.username().is_empty() && source_gateway_url.password().is_none(),
+                "SOURCE_GATEWAY_BASE_URL must not include credentials"
+            );
+            anyhow::ensure!(
+                source_gateway_url.query().is_none() && source_gateway_url.fragment().is_none(),
+                "SOURCE_GATEWAY_BASE_URL must not include a query or fragment"
+            );
             anyhow::ensure!(
                 self.core.source_gateway_prefetch_poll_ms > 0,
                 "SOURCE_GATEWAY_PREFETCH_POLL_MS must be positive"
@@ -568,6 +589,9 @@ fn apply_env_overrides(settings: &mut FileSettings) -> anyhow::Result<()> {
     if let Some(value) = env("SOURCE_GATEWAY_BASE_URL") {
         settings.core.source_gateway_base_url = value;
     }
+    if let Some(value) = optional_bool_env("SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY")? {
+        settings.core.source_gateway_tls_insecure_skip_verify = value;
+    }
     if let Some(value) = env("SOURCE_GATEWAY_PREFETCH_POLL_MS") {
         settings.core.source_gateway_prefetch_poll_ms =
             parse_required_env("SOURCE_GATEWAY_PREFETCH_POLL_MS", &value)?;
@@ -600,6 +624,24 @@ where
     T: FromStr,
 {
     T::from_str(value).map_err(|_| anyhow::anyhow!("{name} must be an integer"))
+}
+
+fn optional_bool_env(name: &str) -> anyhow::Result<Option<bool>> {
+    match std::env::var(name) {
+        Ok(value) => parse_bool_env_value(name, &value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} must contain valid Unicode")
+        }
+    }
+}
+
+fn parse_bool_env_value(name: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => anyhow::bail!("{name} must be true or false"),
+    }
 }
 
 fn split_csv(value: &str) -> Vec<String> {
@@ -741,4 +783,44 @@ pub fn parse_duration_spec(value: &str) -> anyhow::Result<Duration> {
         _ => anyhow::bail!("unsupported duration unit {unit}; use s, m, h or d"),
     };
     Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_gateway_tls_skip_verify_defaults_off_and_parses_strictly() {
+        assert!(!CoreSettings::default().source_gateway_tls_insecure_skip_verify);
+        assert!(parse_bool_env_value("TEST", "true").unwrap());
+        assert!(!parse_bool_env_value("TEST", "FALSE").unwrap());
+        for value in ["", "1", "yes", "enabled"] {
+            let error = parse_bool_env_value("TEST", value).unwrap_err();
+            assert!(error.to_string().contains("must be true or false"));
+        }
+    }
+
+    #[test]
+    fn source_gateway_base_url_must_be_https_without_credentials_or_redirect_data() {
+        for value in [
+            "http://172.21.26.25/bohui/media/",
+            "https://user:password@172.21.26.25/bohui/media/",
+            "https://172.21.26.25/bohui/media/?next=https://attacker.invalid",
+            "https://172.21.26.25/bohui/media/#fragment",
+        ] {
+            let settings = Settings {
+                environment: "development".to_string(),
+                logging: LoggingSettings::default(),
+                core: CoreSettings {
+                    database_url: "postgresql://unused".to_string(),
+                    source_gateway_base_url: value.to_string(),
+                    ..CoreSettings::default()
+                },
+            };
+            assert!(
+                settings.validate(false, false).is_err(),
+                "accepted unsafe Source Gateway URL {value}"
+            );
+        }
+    }
 }

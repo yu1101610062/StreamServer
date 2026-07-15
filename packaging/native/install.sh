@@ -2546,6 +2546,8 @@ assert_security_env_keys_unique() {
     CORE_AGENT_CAPABILITY_JWT_PUBLIC_KEY_PATH CORE_AGENT_CAPABILITY_TTL_SEC \
     CORE_INSTANCE_ID CORE_AGENT_MANAGEMENT_CLIENT_CERT_PATH \
     CORE_AGENT_MANAGEMENT_CLIENT_KEY_PATH CORE_AGENT_MANAGEMENT_CA_PATH \
+    SOURCE_GATEWAY_BASE_URL SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY \
+    SOURCE_GATEWAY_PREFETCH_POLL_MS SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS \
     NODE_ID AGENT_NODE_ID AGENT_CORE_ENDPOINT AGENT_IDENTITY_DIR \
     AGENT_CERT_PATH AGENT_KEY_PATH AGENT_CA_PATH AGENT_TLS_DOMAIN_NAME \
     AGENT_MANAGEMENT_ADDR AGENT_MANAGEMENT_PORT \
@@ -6236,6 +6238,8 @@ configure_core_values() {
   local jwt_public_target
   local jwt_private_temp
   local jwt_public_temp
+  local source_gateway_tls_skip
+  local source_gateway_tls_default
   if [ "${INITIAL_ADMIN_PASSWORD_READY:-0}" -ne 1 ]; then
     unset ADMIN_PASSWORD
   fi
@@ -6297,6 +6301,32 @@ configure_core_values() {
   [ -n "${HOOK_SHARED_SECRET}" ] || HOOK_SHARED_SECRET="${generated_secret}"
   HOOK_SOURCE_ALLOWLIST="$(prompt "Hook 源 IP 白名单，逗号分隔（可留空）" "$(env_value_or_default "${existing_env_file}" "HOOK_SOURCE_ALLOWLIST" "")")"
   STORAGE_ALLOWLIST="$(prompt_non_empty "本地媒体文件访问白名单，逗号分隔" "$(env_value_or_default "${existing_env_file}" "STORAGE_ALLOWLIST" "${INSTALL_DIR}/data/media/work,${INSTALL_DIR}/data/zlm/www")")"
+  SOURCE_GATEWAY_BASE_URL="$(prompt "Source Gateway HTTPS 基准地址（留空关闭）" "$(env_value_or_default "${existing_env_file}" "SOURCE_GATEWAY_BASE_URL" "")")"
+  if [ -n "${SOURCE_GATEWAY_BASE_URL}" ]; then
+    case "${SOURCE_GATEWAY_BASE_URL}" in
+      https://*) ;;
+      *) fail "SOURCE_GATEWAY_BASE_URL must use https" ;;
+    esac
+  fi
+  source_gateway_tls_skip="$(env_value_or_default "${existing_env_file}" "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY" "false")"
+  case "${source_gateway_tls_skip}" in
+    true) source_gateway_tls_default="Y" ;;
+    false) source_gateway_tls_default="N" ;;
+    *) fail "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY must be true or false" ;;
+  esac
+  if prompt_yes_no "是否仅对 Source Gateway 跳过证书链、有效期和主机名验证？" "${source_gateway_tls_default}"; then
+    SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY="true"
+  else
+    SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY="false"
+  fi
+  SOURCE_GATEWAY_PREFETCH_POLL_MS="$(prompt_positive_integer \
+    "SOURCE_GATEWAY_PREFETCH_POLL_MS" "Source Gateway 预取轮询间隔（毫秒）" \
+    "$(env_value_or_default "${existing_env_file}" "SOURCE_GATEWAY_PREFETCH_POLL_MS" "1000")")"
+  SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS="$(prompt_positive_integer \
+    "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS" "Source Gateway 预取总超时（毫秒）" \
+    "$(env_value_or_default "${existing_env_file}" "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS" "600000")")"
+  [ "${SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS}" -ge "${SOURCE_GATEWAY_PREFETCH_POLL_MS}" ] \
+    || fail "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
   existing_auth_mode="$(env_value_or_default "${existing_env_file}" "AUTH_MODE" "local_password")"
   AUTH_MODE="${existing_auth_mode}"
   AUTH_ENABLED="true"
@@ -6815,6 +6845,13 @@ write_env_file() {
     write_env_entry "${env_file}" HOOK_SHARED_SECRET "${HOOK_SHARED_SECRET}"
     write_env_entry "${env_file}" HOOK_SOURCE_ALLOWLIST "${HOOK_SOURCE_ALLOWLIST}"
     write_env_entry "${env_file}" STORAGE_ALLOWLIST "${STORAGE_ALLOWLIST}"
+    write_env_entry "${env_file}" SOURCE_GATEWAY_BASE_URL "${SOURCE_GATEWAY_BASE_URL}"
+    write_env_entry "${env_file}" SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY \
+      "${SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY}"
+    write_env_entry "${env_file}" SOURCE_GATEWAY_PREFETCH_POLL_MS \
+      "${SOURCE_GATEWAY_PREFETCH_POLL_MS}"
+    write_env_entry "${env_file}" SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS \
+      "${SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS}"
     write_env_entry "${env_file}" AUTH_MODE "${AUTH_MODE}"
     write_env_entry "${env_file}" AUTH_ENABLED "${AUTH_ENABLED}"
     write_env_entry "${env_file}" JWT_PUBLIC_KEY "${JWT_PUBLIC_KEY}"

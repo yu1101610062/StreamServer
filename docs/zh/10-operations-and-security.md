@@ -18,6 +18,7 @@
 | 规格与实现不一致 | 文档没同步更新 | 联调误解、返工 | 文档字段缺失 | 接口和表结构变更必须先更新文档 |
 | 时钟漂移 | 节点时间不一致 | 事件顺序混乱 | 时间戳异常跳变 | NTP 同步，事件排序优先用数据库时间 |
 | 录制不计为 viewer | ZLM 默认语义 | 无观众自动关流误伤录制任务 | `stream_no_reader` 频繁触发 | 默认 `auto_close=0`，录制视为保活条件 |
+| Source Gateway 跳过 TLS 身份验证 | `SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY=true` | 中间人可读取或篡改 Gateway API 与 relay 流量 | Core 启动时出现 TLS verification is disabled 警告 | 默认保持 false；确需开启时固定入口 IP、限制网络来源并纳入现场风险签字 |
 
 ## 3. 开发期重点关注
 
@@ -31,3 +32,4 @@
 - ZLM Hook 已验证白名单和 shared secret。
 - 节点能力快照已成功写库。
 - 恢复场景至少验证 Core、Agent、ZLM 三类重启。
+- 如启用 Source Gateway TLS 跳过验证，确认开关只存在于 Core，FFmpeg/FFprobe 参数及其他 mTLS 链路未被修改。

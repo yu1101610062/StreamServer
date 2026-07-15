@@ -38,6 +38,7 @@ callback_settle_delay_ms = 8000
 callback_shared_secret = ""
 storage_allowlist = ["/data/media/work", "/data/zlm/www"]
 source_gateway_base_url = ""
+source_gateway_tls_insecure_skip_verify = false
 source_gateway_prefetch_poll_ms = 1000
 source_gateway_prefetch_timeout_ms = 600000
 

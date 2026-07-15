@@ -52,6 +52,10 @@ const MANAGED_ORDER: &[&str] = &[
     "HOOK_SHARED_SECRET",
     "HOOK_SOURCE_ALLOWLIST",
     "STORAGE_ALLOWLIST",
+    "SOURCE_GATEWAY_BASE_URL",
+    "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",
+    "SOURCE_GATEWAY_PREFETCH_POLL_MS",
+    "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
     "AUTH_MODE",
     "AUTH_ENABLED",
     "JWT_PUBLIC_KEY",
@@ -351,6 +355,34 @@ fn page_fields(page: Page) -> &'static [FieldDef] {
                 kind: FieldKind::Choice(AUTH_MODE_CHOICES),
                 scope: FieldScope::Core,
                 help: "是否启用控制面板内建用户名密码登录。安装后启用时，请确认已有管理员账号。",
+            },
+            FieldDef {
+                key: "SOURCE_GATEWAY_BASE_URL",
+                label: "Source Gateway 地址",
+                kind: FieldKind::Text,
+                scope: FieldScope::Core,
+                help: "Core 访问 Source Gateway 的固定 HTTPS 基准地址。留空表示关闭；带路径前缀时建议以 / 结尾。",
+            },
+            FieldDef {
+                key: "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",
+                label: "忽略 Gateway TLS 校验",
+                kind: FieldKind::Choice(BOOL_CHOICES),
+                scope: FieldScope::Core,
+                help: "仅影响 Core 到 Source Gateway。开启后仍使用 TLS 加密，但不校验证书链、有效期和主机名，存在中间人攻击风险。",
+            },
+            FieldDef {
+                key: "SOURCE_GATEWAY_PREFETCH_POLL_MS",
+                label: "Gateway 预取轮询毫秒",
+                kind: FieldKind::Text,
+                scope: FieldScope::Core,
+                help: "Core 查询点播预取状态的间隔，必须为正整数。",
+            },
+            FieldDef {
+                key: "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
+                label: "Gateway 预取超时毫秒",
+                kind: FieldKind::Text,
+                scope: FieldScope::Core,
+                help: "Core 等待点播预取完成的总时长，必须不小于轮询间隔。",
             },
             FieldDef {
                 key: "NODE_ID",
@@ -1621,6 +1653,19 @@ fn apply_defaults(values: &mut BTreeMap<String, String>, interfaces: &[NetworkIn
         default_if_missing(values, "AUTH_JWT_PUBLIC_KEY_PATH", "");
         default_if_missing(values, "AUTH_ACCESS_TOKEN_TTL", "15m");
         default_if_missing(values, "AUTH_REFRESH_TOKEN_TTL", "7d");
+        default_if_missing(values, "SOURCE_GATEWAY_BASE_URL", "");
+        default_if_missing(values, "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY", "false");
+        default_if_missing(values, "SOURCE_GATEWAY_PREFETCH_POLL_MS", "1000");
+        default_if_missing(values, "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS", "600000");
+    } else {
+        for key in [
+            "SOURCE_GATEWAY_BASE_URL",
+            "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",
+            "SOURCE_GATEWAY_PREFETCH_POLL_MS",
+            "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
+        ] {
+            values.remove(key);
+        }
     }
 
     if values_have_worker(values) {
@@ -2206,6 +2251,8 @@ fn required_text_field(key: &str) -> bool {
             | "AGENT_MP4_RECORD_SEGMENT_SEC"
             | "AGENT_ARTIFACT_CLEANUP_THRESHOLD_PERCENT"
             | "AGENT_ARTIFACT_CLEANUP_CHECK_INTERVAL_SEC"
+            | "SOURCE_GATEWAY_PREFETCH_POLL_MS"
+            | "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS"
     ) || is_port_key(key)
         || is_port_range_key(key)
 }
@@ -2254,6 +2301,11 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
     }
 
     validate_choice(values, "AUTH_MODE", AUTH_MODE_CHOICES)?;
+    validate_choice(
+        values,
+        "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",
+        BOOL_CHOICES,
+    )?;
     validate_choice(values, "AGENT_ACCELERATION_MODE", ACCELERATION_CHOICES)?;
     validate_choice(values, "AGENT_ARTIFACT_CLEANUP_ENABLED", BOOL_CHOICES)?;
     validate_choice(values, "AGENT_HLS_RECORD_SEGMENT_SEC", HLS_SEGMENT_CHOICES)?;
@@ -2302,6 +2354,48 @@ fn validate_values(values: &BTreeMap<String, String>) -> anyhow::Result<()> {
                 .trim()
                 .parse::<u64>()
                 .with_context(|| format!("{key} must be zero or a positive integer"))?;
+        }
+    }
+
+    if let Some(base_url) = values.get("SOURCE_GATEWAY_BASE_URL") {
+        let base_url = base_url.trim();
+        if !base_url.is_empty() && !base_url.starts_with("https://") {
+            bail!("SOURCE_GATEWAY_BASE_URL must use https");
+        }
+    }
+    let source_gateway_poll_ms = values
+        .get("SOURCE_GATEWAY_PREFETCH_POLL_MS")
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| "SOURCE_GATEWAY_PREFETCH_POLL_MS must be an integer")
+        })
+        .transpose()?;
+    let source_gateway_timeout_ms = values
+        .get("SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS")
+        .map(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .with_context(|| "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be an integer")
+        })
+        .transpose()?;
+    if let Some(poll_ms) = source_gateway_poll_ms {
+        if poll_ms == 0 {
+            bail!("SOURCE_GATEWAY_PREFETCH_POLL_MS must be greater than 0");
+        }
+    }
+    if let Some(timeout_ms) = source_gateway_timeout_ms {
+        if timeout_ms == 0 {
+            bail!("SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than 0");
+        }
+    }
+    if let (Some(poll_ms), Some(timeout_ms)) = (source_gateway_poll_ms, source_gateway_timeout_ms) {
+        if timeout_ms < poll_ms {
+            bail!(
+                "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS must be greater than or equal to SOURCE_GATEWAY_PREFETCH_POLL_MS"
+            );
         }
     }
 
@@ -2541,6 +2635,22 @@ const ENV_COMMENTS: &[(&str, &str)] = &[
         "AUTH_MODE",
         "控制台鉴权模式，可选 disabled/local_password/external_jwt。",
     ),
+    (
+        "SOURCE_GATEWAY_BASE_URL",
+        "Core 访问 Source Gateway 的固定 HTTPS 基准地址，留空表示关闭。",
+    ),
+    (
+        "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",
+        "是否仅对 Source Gateway 跳过证书链、有效期和主机名验证，默认 false。",
+    ),
+    (
+        "SOURCE_GATEWAY_PREFETCH_POLL_MS",
+        "点播预取状态轮询间隔毫秒数。",
+    ),
+    (
+        "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
+        "点播预取总超时毫秒数。",
+    ),
     ("AUTH_ENABLED", "是否启用鉴权。"),
     ("NODE_ID", "工作节点唯一 ID，已上线后不要随意修改。"),
     ("AGENT_NODE_NAME", "控制台展示的节点名称。"),
@@ -2666,6 +2776,56 @@ mod tests {
         assert_eq!(parse_port_range_text("TEST_RANGE", "0-0").unwrap(), (0, 0));
         assert!(parse_port_range_text("TEST_RANGE", "10100-10000").is_err());
         assert!(parse_port_range_text("TEST_RANGE", "0-10000").is_err());
+    }
+
+    #[test]
+    fn source_gateway_configuration_is_core_only_and_defaults_to_strict_tls() {
+        let mut core = BTreeMap::from([("INSTALL_ROLE".to_string(), "control-plane".to_string())]);
+        apply_defaults(&mut core, &[]);
+        assert_eq!(core["SOURCE_GATEWAY_BASE_URL"], "");
+        assert_eq!(core["SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY"], "false");
+        assert_eq!(core["SOURCE_GATEWAY_PREFETCH_POLL_MS"], "1000");
+        assert_eq!(core["SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS"], "600000");
+        for key in [
+            "SOURCE_GATEWAY_BASE_URL",
+            "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY",
+            "SOURCE_GATEWAY_PREFETCH_POLL_MS",
+            "SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS",
+        ] {
+            assert!(MANAGED_ORDER.contains(&key));
+            assert!(
+                page_fields(Page::Basic)
+                    .iter()
+                    .any(|field| field.key == key && field.scope == FieldScope::Core),
+                "{key} is not exposed as a Core field"
+            );
+        }
+
+        core.insert(
+            "SOURCE_GATEWAY_BASE_URL".to_string(),
+            "https://172.21.26.25/bohui/media/".to_string(),
+        );
+        core.insert(
+            "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY".to_string(),
+            "true".to_string(),
+        );
+        validate_values(&core).unwrap();
+        core.insert(
+            "SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY".to_string(),
+            "yes".to_string(),
+        );
+        assert!(validate_values(&core).is_err());
+
+        let mut worker = BTreeMap::from([
+            ("INSTALL_ROLE".to_string(), "worker-host-cpu".to_string()),
+            (
+                "SOURCE_GATEWAY_BASE_URL".to_string(),
+                "https://should-be-removed.invalid/".to_string(),
+            ),
+        ]);
+        apply_defaults(&mut worker, &[]);
+        assert!(!worker.contains_key("SOURCE_GATEWAY_BASE_URL"));
+        assert!(!worker.contains_key("SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY"));
     }
 
     #[test]
