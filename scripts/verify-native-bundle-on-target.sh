@@ -649,6 +649,20 @@ if overflow:
 PY
 }
 
+normalize_report_line_endings() {
+  local report_path="$1"
+  python3 - "${report_path}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+content = path.read_bytes()
+normalized = content.replace(b"\r\n", b"\n")
+if normalized != content:
+    path.write_bytes(normalized)
+PY
+}
+
 main() {
   parse_args "$@"
   parse_access_file
@@ -3921,6 +3935,12 @@ exit \"\${remote_status}\"
       status=1
     fi
     exit "${status}"
+  fi
+  if ! normalize_report_line_endings "${LOCAL_REPORT_TMP}"; then
+    rm -f -- "${LOCAL_REPORT_TMP}"
+    LOCAL_REPORT_TMP=""
+    log "ERROR: 无法规范化目标验证报告换行"
+    exit 1
   fi
 
   failure_zero_count="$(grep -Fxc -- '- failures: 0' "${LOCAL_REPORT_TMP}" || true)"
