@@ -589,7 +589,7 @@ static int address_port(const char *value) {
   return colon ? atoi(colon + 1) : 0;
 }
 
-static int run_http_server(const char *address_env) {
+static int run_http_server(const char *address_env, int gateway_mode) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   int enabled = 1;
   struct sockaddr_in address;
@@ -603,14 +603,30 @@ static int run_http_server(const char *address_env) {
   for (;;) {
     int client = accept(fd, NULL, NULL);
     char request[1024];
+    const char *response;
     ssize_t received;
     ssize_t sent;
-    static const char response[] =
+    static const char ok_response[] =
       "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+    static const char ready_response[] =
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+      "Content-Length: 18\r\nConnection: close\r\n\r\n{\"status\":\"ready\"}";
+    static const char status_response[] =
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+      "Content-Length: 22\r\nConnection: close\r\n\r\n{\"queue_high_water\":0}";
     if (client < 0) continue;
-    received = read(client, request, sizeof(request));
-    if (received >= 0) sent = write(client, response, sizeof(response) - 1);
-    else sent = -1;
+    received = read(client, request, sizeof(request) - 1);
+    if (received >= 0) {
+      request[received] = '\0';
+      response = ok_response;
+      if (gateway_mode && strstr(request, "GET /api/readyz "))
+        response = ready_response;
+      else if (gateway_mode && strstr(request, "GET /api/status "))
+        response = status_response;
+      sent = write(client, response, strlen(response));
+    } else {
+      sent = -1;
+    }
     close(client);
     if (sent < 0) continue;
   }
@@ -631,7 +647,7 @@ int main(int argc, char **argv) {
       fputs("unknown media-agent command\n", stderr);
       return 1;
     }
-    return run_http_server("AGENT_PUBLIC_MEDIA_ADDR");
+    return run_http_server("AGENT_PUBLIC_MEDIA_ADDR", 0);
   }
   if (strstr(name, "media-gateway")) {
     const char *pid_file = getenv("STUBBORN_GATEWAY_PID_FILE");
@@ -648,7 +664,7 @@ int main(int argc, char **argv) {
     if (flood_bytes_value) putchar('\n');
     puts("media-gateway ready");
     fflush(stdout);
-    return run_http_server("MEDIA_GATEWAY_BIND_ADDR");
+    return run_http_server("MEDIA_GATEWAY_BIND_ADDR", 1);
   }
   if (strstr(name, "streamserver-config")) {
     int index;
