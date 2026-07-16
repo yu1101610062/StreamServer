@@ -888,12 +888,20 @@ grep -Fq 'chmod 700 "${POSTGRES_SMOKE_CONTROL_DIR}"' "${VERIFY_SCRIPT}" \
   && grep -Fq 'chmod 600 "${POSTGRES_SMOKE_PID_REGISTRY}"' "${VERIFY_SCRIPT}" \
   && grep -Fq 'chmod 755 "${POSTGRES_SMOKE_TOOL_DIR}"' "${VERIFY_SCRIPT}" || \
   contract_failure 'PostgreSQL control/tool paths do not have explicit safe modes'
-grep -Fq 'chmod 711 "${WORK_DIR}" "${RUN_WORK}" "${RUN_WORK}/extract"' \
-  "${VERIFY_SCRIPT}" || \
-  contract_failure 'root verifier does not grant the dropped PostgreSQL process execute-only traversal'
+grep -Fq 'POSTGRES_SMOKE_RUNTIME_DIR="$(mktemp -d /tmp/ss-pg-runtime.XXXXXXXX)"' \
+  "${VERIFY_SCRIPT}" \
+  && grep -Fq 'chmod 755 "${POSTGRES_SMOKE_TOOL_DIR}" "${POSTGRES_SMOKE_RUNTIME_DIR}"' \
+    "${VERIFY_SCRIPT}" \
+  && grep -Fq 'chown -R 0:0 "${POSTGRES_SMOKE_RUNTIME_DIR}"' \
+    "${VERIFY_SCRIPT}" || \
+  contract_failure 'root PostgreSQL smoke does not use an isolated root-owned runtime view'
+if grep -Fq 'chmod 711 "${WORK_DIR}" "${RUN_WORK}" "${RUN_WORK}/extract"' \
+    "${VERIFY_SCRIPT}"; then
+  contract_failure 'root verifier exposes private archive traversal to the dropped PostgreSQL process'
+fi
 grep -Fq 'verification work directory must be canonical, real, and owned by the verifier user' \
   "${VERIFY_SCRIPT}" || \
-  contract_failure 'root verifier can chmod an untrusted or symlinked work directory'
+  contract_failure 'verification work directory ownership and canonical path are not enforced'
 if grep -Fq 'chown -R nobody "${tmp}"' "${VERIFY_SCRIPT}"; then
   contract_failure 'PostgreSQL runtime ownership still includes root control state'
 fi
