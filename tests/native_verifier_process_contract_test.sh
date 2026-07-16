@@ -110,6 +110,15 @@ grep -Fq 'bash --noprofile --norc -e -u -o pipefail -c "$*"' \
   exit 1
 }
 
+if grep -Fq 'if [ "${BASH_VERSINFO[0]}" -ge 5 ]; then' "${VERIFY_SCRIPT}"; then
+  echo 'bounded capture still assumes Bash 5.0 supports wait -p' >&2
+  exit 1
+fi
+grep -Fq '[ "${BASH_VERSINFO[1]}" -ge 1 ]' "${VERIFY_SCRIPT}" || {
+  echo 'bounded capture does not fall back for Bash 5.0 wait -p compatibility' >&2
+  exit 1
+}
+
 gateway_smoke="$(sed -n \
   '/run_shell "media-gateway startup smoke"/,/^"$/p' "${VERIFY_SCRIPT}")"
 printf '%s\n' "${gateway_smoke}" \

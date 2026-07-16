@@ -1662,7 +1662,12 @@ run_bounded_capture() {
   fi
   rm -f -- "${gate_path}" "${command_ready}" "${reader_ready}"
 
-  if [ "${BASH_VERSINFO[0]}" -ge 5 ]; then
+  # `wait -p` was added in Bash 5.1. Bash 5.0 accepts `wait -n` but rejects
+  # `-p`, which used to make every bounded command look like it failed before
+  # it had a chance to write output on older target distributions.
+  if [ "${BASH_VERSINFO[0]}" -gt 5 ] \
+    || { [ "${BASH_VERSINFO[0]}" -eq 5 ] \
+      && [ "${BASH_VERSINFO[1]}" -ge 1 ]; }; then
     if wait -n -p completed_pid "${command_pid}" "${reader_pid}"; then
       first_status=0
     else
