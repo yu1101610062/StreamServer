@@ -44,6 +44,8 @@ streamserver-native-v0.1.0-linux-amd64-control-plane-minimal-20260602.tar.gz
 
 `media-gateway` 对普通 MP4/TS 点播执行 HTTP 下载；HLS 点播即使没有时间参数也会通过 FFmpeg 将播放列表和分片完整物化到共享目录。当 Core 传入 `input.start_offset_sec` 或 `record.duration_sec` 时，Gateway 使用 FFmpeg 输入侧 seek、`-t` 和 `-c copy` 生成共享存储时间片。该过程不转码，编码、分辨率、帧率和音频参数保持不变，但容器索引、时间戳和 HLS 分片边界会重新生成，起点精度受关键帧约束。
 
+直播 relay URL 不依赖文件扩展名。Agent 调用 ZLM `addStreamProxy` 时会按原始输入类型显式传入 `schema=hls|ts|flv`；该参数只选择输入播放器，不是对外播放协议。直播全部 expose 关闭时仍由规格归一化保留 HTTP-fMP4，避免切回存在 MP4 时间轴风险的纯录制路径。
+
 Gateway 主机通过 `MEDIA_GATEWAY_FFMPEG_BIN` 指定 FFmpeg；未设置时依次回退到 `FFMPEG_BIN` 和 PATH 中的 `ffmpeg`。`MEDIA_GATEWAY_FFPROBE_BIN` 用于校验原子发布前的本地输出，未设置时默认使用 FFmpeg 同目录下的 `ffprobe`。worker/all-in-one 可以复用 Native 安装器生成的运行时，独立 Gateway 或 core-only 主机必须显式提供可执行文件。源站不支持 Range、HLS 分片定位或容器快速 seek 时，Gateway 不会在共享存储落完整源文件，但网络侧仍可能读取偏移量之前的数据。
 
 大批量现场任务建议显式使用以下 Gateway 边界。下载与 FFmpeg 各自使用 FIFO 队列，排队任务不建立上游连接或启动子进程；`0` 的排队超时表示不限排队时长：
@@ -78,6 +80,8 @@ SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=0
 ```
 
 `SOURCE_GATEWAY_BASE_URL` 为空时整个 Gateway 改写链路关闭。启用时必须使用 HTTPS；客户端会保留基准地址中的路径前缀、禁用系统代理并拒绝跟随 HTTP 重定向。Core 提交点播后不在创建接口内等待，排队阶段遵循 Gateway 返回的 30 秒提示、运行阶段遵循 5 秒提示；`SOURCE_GATEWAY_PREFETCH_TIMEOUT_MS=0` 表示 Core 不设置总等待时限。`SOURCE_GATEWAY_TLS_INSECURE_SKIP_VERIFY` 默认 `false`，且只接受 `true`/`false`；显式设为 `true` 时，仅 Core 的 Source Gateway 专用客户端跳过证书链、有效期和主机名验证。该开关不影响 Core/Agent mTLS、Agent 管理接口、其他 HTTP 客户端或 FFmpeg/FFprobe。开启后传输仍加密，但对端身份不再可信，应同时使用固定入口地址和网络访问控制，并在 Core 启动日志中核对一次性风险警告。
+
+Prefetch 的 `target_path` 必须是 `imports/{task_id}/<filename>`，且路径 UUID 与请求任务一致。统一 DELETE 会先写取消墓碑并停止队列、HTTP 或 FFmpeg/FFprobe，再删除该任务的发布文件；清理期间状态为 `pending/canceling`。只有 relay 连接归零且文件清理完成才返回 204，清理未完成返回 503 和 `Retry-After: 1`，重复 DELETE 会继续幂等清理。Core 删除任务时也先完成该 Gateway DELETE，失败时保留 Core 任务供重试。
 
 ## 2. 目标服务器验收
 

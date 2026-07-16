@@ -379,6 +379,83 @@ impl TaskRepository {
         self.fetch_task_summary(task_id).await
     }
 
+    pub async fn prepare_task_delete(&self, task_id: Uuid) -> Result<TaskSummary, RepoError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select
+              id,
+              name,
+              type::text as task_type,
+              status::text as status,
+              priority,
+              created_by,
+              assigned_node_id,
+              current_attempt_no,
+              created_at,
+              updated_at,
+              started_at,
+              finished_at,
+              resolved_spec
+            from tasks
+            where id = $1
+            for update
+            "#,
+        )
+        .bind(task_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(RepoError::TaskNotFound(task_id))?;
+        let task = TaskSummary::from_row(&row)?;
+        let has_task_lease = sqlx::query_scalar::<_, bool>(
+            "select exists(select 1 from task_leases where task_id = $1)",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let lost_delete_allowed =
+            task.status == TaskStatus::Lost && task.assigned_node_id.is_none() && !has_task_lease;
+        if !task_status_allows_delete(task.status) && !lost_delete_allowed {
+            return Err(RepoError::TaskDeleteForbidden(task.status));
+        }
+
+        if matches!(
+            task.status,
+            TaskStatus::Created | TaskStatus::Validating | TaskStatus::Queued
+        ) {
+            let now = Utc::now();
+            sqlx::query(
+                r#"
+                update tasks
+                   set status = 'CANCELED'::task_status,
+                       updated_at = $1,
+                       finished_at = $1
+                 where id = $2
+                "#,
+            )
+            .bind(now)
+            .bind(task_id)
+            .execute(&mut *tx)
+            .await?;
+            self.insert_event(
+                &mut tx,
+                task_id,
+                None,
+                task.current_attempt_no_value(),
+                EventSource::User,
+                "task_delete_prepared",
+                "info",
+                json!({
+                    "from": task.status,
+                    "to": TaskStatus::Canceled,
+                }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(task)
+    }
+
     pub async fn delete_task(&self, task_id: Uuid) -> Result<TaskSummary, RepoError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(

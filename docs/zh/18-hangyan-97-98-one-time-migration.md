@@ -291,8 +291,10 @@ token 只能经标准输入传给 enrollment 命令，不得进入 argv、环境
 - 由 42 对候选媒资执行 64 KiB Range 预检，连接超时 5 秒、总超时 10 秒、最大并发 10。源站失败单独记为“客户源不可用”，不得计为 Gateway 失败，并从同层候选中补齐。
 - 固定 `RUN_ID`，按资源 ID 哈希和平台占比选出 1000 条互不重复的浙江点播：约 845 TS、153 MP4，并纳入全部可用 HLS；HLS 不足时以 TS 补齐。所有任务使用独立 UUID 和 `gateway-real-acceptance-<RUN_ID>` 前缀。
 - 20 条浙江真实直播 HLS 必须覆盖主/媒体播放列表和带/不带查询参数，连续运行至少 10 分钟。主清单、子清单、普通 URI、`EXT-X-KEY`、`EXT-X-MAP`、`EXT-X-MEDIA` 及分片都必须改写到 `/bohui/media/relay/<task>/hls/<resource>`；97/98 不得直连客户 CDN。
+- ZLM `addStreamProxy` 对上述无扩展名 relay URL 必须携带输入 `schema=hls`；HTTP-TS、HTTP-FLV 分别使用 `schema=ts`、`schema=flv`。该字段不得取代或覆盖用于验收输出播放地址的 schema。
 - 1000 个真实点播按并发 50 突发提交，其中 900 个完整预取、100 个 60 秒时间片。Core 创建请求应快速返回；Gateway `active_downloads<=4`、`active_ffmpeg<=2`、队列高水位不少于 900，平均状态查询不超过 40 次/秒，且无 OOM、异常重启或文件描述符持续增长。
-- 从上述任务中经 Core 取消 950 个，优先覆盖至少 900 个排队任务，并覆盖活动下载和 FFmpeg。排队项 5 秒内消失，活动项 30 秒内退出；没有残留 PID、上游连接、`.part` 文件或目录，观察两个调度周期不得复活。Gateway 未返回 204 时 Core 必须返回 503，重复取消继续清理。
+- 从上述任务中经 Core 取消 950 个，优先覆盖至少 900 个排队任务，并覆盖活动下载、FFmpeg 和已发布为 ready 的任务。排队项 5 秒内消失，活动项 30 秒内退出；没有残留 PID、上游连接、`.part` 文件、最终文件或任务目录，观察两个调度周期不得复活。清理中的 Gateway 状态为 `pending/canceling`；Gateway 未返回 204 时 Core 必须返回 503，重复取消继续清理。
+- 另选一条可快速完成的真实点播，经 25 提交到 `imports/{task_id}/source.*`，达到 ready 后调用统一 DELETE；确认 42、97、98 上对应任务目录同时消失。未先取消时 reset 必须返回 409，取消完成后 reset 并重新提交必须重新获取媒资。
 - 保留 50 个任务完成，其中 30 个完整预取、20 个 60 秒切片，覆盖 TS、MP4 和全部可用 HLS，完整下载总预算不超过 20 GiB。每个输出使用 FFprobe 检查格式、时长、非空音视频流及可解码性；HLS 必须包含本地播放列表和分片，97/98 对同一输出的 SHA256 一致。
 - 临时清空 `SOURCE_GATEWAY_BASE_URL` 并只重启 Core，分别验证本地上传文件、共享文件、非 HTTP 输入及原 Core 到 Agent 全流程；恢复 Gateway 四项配置后仍只重启 Core。该回归不得修改 Agent 或 Avqual 代码。
 - 正式 Gateway API 验收只能访问 `https://172.21.26.25/bohui/media/`，42 直连仅用于源站预检和进程级诊断，不得作为路由验收结果。
@@ -303,6 +305,7 @@ token 只能经标准输入传给 enrollment 命令，不得进入 argv、环境
 - `curl -k https://172.21.26.25/bohui/media/api/healthz` 和 `/bohui/work/healthz` 成功。
 - `/bohui/work/llm/...` 到达 99、查询参数不丢失；未定义 Work 路径返回 404。
 - 直播返回 `https://172.21.26.25/bohui/media/relay/...`，Agent 能拉取并完成任务；停止任务后旧 relay 及全部 HLS 子资源返回 404。
+- 通过 Core 删除失败直播或完成点播前必须先清理 Gateway；Gateway 返回 503 时 Core 删除也返回 503且任务仍可查询，重试成功后 Gateway 记录、relay 和 `imports/{task_id}` 一并清零。
 - HTTP 点播、时间切片正常，`imports/{task_id}` 在共享目录生成，97/98 哈希一致。
 - 98 原上传文件数量和 SHA256 不变，ZLM 无法通过 HTTP 读取 `streamserver-work`。
 - 97/98 只使用新节点身份，历史身份不能连接；Core/Agent mTLS 正常。

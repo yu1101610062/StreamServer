@@ -101,6 +101,31 @@ fn prefetch_target_path_stays_under_work_root_and_not_uploads() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn prefetch_rejects_target_path_owned_by_another_task() -> anyhow::Result<()> {
+    let temp = test_temp_dir()?;
+    let app = test_gateway_app(
+        temp,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig::default(),
+    );
+    let task_id = uuid::Uuid::from_u128(0x501);
+    let other_task_id = uuid::Uuid::from_u128(0x502);
+    let response = post_json(
+        &app,
+        "/api/prefetch",
+        json!({
+            "task_id": task_id,
+            "source_url": "http://customer.example/archive.mp4",
+            "target_path": format!("imports/{other_task_id}/source.mp4"),
+            "source_kind": "http_mp4"
+        }),
+    )
+    .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    Ok(())
+}
+
+#[tokio::test]
 async fn prefetch_downloads_http_source_to_shared_storage_path() -> anyhow::Result<()> {
     async fn source() -> &'static str {
         "prefetch-bytes"
@@ -818,10 +843,11 @@ async fn production_prefetch_validation_uses_cancelable_ffprobe() -> anyhow::Res
 
 #[cfg(unix)]
 #[tokio::test]
-async fn reset_reuses_an_atomically_published_hls_directory() -> anyhow::Result<()> {
+async fn cancel_then_reset_redownloads_atomically_published_hls() -> anyhow::Result<()> {
     let temp = test_temp_dir()?;
     let ffmpeg = install_fake_ffmpeg(&temp, 0)?;
     let task_id = uuid::Uuid::from_u128(0x447);
+    let target_dir = temp.join(format!("imports/{task_id}"));
     let app = test_gateway_app(temp, ffmpeg.clone(), GatewayRuntimeConfig::default());
     let payload = json!({
         "task_id": task_id,
@@ -843,6 +869,18 @@ async fn reset_reuses_an_atomically_published_hls_directory() -> anyhow::Result<
         app.clone()
             .oneshot(
                 Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/reset"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
                     .method("DELETE")
                     .uri(format!("/api/tasks/{task_id}"))
                     .body(Body::empty())?,
@@ -851,6 +889,7 @@ async fn reset_reuses_an_atomically_published_hls_directory() -> anyhow::Result<
             .status(),
         StatusCode::NO_CONTENT
     );
+    assert!(!target_dir.exists());
     assert_eq!(
         app.clone()
             .oneshot(
@@ -873,9 +912,176 @@ async fn reset_reuses_an_atomically_published_hls_directory() -> anyhow::Result<
         "ready"
     );
     assert!(
-        !fake_ffmpeg_args_path(&ffmpeg).exists(),
-        "published HLS was downloaded again after reset"
+        fake_ffmpeg_args_path(&ffmpeg).exists(),
+        "canceled HLS was not downloaded again after reset"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_cleanup_failure_stays_canceling_until_delete_retry_succeeds() -> anyhow::Result<()> {
+    async fn source() -> &'static str {
+        "ready-prefetch"
+    }
+
+    let upstream = spawn_server(Router::new().route("/archive.mp4", get(source))).await?;
+    let temp = test_temp_dir()?;
+    let task_id = uuid::Uuid::from_u128(0x448);
+    let target_dir = temp.join(format!("imports/{task_id}"));
+    let app = test_gateway_app(
+        temp,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig::default(),
+    );
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/prefetch",
+            json!({
+                "task_id": task_id,
+                "source_url": format!("{upstream}/archive.mp4"),
+                "target_path": format!("imports/{task_id}/source.mp4"),
+                "source_kind": "http_mp4"
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        wait_prefetch_terminal(app.clone(), task_id).await?["status"],
+        "ready"
+    );
+    let blocker = target_dir.join("unexpected-file");
+    std::fs::write(&blocker, "block cleanup")?;
+
+    let first_delete = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(first_delete.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(first_delete.headers()[header::RETRY_AFTER], "1");
+
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/prefetch/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status: Value = serde_json::from_slice(&to_bytes(status.into_body(), usize::MAX).await?)?;
+    assert_eq!(status["status"], "pending");
+    assert_eq!(status["phase"], "canceling");
+    assert_eq!(status["poll_after_ms"], 1_000);
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/reset"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    std::fs::remove_file(blocker)?;
+    assert_eq!(
+        app.oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(!target_dir.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_cleans_ready_directory_after_terminal_record_is_pruned() -> anyhow::Result<()> {
+    async fn source() -> &'static str {
+        "pruned-ready-prefetch"
+    }
+
+    let upstream = spawn_server(Router::new().route("/archive.mp4", get(source))).await?;
+    let temp = test_temp_dir()?;
+    let task_id = uuid::Uuid::from_u128(0x449);
+    let target_dir = temp.join(format!("imports/{task_id}"));
+    let app = test_gateway_app(
+        temp,
+        PathBuf::from("ffmpeg"),
+        GatewayRuntimeConfig {
+            prefetch_terminal_retention: Duration::from_millis(200),
+            ..GatewayRuntimeConfig::default()
+        },
+    );
+    assert_eq!(
+        post_json(
+            &app,
+            "/api/prefetch",
+            json!({
+                "task_id": task_id,
+                "source_url": format!("{upstream}/archive.mp4"),
+                "target_path": format!("imports/{task_id}/source.mp4"),
+                "source_kind": "http_mp4"
+            }),
+        )
+        .await?
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        wait_prefetch_terminal(app.clone(), task_id).await?["status"],
+        "ready"
+    );
+    assert!(target_dir.exists());
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/prefetch/{task_id}"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/tasks/{task_id}/reset"))
+                    .body(Body::empty())?,
+            )
+            .await?
+            .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        app.oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/tasks/{task_id}"))
+                .body(Body::empty())?,
+        )
+        .await?
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(!target_dir.exists());
     Ok(())
 }
 
@@ -1161,11 +1367,7 @@ async fn cancel_running_download_closes_source_and_removes_part_file() -> anyhow
         )
         .await?;
     assert_eq!(canceled.status(), StatusCode::NO_CONTENT);
-    assert!(
-        std::fs::read_dir(&target_dir)?
-            .filter_map(Result::ok)
-            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".part"))
-    );
+    assert!(!target_dir.exists());
     let status = app
         .oneshot(
             Request::builder()

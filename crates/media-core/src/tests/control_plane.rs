@@ -2,7 +2,7 @@ use super::*;
 use crate::test_database::{acquire_test_database_slot, config_from_env, finish_setup};
 use std::{
     net::Ipv4Addr,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicU16, AtomicUsize, Ordering},
 };
 
 use axum::{Json, Router, http::StatusCode};
@@ -697,6 +697,47 @@ async fn spawn_pending_prefetch_gateway_stub()
             .expect("prefetch gateway stub should run");
     });
     Ok((format!("http://{addr}"), posts, gets, handle))
+}
+
+async fn spawn_gateway_cancel_stub() -> anyhow::Result<(
+    String,
+    Arc<AtomicU16>,
+    Arc<tokio::sync::Mutex<Vec<Uuid>>>,
+    JoinHandle<()>,
+)> {
+    use axum::{extract::Path, extract::State, routing::delete};
+
+    #[derive(Clone)]
+    struct CancelStubState {
+        status: Arc<AtomicU16>,
+        calls: Arc<tokio::sync::Mutex<Vec<Uuid>>>,
+    }
+
+    async fn cancel_task(
+        State(state): State<CancelStubState>,
+        Path(task_id): Path<Uuid>,
+    ) -> StatusCode {
+        state.calls.lock().await.push(task_id);
+        StatusCode::from_u16(state.status.load(Ordering::SeqCst))
+            .expect("stub status must be valid")
+    }
+
+    let status = Arc::new(AtomicU16::new(StatusCode::NO_CONTENT.as_u16()));
+    let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/api/tasks/{task_id}", delete(cancel_task))
+        .with_state(CancelStubState {
+            status: status.clone(),
+            calls: calls.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("gateway cancel stub should run");
+    });
+    Ok((format!("http://{addr}"), status, calls, handle))
 }
 
 fn sample_immediate_task_spec() -> TaskSpec {
@@ -3785,6 +3826,180 @@ async fn dispatch_task_fails_queued_task_when_gateway_relay_creation_fails() -> 
     assert_eq!(failed.status, TaskStatus::Failed);
     assert!(receiver.try_recv().is_err());
 
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_task_cancels_gateway_before_removing_database_row() -> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let (gateway_base, _status, calls, _gateway) = spawn_gateway_cancel_stub().await?;
+    let service = ControlPlaneService::with_source_gateway(
+        repository.clone(),
+        crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?,
+    );
+    let task = match repository
+        .create_task(
+            "source-gateway-delete",
+            "source-gateway-delete-hash",
+            sample_immediate_task_spec(),
+        )
+        .await?
+    {
+        crate::repository::CreateTaskResult::Fresh(task)
+        | crate::repository::CreateTaskResult::Replay(task) => task,
+    };
+    let queued = repository.ensure_task_queued(task.id).await?;
+
+    let deleted = service.delete_task(task.id).await?;
+
+    assert_eq!(deleted.id, task.id);
+    assert_eq!(deleted.status, queued.status);
+    assert_eq!(calls.lock().await.as_slice(), &[task.id]);
+    assert!(matches!(
+        repository.get_task_summary(task.id).await,
+        Err(RepoError::TaskNotFound(id)) if id == task.id
+    ));
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_task_keeps_canceled_row_when_gateway_cleanup_fails_and_allows_retry()
+-> anyhow::Result<()> {
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let (gateway_base, status, calls, _gateway) = spawn_gateway_cancel_stub().await?;
+    status.store(StatusCode::SERVICE_UNAVAILABLE.as_u16(), Ordering::SeqCst);
+    let service = ControlPlaneService::with_source_gateway(
+        repository.clone(),
+        crate::source_gateway::SourceGatewayClient::new_for_test(&gateway_base)?,
+    );
+    let task = match repository
+        .create_task(
+            "source-gateway-delete-retry",
+            "source-gateway-delete-retry-hash",
+            sample_immediate_task_spec(),
+        )
+        .await?
+    {
+        crate::repository::CreateTaskResult::Fresh(task)
+        | crate::repository::CreateTaskResult::Replay(task) => task,
+    };
+    repository.ensure_task_queued(task.id).await?;
+
+    assert!(matches!(
+        service.delete_task(task.id).await,
+        Err(ControlPlaneError::SourceGateway(_))
+    ));
+    assert_eq!(
+        repository.get_task_summary(task.id).await?.status,
+        TaskStatus::Canceled
+    );
+    assert_eq!(calls.lock().await.len(), 3);
+
+    status.store(StatusCode::NO_CONTENT.as_u16(), Ordering::SeqCst);
+    let deleted = service.delete_task(task.id).await?;
+    assert_eq!(deleted.status, TaskStatus::Canceled);
+    assert_eq!(calls.lock().await.len(), 4);
+    assert!(matches!(
+        repository.get_task_summary(task.id).await,
+        Err(RepoError::TaskNotFound(id)) if id == task.id
+    ));
+    db.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_task_serializes_against_gateway_dispatch() -> anyhow::Result<()> {
+    use axum::{extract::State, routing::delete, routing::post};
+
+    #[derive(Clone)]
+    struct GatewayRaceState {
+        delete_entered: Arc<tokio::sync::Notify>,
+        release_delete: Arc<tokio::sync::Notify>,
+        relay_posts: Arc<AtomicUsize>,
+    }
+
+    async fn cancel_task(State(state): State<GatewayRaceState>) -> StatusCode {
+        state.delete_entered.notify_one();
+        state.release_delete.notified().await;
+        StatusCode::NO_CONTENT
+    }
+
+    async fn create_relay(State(state): State<GatewayRaceState>) -> Json<Value> {
+        state.relay_posts.fetch_add(1, Ordering::SeqCst);
+        Json(json!({"relay_url": "http://media:18080/relay/unexpected"}))
+    }
+
+    let Some(db) = require_test_database(true).await? else {
+        return Ok(());
+    };
+    let delete_entered = Arc::new(tokio::sync::Notify::new());
+    let release_delete = Arc::new(tokio::sync::Notify::new());
+    let relay_posts = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/api/tasks/{task_id}", delete(cancel_task))
+        .route("/api/relays", post(create_relay))
+        .with_state(GatewayRaceState {
+            delete_entered: delete_entered.clone(),
+            release_delete: release_delete.clone(),
+            relay_posts: relay_posts.clone(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let gateway = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("gateway race stub should run");
+    });
+
+    let repository = Arc::new(TaskRepository::new(db.pool.clone()));
+    let service = ControlPlaneService::with_source_gateway(
+        repository.clone(),
+        crate::source_gateway::SourceGatewayClient::new_for_test(&format!("http://{addr}"))?,
+    );
+    let mut spec = sample_immediate_task_spec();
+    spec.input.kind = Some(InputKind::HttpFlv);
+    spec.input.source_mode = Some(SourceMode::Live);
+    spec.input.url = Some("http://customer.example/live.flv".to_string());
+    let task = match repository
+        .create_task(
+            "source-gateway-delete-race",
+            "source-gateway-delete-race-hash",
+            spec,
+        )
+        .await?
+    {
+        crate::repository::CreateTaskResult::Fresh(task)
+        | crate::repository::CreateTaskResult::Replay(task) => task,
+    };
+    repository.ensure_task_queued(task.id).await?;
+
+    let delete_service = service.clone();
+    let delete_handle = tokio::spawn(async move { delete_service.delete_task(task.id).await });
+    timeout(Duration::from_secs(1), delete_entered.notified()).await?;
+    let dispatch_service = service.clone();
+    let dispatch_handle =
+        tokio::spawn(async move { dispatch_service.dispatch_task(task.id).await });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(relay_posts.load(Ordering::SeqCst), 0);
+
+    release_delete.notify_one();
+    delete_handle.await??;
+    assert!(matches!(
+        dispatch_handle.await?,
+        Err(ControlPlaneError::Repository(RepoError::TaskNotFound(id))) if id == task.id
+    ));
+    assert_eq!(relay_posts.load(Ordering::SeqCst), 0);
+
+    gateway.abort();
     db.cleanup().await?;
     Ok(())
 }

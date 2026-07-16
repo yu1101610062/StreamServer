@@ -68,7 +68,7 @@ use crate::repository::{
     AgentManagementRotationActivationOutcome, AgentManagementRotationActivationRequest,
     AgentSessionWriteOutcome, AgentTaskEventRecord, CompleteAgentCertificateRotationOutcome,
     RecordingControlCommand, RepoError, TaskLogBatchRecord, TaskProgressRecord, TaskRepository,
-    TaskSnapshotRecord,
+    TaskSnapshotRecord, TaskSummary,
 };
 use crate::source_gateway::{GatewayPreparation, SourceGatewayClient};
 
@@ -2036,6 +2036,21 @@ impl ControlPlaneService {
         );
 
         Ok(())
+    }
+
+    pub async fn delete_task(&self, task_id: Uuid) -> Result<TaskSummary, ControlPlaneError> {
+        let Some(source_gateway) = &self.source_gateway else {
+            return Ok(self.repository.delete_task(task_id).await?);
+        };
+        let _gateway_guard = self.gateway_task_lock(task_id).await.lock_owned().await;
+        let original = self.repository.prepare_task_delete(task_id).await?;
+        self.gateway_poll_not_before.lock().await.remove(&task_id);
+        source_gateway
+            .cancel_task(task_id)
+            .await
+            .map_err(|error| ControlPlaneError::SourceGateway(error.to_string()))?;
+        self.repository.delete_task(task_id).await?;
+        Ok(original)
     }
 
     pub async fn reset_gateway_task(&self, task_id: Uuid) -> Result<(), ControlPlaneError> {

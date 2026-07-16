@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 mod prefetch;
@@ -181,6 +182,7 @@ struct PrefetchEntry {
     job: prefetch::PrefetchJob,
     class: prefetch::ExecutionClass,
     lifecycle: Mutex<PrefetchLifecycle>,
+    cleanup_serial: Mutex<()>,
     cancellation: CancellationToken,
     finished: Notify,
 }
@@ -189,6 +191,7 @@ struct PrefetchEntry {
 enum PrefetchPhase {
     Queued,
     Running,
+    Canceling,
     Ready,
     Failed,
     Canceled,
@@ -203,6 +206,7 @@ impl PrefetchPhase {
 #[derive(Debug)]
 struct PrefetchLifecycle {
     phase: PrefetchPhase,
+    execution_active: bool,
     created_at: Instant,
     source_url: Option<String>,
     failure_reason: Option<String>,
@@ -303,13 +307,12 @@ impl GatewayState {
             let entry = self.next_prefetch(class).await;
             let mut lifecycle = entry.lifecycle.lock().await;
             if lifecycle.phase != PrefetchPhase::Queued || entry.cancellation.is_cancelled() {
-                if !lifecycle.phase.is_terminal() {
-                    lifecycle.phase = PrefetchPhase::Canceled;
+                if !lifecycle.phase.is_terminal() && lifecycle.phase != PrefetchPhase::Canceling {
+                    lifecycle.phase = PrefetchPhase::Canceling;
                     lifecycle.failure_reason = Some("prefetch canceled".to_string());
-                    drop(lifecycle);
-                    self.record_prefetch_completion(entry.request.task_id).await;
-                    entry.finished.notify_waiters();
                 }
+                drop(lifecycle);
+                entry.finished.notify_waiters();
                 continue;
             }
             if !self.runtime.prefetch_queue_timeout.is_zero()
@@ -323,6 +326,7 @@ impl GatewayState {
                 continue;
             }
             lifecycle.phase = PrefetchPhase::Running;
+            lifecycle.execution_active = true;
             drop(lifecycle);
 
             let execution = prefetch::execute_prefetch(
@@ -348,11 +352,12 @@ impl GatewayState {
             };
 
             let mut lifecycle = entry.lifecycle.lock().await;
+            lifecycle.execution_active = false;
             if execution_timed_out {
                 lifecycle.phase = PrefetchPhase::Failed;
                 lifecycle.failure_reason = Some("prefetch execution timeout".to_string());
             } else if entry.cancellation.is_cancelled() {
-                lifecycle.phase = PrefetchPhase::Canceled;
+                lifecycle.phase = PrefetchPhase::Canceling;
                 lifecycle.failure_reason = Some("prefetch canceled".to_string());
             } else {
                 match result {
@@ -368,8 +373,11 @@ impl GatewayState {
                     }
                 }
             }
+            let terminal = lifecycle.phase.is_terminal();
             drop(lifecycle);
-            self.record_prefetch_completion(entry.request.task_id).await;
+            if terminal {
+                self.record_prefetch_completion(entry.request.task_id).await;
+            }
             entry.finished.notify_waiters();
         }
     }
@@ -395,11 +403,11 @@ impl GatewayState {
     }
 
     async fn record_prefetch_completion(&self, task_id: Uuid) {
-        self.prefetches
-            .lock()
-            .await
+        let mut registry = self.prefetches.lock().await;
+        registry
             .completed
-            .push_back((Instant::now(), task_id));
+            .retain(|(_, completed_task_id)| *completed_task_id != task_id);
+        registry.completed.push_back((Instant::now(), task_id));
     }
 
     async fn prune_tombstones(&self) {
@@ -499,6 +507,20 @@ pub fn safe_target_path(root: &Path, relative_path: &str) -> anyhow::Result<Path
     Ok(root.join(clean))
 }
 
+fn safe_prefetch_target_path(
+    root: &Path,
+    task_id: Uuid,
+    relative_path: &str,
+) -> anyhow::Result<PathBuf> {
+    let final_path = safe_target_path(root, relative_path)?;
+    let expected_parent = root.join("imports").join(task_id.to_string());
+    anyhow::ensure!(
+        final_path.parent() == Some(expected_parent.as_path()),
+        "target_path must be imports/{task_id}/<filename>"
+    );
+    Ok(final_path)
+}
+
 async fn healthz() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
@@ -524,6 +546,7 @@ async fn gateway_status(State(state): State<GatewayState>) -> impl IntoResponse 
     drop(registry);
     let mut queued = 0usize;
     let mut running = 0usize;
+    let mut canceling = 0usize;
     let mut ready = 0usize;
     let mut failed = 0usize;
     let mut canceled = 0usize;
@@ -539,6 +562,7 @@ async fn gateway_status(State(state): State<GatewayState>) -> impl IntoResponse 
                     prefetch::ExecutionClass::Ffmpeg => active_ffmpeg += 1,
                 }
             }
+            PrefetchPhase::Canceling => canceling += 1,
             PrefetchPhase::Ready => ready += 1,
             PrefetchPhase::Failed => failed += 1,
             PrefetchPhase::Canceled => canceled += 1,
@@ -554,6 +578,7 @@ async fn gateway_status(State(state): State<GatewayState>) -> impl IntoResponse 
             "records": entries.len(),
             "queued": queued,
             "running": running,
+            "canceling": canceling,
             "ready": ready,
             "failed": failed,
             "canceled": canceled,
@@ -948,8 +973,12 @@ async fn create_prefetch(
     if request.target_path.len() > MAX_TARGET_PATH_BYTES {
         return bad_request("target_path must not exceed 1024 bytes");
     }
-    let Ok(final_path) = safe_target_path(&state.config.work_root, &request.target_path) else {
-        return bad_request("target_path must be a non-upload relative path");
+    let Ok(final_path) = safe_prefetch_target_path(
+        &state.config.work_root,
+        request.task_id,
+        &request.target_path,
+    ) else {
+        return bad_request("target_path must be imports/{task_id}/<filename>");
     };
     request.start_offset_sec = request.start_offset_sec.filter(|value| *value > 0);
     if request.duration_sec == Some(0) {
@@ -995,11 +1024,13 @@ async fn create_prefetch(
         class,
         lifecycle: Mutex::new(PrefetchLifecycle {
             phase: PrefetchPhase::Queued,
+            execution_active: false,
             created_at: Instant::now(),
             source_url: None,
             failure_reason: None,
             time_slice_applied: false,
         }),
+        cleanup_serial: Mutex::new(()),
         cancellation: CancellationToken::new(),
         finished: Notify::new(),
     });
@@ -1038,6 +1069,7 @@ async fn prefetch_response(state: &GatewayState, entry: &PrefetchEntry) -> Prefe
     let (status, phase, poll_after_ms) = match lifecycle.phase {
         PrefetchPhase::Queued => ("pending", Some("queued"), Some(30_000)),
         PrefetchPhase::Running => ("pending", Some("running"), Some(5_000)),
+        PrefetchPhase::Canceling => ("pending", Some("canceling"), Some(1_000)),
         PrefetchPhase::Ready => ("ready", Some("ready"), None),
         PrefetchPhase::Failed => ("failed", Some("failed"), None),
         PrefetchPhase::Canceled => ("canceled", Some("canceled"), None),
@@ -1095,22 +1127,44 @@ async fn reset_task(
     State(state): State<GatewayState>,
     AxumPath(task_id): AxumPath<Uuid>,
 ) -> Response {
-    let relay = state.relays.lock().await.get(&task_id).cloned();
-    if relay.is_some_and(|relay| relay.active_requests.load(Ordering::Acquire) != 0) {
-        return conflict("relay still has active requests");
+    if state.relays.lock().await.contains_key(&task_id) {
+        return conflict("relay is still registered; cancel it before reset");
     }
     let entry = state.prefetches.lock().await.records.get(&task_id).cloned();
     if let Some(entry) = entry {
-        if !entry.lifecycle.lock().await.phase.is_terminal() {
-            return conflict("prefetch is still active");
+        let _cleanup_guard = entry.cleanup_serial.lock().await;
+        if matches!(
+            entry.lifecycle.lock().await.phase,
+            PrefetchPhase::Queued | PrefetchPhase::Running | PrefetchPhase::Canceling
+        ) {
+            return conflict("prefetch is still active or cleaning up");
+        }
+        match prefetch::published_target_exists(&entry.job).await {
+            Ok(true) => return conflict("prefetch artifact still exists; cancel it before reset"),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(task_id = %task_id, error = %error, "failed to inspect prefetch target during reset");
+                return service_unavailable("failed to inspect prefetch artifact", Some(1));
+            }
+        }
+        if state.relays.lock().await.contains_key(&task_id) {
+            return conflict("relay is still registered; cancel it before reset");
         }
         let mut registry = state.prefetches.lock().await;
         registry.records.remove(&task_id);
         registry
             .completed
             .retain(|(_, completed_task_id)| *completed_task_id != task_id);
+    } else {
+        match prefetch::task_directory_exists(&state.config.work_root, task_id).await {
+            Ok(true) => return conflict("prefetch artifact still exists; cancel it before reset"),
+            Ok(false) => {}
+            Err(error) => {
+                warn!(task_id = %task_id, error = %error, "failed to inspect prefetch task directory during reset");
+                return service_unavailable("failed to inspect prefetch artifact", Some(1));
+            }
+        }
     }
-    state.relays.lock().await.remove(&task_id);
     state.tombstones.lock().await.remove(&task_id);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1153,34 +1207,56 @@ async fn cancel_prefetch(state: &GatewayState, task_id: Uuid) -> Result<(), ()> 
         registry.records.get(&task_id).cloned()
     };
     let Some(entry) = entry else {
-        return Ok(());
+        return prefetch::cleanup_task_directory(&state.config.work_root, task_id)
+            .await
+            .map_err(|error| {
+                warn!(task_id = %task_id, error = %error, "failed to clean untracked prefetch task directory");
+            });
     };
     entry.cancellation.cancel();
-    {
+    let _cleanup_guard = entry.cleanup_serial.lock().await;
+    let originally_canceled = {
         let mut lifecycle = entry.lifecycle.lock().await;
-        if lifecycle.phase == PrefetchPhase::Queued {
-            lifecycle.phase = PrefetchPhase::Canceled;
-            lifecycle.failure_reason = Some("prefetch canceled".to_string());
-            drop(lifecycle);
-            state.record_prefetch_completion(task_id).await;
-            entry.finished.notify_waiters();
-            return Ok(());
-        }
-        if lifecycle.phase.is_terminal() {
-            return Ok(());
-        }
-    }
+        let originally_canceled = lifecycle.phase == PrefetchPhase::Canceled;
+        lifecycle.phase = PrefetchPhase::Canceling;
+        lifecycle.failure_reason = Some("prefetch canceled".to_string());
+        originally_canceled
+    };
+    entry.finished.notify_waiters();
+
     let deadline = Instant::now() + state.runtime.prefetch_cancel_wait;
     loop {
         let notified = entry.finished.notified();
-        if entry.lifecycle.lock().await.phase.is_terminal() {
-            return Ok(());
+        if !entry.lifecycle.lock().await.execution_active {
+            break;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
             return Err(());
         }
     }
+
+    if let Err(error) = prefetch::cleanup_published_target(&entry.job).await {
+        warn!(task_id = %task_id, error = %error, "failed to clean canceled prefetch target");
+        let mut lifecycle = entry.lifecycle.lock().await;
+        lifecycle.failure_reason = Some(format!("prefetch cleanup failed: {error}"));
+        drop(lifecycle);
+        entry.finished.notify_waiters();
+        return Err(());
+    }
+
+    {
+        let mut lifecycle = entry.lifecycle.lock().await;
+        lifecycle.phase = PrefetchPhase::Canceled;
+        lifecycle.source_url = None;
+        lifecycle.failure_reason = Some("prefetch canceled".to_string());
+        lifecycle.time_slice_applied = false;
+    }
+    if !originally_canceled {
+        state.record_prefetch_completion(task_id).await;
+    }
+    entry.finished.notify_waiters();
+    Ok(())
 }
 
 fn valid_source_url(value: &str) -> bool {

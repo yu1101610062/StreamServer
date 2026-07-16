@@ -925,6 +925,14 @@ pub(crate) fn build_live_relay_api_params(
     if matches!(spec.input.kind, Some(InputKind::Rtsp)) {
         params.push(("rtp_type".to_string(), "0".to_string()));
     }
+    if let Some(schema) = match spec.input.kind {
+        Some(InputKind::Hls) => Some("hls"),
+        Some(InputKind::HttpTs) => Some("ts"),
+        Some(InputKind::HttpFlv) => Some("flv"),
+        _ => None,
+    } {
+        params.push(("schema".to_string(), schema.to_string()));
+    }
 
     params
 }
@@ -1156,6 +1164,77 @@ JSON
             args.get(duration_index + 1).map(String::as_str),
             Some("180")
         );
+    }
+
+    fn live_http_spec(kind: InputKind) -> TaskSpec {
+        let mut spec = vod_record_spec(ExposeSpec::default());
+        spec.input.kind = Some(kind);
+        spec.input.source_mode = Some(SourceMode::Live);
+        spec.input.start_offset_sec = None;
+        spec.input.url =
+            Some("https://172.21.26.25/bohui/media/relay/task?token=secret".to_string());
+        spec.record.enabled = Some(false);
+        spec.record.duration_sec = None;
+        spec
+    }
+
+    fn relay_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        params
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn live_http_inputs_set_explicit_zlm_player_schema() {
+        let startup_probe = StartupProbe {
+            schema: Some("fmp4".to_string()),
+            vhost: "__defaultVhost__".to_string(),
+            app: "live".to_string(),
+            stream: "gateway".to_string(),
+        };
+
+        for (kind, expected) in [
+            (InputKind::Hls, "hls"),
+            (InputKind::HttpTs, "ts"),
+            (InputKind::HttpFlv, "flv"),
+        ] {
+            let spec = live_http_spec(kind);
+            let params = build_live_relay_api_params(
+                &agent_settings(),
+                &spec,
+                &startup_probe,
+                spec.input.url.as_deref().expect("input URL should exist"),
+            );
+            assert_eq!(relay_param(&params, "schema"), Some(expected));
+            assert_eq!(startup_probe.schema.as_deref(), Some("fmp4"));
+        }
+    }
+
+    #[test]
+    fn non_http_live_inputs_do_not_set_zlm_player_schema() {
+        let startup_probe = StartupProbe {
+            schema: Some("rtsp".to_string()),
+            vhost: "__defaultVhost__".to_string(),
+            app: "live".to_string(),
+            stream: "direct".to_string(),
+        };
+
+        for kind in [InputKind::Rtsp, InputKind::Rtmp] {
+            let mut spec = live_http_spec(kind);
+            spec.input.url = Some(match kind {
+                InputKind::Rtsp => "rtsp://customer.example/live/source".to_string(),
+                InputKind::Rtmp => "rtmp://customer.example/live/source".to_string(),
+                _ => unreachable!(),
+            });
+            let params = build_live_relay_api_params(
+                &agent_settings(),
+                &spec,
+                &startup_probe,
+                spec.input.url.as_deref().expect("input URL should exist"),
+            );
+            assert_eq!(relay_param(&params, "schema"), None);
+        }
     }
 
     #[test]

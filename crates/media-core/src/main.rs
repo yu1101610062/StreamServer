@@ -1344,7 +1344,7 @@ async fn delete_task(
 ) -> Result<Json<repository::TaskSummary>, AppError> {
     let _principal =
         authorize_business_request(&state, &headers, peer, ApiPermission::TaskWrite).await?;
-    let task = state.repository.delete_task(task_id).await?;
+    let task = state.control_plane.delete_task(task_id).await?;
     Ok(Json(task))
 }
 

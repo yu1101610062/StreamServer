@@ -107,6 +107,66 @@ pub(crate) async fn execute_prefetch(
     })
 }
 
+pub(crate) async fn published_target_exists(job: &PrefetchJob) -> anyhow::Result<bool> {
+    let target = published_target(job)?;
+    fs::try_exists(target)
+        .await
+        .context("inspect published prefetch target")
+}
+
+pub(crate) async fn cleanup_published_target(job: &PrefetchJob) -> anyhow::Result<()> {
+    let target = published_target(job)?;
+    if job.source_kind == Some(PrefetchSourceKind::Hls) {
+        match fs::remove_dir_all(target).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error).context("remove published HLS directory"),
+        }
+    }
+
+    match fs::remove_file(target).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("remove published prefetch file"),
+    }
+    let Some(parent) = job.final_path.parent() else {
+        return Ok(());
+    };
+    match fs::remove_dir(parent).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove prefetch task directory"),
+    }
+}
+
+pub(crate) async fn task_directory_exists(work_root: &Path, task_id: Uuid) -> anyhow::Result<bool> {
+    fs::try_exists(prefetch_task_directory(work_root, task_id))
+        .await
+        .context("inspect prefetch task directory")
+}
+
+pub(crate) async fn cleanup_task_directory(work_root: &Path, task_id: Uuid) -> anyhow::Result<()> {
+    match fs::remove_dir_all(prefetch_task_directory(work_root, task_id)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove prefetch task directory"),
+    }
+}
+
+fn prefetch_task_directory(work_root: &Path, task_id: Uuid) -> PathBuf {
+    work_root.join("imports").join(task_id.to_string())
+}
+
+fn published_target(job: &PrefetchJob) -> anyhow::Result<&Path> {
+    if job.source_kind == Some(PrefetchSourceKind::Hls) {
+        job.final_path
+            .parent()
+            .context("HLS target has no task directory")
+    } else {
+        Ok(&job.final_path)
+    }
+}
+
 async fn clip_hls(
     ffmpeg_bin: &Path,
     ffprobe_bin: Option<&Path>,
